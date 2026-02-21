@@ -1,0 +1,41 @@
+// ============================================================================
+// GO WORKSPACE
+// ============================================================================
+//
+// WHY: Go workspaces (introduced in Go 1.18) allow multiple modules to live
+// in a single repo and reference each other without publishing to a registry.
+// This is the monorepo enabler — each service is an independent module with
+// its own go.mod, but `go.work` lets them import `pkg/` directly during
+// development.
+//
+// HOW IT WORKS:
+//   - `go.work` lists all modules in the workspace via `use` directives
+//   - `go build`, `go test`, etc. automatically resolve inter-module imports
+//     to local source instead of fetching from a remote registry
+//   - Each module still has its own go.mod with proper module paths
+//     (e.g., github.com/abd-ulbasit/goml/pkg) for external consumers
+//
+// ALTERNATIVES:
+//   - Go 1.17 replace directives: Fragile, each module needs replace for
+//     every other module. Doesn't scale past 3-4 modules.
+//   - Polyrepo: Each service in its own Git repo. Better isolation, but
+//     painful cross-service refactoring, proto changes, and shared lib updates.
+//   - Single go.mod monolith: All services in one module. Simple but forces
+//     all services to share ALL dependencies — a Redis upgrade for one service
+//     affects all services.
+//
+// HOW UBER/GOOGLE DO IT:
+//   - Uber: Monorepo with Go workspaces (migrated from Bazel-based mono-module)
+//   - Google: Monorepo (Blaze/Bazel build system, not Go modules)
+//   - Buf (proto company): Uses Go workspaces for their OSS projects
+//   - We follow Uber's pattern: workspace + independent modules per service
+//
+// NOTE: Services are added to `use()` as they're built. Start with just
+// pkg (shared libs) and auth (first service).
+
+go 1.24
+
+use (
+	./pkg
+	./services/auth
+)
