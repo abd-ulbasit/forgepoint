@@ -33,9 +33,8 @@
 // NOTE: Services are added to `use()` as they're built. Start with just
 // pkg (shared libs) and auth (first service).
 
-go 1.24
+go 1.26.0
 
 use (
 	./pkg
-	./services/auth
 )
