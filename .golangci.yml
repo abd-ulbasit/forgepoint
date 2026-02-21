@@ -1,0 +1,77 @@
+# ============================================================================
+# golangci-lint Configuration
+# ============================================================================
+#
+# WHY golangci-lint:
+#   Runs 50+ Go linters in parallel with shared AST parsing. Instead of
+#   managing individual linter binaries (errcheck, govet, etc.), this single
+#   tool handles everything with one config file.
+#
+# LINTER CHOICES:
+#   - errcheck: Catches unchecked errors (Go's #1 bug source)
+#   - govet: Catches subtle bugs (printf format strings, struct tags, etc.)
+#   - staticcheck: Advanced static analysis (like a mini formal verifier)
+#   - unused: Finds dead code (functions, types, variables never referenced)
+#   - gosimple: Suggests simpler code constructs
+#   - ineffassign: Catches assignments to variables that are never read
+#   - misspell: Catches typos in comments and strings
+#   - gofmt/goimports: Enforces standard Go formatting
+#   - gocritic: Opinionated style checks (range over map, etc.)
+#   - revive: Extensible linter (successor to golint)
+#
+# DISABLED:
+#   - exhaustruct: Requires ALL struct fields to be set explicitly. Too noisy
+#     for proto-generated structs (which have dozens of fields). Would need
+#     `//nolint:exhaustruct` on every proto conversion.
+#   - wrapcheck: Requires wrapping every error from external packages. Good
+#     in theory, but overly strict with gRPC status errors which should be
+#     returned as-is.
+# ============================================================================
+
+version: "2"
+
+run:
+  # Timeout for the entire linting run. Integration test files with
+  # testcontainers can be large — 5 minutes prevents false timeouts.
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - gocritic
+    - revive
+    - misspell
+    - prealloc
+    - unconvert
+    - unparam
+  disable:
+    # Too noisy for proto-generated struct conversions.
+    - exhaustruct
+
+linters-settings:
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - style
+      - performance
+  revive:
+    rules:
+      - name: exported
+        arguments:
+          - "checkPrivateReceivers"
+      - name: unused-parameter
+  misspell:
+    locale: US
+
+issues:
+  exclude-dirs:
+    # Generated proto code — not our responsibility to lint
+    - gen
+  exclude-rules:
+    # Test files can have longer functions and magic numbers
+    - path: _test\.go
+      linters:
+        - gocritic
+        - revive
+  max-issues-per-linter: 0
+  max-same-issues: 0

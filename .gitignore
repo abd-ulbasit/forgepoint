@@ -1,0 +1,49 @@
+# ============================================================================
+# GoML Platform — .gitignore
+# ============================================================================
+
+# Compiled binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.out
+cover.out
+cover.html
+*.test
+
+# Go vendor (we use modules, not vendoring)
+vendor/
+
+# Environment files (may contain secrets: DB passwords, JWT secrets, API keys)
+.env
+.env.*
+!.env.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Terraform state (contains sensitive infrastructure details)
+*.tfstate
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+
+# Helm packaging artifacts
+deploy/helm/*/charts/
+*.tgz
+
+# Temporary files
+tmp/
