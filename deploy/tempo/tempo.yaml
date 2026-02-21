@@ -1,0 +1,35 @@
+# ============================================================================
+# TEMPO CONFIGURATION
+# ============================================================================
+#
+# Tempo is a distributed tracing backend that receives traces via OTLP
+# and stores them for querying via Grafana.
+#
+# TRACE FLOW:
+#   GoML Service → OpenTelemetry SDK → OTLP gRPC (:4317) → Tempo → Grafana
+#
+# This is a minimal local-dev config. Production would use S3/GCS backend
+# and WAL replication for durability.
+# ============================================================================
+
+stream_over_http_enabled: true
+
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: "0.0.0.0:4317"
+        http:
+          endpoint: "0.0.0.0:4318"
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /tmp/tempo/blocks
+    wal:
+      path: /tmp/tempo/wal
