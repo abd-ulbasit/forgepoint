@@ -1,0 +1,44 @@
+# ============================================================================
+# Buf Code Generation Configuration
+# ============================================================================
+#
+# WHY remote plugins over local protoc plugins:
+#   - No need to install protoc-gen-go or protoc-gen-go-grpc locally
+#   - Buf's remote plugins are versioned and reproducible
+#   - Same generation output regardless of developer's local setup
+#   - CI/CD doesn't need Go toolchain just for proto generation
+#
+# PLUGINS:
+#   1. buf.build/protocolbuffers/go — generates *.pb.go files
+#      (message types, serialization, field accessors)
+#   2. buf.build/grpc/go — generates *_grpc.pb.go files
+#      (gRPC service interfaces, client/server stubs)
+#
+# OUTPUT: ../gen/go/ (relative to proto/ directory)
+#   This puts generated code at the repo root under gen/go/goml/{service}/v1/
+#   All services import from this shared generated package.
+#
+# OPT paths=source_relative:
+#   Generated files are placed relative to the .proto source file's package.
+#   E.g., proto/goml/auth/v1/auth.proto → gen/go/goml/auth/v1/auth.pb.go
+#   Alternative is module-based (paths=module), but source_relative is simpler
+#   and more predictable for monorepo layouts.
+# ============================================================================
+
+version: v2
+
+plugins:
+  # Generates Go structs for all proto messages + serialization methods.
+  # Each message becomes a Go struct with getters, Reset(), String(), etc.
+  - remote: buf.build/protocolbuffers/go
+    out: ../gen/go
+    opt: paths=source_relative
+
+  # Generates gRPC service interfaces (server + client).
+  # For each `service Foo { rpc Bar(...) returns (...); }` in proto:
+  #   - FooServer interface (implement this in your handler)
+  #   - FooClient interface (use this to call the service)
+  #   - RegisterFooServer() function (wire handler to gRPC server)
+  - remote: buf.build/grpc/go
+    out: ../gen/go
+    opt: paths=source_relative
