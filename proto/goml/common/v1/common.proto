@@ -1,0 +1,165 @@
+// ============================================================================
+// GoML Common Proto Definitions
+// ============================================================================
+//
+// WHY: Shared types used across ALL services. Defining them once in a common
+// package prevents duplication and ensures consistent structure across the
+// platform.
+//
+// WHAT'S HERE:
+//   - EventEnvelope: Standard wrapper for all NATS async events
+//   - Pagination: Cursor-based pagination for list RPCs
+//   - ErrorDetail: Structured error information for gRPC responses
+//
+// VERSIONING: Package path includes v1 following Buf/Google convention.
+// If we need breaking changes, we create goml.common.v2 (new package)
+// and both versions coexist during migration.
+// ============================================================================
+
+syntax = "proto3";
+
+package goml.common.v1;
+
+option go_package = "github.com/abd-ulbasit/goml/gen/go/goml/common/v1;commonv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/any.proto";
+
+// ============================================================================
+// EVENT ENVELOPE
+// ============================================================================
+//
+// WHY: Every async event (NATS) is wrapped in a standard envelope. This
+// ensures consistent metadata across all events regardless of which service
+// publishes them. It's the async equivalent of HTTP headers.
+//
+// HOW IT WORKS:
+//   - Producer wraps domain event in EventEnvelope before publishing to NATS
+//   - Consumer unwraps envelope, uses metadata for:
+//     * Deduplication: `id` field (UUID) → idempotent consumer checks
+//     * Tracing: `correlation_id` → links async events to original request
+//     * Routing: `type` + `source` → consumers filter on subject hierarchy
+//     * Debugging: `timestamp` → when event was produced
+//   - `data` is google.protobuf.Any → type-safe payload with URL-based type ID
+//
+// ALTERNATIVES:
+//   - CloudEvents spec: Industry standard for event metadata. Our envelope
+//     is a simplified CloudEvents. Full CloudEvents adds: specversion,
+//     datacontenttype, dataschema, subject, time. We keep it minimal since
+//     all our events are internal (not crossing org boundaries).
+//   - Raw JSON: No schema, no type safety, easy to break consumers silently.
+//   - Protobuf oneof for data: Would require listing ALL event types in this
+//     file — tight coupling. Any + type URL keeps it extensible.
+//
+// HOW UBER/CONFLUENT DO IT:
+//   - Uber: Uses Protobuf envelopes with Kafka (very similar to this)
+//   - Confluent: Schema Registry + Avro envelopes with subject-based routing
+//   - AWS EventBridge: CloudEvents-like envelope with source + detail-type
+// ============================================================================
+message EventEnvelope {
+  // Unique event ID (UUID v4). Used for idempotent consumption — consumers
+  // track processed IDs to safely handle redelivery.
+  string id = 1;
+
+  // Event type following dot notation: "model.registered", "pipeline.started".
+  // Maps to NATS subject hierarchy: goml.{source}.{type}
+  string type = 2;
+
+  // Source service that produced this event: "auth", "registry", "pipeline".
+  string source = 3;
+
+  // When the event was produced (not when it was consumed).
+  google.protobuf.Timestamp timestamp = 4;
+
+  // Correlation ID linking this event to the original request.
+  // Propagated from the inbound gRPC request's trace context.
+  // Enables distributed tracing across sync (gRPC) and async (NATS) paths.
+  string correlation_id = 5;
+
+  // The actual event payload. Uses google.protobuf.Any for type safety
+  // with runtime type resolution via the type_url field.
+  google.protobuf.Any data = 6;
+}
+
+// ============================================================================
+// PAGINATION
+// ============================================================================
+//
+// WHY cursor-based over offset-based:
+//   - Offset pagination (LIMIT/OFFSET) breaks when data changes between pages.
+//     If a new item is inserted at page 1, offset-based page 2 shows a
+//     duplicate. Cursor-based uses a stable pointer (usually the last item's
+//     ID or timestamp).
+//   - Performance: OFFSET N scans and discards N rows. Cursor-based uses
+//     WHERE id > cursor with an index — O(1) vs O(N) seek time.
+//   - Used by: Google APIs, Stripe, GitHub, Slack, Twitter
+//
+// HOW IT WORKS:
+//   - Client sends page_size + page_token (opaque string, usually base64)
+//   - Server decodes token → gets cursor value → queries with WHERE clause
+//   - Server returns next_page_token + total_count
+//   - Empty next_page_token = last page
+//
+// ALTERNATIVES:
+//   - Offset/Limit: Simple but breaks with concurrent mutations, O(N) seek
+//   - Keyset (seek): Similar to cursor but exposes the actual key value
+//   - Relay-style (GraphQL): First/After/Last/Before — more flexible but complex
+//   - We use Google's convention (page_token/next_page_token) — most Go APIs do
+// ============================================================================
+message PaginationRequest {
+  // Maximum items per page. Server may return fewer.
+  // Default: 20, Max: 100 (enforced server-side to prevent abuse).
+  int32 page_size = 1;
+
+  // Opaque cursor from a previous response's next_page_token.
+  // Empty string = first page.
+  string page_token = 2;
+}
+
+message PaginationResponse {
+  // Opaque cursor for the next page. Empty = no more pages.
+  string next_page_token = 1;
+
+  // Total number of items across all pages (if efficiently computable).
+  // May be -1 if total count is expensive (e.g., requires full table scan).
+  int32 total_count = 2;
+}
+
+// ============================================================================
+// ERROR DETAILS
+// ============================================================================
+//
+// WHY structured errors over plain strings:
+//   - Clients need machine-readable error information to show field-specific
+//     validation errors, retry on specific codes, or display localized messages.
+//   - gRPC status codes (OK, NOT_FOUND, etc.) are too coarse. ErrorDetail
+//     provides field-level granularity within a single RPC response.
+//
+// HOW gRPC ERROR MODEL WORKS:
+//   - gRPC has 16 status codes (OK through DATA_LOSS)
+//   - For richer errors, attach ErrorDetail as "status details" using
+//     google.golang.org/grpc/status package:
+//       st := status.New(codes.InvalidArgument, "validation failed")
+//       st, _ = st.WithDetails(&ErrorDetail{code: "INVALID_EMAIL", ...})
+//       return nil, st.Err()
+//   - Client extracts details: status.FromError(err).Details()
+//
+// HOW GOOGLE DOES IT:
+//   - Google APIs use google.rpc.Status with google.rpc.ErrorInfo,
+//     google.rpc.BadRequest, google.rpc.RetryInfo as detail types.
+//   - We simplify to a single ErrorDetail type covering the common cases.
+// ============================================================================
+message ErrorDetail {
+  // Machine-readable error code: "INVALID_EMAIL", "DUPLICATE_MODEL_NAME",
+  // "QUOTA_EXCEEDED". Clients switch on this for programmatic handling.
+  string code = 1;
+
+  // Human-readable error message for debugging/logging.
+  // NOT for end-user display (localization is the client's job).
+  string message = 2;
+
+  // Field path that caused the error (for validation errors).
+  // Uses dot notation: "model.name", "version.metrics.accuracy".
+  // Empty for non-field-specific errors.
+  string field = 3;
+}

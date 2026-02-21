@@ -1,0 +1,47 @@
+# ============================================================================
+# Buf Configuration
+# ============================================================================
+#
+# WHY Buf over raw protoc:
+#   - protoc requires manual plugin management: you must install
+#     protoc-gen-go and protoc-gen-go-grpc separately, keep versions in sync,
+#     and construct long CLI invocations with include paths.
+#   - Buf handles dependency resolution, linting, breaking change detection,
+#     and code generation in a single declarative config.
+#   - buf.build registry provides versioned proto plugins (no local installs).
+#
+# HOW IT WORKS:
+#   - `modules` declares this directory as a Buf module
+#   - `lint.use: [STANDARD]` enables Buf's recommended lint rules:
+#     * PACKAGE_DEFINED, PACKAGE_SAME_DIRECTORY, PACKAGE_SAME_GO_PACKAGE
+#     * ENUM_NO_ALLOW_ALIAS, ENUM_PASCAL_CASE, ENUM_VALUE_PREFIX, ENUM_ZERO_VALUE_SUFFIX
+#     * FIELD_LOWER_SNAKE_CASE, MESSAGE_PASCAL_CASE, SERVICE_PASCAL_CASE, RPC_PASCAL_CASE
+#     * etc. (~40 rules total)
+#   - `breaking.use: [FILE]` — the strictest breaking change detection level.
+#     Checks: no removed messages/fields/RPCs, no type changes, no renaming.
+#     Ensures any proto change is backward compatible.
+#
+# BREAKING CHANGE LEVELS (from strictest to most lenient):
+#   FILE > PACKAGE > WIRE_JSON > WIRE
+#   We use FILE because we want maximum compatibility guarantees —
+#   even field renames (which are wire-compatible) are caught, since they
+#   break generated Go code.
+#
+# REAL-WORLD COMPARISON:
+#   - Google: Internal proto style guide with custom linting
+#   - Buf: Their own dogfooding of these exact rules
+#   - gRPC ecosystem: Most use STANDARD + FILE breaking
+# ============================================================================
+
+version: v2
+
+modules:
+  - path: .
+
+lint:
+  use:
+    - STANDARD
+
+breaking:
+  use:
+    - FILE
