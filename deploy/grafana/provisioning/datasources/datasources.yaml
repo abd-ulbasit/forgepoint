@@ -1,0 +1,55 @@
+# ============================================================================
+# GRAFANA DATASOURCE PROVISIONING
+# ============================================================================
+#
+# WHY auto-provisioning:
+#   Without this file, every developer would need to manually add datasources
+#   in Grafana UI after running docker compose. Auto-provisioning ensures
+#   Grafana starts with all datasources pre-configured — zero manual setup.
+#
+# THREE PILLARS OF OBSERVABILITY:
+#   1. Metrics (Prometheus) — RED metrics: Rate, Errors, Duration
+#   2. Logs (Loki) — Structured JSON logs from all services
+#   3. Traces (Tempo) — Distributed traces across service boundaries
+#
+#   Grafana correlates all three: click a spike in metrics → see relevant
+#   logs → jump to the distributed trace that caused it.
+# ============================================================================
+
+apiVersion: 1
+
+datasources:
+  # Prometheus — metrics (RED: Rate, Errors, Duration)
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+
+  # Tempo — distributed traces (OpenTelemetry → OTLP)
+  - name: Tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: false
+    jsonData:
+      tracesToMetrics:
+        datasourceUid: prometheus
+      tracesToLogs:
+        datasourceUid: loki
+      nodeGraph:
+        enabled: true
+
+  # Loki — logs (structured JSON via slog → stdout → Loki)
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+    jsonData:
+      derivedFields:
+        - datasourceUid: tempo
+          matcherRegex: '"trace_id":"(\w+)"'
+          name: TraceID
+          url: "$${__value.raw}"

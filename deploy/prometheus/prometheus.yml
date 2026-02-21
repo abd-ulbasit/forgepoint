@@ -1,0 +1,51 @@
+# ============================================================================
+# PROMETHEUS CONFIGURATION
+# ============================================================================
+#
+# WHY Prometheus:
+#   Prometheus is the standard for Kubernetes-native metrics collection.
+#   It uses a pull model: Prometheus scrapes /metrics endpoints from services.
+#   This is simpler than push-based (no agent needed on each service) and
+#   Prometheus handles discovery, storage, and alerting.
+#
+# SCRAPE FLOW:
+#   Prometheus → polls /metrics every 15s → stores time-series → Grafana queries
+#
+# SERVICE DISCOVERY:
+#   In production (K8s), we use kubernetes_sd_configs for auto-discovery.
+#   In local dev (Docker Compose), we use static_configs with service names.
+# ============================================================================
+
+global:
+  scrape_interval: 15s     # How often to scrape targets
+  evaluation_interval: 15s # How often to evaluate alerting rules
+  scrape_timeout: 10s      # Timeout per scrape request
+
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # GoML microservices (add entries as services are built)
+  # Each service exposes /metrics on its HTTP port (default 8080)
+  - job_name: "goml-services"
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "auth:8080"
+          - "registry:8080"
+          - "inference-gateway:8080"
+          - "pipeline-orchestrator:8080"
+          - "feature-store:8080"
+          - "experiment-tracker:8080"
+          - "billing:8080"
+          - "notification:8080"
+        labels:
+          environment: "local"
+
+  # NATS server metrics (exposed on monitoring port)
+  - job_name: "nats"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["nats:8222"]

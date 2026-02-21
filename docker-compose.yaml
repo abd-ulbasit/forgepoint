@@ -1,0 +1,204 @@
+# ============================================================================
+# GOML LOCAL INFRASTRUCTURE STACK
+# ============================================================================
+#
+# PURPOSE: Local development dependencies only. No GoML services here —
+# services are built and run separately (via `make run SVC=auth` or Skaffold).
+#
+# USAGE:
+#   make up           # Start all infrastructure
+#   make down         # Stop all infrastructure
+#   make down-clean   # Stop and remove volumes (reset all data)
+#
+# VERIFICATION:
+#   curl http://localhost:8222/healthz        # NATS
+#   psql -h localhost -U goml -c "SELECT 1"   # Postgres (password: goml)
+#   redis-cli -h localhost ping               # Redis
+#   curl http://localhost:9000/minio/health/live  # MinIO
+#   curl http://localhost:9090/-/healthy      # Prometheus
+#   curl http://localhost:3000/api/health     # Grafana (admin/admin)
+#
+# ARCHITECTURE:
+#   ┌─────────────────────────────────────────────────────┐
+#   │                    GoML Services                     │
+#   │  (run separately via make run / Skaffold / Kind)     │
+#   └──────────────┬──────────────────────┬───────────────┘
+#                  │                      │
+#   ┌──────────────▼──────────────────────▼───────────────┐
+#   │              Docker Compose Stack                    │
+#   │  ┌─────────┐ ┌─────────┐ ┌───────┐ ┌──────────┐   │
+#   │  │  NATS   │ │Postgres │ │ Redis │ │  MinIO   │   │
+#   │  │  :4222  │ │  :5432  │ │ :6379 │ │  :9000   │   │
+#   │  └─────────┘ └─────────┘ └───────┘ └──────────┘   │
+#   │  ┌──────────────┐ ┌────────┐ ┌───────┐ ┌──────┐   │
+#   │  │  Prometheus   │ │Grafana │ │ Tempo │ │ Loki │   │
+#   │  │    :9090      │ │ :3000  │ │ :4317 │ │:3100 │   │
+#   │  └──────────────┘ └────────┘ └───────┘ └──────┘   │
+#   └─────────────────────────────────────────────────────┘
+# ============================================================================
+
+services:
+  # ==========================================================================
+  # NATS — Async event bus (JetStream for persistence)
+  # ==========================================================================
+  nats:
+    image: nats:2.11
+    command: ["--jetstream", "--http_port", "8222", "-DV"]
+    ports:
+      - "4222:4222"   # Client connections
+      - "8222:8222"   # HTTP monitoring + metrics
+    volumes:
+      - nats-data:/data
+    restart: unless-stopped
+
+  # ==========================================================================
+  # POSTGRES — Primary data store for all services
+  # ==========================================================================
+  #
+  # Each service gets its own database (goml_auth, goml_registry, etc.)
+  # via the init script. Services use separate connection strings:
+  #   AUTH_DATABASE_URL=postgres://goml:goml@localhost:5432/goml_auth
+  #   REGISTRY_DATABASE_URL=postgres://goml:goml@localhost:5432/goml_registry
+  # ==========================================================================
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: goml
+      POSTGRES_PASSWORD: goml
+      POSTGRES_DB: goml
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init-postgres.sh:/docker-entrypoint-initdb.d/init-postgres.sh:ro
+    restart: unless-stopped
+
+  # ==========================================================================
+  # REDIS — Caching (registry read model, rate limiting, sessions)
+  # ==========================================================================
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  # ==========================================================================
+  # MINIO — S3-compatible object storage (model artifacts)
+  # ==========================================================================
+  #
+  # MinIO provides local S3 API so services use the same code path as
+  # production (AWS S3). No special "local file" storage adapter needed.
+  #
+  # Console UI: http://localhost:9001 (minioadmin/minioadmin)
+  # API endpoint: http://localhost:9000
+  # ==========================================================================
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    volumes:
+      - minio-data:/data
+    restart: unless-stopped
+
+  # Create default bucket on startup
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint: >
+      /bin/sh -c "
+      sleep 3 &&
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb local/goml-models --ignore-existing &&
+      echo 'Bucket goml-models created successfully'
+      "
+
+  # ==========================================================================
+  # PROMETHEUS — Metrics collection (pull-based scraping)
+  # ==========================================================================
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+    restart: unless-stopped
+
+  # ==========================================================================
+  # GRAFANA — Dashboards for metrics, logs, and traces
+  # ==========================================================================
+  #
+  # Datasources (Prometheus, Tempo, Loki) are auto-provisioned.
+  # Default login: admin / admin
+  # ==========================================================================
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
+    restart: unless-stopped
+
+  # ==========================================================================
+  # TEMPO — Distributed tracing backend (receives OTLP from services)
+  # ==========================================================================
+  #
+  # Services send traces via OpenTelemetry SDK → OTLP gRPC → Tempo
+  # Grafana queries Tempo to display trace waterfalls.
+  # ==========================================================================
+  tempo:
+    image: grafana/tempo:latest
+    command: ["-config.file=/etc/tempo.yaml"]
+    ports:
+      - "4317:4317"   # OTLP gRPC (OpenTelemetry traces)
+      - "3200:3200"   # Tempo HTTP API (Grafana queries this)
+    volumes:
+      - ./deploy/tempo/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/tmp/tempo
+    restart: unless-stopped
+
+  # ==========================================================================
+  # LOKI — Log aggregation (receives logs from services via promtail or direct)
+  # ==========================================================================
+  #
+  # In production, services log to stdout → collected by Kubernetes log driver.
+  # Locally, services can push directly to Loki or we can add promtail later.
+  # ==========================================================================
+  loki:
+    image: grafana/loki:latest
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki-data:/loki
+    restart: unless-stopped
+
+volumes:
+  nats-data:
+  postgres-data:
+  redis-data:
+  minio-data:
+  prometheus-data:
+  grafana-data:
+  tempo-data:
+  loki-data:
