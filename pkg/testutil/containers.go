@@ -71,9 +71,9 @@ func StartPostgres(t *testing.T) string {
 	// postgres module creates a container with the given image,
 	// database, username, password, and waits for readiness.
 	container, err := postgres.Run(ctx, "postgres:17",
-		postgres.WithDatabase("goml_test"),
-		postgres.WithUsername("goml"),
-		postgres.WithPassword("goml"),
+		postgres.WithDatabase("fp_test"),
+		postgres.WithUsername("fp"),
+		postgres.WithPassword("fp"),
 		testcontainers.WithWaitStrategy(
 			wait.ForLog("database system is ready to accept connections").
 				WithOccurrence(2)), // Postgres logs this twice: once for TCP, once for Unix socket

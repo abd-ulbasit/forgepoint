@@ -3,9 +3,17 @@ package health
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"sync"
+	"time"
 )
+
+// defaultCheckTimeout bounds how long a single readiness check may run before
+// it's reported as failed. Kept well under a typical kubelet readinessProbe
+// timeoutSeconds (usually 1-5s) so we always answer the probe in time rather
+// than letting one slow dependency hang the whole endpoint.
+const defaultCheckTimeout = 2 * time.Second
 
 // ============================================================================
 // HEALTH CHECK HANDLER
@@ -74,15 +82,32 @@ type ReadinessResponse struct {
 
 // Handler manages health check functions and serves HTTP endpoints.
 type Handler struct {
-	mu     sync.RWMutex
-	checks map[string]CheckFunc
+	mu           sync.RWMutex
+	checks       map[string]CheckFunc
+	checkTimeout time.Duration
+}
+
+// Option configures a Handler (functional options pattern).
+type Option func(*Handler)
+
+// WithCheckTimeout overrides the per-check timeout used by the readiness probe.
+// Each registered check is bounded by this timeout independently.
+func WithCheckTimeout(d time.Duration) Option {
+	return func(h *Handler) {
+		h.checkTimeout = d
+	}
 }
 
 // New creates a new health check Handler.
-func New() *Handler {
-	return &Handler{
-		checks: make(map[string]CheckFunc),
+func New(opts ...Option) *Handler {
+	h := &Handler{
+		checks:       make(map[string]CheckFunc),
+		checkTimeout: defaultCheckTimeout,
 	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
 }
 
 // AddCheck registers a named health check function.
@@ -131,15 +156,53 @@ func (h *Handler) ReadinessHandler() http.HandlerFunc {
 		}
 		h.mu.RUnlock()
 
+		// Run every check CONCURRENTLY, each bounded by its own timeout.
+		//
+		// WHY concurrent: run serially and the probe's latency becomes the SUM
+		// of all dependency latencies, and a single hung dependency stalls the
+		// whole /readyz past the kubelet's timeoutSeconds — causing the pod to
+		// flap out of the Service endpoints. Concurrency bounds probe latency to
+		// the SLOWEST single check; the per-check WithTimeout guarantees we
+		// always answer the kubelet within ~checkTimeout even if a dep hangs.
+		type checkOutcome struct {
+			name string
+			err  error
+		}
+		outcomes := make(chan checkOutcome, len(checks))
+
+		var wg sync.WaitGroup
+		for name, check := range checks {
+			// Go 1.22+ gives each iteration its own name/check variables, so
+			// capturing them directly in the goroutine is safe (no shadowing).
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				// Recover here: these checks run in goroutines WE spawned, so a
+				// panicking check would crash the whole process (net/http only
+				// recovers panics on its own request goroutine, not ours). A bad
+				// check should fail that check, not take down the service.
+				defer func() {
+					if rec := recover(); rec != nil {
+						outcomes <- checkOutcome{name, fmt.Errorf("check panicked: %v", rec)}
+					}
+				}()
+
+				ctx, cancel := context.WithTimeout(r.Context(), h.checkTimeout)
+				defer cancel()
+				outcomes <- checkOutcome{name, check(ctx)}
+			}()
+		}
+		wg.Wait()
+		close(outcomes)
+
 		results := make(map[string]CheckResult, len(checks))
 		allOK := true
-
-		for name, check := range checks {
-			if err := check(r.Context()); err != nil {
-				results[name] = CheckResult{Status: "fail", Error: err.Error()}
+		for o := range outcomes {
+			if o.err != nil {
+				results[o.name] = CheckResult{Status: "fail", Error: o.err.Error()}
 				allOK = false
 			} else {
-				results[name] = CheckResult{Status: "ok"}
+				results[o.name] = CheckResult{Status: "ok"}
 			}
 		}
 

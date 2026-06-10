@@ -1,9 +1,12 @@
 package observability
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"strings"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 // ============================================================================
@@ -39,15 +42,18 @@ import (
 //   structured queries like: {service="auth"} |= `"level":"ERROR"` in Loki.
 //
 // HOW TRACE CONTEXT GETS INTO LOGS:
-//   When a handler processes a request, the context carries an OTel span.
-//   Middleware extracts trace_id and span_id from the span context and adds
-//   them as slog attributes. This links logs to distributed traces in Tempo:
+//   Every log call that passes a context carrying an OTel span (slog's
+//   LogAttrs/InfoContext/etc.) automatically gets trace_id and span_id added,
+//   via the traceContextHandler below. This links logs to distributed traces:
 //     {"level":"INFO","msg":"request handled","trace_id":"abc123","service":"auth"}
 //   → Click trace_id in Grafana → jump from Loki log to Tempo trace.
+//   The interceptor/handler must use the *Context logging methods for this to
+//   fire (a bare logger.Info with no ctx has no span to read).
 //
 // ============================================================================
 
-// NewLogger creates a structured JSON logger with service metadata.
+// NewLogger creates a structured JSON logger with service metadata and
+// automatic trace correlation.
 //
 // The logger writes JSON to stdout (12-Factor App: logs are event streams,
 // not files). The container runtime (Docker/K8s) captures stdout and routes
@@ -58,16 +64,50 @@ import (
 func NewLogger(serviceName, level string) *slog.Logger {
 	logLevel := parseLogLevel(level)
 
-	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+	base := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: logLevel,
 		// AddSource includes the file:line in every log entry.
 		// Useful for debugging but adds ~10% overhead. Enabled only at debug level.
 		AddSource: logLevel == slog.LevelDebug,
 	})
 
+	// Wrap the JSON handler so trace_id/span_id are injected from context.
+	handler := traceContextHandler{Handler: base}
+
 	return slog.New(handler).With(
 		slog.String("service", serviceName),
 	)
+}
+
+// traceContextHandler is a slog.Handler decorator that adds trace_id and span_id
+// from the OTel span in the record's context. This is what makes Loki↔Tempo
+// correlation work without a full OTel LoggerProvider — we keep the simple
+// stdout-JSON-to-Loki path and just enrich each line.
+//
+// WHY override WithAttrs/WithGroup: slog calls these to derive child handlers
+// (e.g., logger.With(...)). If we embedded slog.Handler and didn't override
+// them, the child would be the UNWRAPPED inner handler and we'd silently lose
+// trace correlation after any .With() call. So we re-wrap on each.
+type traceContextHandler struct {
+	slog.Handler
+}
+
+func (h traceContextHandler) Handle(ctx context.Context, r slog.Record) error {
+	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
+		r.AddAttrs(
+			slog.String("trace_id", sc.TraceID().String()),
+			slog.String("span_id", sc.SpanID().String()),
+		)
+	}
+	return h.Handler.Handle(ctx, r)
+}
+
+func (h traceContextHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return traceContextHandler{Handler: h.Handler.WithAttrs(attrs)}
+}
+
+func (h traceContextHandler) WithGroup(name string) slog.Handler {
+	return traceContextHandler{Handler: h.Handler.WithGroup(name)}
 }
 
 // parseLogLevel converts a string log level to slog.Level.
