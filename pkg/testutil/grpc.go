@@ -64,21 +64,30 @@ const bufSize = 1024 * 1024 // 1MB buffer — sufficient for test payloads
 //	})
 //	client := authv1.NewAuthServiceClient(conn)
 //	resp, err := client.Login(ctx, &authv1.LoginRequest{...})
-func NewTestGRPCServer(t *testing.T, register func(s *grpc.Server)) *grpc.ClientConn {
+//
+// Pass serverOpts to install the interceptor chain under test, e.g.:
+//
+//	conn := testutil.NewTestGRPCServer(t, register,
+//	    grpc.ChainUnaryInterceptor(grpcutil.AuthUnaryInterceptor(validator)))
+func NewTestGRPCServer(t *testing.T, register func(s *grpc.Server), serverOpts ...grpc.ServerOption) *grpc.ClientConn {
 	t.Helper()
 
 	lis := bufconn.Listen(bufSize)
 
-	server := grpc.NewServer()
+	server := grpc.NewServer(serverOpts...)
 	register(server)
 
-	// Start serving in background goroutine.
+	// Start serving in a background goroutine, sending the final Serve error
+	// back over a buffered channel.
+	//
+	// WHY a channel and not t.Logf here: t.Logf/t.Errorf MUST NOT be called
+	// from a goroutine that can outlive the test function — doing so panics
+	// ("Log in goroutine after Test has completed"). The Serve goroutine is
+	// exactly such a goroutine. So we hand the error back to the test goroutine
+	// and inspect it inside t.Cleanup, where calling t.* is safe.
+	serveErrCh := make(chan error, 1)
 	go func() {
-		if err := server.Serve(lis); err != nil {
-			// Serve returns error when stopped — expected during cleanup.
-			// Only log if it's not a "use of closed" error.
-			t.Logf("bufconn server stopped: %v", err)
-		}
+		serveErrCh <- server.Serve(lis)
 	}()
 
 	// Create client connection through the bufconn dialer.
@@ -94,8 +103,13 @@ func NewTestGRPCServer(t *testing.T, register func(s *grpc.Server)) *grpc.Client
 	}
 
 	t.Cleanup(func() {
-		conn.Close()
+		_ = conn.Close()
+		// GracefulStop unblocks Serve, which then returns nil. Any non-nil
+		// error is a real test failure (e.g., listener died mid-test).
 		server.GracefulStop()
+		if err := <-serveErrCh; err != nil {
+			t.Errorf("bufconn server.Serve returned: %v", err)
+		}
 	})
 
 	return conn

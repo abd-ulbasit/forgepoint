@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/goml/pkg/natsutil"
+	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/testcontainers/testcontainers-go"
 	natscontainer "github.com/testcontainers/testcontainers-go/modules/nats"
@@ -151,7 +151,7 @@ func TestPublishAndSubscribe(t *testing.T) {
 	ctx := context.Background()
 	_, err = js.CreateStream(ctx, jetstream.StreamConfig{
 		Name:     "TEST",
-		Subjects: []string{"goml.test.>"},
+		Subjects: []string{"fp.test.>"},
 	})
 	if err != nil {
 		t.Fatalf("create stream error: %v", err)
@@ -162,7 +162,7 @@ func TestPublishAndSubscribe(t *testing.T) {
 
 	received := make(chan natsutil.EventEnvelope, 1)
 	sub := natsutil.NewSubscriber(js)
-	err = sub.Subscribe(ctx, "TEST", "goml.test.>", func(ctx context.Context, env natsutil.EventEnvelope) error {
+	err = sub.Subscribe(ctx, "TEST", "fp.test.>", func(ctx context.Context, env natsutil.EventEnvelope) error {
 		received <- env
 		return nil
 	})
@@ -175,7 +175,7 @@ func TestPublishAndSubscribe(t *testing.T) {
 		ModelID string `json:"model_id"`
 	}
 
-	err = pub.Publish(ctx, "goml.test.model.registered", TestPayload{ModelID: "model-123"})
+	err = pub.Publish(ctx, "fp.test.model.registered", TestPayload{ModelID: "model-123"})
 	if err != nil {
 		t.Fatalf("publish error: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestConsumerGroup_OnlyOneReceives(t *testing.T) {
 	ctx := context.Background()
 	_, err = js.CreateStream(ctx, jetstream.StreamConfig{
 		Name:     "CG_TEST",
-		Subjects: []string{"goml.cg.>"},
+		Subjects: []string{"fp.cg.>"},
 	})
 	if err != nil {
 		t.Fatalf("create stream error: %v", err)
@@ -247,7 +247,7 @@ func TestConsumerGroup_OnlyOneReceives(t *testing.T) {
 	for i := range 2 {
 		subscriberID := i
 		sub := natsutil.NewSubscriber(js, natsutil.WithConsumerGroup("test-group"))
-		err := sub.Subscribe(ctx, "CG_TEST", "goml.cg.>", func(ctx context.Context, env natsutil.EventEnvelope) error {
+		err := sub.Subscribe(ctx, "CG_TEST", "fp.cg.>", func(ctx context.Context, env natsutil.EventEnvelope) error {
 			mu.Lock()
 			receivedBy = append(receivedBy, subscriberID)
 			mu.Unlock()
@@ -260,7 +260,7 @@ func TestConsumerGroup_OnlyOneReceives(t *testing.T) {
 
 	// Publish one event
 	pub := natsutil.NewPublisher(js, "test")
-	if err := pub.Publish(ctx, "goml.cg.event", map[string]string{"key": "value"}); err != nil {
+	if err := pub.Publish(ctx, "fp.cg.event", map[string]string{"key": "value"}); err != nil {
 		t.Fatalf("publish error: %v", err)
 	}
 
@@ -311,7 +311,7 @@ func TestDLQ_AfterMaxRetries(t *testing.T) {
 	// Create stream for both the main subject and the DLQ subject
 	_, err = js.CreateStream(ctx, jetstream.StreamConfig{
 		Name:     "DLQ_TEST",
-		Subjects: []string{"goml.dlq.>"},
+		Subjects: []string{"fp.dlq.>"},
 	})
 	if err != nil {
 		t.Fatalf("create stream error: %v", err)
@@ -327,11 +327,11 @@ func TestDLQ_AfterMaxRetries(t *testing.T) {
 
 	sub := natsutil.NewSubscriber(js,
 		natsutil.WithMaxRetries(maxRetries),
-		natsutil.WithDLQSubject("goml.dlq.dead"),
+		natsutil.WithDLQSubject("fp.dlq.dead"),
 	)
 
 	// Handler always fails — simulates a poison pill message
-	err = sub.Subscribe(ctx, "DLQ_TEST", "goml.dlq.events.>", func(ctx context.Context, env natsutil.EventEnvelope) error {
+	err = sub.Subscribe(ctx, "DLQ_TEST", "fp.dlq.events.>", func(ctx context.Context, env natsutil.EventEnvelope) error {
 		mu.Lock()
 		handlerCalls++
 		mu.Unlock()
@@ -343,7 +343,7 @@ func TestDLQ_AfterMaxRetries(t *testing.T) {
 
 	// Subscribe to DLQ to verify the message lands there
 	dlqSub := natsutil.NewSubscriber(js)
-	err = dlqSub.Subscribe(ctx, "DLQ_TEST", "goml.dlq.dead", func(ctx context.Context, env natsutil.EventEnvelope) error {
+	err = dlqSub.Subscribe(ctx, "DLQ_TEST", "fp.dlq.dead", func(ctx context.Context, env natsutil.EventEnvelope) error {
 		dlqReceived <- env
 		return nil
 	})
@@ -353,7 +353,7 @@ func TestDLQ_AfterMaxRetries(t *testing.T) {
 
 	// Publish a message that will always fail
 	pub := natsutil.NewPublisher(js, "test")
-	if err := pub.Publish(ctx, "goml.dlq.events.fail", map[string]string{"poison": "true"}); err != nil {
+	if err := pub.Publish(ctx, "fp.dlq.events.fail", map[string]string{"poison": "true"}); err != nil {
 		t.Fatalf("publish error: %v", err)
 	}
 

@@ -19,7 +19,7 @@ import "time"
 func SampleUser() map[string]any {
 	return map[string]any{
 		"id":         "usr_test_001",
-		"email":      "test@goml.dev",
+		"email":      "test@fp.dev",
 		"team":       "ml-platform",
 		"role":       "admin",
 		"scopes":     []string{"models:read", "models:write", "inference:invoke"},
@@ -30,12 +30,12 @@ func SampleUser() map[string]any {
 // SampleModelMetadata returns test model metadata for registry tests.
 func SampleModelMetadata() map[string]any {
 	return map[string]any{
-		"id":          "mdl_test_001",
-		"name":        "fraud-detector",
-		"version":     "v1.2.0",
-		"framework":   "pytorch",
-		"format":      "onnx",
-		"artifact_uri": "s3://goml-models/fraud-detector/v1.2.0/model.onnx",
+		"id":           "mdl_test_001",
+		"name":         "fraud-detector",
+		"version":      "v1.2.0",
+		"framework":    "pytorch",
+		"format":       "onnx",
+		"artifact_uri": "s3://fp-models/fraud-detector/v1.2.0/model.onnx",
 		"metrics": map[string]float64{
 			"accuracy":  0.95,
 			"precision": 0.92,
@@ -54,7 +54,7 @@ func SampleModelMetadata() map[string]any {
 func SampleAPIKey() map[string]any {
 	return map[string]any{
 		"id":         "key_test_001",
-		"key":        "goml_test_sk_abcdef1234567890",
+		"key":        "fp_test_sk_abcdef1234567890",
 		"user_id":    "usr_test_001",
 		"name":       "test-key",
 		"scopes":     []string{"inference:invoke"},

@@ -3,7 +3,7 @@ package config_test
 import (
 	"testing"
 
-	"github.com/abd-ulbasit/goml/pkg/config"
+	"github.com/abd-ulbasit/forgepoint/pkg/config"
 )
 
 // ============================================================================
@@ -33,16 +33,16 @@ type TestConfig struct {
 }
 
 func TestLoad_WithAllEnvVars(t *testing.T) {
-	// Arrange: set all env vars with the GOML_ prefix
-	t.Setenv("GOML_PORT", "9090")
-	t.Setenv("GOML_HOST", "0.0.0.0")
-	t.Setenv("GOML_DATABASE_URL", "postgres://localhost:5432/goml")
-	t.Setenv("GOML_DEBUG", "true")
-	t.Setenv("GOML_LOG_LEVEL", "debug")
-	t.Setenv("GOML_WORKERS", "4")
+	// Arrange: set all env vars with the FP_ prefix
+	t.Setenv("FP_PORT", "9090")
+	t.Setenv("FP_HOST", "0.0.0.0")
+	t.Setenv("FP_DATABASE_URL", "postgres://localhost:5432/fp")
+	t.Setenv("FP_DEBUG", "true")
+	t.Setenv("FP_LOG_LEVEL", "debug")
+	t.Setenv("FP_WORKERS", "4")
 
 	// Act
-	cfg, err := config.Load[TestConfig]("GOML")
+	cfg, err := config.Load[TestConfig]("FP")
 
 	// Assert
 	if err != nil {
@@ -54,8 +54,8 @@ func TestLoad_WithAllEnvVars(t *testing.T) {
 	if cfg.Host != "0.0.0.0" {
 		t.Errorf("Host = %q, want %q", cfg.Host, "0.0.0.0")
 	}
-	if cfg.DatabaseURL != "postgres://localhost:5432/goml" {
-		t.Errorf("DatabaseURL = %q, want postgres://localhost:5432/goml", cfg.DatabaseURL)
+	if cfg.DatabaseURL != "postgres://localhost:5432/fp" {
+		t.Errorf("DatabaseURL = %q, want postgres://localhost:5432/fp", cfg.DatabaseURL)
 	}
 	if !cfg.Debug {
 		t.Error("Debug = false, want true")
@@ -70,10 +70,10 @@ func TestLoad_WithAllEnvVars(t *testing.T) {
 
 func TestLoad_UsesDefaults(t *testing.T) {
 	// Arrange: only set the required field, let others use defaults
-	t.Setenv("GOML_DATABASE_URL", "postgres://localhost:5432/goml")
+	t.Setenv("FP_DATABASE_URL", "postgres://localhost:5432/fp")
 
 	// Act
-	cfg, err := config.Load[TestConfig]("GOML")
+	cfg, err := config.Load[TestConfig]("FP")
 
 	// Assert
 	if err != nil {
@@ -100,10 +100,10 @@ func TestLoad_UsesDefaults(t *testing.T) {
 func TestLoad_RequiredFieldMissing(t *testing.T) {
 	// Arrange: do NOT set DATABASE_URL which is required
 	// (clear it in case it's set in the environment)
-	t.Setenv("GOML_DATABASE_URL", "")
+	t.Setenv("FP_DATABASE_URL", "")
 
 	// Act
-	_, err := config.Load[TestConfig]("GOML")
+	_, err := config.Load[TestConfig]("FP")
 
 	// Assert: should return an error about the missing required field
 	if err == nil {
@@ -113,11 +113,11 @@ func TestLoad_RequiredFieldMissing(t *testing.T) {
 
 func TestLoad_InvalidIntValue(t *testing.T) {
 	// Arrange: set PORT to a non-integer value
-	t.Setenv("GOML_PORT", "not-a-number")
-	t.Setenv("GOML_DATABASE_URL", "postgres://localhost/goml")
+	t.Setenv("FP_PORT", "not-a-number")
+	t.Setenv("FP_DATABASE_URL", "postgres://localhost/fp")
 
 	// Act
-	_, err := config.Load[TestConfig]("GOML")
+	_, err := config.Load[TestConfig]("FP")
 
 	// Assert
 	if err == nil {
@@ -127,11 +127,11 @@ func TestLoad_InvalidIntValue(t *testing.T) {
 
 func TestLoad_InvalidBoolValue(t *testing.T) {
 	// Arrange: set DEBUG to an invalid bool value
-	t.Setenv("GOML_DEBUG", "not-a-bool")
-	t.Setenv("GOML_DATABASE_URL", "postgres://localhost/goml")
+	t.Setenv("FP_DEBUG", "not-a-bool")
+	t.Setenv("FP_DATABASE_URL", "postgres://localhost/fp")
 
 	// Act
-	_, err := config.Load[TestConfig]("GOML")
+	_, err := config.Load[TestConfig]("FP")
 
 	// Assert
 	if err == nil {
@@ -145,7 +145,7 @@ func TestLoad_InvalidBoolValue(t *testing.T) {
 
 func TestLoad_BaseConfig_Defaults(t *testing.T) {
 	// Act: load BaseConfig with no env vars set
-	cfg, err := config.Load[config.BaseConfig]("GOML")
+	cfg, err := config.Load[config.BaseConfig]("FP")
 
 	// Assert: all defaults should apply, no required fields in BaseConfig
 	if err != nil {
@@ -187,11 +187,11 @@ type NestedConfig struct {
 
 func TestLoad_NestedConfig(t *testing.T) {
 	// Arrange
-	t.Setenv("GOML_PORT", "3000")
-	t.Setenv("GOML_JWT_SECRET", "super-secret-key")
+	t.Setenv("FP_PORT", "3000")
+	t.Setenv("FP_JWT_SECRET", "super-secret-key")
 
 	// Act
-	cfg, err := config.Load[NestedConfig]("GOML")
+	cfg, err := config.Load[NestedConfig]("FP")
 
 	// Assert
 	if err != nil {

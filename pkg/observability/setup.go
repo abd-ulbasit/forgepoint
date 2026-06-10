@@ -6,42 +6,43 @@
 // ============================================================================
 //
 // WHY OpenTelemetry (OTel):
-//   OTel is the CNCF standard for instrumenting distributed systems. Before
-//   OTel, you'd use separate libraries for each pillar:
-//   - Traces: OpenTracing or OpenCensus (now merged into OTel)
-//   - Metrics: Prometheus client_golang
-//   - Logs: slog/zap/zerolog (still separate, OTel log bridge is newer)
 //
-//   OTel unifies all three with a single SDK, single context propagation,
-//   and vendor-neutral exporters. You instrument once, then switch backends
-//   (Jaeger→Tempo, Prometheus→Datadog) by changing config, not code.
+//	OTel is the CNCF standard for instrumenting distributed systems. Before
+//	OTel, you'd use separate libraries for each pillar:
+//	- Traces: OpenTracing or OpenCensus (now merged into OTel)
+//	- Metrics: Prometheus client_golang
+//	- Logs: slog/zap/zerolog (still separate, OTel log bridge is newer)
+//
+//	OTel unifies all three with a single SDK, single context propagation,
+//	and vendor-neutral exporters. You instrument once, then switch backends
+//	(Jaeger→Tempo, Prometheus→Datadog) by changing config, not code.
 //
 // THREE PILLARS EXPLAINED:
 //
-//   1. TRACES (distributed tracing):
-//      A trace follows a single request across all services it touches.
-//      Each service creates a "span" (a timed operation) linked by trace_id.
+//  1. TRACES (distributed tracing):
+//     A trace follows a single request across all services it touches.
+//     Each service creates a "span" (a timed operation) linked by trace_id.
 //
-//      Example trace for a prediction request:
-//      ┌─────────────────────────────────────────────────────────────────┐
-//      │ trace_id: abc-123                                               │
-//      │                                                                 │
-//      │ gateway.predict ─────────────────────────────── 45ms           │
-//      │   ├─ auth.validate ──── 3ms                                    │
-//      │   ├─ serving.predict ──────────── 35ms                         │
-//      │   └─ billing.record ── 2ms (async via NATS)                    │
-//      └─────────────────────────────────────────────────────────────────┘
+//     Example trace for a prediction request:
+//     ┌─────────────────────────────────────────────────────────────────┐
+//     │ trace_id: abc-123                                               │
+//     │                                                                 │
+//     │ gateway.predict ─────────────────────────────── 45ms           │
+//     │   ├─ auth.validate ──── 3ms                                    │
+//     │   ├─ serving.predict ──────────── 35ms                         │
+//     │   └─ billing.record ── 2ms (async via NATS)                    │
+//     └─────────────────────────────────────────────────────────────────┘
 //
-//   2. METRICS (Prometheus):
-//      Numeric aggregates: counters, histograms, gauges.
-//      RED method per service:
-//      - Rate: requests/sec
-//      - Errors: error rate (%)
-//      - Duration: latency histogram (p50, p95, p99)
+//  2. METRICS (Prometheus):
+//     Numeric aggregates: counters, histograms, gauges.
+//     RED method per service:
+//     - Rate: requests/sec
+//     - Errors: error rate (%)
+//     - Duration: latency histogram (p50, p95, p99)
 //
-//   3. LOGS (structured JSON via slog):
-//      Event-level detail linked to traces via trace_id.
-//      Enables: "show me all logs for trace abc-123" in Grafana.
+//  3. LOGS (structured JSON via slog):
+//     Event-level detail linked to traces via trace_id.
+//     Enables: "show me all logs for trace abc-123" in Grafana.
 //
 // HOW UBER/NETFLIX DO IT:
 //   - Uber: Jaeger (they created it) → now migrating to OTel + Tempo
@@ -52,15 +53,15 @@
 //
 // ARCHITECTURE:
 //
-//   Service → OTel SDK → OTLP Exporter → OTel Collector → Backends
-//                                              │
-//                                    ┌─────────┼─────────┐
-//                                    ▼         ▼         ▼
-//                                  Tempo   Prometheus   Loki
-//                                 (traces) (metrics)   (logs)
-//                                    └─────────┼─────────┘
-//                                              ▼
-//                                           Grafana
+//	Service → OTel SDK → OTLP Exporter → OTel Collector → Backends
+//	                                           │
+//	                                 ┌─────────┼─────────┐
+//	                                 ▼         ▼         ▼
+//	                               Tempo   Prometheus   Loki
+//	                              (traces) (metrics)   (logs)
+//	                                 └─────────┼─────────┘
+//	                                           ▼
+//	                                        Grafana
 //
 // ============================================================================
 package observability
@@ -70,6 +71,8 @@ import (
 	"errors"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/exporters/stdout/stdoutmetric"
 	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
 	"go.opentelemetry.io/otel/propagation"
@@ -95,34 +98,38 @@ type Config struct {
 
 	// OTLPEndpoint is the OpenTelemetry Collector gRPC endpoint.
 	// If empty, falls back to stdout exporters (useful for testing/dev).
-	// Production: "otel-collector.goml-infra.svc.cluster.local:4317"
+	// Production: "otel-collector.fp-infra.svc.cluster.local:4317"
 	OTLPEndpoint string
 }
 
 // Setup initializes OpenTelemetry trace and metric providers.
 //
 // WHY a single Setup() function:
-//   Every service needs the exact same initialization sequence. Without this,
-//   each service's main.go would have 50+ lines of boilerplate OTel setup.
-//   One function, one import, consistent behavior across all 9 services.
+//
+//	Every service needs the exact same initialization sequence. Without this,
+//	each service's main.go would have 50+ lines of boilerplate OTel setup.
+//	One function, one import, consistent behavior across all 9 services.
 //
 // RETURNS:
-//   A shutdown function that flushes all pending telemetry data and releases
-//   resources. Call this in main() with defer:
-//     shutdown, err := observability.Setup(cfg)
-//     if err != nil { log.Fatal(err) }
-//     defer shutdown(context.Background())
 //
-//   WHY shutdown matters: OTel batches traces and metrics for efficiency.
-//   Without flushing on shutdown, the last few seconds of telemetry are lost.
-//   In K8s, SIGTERM gives 30s grace period — plenty of time to flush.
+//	A shutdown function that flushes all pending telemetry data and releases
+//	resources. Call this in main() with defer:
+//	  shutdown, err := observability.Setup(ctx, cfg)
+//	  if err != nil { log.Fatal(err) }
+//	  defer shutdown(context.Background())
+//
+//	WHY shutdown matters: OTel batches traces and metrics for efficiency.
+//	Without flushing on shutdown, the last few seconds of telemetry are lost.
+//	In K8s, SIGTERM gives 30s grace period — plenty of time to flush.
+//
+//	ctx is used while establishing the OTLP exporter connections.
 //
 // FAILURE MODES:
 //   - OTLP endpoint unreachable: Setup succeeds, spans are buffered then
 //     dropped when buffer fills. Service continues running — observability
 //     is never a hard dependency (you don't want monitoring to cause outages).
 //   - Invalid config: Returns error immediately (fail fast).
-func Setup(cfg Config) (shutdown func(ctx context.Context) error, err error) {
+func Setup(ctx context.Context, cfg Config) (shutdown func(ctx context.Context) error, err error) {
 	var shutdownFuncs []func(context.Context) error
 
 	// shutdown combines all cleanup functions into one.
@@ -190,7 +197,7 @@ func Setup(cfg Config) (shutdown func(ctx context.Context) error, err error) {
 	// ================================================================
 	// TRACE PROVIDER
 	// ================================================================
-	tracerProvider, err := newTracerProvider(cfg, res)
+	tracerProvider, err := newTracerProvider(ctx, cfg, res)
 	if err != nil {
 		handleErr(err)
 		return
@@ -201,7 +208,7 @@ func Setup(cfg Config) (shutdown func(ctx context.Context) error, err error) {
 	// ================================================================
 	// METER PROVIDER
 	// ================================================================
-	meterProvider, err := newMeterProvider(cfg, res)
+	meterProvider, err := newMeterProvider(ctx, cfg, res)
 	if err != nil {
 		handleErr(err)
 		return
@@ -223,11 +230,8 @@ func Setup(cfg Config) (shutdown func(ctx context.Context) error, err error) {
 // EXPORTER STRATEGY:
 //   - OTLPEndpoint set → OTLP gRPC exporter (production: sends to OTel Collector)
 //   - OTLPEndpoint empty → stdout exporter (dev/test: prints spans to console)
-//   Future: add OTLP exporter when we set up the OTel Collector in docker-compose
-func newTracerProvider(cfg Config, res *resource.Resource) (*trace.TracerProvider, error) {
-	// For now, use stdout exporter. When OTel Collector is set up (Task 0.9),
-	// we'll add OTLP gRPC exporter conditioned on cfg.OTLPEndpoint.
-	exporter, err := stdouttrace.New(stdouttrace.WithPrettyPrint())
+func newTracerProvider(ctx context.Context, cfg Config, res *resource.Resource) (*trace.TracerProvider, error) {
+	exporter, err := newSpanExporter(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -248,22 +252,22 @@ func newTracerProvider(cfg Config, res *resource.Resource) (*trace.TracerProvide
 
 // newMeterProvider creates a metric provider with the appropriate exporter.
 //
-// METRICS PIPELINE:
-//   Service → OTel Meter SDK → Prometheus Exporter → /metrics endpoint
-//                                                      ↓
-//                                               Prometheus scrapes
-//                                                      ↓
-//                                               Grafana dashboards
+// METRICS PIPELINE (OTLP → Collector → Prometheus):
 //
-// WHY Prometheus-style (pull) over OTLP push:
-//   - K8s ecosystem is Prometheus-native (ServiceMonitor, PodMonitor)
-//   - Prometheus has mature alerting (Alertmanager) and Grafana integration
-//   - Pull model: Prometheus decides scrape interval, no back-pressure on services
-//   - OTLP push: better for serverless/short-lived processes (not our case)
-func newMeterProvider(cfg Config, res *resource.Resource) (*metric.MeterProvider, error) {
-	// Use stdout exporter for now. When Prometheus is set up (Task 0.9),
-	// we'll add the Prometheus exporter that serves /metrics.
-	exporter, err := stdoutmetric.New()
+//	Service → OTel Meter SDK → OTLP push → OTel Collector → Prometheus scrapes
+//	                                                                ↓
+//	                                                        Grafana dashboards
+//
+// WHY push OTLP to the collector instead of exposing /metrics per service:
+//   - ONE instrumentation path for all three pillars (traces+metrics+logs all
+//     speak OTLP to the same collector) — less code, one config to change.
+//   - The collector re-exports to Prometheus, so we KEEP the Prometheus pull
+//     model where it matters (Prometheus still scrapes the collector with its
+//     ServiceMonitor/Alertmanager ecosystem intact) without every service
+//     having to run and secure its own scrape endpoint.
+//   - Backends become swappable by reconfiguring the collector, not the code.
+func newMeterProvider(ctx context.Context, cfg Config, res *resource.Resource) (*metric.MeterProvider, error) {
+	exporter, err := newMetricExporter(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -274,4 +278,37 @@ func newMeterProvider(cfg Config, res *resource.Resource) (*metric.MeterProvider
 	)
 
 	return mp, nil
+}
+
+// newSpanExporter builds the trace exporter based on config: OTLP gRPC to the
+// collector when an endpoint is set, otherwise stdout for local dev.
+//
+// WHY WithInsecure: inside the cluster, traffic to the collector is on the pod
+// network and (with Istio) already mTLS-encrypted at the mesh layer, so the
+// OTLP client itself doesn't terminate TLS. Outside a mesh you'd add real TLS.
+//
+// WHY no WithPrettyPrint on stdout: the container's stdout is scraped line-by-
+// line into Loki, which expects ONE JSON object per line. Pretty-printed,
+// multi-line spans would break that parsing. Compact output is the correct
+// choice for a log-shipped pipeline.
+func newSpanExporter(ctx context.Context, cfg Config) (trace.SpanExporter, error) {
+	if cfg.OTLPEndpoint != "" {
+		return otlptracegrpc.New(ctx,
+			otlptracegrpc.WithEndpoint(cfg.OTLPEndpoint),
+			otlptracegrpc.WithInsecure(),
+		)
+	}
+	return stdouttrace.New()
+}
+
+// newMetricExporter builds the metric exporter based on config: OTLP gRPC to the
+// collector when an endpoint is set, otherwise stdout for local dev.
+func newMetricExporter(ctx context.Context, cfg Config) (metric.Exporter, error) {
+	if cfg.OTLPEndpoint != "" {
+		return otlpmetricgrpc.New(ctx,
+			otlpmetricgrpc.WithEndpoint(cfg.OTLPEndpoint),
+			otlpmetricgrpc.WithInsecure(),
+		)
+	}
+	return stdoutmetric.New()
 }

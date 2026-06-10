@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/abd-ulbasit/goml/pkg/observability"
+	"github.com/abd-ulbasit/forgepoint/pkg/observability"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -38,7 +38,7 @@ func TestSetup_ReturnsShutdownFunction(t *testing.T) {
 	}
 
 	// Act
-	shutdown, err := observability.Setup(cfg)
+	shutdown, err := observability.Setup(context.Background(), cfg)
 
 	// Assert
 	if err != nil {
@@ -63,7 +63,7 @@ func TestSetup_SetsGlobalTracerProvider(t *testing.T) {
 	}
 
 	// Act
-	shutdown, err := observability.Setup(cfg)
+	shutdown, err := observability.Setup(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Setup() returned error: %v", err)
 	}
@@ -87,7 +87,7 @@ func TestSetup_TracerProducesValidTraceID(t *testing.T) {
 		Environment:    "test",
 	}
 
-	shutdown, err := observability.Setup(cfg)
+	shutdown, err := observability.Setup(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("Setup() returned error: %v", err)
 	}

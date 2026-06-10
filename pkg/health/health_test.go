@@ -8,7 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/abd-ulbasit/goml/pkg/health"
+	"github.com/abd-ulbasit/forgepoint/pkg/health"
 )
 
 // ============================================================================

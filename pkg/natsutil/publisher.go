@@ -23,11 +23,11 @@ import (
 //   data, _ := json.Marshal(event)
 //   envelope := EventEnvelope{ID: uuid.New(), Type: "model.registered", ...}
 //   bytes, _ := json.Marshal(envelope)
-//   js.Publish(ctx, "goml.models.registered", bytes)
+//   js.Publish(ctx, "fp.models.registered", bytes)
 //   // Easy to forget envelope, forget dedup ID, use wrong type, etc.
 //
 // With Publisher:
-//   pub.Publish(ctx, "goml.models.registered", event)
+//   pub.Publish(ctx, "fp.models.registered", event)
 //   // Envelope, serialization, dedup all handled
 //
 // DEDUPLICATION:
@@ -56,10 +56,11 @@ func NewPublisher(js jetstream.JetStream, source string) *Publisher {
 // Publish serializes the payload, wraps it in an EventEnvelope, and publishes
 // to the given NATS subject.
 //
-// The event type in the envelope is derived from the subject by stripping
-// the "goml.{service}." prefix. For example:
-//   subject "goml.models.registered" → type "model.registered"
-//   subject "goml.auth.user.created" → type "user.created"
+// The event type in the envelope is derived from the subject by stripping the
+// "fp.{service}." prefix (the first two segments). For example:
+//
+//	subject "fp.models.registered"  → type "registered"
+//	subject "fp.auth.user.created"  → type "user.created"
 //
 // This convention ensures event types are stable identifiers (not tied to
 // NATS subject structure, which may change if we reorganize subjects).
@@ -70,13 +71,17 @@ func (p *Publisher) Publish(ctx context.Context, subject string, payload any) er
 		return fmt.Errorf("natsutil: marshal payload: %w", err)
 	}
 
-	// Derive event type from subject.
-	// "goml.models.registered" → strip first two parts → "registered"
-	// "goml.auth.user.created" → strip first two parts → "user.created"
+	// Derive event type from subject (strip the "fp.{service}." prefix).
 	eventType := deriveEventType(subject)
 
-	// Create envelope with standard metadata.
+	// Create envelope with standard metadata, then enrich it from the request
+	// context so observability survives the async hop:
+	//   - CorrelationID continues the logical workflow across services.
+	//   - TraceContext carries the W3C traceparent so the consumer's spans
+	//     attach to this producer's trace in Tempo.
 	envelope := NewEnvelope(eventType, p.source, data)
+	envelope.CorrelationID = correlationIDForPublish(ctx)
+	injectTraceContext(ctx, &envelope)
 
 	// Serialize the complete envelope.
 	envBytes, err := json.Marshal(envelope)
@@ -96,11 +101,12 @@ func (p *Publisher) Publish(ctx context.Context, subject string, payload any) er
 	return nil
 }
 
-// deriveEventType extracts the event type from a NATS subject.
-// "goml.models.registered" → "model.registered"
-// "goml.auth.user.created" → "user.created"
+// deriveEventType extracts the event type from a NATS subject by stripping the
+// first two segments ("fp.{service}.").
+// "fp.models.registered" → "registered"
+// "fp.auth.user.created" → "user.created"
 func deriveEventType(subject string) string {
-	// Strip "goml." prefix and the service segment
+	// Strip "fp." prefix and the service segment
 	parts := strings.SplitN(subject, ".", 3)
 	if len(parts) >= 3 {
 		return parts[2]
