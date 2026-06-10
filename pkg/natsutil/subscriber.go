@@ -318,9 +318,14 @@ func (s *Subscriber) routeToDLQ(ctx context.Context, msg jetstream.Msg, envelope
 		slog.String("dlq.subject", s.cfg.dlqSubject),
 	)
 
-	// Preserve the envelope ID as the DLQ message's Nats-Msg-Id so DLQ
-	// consumers get the same dedup protection and the original identity.
-	_, err := s.js.Publish(ctx, s.cfg.dlqSubject, msg.Data(), jetstream.WithMsgID(envelope.ID))
+	// Give the DLQ copy a DLQ-specific Nats-Msg-Id — NOT the original
+	// envelope.ID. The DLQ subject frequently lives in the SAME stream as the
+	// source subject, and JetStream dedup is per-stream by Msg-Id: reusing the
+	// original ID makes the broker silently drop the DLQ copy as a "duplicate"
+	// of the message we're trying to dead-letter. The "-dlq" suffix preserves
+	// idempotent DLQ publishing (a re-run of routeToDLQ won't double-publish)
+	// without colliding with the original.
+	_, err := s.js.Publish(ctx, s.cfg.dlqSubject, msg.Data(), jetstream.WithMsgID(envelope.ID+"-dlq"))
 	if err != nil {
 		slog.ErrorContext(ctx, "failed to publish to DLQ",
 			slog.String("dlq.subject", s.cfg.dlqSubject),
