@@ -6,7 +6,7 @@
 # and stores them for querying via Grafana.
 #
 # TRACE FLOW:
-#   GoML Service → OpenTelemetry SDK → OTLP gRPC (:4317) → Tempo → Grafana
+#   Forgepoint Service → OpenTelemetry SDK → OTLP gRPC (:4317) → Tempo → Grafana
 #
 # This is a minimal local-dev config. Production would use S3/GCS backend
 # and WAL replication for durability.

@@ -1,5 +1,5 @@
 // ============================================================================
-// GoML Common Proto Definitions
+// Forgepoint Common Proto Definitions
 // ============================================================================
 //
 // WHY: Shared types used across ALL services. Defining them once in a common
@@ -12,15 +12,15 @@
 //   - ErrorDetail: Structured error information for gRPC responses
 //
 // VERSIONING: Package path includes v1 following Buf/Google convention.
-// If we need breaking changes, we create goml.common.v2 (new package)
+// If we need breaking changes, we create forgepoint.common.v2 (new package)
 // and both versions coexist during migration.
 // ============================================================================
 
 syntax = "proto3";
 
-package goml.common.v1;
+package forgepoint.common.v1;
 
-option go_package = "github.com/abd-ulbasit/goml/gen/go/goml/common/v1;commonv1";
+option go_package = "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/common/v1;commonv1";
 
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/any.proto";
@@ -62,7 +62,7 @@ message EventEnvelope {
   string id = 1;
 
   // Event type following dot notation: "model.registered", "pipeline.started".
-  // Maps to NATS subject hierarchy: goml.{source}.{type}
+  // Maps to NATS subject hierarchy: fp.{source}.{type}
   string type = 2;
 
   // Source service that produced this event: "auth", "registry", "pipeline".

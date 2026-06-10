@@ -27,9 +27,9 @@ scrape_configs:
     static_configs:
       - targets: ["localhost:9090"]
 
-  # GoML microservices (add entries as services are built)
+  # Forgepoint microservices (add entries as services are built)
   # Each service exposes /metrics on its HTTP port (default 8080)
-  - job_name: "goml-services"
+  - job_name: "fp-services"
     metrics_path: /metrics
     static_configs:
       - targets:

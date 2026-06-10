@@ -1,5 +1,5 @@
 # ============================================================================
-# GoML Platform — Root Makefile
+# Forgepoint Platform — Root Makefile
 # ============================================================================
 #
 # WHY: A single entry point for all build, test, lint, and deploy operations.
@@ -32,7 +32,7 @@ SVC ?=
 SERVICES := auth
 
 # Docker image registry prefix (override for GHCR/ECR in CI)
-REGISTRY ?= goml
+REGISTRY ?= fp
 IMAGE_TAG ?= dev
 
 # Go build flags
@@ -229,17 +229,17 @@ down-clean: ## Stop and remove all volumes (fresh start)
 .PHONY: kind-create
 kind-create: ## Create Kind cluster
 	@echo "==> Creating Kind cluster..."
-	kind create cluster --config deploy/kind/kind-config.yaml --name goml
+	kind create cluster --config deploy/kind/kind-config.yaml --name fp
 
 .PHONY: kind-delete
 kind-delete: ## Delete Kind cluster
 	@echo "==> Deleting Kind cluster..."
-	kind delete cluster --name goml
+	kind delete cluster --name fp
 
 .PHONY: kind-load
 kind-load: ## Load Docker image into Kind: make kind-load SVC=auth
 	@if [ -z "$(SVC)" ]; then echo "ERROR: specify SVC=<service>"; exit 1; fi
-	kind load docker-image $(REGISTRY)-$(SVC):$(IMAGE_TAG) --name goml
+	kind load docker-image $(REGISTRY)-$(SVC):$(IMAGE_TAG) --name fp
 
 # ============================================================================
 # Helm
@@ -249,8 +249,8 @@ kind-load: ## Load Docker image into Kind: make kind-load SVC=auth
 helm-install: ## Install service via Helm: make helm-install SVC=auth
 	@if [ -z "$(SVC)" ]; then echo "ERROR: specify SVC=<service>"; exit 1; fi
 	@echo "==> Installing $(SVC) via Helm..."
-	helm install goml-$(SVC) deploy/helm/goml-$(SVC)/ \
-		--namespace goml-system \
+	helm install fp-$(SVC) deploy/helm/fp-$(SVC)/ \
+		--namespace fp-system \
 		--create-namespace \
 		--set image.repository=$(REGISTRY)-$(SVC) \
 		--set image.tag=$(IMAGE_TAG)
@@ -259,8 +259,8 @@ helm-install: ## Install service via Helm: make helm-install SVC=auth
 helm-upgrade: ## Upgrade service via Helm: make helm-upgrade SVC=auth
 	@if [ -z "$(SVC)" ]; then echo "ERROR: specify SVC=<service>"; exit 1; fi
 	@echo "==> Upgrading $(SVC) via Helm..."
-	helm upgrade goml-$(SVC) deploy/helm/goml-$(SVC)/ \
-		--namespace goml-system \
+	helm upgrade fp-$(SVC) deploy/helm/fp-$(SVC)/ \
+		--namespace fp-system \
 		--set image.repository=$(REGISTRY)-$(SVC) \
 		--set image.tag=$(IMAGE_TAG)
 

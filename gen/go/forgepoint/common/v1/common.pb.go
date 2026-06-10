@@ -1,5 +1,5 @@
 // ============================================================================
-// GoML Common Proto Definitions
+// Forgepoint Common Proto Definitions
 // ============================================================================
 //
 // WHY: Shared types used across ALL services. Defining them once in a common
@@ -12,7 +12,7 @@
 //   - ErrorDetail: Structured error information for gRPC responses
 //
 // VERSIONING: Package path includes v1 following Buf/Google convention.
-// If we need breaking changes, we create goml.common.v2 (new package)
+// If we need breaking changes, we create forgepoint.common.v2 (new package)
 // and both versions coexist during migration.
 // ============================================================================
 
@@ -20,7 +20,7 @@
 // versions:
 // 	protoc-gen-go v1.36.11
 // 	protoc        (unknown)
-// source: goml/common/v1/common.proto
+// source: forgepoint/common/v1/common.proto
 
 package commonv1
 
@@ -79,7 +79,7 @@ type EventEnvelope struct {
 	// track processed IDs to safely handle redelivery.
 	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
 	// Event type following dot notation: "model.registered", "pipeline.started".
-	// Maps to NATS subject hierarchy: goml.{source}.{type}
+	// Maps to NATS subject hierarchy: fp.{source}.{type}
 	Type string `protobuf:"bytes,2,opt,name=type,proto3" json:"type,omitempty"`
 	// Source service that produced this event: "auth", "registry", "pipeline".
 	Source string `protobuf:"bytes,3,opt,name=source,proto3" json:"source,omitempty"`
@@ -98,7 +98,7 @@ type EventEnvelope struct {
 
 func (x *EventEnvelope) Reset() {
 	*x = EventEnvelope{}
-	mi := &file_goml_common_v1_common_proto_msgTypes[0]
+	mi := &file_fp_common_v1_common_proto_msgTypes[0]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -110,7 +110,7 @@ func (x *EventEnvelope) String() string {
 func (*EventEnvelope) ProtoMessage() {}
 
 func (x *EventEnvelope) ProtoReflect() protoreflect.Message {
-	mi := &file_goml_common_v1_common_proto_msgTypes[0]
+	mi := &file_fp_common_v1_common_proto_msgTypes[0]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -123,7 +123,7 @@ func (x *EventEnvelope) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EventEnvelope.ProtoReflect.Descriptor instead.
 func (*EventEnvelope) Descriptor() ([]byte, []int) {
-	return file_goml_common_v1_common_proto_rawDescGZIP(), []int{0}
+	return file_fp_common_v1_common_proto_rawDescGZIP(), []int{0}
 }
 
 func (x *EventEnvelope) GetId() string {
@@ -208,7 +208,7 @@ type PaginationRequest struct {
 
 func (x *PaginationRequest) Reset() {
 	*x = PaginationRequest{}
-	mi := &file_goml_common_v1_common_proto_msgTypes[1]
+	mi := &file_fp_common_v1_common_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -220,7 +220,7 @@ func (x *PaginationRequest) String() string {
 func (*PaginationRequest) ProtoMessage() {}
 
 func (x *PaginationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_goml_common_v1_common_proto_msgTypes[1]
+	mi := &file_fp_common_v1_common_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -233,7 +233,7 @@ func (x *PaginationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PaginationRequest.ProtoReflect.Descriptor instead.
 func (*PaginationRequest) Descriptor() ([]byte, []int) {
-	return file_goml_common_v1_common_proto_rawDescGZIP(), []int{1}
+	return file_fp_common_v1_common_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *PaginationRequest) GetPageSize() int32 {
@@ -263,7 +263,7 @@ type PaginationResponse struct {
 
 func (x *PaginationResponse) Reset() {
 	*x = PaginationResponse{}
-	mi := &file_goml_common_v1_common_proto_msgTypes[2]
+	mi := &file_fp_common_v1_common_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -275,7 +275,7 @@ func (x *PaginationResponse) String() string {
 func (*PaginationResponse) ProtoMessage() {}
 
 func (x *PaginationResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_goml_common_v1_common_proto_msgTypes[2]
+	mi := &file_fp_common_v1_common_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -288,7 +288,7 @@ func (x *PaginationResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PaginationResponse.ProtoReflect.Descriptor instead.
 func (*PaginationResponse) Descriptor() ([]byte, []int) {
-	return file_goml_common_v1_common_proto_rawDescGZIP(), []int{2}
+	return file_fp_common_v1_common_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *PaginationResponse) GetNextPageToken() string {
@@ -348,7 +348,7 @@ type ErrorDetail struct {
 
 func (x *ErrorDetail) Reset() {
 	*x = ErrorDetail{}
-	mi := &file_goml_common_v1_common_proto_msgTypes[3]
+	mi := &file_fp_common_v1_common_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -360,7 +360,7 @@ func (x *ErrorDetail) String() string {
 func (*ErrorDetail) ProtoMessage() {}
 
 func (x *ErrorDetail) ProtoReflect() protoreflect.Message {
-	mi := &file_goml_common_v1_common_proto_msgTypes[3]
+	mi := &file_fp_common_v1_common_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -373,7 +373,7 @@ func (x *ErrorDetail) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ErrorDetail.ProtoReflect.Descriptor instead.
 func (*ErrorDetail) Descriptor() ([]byte, []int) {
-	return file_goml_common_v1_common_proto_rawDescGZIP(), []int{3}
+	return file_fp_common_v1_common_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *ErrorDetail) GetCode() string {
@@ -397,11 +397,11 @@ func (x *ErrorDetail) GetField() string {
 	return ""
 }
 
-var File_goml_common_v1_common_proto protoreflect.FileDescriptor
+var File_fp_common_v1_common_proto protoreflect.FileDescriptor
 
-const file_goml_common_v1_common_proto_rawDesc = "" +
+const file_fp_common_v1_common_proto_rawDesc = "" +
 	"\n" +
-	"\x1bgoml/common/v1/common.proto\x12\x0egoml.common.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x19google/protobuf/any.proto\"\xd6\x01\n" +
+	"\x1bfp/common/v1/common.proto\x12\x0eforgepoint.common.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x19google/protobuf/any.proto\"\xd6\x01\n" +
 	"\rEventEnvelope\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04type\x18\x02 \x01(\tR\x04type\x12\x16\n" +
@@ -420,32 +420,32 @@ const file_goml_common_v1_common_proto_rawDesc = "" +
 	"\vErrorDetail\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\tR\x04code\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12\x14\n" +
-	"\x05field\x18\x03 \x01(\tR\x05fieldB<Z:github.com/abd-ulbasit/goml/gen/go/goml/common/v1;commonv1b\x06proto3"
+	"\x05field\x18\x03 \x01(\tR\x05fieldB<Z:github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/common/v1;commonv1b\x06proto3"
 
 var (
-	file_goml_common_v1_common_proto_rawDescOnce sync.Once
-	file_goml_common_v1_common_proto_rawDescData []byte
+	file_fp_common_v1_common_proto_rawDescOnce sync.Once
+	file_fp_common_v1_common_proto_rawDescData []byte
 )
 
-func file_goml_common_v1_common_proto_rawDescGZIP() []byte {
-	file_goml_common_v1_common_proto_rawDescOnce.Do(func() {
-		file_goml_common_v1_common_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_goml_common_v1_common_proto_rawDesc), len(file_goml_common_v1_common_proto_rawDesc)))
+func file_fp_common_v1_common_proto_rawDescGZIP() []byte {
+	file_fp_common_v1_common_proto_rawDescOnce.Do(func() {
+		file_fp_common_v1_common_proto_rawDescData = protoimpl.X.CompressGZIP(unsafe.Slice(unsafe.StringData(file_fp_common_v1_common_proto_rawDesc), len(file_fp_common_v1_common_proto_rawDesc)))
 	})
-	return file_goml_common_v1_common_proto_rawDescData
+	return file_fp_common_v1_common_proto_rawDescData
 }
 
-var file_goml_common_v1_common_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
-var file_goml_common_v1_common_proto_goTypes = []any{
-	(*EventEnvelope)(nil),         // 0: goml.common.v1.EventEnvelope
-	(*PaginationRequest)(nil),     // 1: goml.common.v1.PaginationRequest
-	(*PaginationResponse)(nil),    // 2: goml.common.v1.PaginationResponse
-	(*ErrorDetail)(nil),           // 3: goml.common.v1.ErrorDetail
+var file_fp_common_v1_common_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
+var file_fp_common_v1_common_proto_goTypes = []any{
+	(*EventEnvelope)(nil),         // 0: forgepoint.common.v1.EventEnvelope
+	(*PaginationRequest)(nil),     // 1: forgepoint.common.v1.PaginationRequest
+	(*PaginationResponse)(nil),    // 2: forgepoint.common.v1.PaginationResponse
+	(*ErrorDetail)(nil),           // 3: forgepoint.common.v1.ErrorDetail
 	(*timestamppb.Timestamp)(nil), // 4: google.protobuf.Timestamp
 	(*anypb.Any)(nil),             // 5: google.protobuf.Any
 }
-var file_goml_common_v1_common_proto_depIdxs = []int32{
-	4, // 0: goml.common.v1.EventEnvelope.timestamp:type_name -> google.protobuf.Timestamp
-	5, // 1: goml.common.v1.EventEnvelope.data:type_name -> google.protobuf.Any
+var file_fp_common_v1_common_proto_depIdxs = []int32{
+	4, // 0: forgepoint.common.v1.EventEnvelope.timestamp:type_name -> google.protobuf.Timestamp
+	5, // 1: forgepoint.common.v1.EventEnvelope.data:type_name -> google.protobuf.Any
 	2, // [2:2] is the sub-list for method output_type
 	2, // [2:2] is the sub-list for method input_type
 	2, // [2:2] is the sub-list for extension type_name
@@ -453,26 +453,26 @@ var file_goml_common_v1_common_proto_depIdxs = []int32{
 	0, // [0:2] is the sub-list for field type_name
 }
 
-func init() { file_goml_common_v1_common_proto_init() }
-func file_goml_common_v1_common_proto_init() {
-	if File_goml_common_v1_common_proto != nil {
+func init() { file_fp_common_v1_common_proto_init() }
+func file_fp_common_v1_common_proto_init() {
+	if File_fp_common_v1_common_proto != nil {
 		return
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
-			RawDescriptor: unsafe.Slice(unsafe.StringData(file_goml_common_v1_common_proto_rawDesc), len(file_goml_common_v1_common_proto_rawDesc)),
+			RawDescriptor: unsafe.Slice(unsafe.StringData(file_fp_common_v1_common_proto_rawDesc), len(file_fp_common_v1_common_proto_rawDesc)),
 			NumEnums:      0,
 			NumMessages:   4,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
-		GoTypes:           file_goml_common_v1_common_proto_goTypes,
-		DependencyIndexes: file_goml_common_v1_common_proto_depIdxs,
-		MessageInfos:      file_goml_common_v1_common_proto_msgTypes,
+		GoTypes:           file_fp_common_v1_common_proto_goTypes,
+		DependencyIndexes: file_fp_common_v1_common_proto_depIdxs,
+		MessageInfos:      file_fp_common_v1_common_proto_msgTypes,
 	}.Build()
-	File_goml_common_v1_common_proto = out.File
-	file_goml_common_v1_common_proto_goTypes = nil
-	file_goml_common_v1_common_proto_depIdxs = nil
+	File_fp_common_v1_common_proto = out.File
+	file_fp_common_v1_common_proto_goTypes = nil
+	file_fp_common_v1_common_proto_depIdxs = nil
 }

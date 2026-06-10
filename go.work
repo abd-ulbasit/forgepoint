@@ -13,7 +13,7 @@
 //   - `go build`, `go test`, etc. automatically resolve inter-module imports
 //     to local source instead of fetching from a remote registry
 //   - Each module still has its own go.mod with proper module paths
-//     (e.g., github.com/abd-ulbasit/goml/pkg) for external consumers
+//     (e.g., github.com/abd-ulbasit/forgepoint/pkg) for external consumers
 //
 // ALTERNATIVES:
 //   - Go 1.17 replace directives: Fragile, each module needs replace for

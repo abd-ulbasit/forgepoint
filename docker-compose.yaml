@@ -1,8 +1,8 @@
 # ============================================================================
-# GOML LOCAL INFRASTRUCTURE STACK
+# FORGEPOINT LOCAL INFRASTRUCTURE STACK
 # ============================================================================
 #
-# PURPOSE: Local development dependencies only. No GoML services here —
+# PURPOSE: Local development dependencies only. No Forgepoint services here —
 # services are built and run separately (via `make run SVC=auth` or Skaffold).
 #
 # USAGE:
@@ -12,7 +12,7 @@
 #
 # VERIFICATION:
 #   curl http://localhost:8222/healthz        # NATS
-#   psql -h localhost -U goml -c "SELECT 1"   # Postgres (password: goml)
+#   psql -h localhost -U fp -c "SELECT 1"   # Postgres (password: fp)
 #   redis-cli -h localhost ping               # Redis
 #   curl http://localhost:9000/minio/health/live  # MinIO
 #   curl http://localhost:9090/-/healthy      # Prometheus
@@ -20,7 +20,7 @@
 #
 # ARCHITECTURE:
 #   ┌─────────────────────────────────────────────────────┐
-#   │                    GoML Services                     │
+#   │                    Forgepoint Services                     │
 #   │  (run separately via make run / Skaffold / Kind)     │
 #   └──────────────┬──────────────────────┬───────────────┘
 #                  │                      │
@@ -55,17 +55,17 @@ services:
   # POSTGRES — Primary data store for all services
   # ==========================================================================
   #
-  # Each service gets its own database (goml_auth, goml_registry, etc.)
+  # Each service gets its own database (fp_auth, fp_registry, etc.)
   # via the init script. Services use separate connection strings:
-  #   AUTH_DATABASE_URL=postgres://goml:goml@localhost:5432/goml_auth
-  #   REGISTRY_DATABASE_URL=postgres://goml:goml@localhost:5432/goml_registry
+  #   AUTH_DATABASE_URL=postgres://fp:fp@localhost:5432/fp_auth
+  #   REGISTRY_DATABASE_URL=postgres://fp:fp@localhost:5432/fp_registry
   # ==========================================================================
   postgres:
     image: postgres:17
     environment:
-      POSTGRES_USER: goml
-      POSTGRES_PASSWORD: goml
-      POSTGRES_DB: goml
+      POSTGRES_USER: fp
+      POSTGRES_PASSWORD: fp
+      POSTGRES_DB: fp
     ports:
       - "5432:5432"
     volumes:
@@ -117,8 +117,8 @@ services:
       /bin/sh -c "
       sleep 3 &&
       mc alias set local http://minio:9000 minioadmin minioadmin &&
-      mc mb local/goml-models --ignore-existing &&
-      echo 'Bucket goml-models created successfully'
+      mc mb local/fp-models --ignore-existing &&
+      echo 'Bucket fp-models created successfully'
       "
 
   # ==========================================================================
