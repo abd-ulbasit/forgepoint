@@ -1,5 +1,5 @@
 # ============================================================================
-# GoML Platform — .gitignore
+# Forgepoint Platform — .gitignore
 # ============================================================================
 
 # Compiled binaries
@@ -47,3 +47,7 @@ deploy/helm/*/charts/
 
 # Temporary files
 tmp/
+
+# AI assistant instructions & local agent config (not part of the public repo)
+CLAUDE.md
+.claude/
