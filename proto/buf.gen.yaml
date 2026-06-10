@@ -15,12 +15,12 @@
 #      (gRPC service interfaces, client/server stubs)
 #
 # OUTPUT: ../gen/go/ (relative to proto/ directory)
-#   This puts generated code at the repo root under gen/go/goml/{service}/v1/
+#   This puts generated code at the repo root under gen/go/forgepoint/{service}/v1/
 #   All services import from this shared generated package.
 #
 # OPT paths=source_relative:
 #   Generated files are placed relative to the .proto source file's package.
-#   E.g., proto/goml/auth/v1/auth.proto → gen/go/goml/auth/v1/auth.pb.go
+#   E.g., proto/forgepoint/auth/v1/auth.proto → gen/go/forgepoint/auth/v1/auth.pb.go
 #   Alternative is module-based (paths=module), but source_relative is simpler
 #   and more predictable for monorepo layouts.
 # ============================================================================
