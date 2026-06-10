@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  pkg:
+    name: pkg (build · vet · test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        # Only the shared `pkg` module exists today; services land in later
+        # phases. The go.work at the repo root scopes the build to ./pkg.
+        working-directory: pkg
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache-dependency-path: pkg/go.sum
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # Integration tests use testcontainers; the GitHub runner has Docker, so
+      # the real Postgres/NATS containers spin up. The race detector is on to
+      # catch concurrency bugs in the shared libraries.
+      - name: Test
+        run: go test -race ./...
