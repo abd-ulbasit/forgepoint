@@ -1,4 +1,4 @@
-# GoML — ML Platform as Microservices
+# Forgepoint — ML Platform as Microservices
 
 **Date:** 2026-02-21
 **Status:** Approved
@@ -6,18 +6,18 @@
 
 ## Overview
 
-GoML is a full ML lifecycle platform built as a distributed microservices system in Go. It covers model training, registration, deployment, serving, monitoring, and retraining — orchestrated across 9 independent services communicating via gRPC (sync) and NATS JetStream (async), deployed on Kubernetes.
+Forgepoint is a full ML lifecycle platform built as a distributed microservices system in Go. It covers model training, registration, deployment, serving, monitoring, and retraining — orchestrated across 9 independent services communicating via gRPC (sync) and NATS JetStream (async), deployed on Kubernetes.
 
 **Goals:**
 - Learn every major microservices pattern (saga, CQRS, event sourcing, choreography, outbox, etc.) with a real, production-standard project
 - Build a portfolio piece targeting remote high-paying roles at YC startups and platform engineering positions
 - Demonstrate mastery of Go, Kubernetes, distributed systems, and cloud-native infrastructure
 - Cover the full MLOps lifecycle: train → register → deploy → serve → monitor → retrain
+- Deliver a polished, working product with good UX — including a web UI as a first-class interface alongside the CLI and gRPC/HTTP APIs
 
 **Non-goals:**
 - Building actual ML models (we use pre-trained ONNX CPU models)
 - GPU infrastructure (all inference runs on CPU, keeping costs near zero)
-- Web UI (CLI + gRPC/HTTP APIs are the interface)
 
 ## Architecture
 
@@ -238,33 +238,33 @@ Each step is durable (persisted to DB). If the orchestrator crashes mid-saga, it
 ```
 NATS JetStream Subjects:
 
-goml.models.>              Model Registry events
-  goml.models.registered
-  goml.models.version.created
-  goml.models.archived
+fp.models.>              Model Registry events
+  fp.models.registered
+  fp.models.version.created
+  fp.models.archived
 
-goml.pipelines.>           Pipeline Orchestrator events
-  goml.pipelines.started
-  goml.pipelines.step.completed
-  goml.pipelines.step.failed
-  goml.pipelines.completed
-  goml.pipelines.compensation.triggered
+fp.pipelines.>           Pipeline Orchestrator events
+  fp.pipelines.started
+  fp.pipelines.step.completed
+  fp.pipelines.step.failed
+  fp.pipelines.completed
+  fp.pipelines.compensation.triggered
 
-goml.inference.>           Inference Gateway events
-  goml.inference.completed
-  goml.inference.failed
+fp.inference.>           Inference Gateway events
+  fp.inference.completed
+  fp.inference.failed
 
-goml.features.>            Feature Store events
-  goml.features.set.created
-  goml.features.ingested
+fp.features.>            Feature Store events
+  fp.features.set.created
+  fp.features.ingested
 
-goml.billing.>             Billing events
-  goml.billing.quota.exceeded
-  goml.billing.invoice.generated
+fp.billing.>             Billing events
+  fp.billing.quota.exceeded
+  fp.billing.invoice.generated
 
-goml.notifications.>       Notification delivery events
-  goml.notifications.delivered
-  goml.notifications.failed
+fp.notifications.>       Notification delivery events
+  fp.notifications.delivered
+  fp.notifications.failed
 ```
 
 ### Event Flow Map
@@ -307,7 +307,7 @@ Billing           → QuotaExceeded           → Notification Service
 Go monorepo with workspaces:
 
 ```
-goml/
+forgepoint/
 ├── proto/                          # Single source of truth for ALL APIs
 │   ├── buf.yaml                    # Buf for proto linting + breaking changes
 │   ├── buf.gen.yaml
@@ -339,7 +339,11 @@ goml/
 │   ├── experiment-tracker/
 │   ├── billing/
 │   ├── notification/
-│   └── model-serving/
+│   ├── model-serving/
+│   └── bff/                        # Backend-for-Frontend for the web UI (ADR 0001)
+│                                   #   composition + gRPC↔JSON/SSE, ZERO business logic
+│
+├── web/                            # Web UI (Vite + React + TS), talks only to the BFF
 │
 ├── pkg/                            # Shared libraries
 │   ├── grpcutil/                   # gRPC interceptors, middleware
@@ -357,7 +361,7 @@ goml/
 │   └── skaffold.yaml               # Local K8s dev workflow
 │
 ├── tools/
-│   ├── goml-cli/                   # CLI for interacting with the platform
+│   ├── fp-cli/                   # CLI for interacting with the platform
 │   └── loadtest/                   # k6 scripts per service
 │
 ├── scripts/
@@ -389,10 +393,10 @@ goml/
 ### Kubernetes Namespaces
 
 ```
-goml-system    Platform services (auth, registry, gateway, etc.)
-goml-models    Model serving workloads (dynamic, per model)
-goml-jobs      Training and batch jobs (K8s Jobs)
-goml-infra     NATS, Postgres, Redis, MinIO, monitoring
+fp-system    Platform services (auth, registry, gateway, etc.)
+fp-models    Model serving workloads (dynamic, per model)
+fp-jobs      Training and batch jobs (K8s Jobs)
+fp-infra     NATS, Postgres, Redis, MinIO, monitoring
 ```
 
 Each service has: Deployment, Service, ServiceAccount, ConfigMap, Secret, PDB, NetworkPolicy, ServiceMonitor.
@@ -411,8 +415,8 @@ Training/batch: K8s Jobs managed by Pipeline Orchestrator.
 All services instrumented via `pkg/observability/` — single setup function, all three pillars.
 
 Every service exposes:
-- RED metrics: `goml_{service}_grpc_requests_total`, `goml_{service}_grpc_duration_seconds`
-- Business metrics: `goml_inference_predictions_total{model,version}`, `goml_pipeline_active_sagas`
+- RED metrics: `fp_{service}_grpc_requests_total`, `fp_{service}_grpc_duration_seconds`
+- Business metrics: `fp_inference_predictions_total{model,version}`, `fp_pipeline_active_sagas`
 - Health probes: `/healthz` (liveness), `/readyz` (readiness)
 
 ### Service Mesh (Istio)
