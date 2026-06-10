@@ -1,35 +1,58 @@
-# GoML Implementation Plan
+# Forgepoint Implementation Plan
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Build a full ML lifecycle platform as 9 microservices in Go — covering saga, CQRS, event sourcing, choreography, outbox, circuit breakers, and more — deployed on Kubernetes.
+**Goal:** Build a full ML lifecycle platform as 9 microservices in Go — covering saga, CQRS, event sourcing, choreography, outbox, circuit breakers, and more — deployed on Kubernetes. Deliver it as a polished, working product with good UX, including a web UI as a first-class interface alongside the CLI and gRPC/HTTP APIs.
 
 **Architecture:** Go monorepo with workspaces. 9 services communicating via gRPC (sync) and NATS JetStream (async). Each service owns its PostgreSQL database. Clean Architecture (handler → domain → repository). Deployed on Kind locally, EKS for production.
 
 **Tech Stack:** Go, gRPC, Buf, NATS JetStream, PostgreSQL, Redis, MinIO, Docker, Kubernetes, Helm, Skaffold, OpenTelemetry, Prometheus, Grafana, Loki, Tempo, Istio, Terraform, GitHub Actions, k6, Testcontainers
 
-**Design Doc:** `docs/plans/goml-platform-design.md`
+**Design Doc:** `docs/plans/forgepoint-platform-design.md`
 
 ---
 
+## Scope Tiers
+
+This plan is intentionally larger than what should be built first. Depth on a focused
+core interviews better than breadth across a half-finished 9-service repo. Phases are
+tagged:
+
+- **Core** — build to polish. Every distinct distributed-systems pattern, the BFF + web
+  UI, full local Kubernetes, observability *with real alerts/SLOs + a runbook*, and CI.
+  This alone covers every interview talking point (saga, CQRS, circuit breaker, BFF,
+  observability, K8s, IaC-lite) with enough depth to defend on a shared screen.
+- **Stretch** — build only if the Core is genuinely polished. Services 6-9 are mostly
+  event-consumer *repeats* with diminishing learning return; pick 1-2 for pattern variety
+  (Outbox and Event Sourcing are the most interview-worth). EKS/Terraform is high-effort,
+  low-novel-learning, and invisible in a portfolio — make it last.
+
+> **Rule:** a recorded demo of a polished local Kind deployment demonstrates the same
+> competency as a torn-down EKS cluster nobody can see. Don't let EKS gate the project.
+
 ## Phase Overview
 
-| Phase | Focus | Services/Components | Key Pattern | Depends On |
-|-------|-------|--------------------|----|------------|
-| **0** | Foundation | Repo scaffold, shared libs, local infra | — | Nothing |
-| **1** | Auth/IAM | `services/auth` | Centralized Auth, JWT | Phase 0 |
-| **2** | Model Registry | `services/registry` | CQRS | Phase 1 |
-| **3** | Model Serving | `services/model-serving` | Sidecar, HPA | Phase 2 |
-| **4** | Inference Gateway | `services/inference-gateway` | Circuit Breaker, Rate Limiting | Phase 3 |
-| **5** | Pipeline Orchestrator | `services/pipeline-orchestrator` | Saga, DAG Execution | Phase 2, 3 |
-| **6** | Feature Store | `services/feature-store` | Event Sourcing | Phase 1 |
-| **7** | Experiment Tracker | `services/experiment-tracker` | Event-Driven, Batch Consumer | Phase 1 |
-| **8** | Billing/Usage | `services/billing` | Outbox Pattern | Phase 1 |
-| **9** | Notification | `services/notification` | Choreography | Phase 1 |
-| **10** | Observability & Mesh | Grafana dashboards, Istio | Three Pillars, mTLS | Phase 1-9 |
-| **11** | CI/CD | GitHub Actions | Path-filtered pipelines | Phase 0-9 |
-| **12** | AWS Deployment | Terraform EKS, RDS, S3 | IaC | Phase 0-11 |
-| **13** | E2E & Load Testing | Cross-service tests, k6 | Full lifecycle validation | Phase 0-9 |
+| Phase | Tier | Focus | Services/Components | Key Pattern | Depends On |
+|-------|------|-------|--------------------|----|------------|
+| **0** | Core | Foundation | Repo scaffold, shared libs, local infra | — | Nothing |
+| **1** | Core | Auth/IAM | `services/auth` | Centralized Auth, JWT | Phase 0 |
+| **2** | Core | Model Registry | `services/registry` | CQRS | Phase 1 |
+| **3** | Core | Model Serving | `services/model-serving` | Sidecar, HPA | Phase 2 |
+| **4** | Core | Inference Gateway | `services/inference-gateway` | Circuit Breaker, Rate Limiting | Phase 3 |
+| **5** | Core | Pipeline Orchestrator | `services/pipeline-orchestrator` | Saga, DAG Execution | Phase 2, 3 |
+| **6** | Stretch | Feature Store | `services/feature-store` | Event Sourcing | Phase 1 |
+| **7** | Stretch | Experiment Tracker | `services/experiment-tracker` | Event-Driven, Batch Consumer | Phase 1 |
+| **8** | Stretch | Billing/Usage | `services/billing` | Outbox Pattern | Phase 1 |
+| **9** | Stretch | Notification | `services/notification` | Choreography | Phase 1 |
+| **10** | Core | Observability & Mesh | Grafana dashboards, Istio | Three Pillars, mTLS | Phase 1-5 |
+| **11** | Core | CI/CD | GitHub Actions | Path-filtered pipelines | Phase 0-5 |
+| **12** | Stretch | AWS Deployment | Terraform EKS, RDS, S3 | IaC | Phase 0-11 |
+| **13** | Core | E2E & Load Testing | Cross-service tests, k6 | Full lifecycle validation | Phase 1-5 |
+| **14** | Core | Web UI (BFF + frontend) | `services/bff`, `web/` dashboard | Backend-for-Frontend, gRPC→SSE | Phase 1-5 |
+| **15** | Core | Operability & SRE | SLOs, alert rules, runbook | SLO/error-budget, on-call signal | Phase 10 |
+
+> Recommended Core sequence: **0 → 1 → 2 → 3 → 4 → 5 → 10 → 11 → 13 → 14 → 15**, then
+> Stretch (pick 1-2 of 6-9, then 12) only if time allows.
 
 ---
 
@@ -99,7 +122,7 @@ git commit -m "feat: scaffold repository with go workspace and tooling"
 - Create: `proto/buf.yaml`
 - Create: `proto/buf.gen.yaml`
 - Create: `proto/buf.lock`
-- Create: `proto/goml/common/v1/common.proto` (shared event envelope, pagination, errors)
+- Create: `proto/forgepoint/common/v1/common.proto` (shared event envelope, pagination, errors)
 
 **Step 1: Install Buf CLI**
 
@@ -140,7 +163,7 @@ plugins:
 
 **Step 4: Create common proto definitions**
 
-`proto/goml/common/v1/common.proto`:
+`proto/forgepoint/common/v1/common.proto`:
 - `EventEnvelope` message: `id`, `type`, `source`, `timestamp`, `correlation_id`, `data` (bytes)
 - `PaginationRequest`: `page_size`, `page_token`
 - `PaginationResponse`: `next_page_token`, `total_count`
@@ -150,7 +173,7 @@ plugins:
 
 Run: `cd proto && buf lint && buf generate`
 
-Verify: `ls ../gen/go/goml/common/v1/` contains generated `.pb.go` files.
+Verify: `ls ../gen/go/forgepoint/common/v1/` contains generated `.pb.go` files.
 
 **Step 6: Commit**
 
@@ -171,7 +194,7 @@ git commit -m "feat: setup buf proto tooling with common definitions"
 **Step 1: Write the failing test**
 
 `pkg/config/config_test.go`:
-- Test loading config from env vars with `GOML_` prefix
+- Test loading config from env vars with `FP_` prefix
 - Test default values when env vars are not set
 - Test required fields returning error when missing
 
@@ -408,9 +431,9 @@ git commit -m "feat(pkg): add test utilities (testcontainers, in-process gRPC, f
 
 Services:
 - `nats`: nats:latest with JetStream enabled (`-js`), ports 4222, 8222
-- `postgres`: postgres:17, port 5432, init script creates per-service databases (goml_auth, goml_registry, goml_pipeline, goml_feature, goml_experiment, goml_billing, goml_notification)
+- `postgres`: postgres:17, port 5432, init script creates per-service databases (fp_auth, fp_registry, fp_pipeline, fp_feature, fp_experiment, fp_billing, fp_notification)
 - `redis`: redis:7, port 6379
-- `minio`: minio/minio, ports 9000 (API), 9001 (console), creates `goml-models` bucket on start
+- `minio`: minio/minio, ports 9000 (API), 9001 (console), creates `fp-models` bucket on start
 - `prometheus`: prom/prometheus, port 9090, mounts `deploy/prometheus/prometheus.yml`
 - `grafana`: grafana/grafana, port 3000, auto-provisions Prometheus + Tempo + Loki datasources
 - `tempo`: grafana/tempo, port 4317 (OTLP gRPC), 3200 (HTTP)
@@ -426,7 +449,7 @@ Run: `docker compose up -d`
 
 Verify:
 - `curl http://localhost:8222/healthz` (NATS)
-- `psql -h localhost -U goml -c "SELECT 1"` (Postgres)
+- `psql -h localhost -U fp -c "SELECT 1"` (Postgres)
 - `redis-cli -h localhost ping` (Redis)
 - `curl http://localhost:9000/minio/health/live` (MinIO)
 - `curl http://localhost:9090/-/healthy` (Prometheus)
@@ -462,24 +485,24 @@ Kind cluster with:
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: goml-system
+  name: fp-system
   labels:
     istio-injection: enabled
 ---
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: goml-models
+  name: fp-models
 ---
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: goml-jobs
+  name: fp-jobs
 ---
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: goml-infra
+  name: fp-infra
 ```
 
 **Step 3: Create Skaffold config**
@@ -488,11 +511,11 @@ Skeleton with the auth service as first module. More services added as they're b
 
 **Step 4: Create cluster and verify**
 
-Run: `kind create cluster --config deploy/kind/kind-config.yaml --name goml`
+Run: `kind create cluster --config deploy/kind/kind-config.yaml --name fp`
 
 Run: `kubectl apply -f deploy/k8s/namespaces.yaml`
 
-Verify: `kubectl get ns` shows goml-system, goml-models, goml-jobs, goml-infra.
+Verify: `kubectl get ns` shows fp-system, fp-models, fp-jobs, fp-infra.
 
 **Step 5: Commit**
 
@@ -533,7 +556,7 @@ git commit -m "docs: add foundational architecture decision records"
 ### Task 1.1: Auth Proto Definitions
 
 **Files:**
-- Create: `proto/goml/auth/v1/auth.proto`
+- Create: `proto/forgepoint/auth/v1/auth.proto`
 
 **Step 1: Define the auth service proto**
 
@@ -558,12 +581,12 @@ RPCs:
 
 Run: `cd proto && buf lint && buf generate`
 
-Verify: `ls ../gen/go/goml/auth/v1/` contains `auth.pb.go` and `auth_grpc.pb.go`.
+Verify: `ls ../gen/go/forgepoint/auth/v1/` contains `auth.pb.go` and `auth_grpc.pb.go`.
 
 **Step 3: Commit**
 
 ```bash
-git add proto/goml/auth/ gen/go/goml/auth/
+git add proto/forgepoint/auth/ gen/go/forgepoint/auth/
 git commit -m "feat(auth): define auth service proto with user, API key, and RBAC RPCs"
 ```
 
@@ -583,7 +606,7 @@ git commit -m "feat(auth): define auth service proto with user, API key, and RBA
 **Step 1: Create go.mod for auth service**
 
 ```
-module github.com/abd-ulbasit/goml/services/auth
+module github.com/abd-ulbasit/forgepoint/services/auth
 
 go 1.24
 ```
@@ -835,15 +858,15 @@ git commit -m "feat(auth): implement gRPC handler with request validation"
 **Step 1: Write failing test**
 
 - Start NATS via testcontainers
-- Subscribe to `goml.auth.>`
+- Subscribe to `fp.auth.>`
 - Call publisher methods, verify events received with correct envelope
 
 **Step 2: Implement**
 
 `publisher.go`:
 - `AuthEventPublisher` wrapping `pkg/natsutil.Publisher`
-- `PublishUserCreated(ctx, user)` — publishes to `goml.auth.user.created`
-- `PublishAPIKeyRotated(ctx, keyID, userID)` — publishes to `goml.auth.apikey.rotated`
+- `PublishUserCreated(ctx, user)` — publishes to `fp.auth.user.created`
+- `PublishAPIKeyRotated(ctx, keyID, userID)` — publishes to `fp.auth.apikey.rotated`
 - Wire into domain service — service calls publisher after successful operations
 
 **Step 3: Run tests, verify pass, commit**
@@ -859,16 +882,16 @@ git commit -m "feat(auth): add NATS event publishing for user and API key events
 
 **Files:**
 - Create: `services/auth/Dockerfile`
-- Create: `deploy/helm/goml-auth/Chart.yaml`
-- Create: `deploy/helm/goml-auth/values.yaml`
-- Create: `deploy/helm/goml-auth/templates/deployment.yaml`
-- Create: `deploy/helm/goml-auth/templates/service.yaml`
-- Create: `deploy/helm/goml-auth/templates/configmap.yaml`
-- Create: `deploy/helm/goml-auth/templates/secret.yaml`
-- Create: `deploy/helm/goml-auth/templates/pdb.yaml`
-- Create: `deploy/helm/goml-auth/templates/serviceaccount.yaml`
-- Create: `deploy/helm/goml-auth/templates/servicemonitor.yaml`
-- Create: `deploy/helm/goml-auth/templates/networkpolicy.yaml`
+- Create: `deploy/helm/fp-auth/Chart.yaml`
+- Create: `deploy/helm/fp-auth/values.yaml`
+- Create: `deploy/helm/fp-auth/templates/deployment.yaml`
+- Create: `deploy/helm/fp-auth/templates/service.yaml`
+- Create: `deploy/helm/fp-auth/templates/configmap.yaml`
+- Create: `deploy/helm/fp-auth/templates/secret.yaml`
+- Create: `deploy/helm/fp-auth/templates/pdb.yaml`
+- Create: `deploy/helm/fp-auth/templates/serviceaccount.yaml`
+- Create: `deploy/helm/fp-auth/templates/servicemonitor.yaml`
+- Create: `deploy/helm/fp-auth/templates/networkpolicy.yaml`
 
 **Step 1: Create multi-stage Dockerfile**
 
@@ -890,18 +913,18 @@ ENTRYPOINT ["/auth"]
 
 **Step 2: Create Helm chart**
 
-Standard K8s resources: Deployment (2 replicas), Service (ClusterIP, gRPC port), ConfigMap (env vars), Secret (DB password, JWT secret), PDB (minAvailable: 1), ServiceAccount, ServiceMonitor (Prometheus scrape), NetworkPolicy (allow ingress only from goml-system namespace).
+Standard K8s resources: Deployment (2 replicas), Service (ClusterIP, gRPC port), ConfigMap (env vars), Secret (DB password, JWT secret), PDB (minAvailable: 1), ServiceAccount, ServiceMonitor (Prometheus scrape), NetworkPolicy (allow ingress only from fp-system namespace).
 
 **Step 3: Build and test locally**
 
-Run: `docker build -t goml-auth:dev -f services/auth/Dockerfile services/auth/`
+Run: `docker build -t fp-auth:dev -f services/auth/Dockerfile services/auth/`
 
-Run: `helm template goml-auth deploy/helm/goml-auth/ | kubectl apply --dry-run=client -f -`
+Run: `helm template fp-auth deploy/helm/fp-auth/ | kubectl apply --dry-run=client -f -`
 
 **Step 4: Commit**
 
 ```bash
-git add services/auth/Dockerfile deploy/helm/goml-auth/
+git add services/auth/Dockerfile deploy/helm/fp-auth/
 git commit -m "feat(auth): add Dockerfile and Helm chart with full K8s resources"
 ```
 
@@ -912,32 +935,32 @@ git commit -m "feat(auth): add Dockerfile and Helm chart with full K8s resources
 **Step 1: Build and load image into Kind**
 
 ```bash
-docker build -t goml-auth:dev -f services/auth/Dockerfile services/auth/
-kind load docker-image goml-auth:dev --name goml
+docker build -t fp-auth:dev -f services/auth/Dockerfile services/auth/
+kind load docker-image fp-auth:dev --name fp
 ```
 
 **Step 2: Deploy with Helm**
 
 ```bash
-helm install goml-auth deploy/helm/goml-auth/ \
-  --namespace goml-system \
-  --set image.repository=goml-auth \
+helm install fp-auth deploy/helm/fp-auth/ \
+  --namespace fp-system \
+  --set image.repository=fp-auth \
   --set image.tag=dev
 ```
 
 **Step 3: Verify**
 
 ```bash
-kubectl get pods -n goml-system -l app=goml-auth
-kubectl logs -n goml-system -l app=goml-auth
+kubectl get pods -n fp-system -l app=fp-auth
+kubectl logs -n fp-system -l app=fp-auth
 ```
 
 Port-forward and smoke test:
 ```bash
-kubectl port-forward -n goml-system svc/goml-auth 8080:8080
+kubectl port-forward -n fp-system svc/fp-auth 8080:8080
 grpcurl -plaintext localhost:8080 list
-grpcurl -plaintext -d '{"email":"test@goml.io","name":"Test","password":"secret123","team":"platform"}' \
-  localhost:8080 goml.auth.v1.AuthService/CreateUser
+grpcurl -plaintext -d '{"email":"test@fp.io","name":"Test","password":"secret123","team":"platform"}' \
+  localhost:8080 forgepoint.auth.v1.AuthService/CreateUser
 ```
 
 **Step 4: Commit any fixes**
@@ -957,7 +980,7 @@ git commit -m "fix(auth): deployment fixes from Kind smoke test"
 ### Task 2.1: Registry Proto Definitions
 
 **Files:**
-- Create: `proto/goml/registry/v1/registry.proto`
+- Create: `proto/forgepoint/registry/v1/registry.proto`
 
 Messages: `Model`, `ModelVersion`, `ModelArtifact`, `ModelTag`
 
@@ -1013,7 +1036,7 @@ TDD: write tests first with testcontainers, then implement.
 **Key CQRS implementation:**
 
 `projection.go`:
-- Subscribes to `goml.models.>` NATS subjects
+- Subscribes to `fp.models.>` NATS subjects
 - On `ModelRegistered`: serialize model to JSON, store in Redis as `model:{id}`, add to `models:list` sorted set, update `models:tag:{key}:{value}` sets for tag-based search
 - On `ModelVersionCreated`: update `model:{id}:latest_version`, add to `model:{id}:versions` list
 - On `ModelArchived`: remove from `models:list`, keep in `model:{id}` (soft delete)
@@ -1055,7 +1078,7 @@ TDD throughout.
 Follow same pattern as auth (Task 1.5 → 1.8):
 - Implement gRPC handler with tests
 - Create Dockerfile (multi-stage, distroless)
-- Create Helm chart (deploy/helm/goml-registry/)
+- Create Helm chart (deploy/helm/fp-registry/)
 - Deploy to Kind, smoke test with grpcurl
 - Verify CQRS: register a model → check NATS event → check Redis projection → query via read path
 
@@ -1070,7 +1093,7 @@ Follow same pattern as auth (Task 1.5 → 1.8):
 ### Task 3.1: Serving Proto Definitions
 
 **Files:**
-- Create: `proto/goml/serving/v1/serving.proto`
+- Create: `proto/forgepoint/serving/v1/serving.proto`
 
 Messages: `PredictRequest` (model_name, version, inputs as map<string, TensorData>), `PredictResponse` (outputs, latency_ms), `TensorData` (shape[], data bytes, dtype), `ModelInfo` (name, version, input_schema, output_schema, loaded_at)
 
@@ -1116,7 +1139,7 @@ TDD, Dockerfile, Helm chart, deploy to Kind.
 ### Task 4.1: Inference Gateway Proto + HTTP API
 
 **Files:**
-- Create: `proto/goml/inference/v1/inference.proto`
+- Create: `proto/forgepoint/inference/v1/inference.proto`
 - Create: `services/inference-gateway/internal/handler/http_handler.go`
 
 Proto (internal gRPC to model serving):
@@ -1139,8 +1162,8 @@ HTTP API (external-facing):
 
 Router:
 - `RouteTable` struct: model_name → list of `{version, address, weight}`
-- Consumes `goml.pipelines.model.deployed` → adds route
-- Consumes `goml.pipelines.model.undeployed` → removes route
+- Consumes `fp.pipelines.model.deployed` → adds route
+- Consumes `fp.pipelines.model.undeployed` → removes route
 - Supports weighted routing (e.g., canary: v1=90%, v2=10%)
 - Thread-safe (RWMutex or atomic swap)
 
@@ -1157,7 +1180,7 @@ TDD: test route addition, removal, weighted selection.
 3-state circuit breaker (closed → open → half-open):
 - Configurable failure threshold, success threshold, timeout
 - Per-backend (each model version endpoint has its own breaker)
-- Metrics: `goml_gateway_circuit_breaker_state{model, version}` gauge
+- Metrics: `fp_gateway_circuit_breaker_state{model, version}` gauge
 
 TDD: test state transitions, concurrent access, half-open probe.
 
@@ -1214,7 +1237,7 @@ Wire everything together:
 ### Task 5.1: Pipeline Proto Definitions
 
 **Files:**
-- Create: `proto/goml/pipeline/v1/pipeline.proto`
+- Create: `proto/forgepoint/pipeline/v1/pipeline.proto`
 
 Messages:
 - `PipelineDefinition`: id, name, type (DEPLOYMENT_SAGA | TRAINING_DAG | BATCH_INFERENCE), steps[], created_by
@@ -1365,7 +1388,7 @@ Proto RPCs: `CreateExperiment`, `StartRun`, `LogMetrics`, `LogParameters`, `Comp
 
 ### Task 7.2: NATS Batch Consumer
 
-Key pattern: subscribe to `goml.inference.completed`, buffer events, flush to DB in batches every N seconds or when buffer reaches M events. Demonstrates back-pressure handling — if DB is slow, buffer grows (up to limit), then NAK to slow down NATS delivery.
+Key pattern: subscribe to `fp.inference.completed`, buffer events, flush to DB in batches every N seconds or when buffer reaches M events. Demonstrates back-pressure handling — if DB is slow, buffer grows (up to limit), then NAK to slow down NATS delivery.
 
 ### Task 7.3: Metrics Storage (Time-Partitioned)
 
@@ -1403,7 +1426,7 @@ Proto RPCs: `RecordUsage`, `GetUsage`, `CheckQuota`, `CreateRatePlan`, `GetInvoi
 
 ### Task 8.2: Usage Metering via NATS
 
-Subscribe to `goml.inference.completed`. For each event, increment usage counter for the API key's rate plan.
+Subscribe to `fp.inference.completed`. For each event, increment usage counter for the API key's rate plan.
 
 ### Task 8.3: Outbox Pattern Implementation
 
@@ -1448,11 +1471,11 @@ Tables: `notification_rules` (id, user_id, event_type pattern, channel, config J
 
 Channels: `webhook` (HTTP POST), `slack` (webhook URL), `email` (SMTP — optional, can mock)
 
-Rule matching: event type supports wildcards. E.g., rule `goml.pipelines.*` matches `goml.pipelines.started` AND `goml.pipelines.failed`.
+Rule matching: event type supports wildcards. E.g., rule `fp.pipelines.*` matches `fp.pipelines.started` AND `fp.pipelines.failed`.
 
 ### Task 9.3: Event Subscriber (Choreography)
 
-Subscribe to ALL `goml.>` events. For each:
+Subscribe to ALL `fp.>` events. For each:
 1. Query matching rules (cached in memory, refreshed periodically)
 2. For each matching rule, deliver notification via appropriate channel
 3. Log delivery attempt to `delivery_log` table (success/failure, response code, retry count)
@@ -1504,8 +1527,8 @@ Fix any gaps in trace propagation (missing context passing in NATS messages, mis
 
 ```bash
 istioctl install --set profile=demo
-kubectl label namespace goml-system istio-injection=enabled
-kubectl rollout restart deployment -n goml-system
+kubectl label namespace fp-system istio-injection=enabled
+kubectl rollout restart deployment -n fp-system
 ```
 
 Verify:
@@ -1652,6 +1675,134 @@ Using Chaos Mesh (if installed on Kind):
 
 ---
 
+## Phase 14: Web UI (BFF + Frontend)
+
+> The browser can't speak gRPC directly. A **Backend-for-Frontend** service speaks gRPC to
+> the platform services and exposes a JSON/HTTP + SSE API *shaped for the UI's screens*,
+> not for the services. See `docs/adr/0001-bff-for-web-ui.md` for why BFF over
+> grpc-gateway / gRPC-Web+Envoy.
+>
+> **Hard boundary (enforced in review): the BFF contains ZERO business logic.** It does
+> composition (fan-out + aggregate), protocol/stream translation (gRPC ↔ JSON/SSE), and
+> browser-session concerns (cookies, CSRF, CORS) only. All domain logic stays in the
+> services. If you're tempted to add a rule or a calculation in the BFF, it belongs in a
+> service.
+
+---
+
+### Task 14.1: BFF Scaffold
+
+**Files:**
+- Create: `services/bff/cmd/server/main.go`
+- Create: `services/bff/go.mod` (add to `go.work`)
+- Create: `services/bff/internal/clients/` — typed gRPC clients to each service
+- Create: `services/bff/internal/http/` — chi/stdlib HTTP router, handlers, middleware
+
+The BFF is a Go module like any service, but it has **no domain/ or repository/ layer** —
+it holds gRPC client connections (auth, registry, orchestrator, gateway) and an HTTP server.
+Reuse `pkg/observability`, `pkg/health`, `pkg/grpcutil` (for the outbound client interceptor
+chain). Config via `pkg/config`: one upstream address per service.
+
+### Task 14.2: Browser Auth Bridge
+
+Services authenticate with bearer JWT (from `pkg/auth`). Browsers want cookies. The BFF:
+1. `POST /api/login` → calls `auth.ValidateToken`/issues session → sets an **HttpOnly,
+   Secure, SameSite** session cookie (server-side session or signed cookie holding the JWT).
+2. On every `/api/*` request → reads cookie → attaches the JWT to outbound gRPC metadata.
+3. CSRF protection (double-submit token) on mutating routes. CORS locked to the UI origin.
+
+This is the one place the bearer-vs-cookie impedance mismatch is solved — keep it out of
+the services.
+
+### Task 14.3: View-Composition Endpoints (the reason BFF exists)
+
+Aggregate across services server-side so the browser makes ONE call per screen:
+- `GET /api/dashboard` → fan-out (registry.ListModels + orchestrator.ListExecutions +
+  experiment.RecentRuns + billing.GetUsage) → one view-shaped JSON payload.
+- `GET /api/models/{id}` → registry.GetModel + experiment runs for that model + serving
+  status → one payload.
+
+Use `errgroup` for the fan-out; partial failure degrades gracefully (return the panels that
+resolved, mark the failed panel, don't 500 the whole page). This is the UX win over 1:1
+edge translation, and a clean place to show idiomatic Go concurrency.
+
+### Task 14.4: Real-Time Updates (gRPC server-stream → SSE)
+
+Pipeline Orchestrator exposes server-streaming `WatchExecution`. The BFF bridges it to the
+browser:
+- `GET /api/executions/{id}/stream` → opens the gRPC stream → relays each update as a
+  **Server-Sent Event**. Handle client disconnect (ctx cancel → close upstream stream).
+- SSE chosen over WebSocket: one-directional server→client fits status updates, works over
+  plain HTTP/2, no extra protocol. (Note this tradeoff in the ADR.)
+
+### Task 14.5: Frontend Dashboard
+
+**Files:**
+- Create: `web/` (Vite + React + TypeScript, Tailwind)
+
+Screens: Models (list/detail/versions), Pipelines (list + live execution view via SSE),
+Experiments (runs + metric comparison), Usage/Billing. Talks ONLY to the BFF over JSON/SSE
+— it never sees a gRPC stub or a service boundary. Served as static assets (the BFF or an
+nginx sidecar can serve them); Dockerfile + Helm chart like any other workload.
+
+### Task 14.6: BFF Tests + Deploy
+
+- Unit: composition handlers with mocked gRPC clients (table-driven, including partial-failure).
+- Component: in-process BFF with `bufconn` fakes for upstream services.
+- Dockerfile (multi-stage, distroless), Helm chart, deploy to Kind, smoke test the dashboard.
+
+---
+
+## Phase 15: Operability & SRE
+
+> Services that run are not the same as services you can *operate*. This phase produces the
+> operational artifacts platform-engineering interviews probe for: SLOs with error budgets,
+> actionable alerts, and a runbook. This is the layer that signals "platform engineer," not
+> "backend engineer who knows K8s." (Phase 10 added dashboards + raw alert rules; this phase
+> makes them SLO-driven and adds the human-facing operational docs.)
+
+---
+
+### Task 15.1: Define SLOs + Error Budgets
+
+**Files:**
+- Create: `docs/slo/inference-gateway.md`, `docs/slo/pipeline-orchestrator.md`
+
+For the two user-facing critical paths, define: SLI (e.g., gateway availability =
+non-5xx/total; latency = p99 < 300ms), SLO target (e.g., 99.5% over 30d), and the resulting
+**error budget**. State what burning the budget means (freeze feature work, focus on
+reliability). Reference Google SRE workbook conventions.
+
+### Task 15.2: SLO-Based Alerting (multi-window burn rate)
+
+**Files:**
+- Edit: `deploy/prometheus/alerting-rules.yaml` (created in Task 10.4)
+
+Replace/augment the static threshold alerts with **multi-window, multi-burn-rate** alerts
+(fast burn: 2% budget in 1h → page; slow burn: 10% in 6h → ticket). Recording rules for the
+SLIs. This is the difference between "p99 > 500ms" (noisy) and "we are burning our error
+budget fast enough to miss the SLO" (actionable).
+
+### Task 15.3: Runbook
+
+**Files:**
+- Create: `docs/runbooks/README.md` + one runbook per page-able alert
+
+For each alert that pages (HighErrorRate, SagaStuck, CircuitBreakerOpen, fast-burn SLO):
+symptom → dashboards/queries to check → likely causes → mitigation steps → escalation. Link
+each Prometheus alert's annotation to its runbook URL. An interviewer asking "what happens at
+3am when this fires?" should be answerable by pointing at this doc.
+
+### Task 15.4: Graceful Degradation + Readiness Discipline
+
+Verify the platform degrades instead of cascading:
+- BFF dashboard renders with a failed panel (Task 14.3) rather than 500ing.
+- `/readyz` actually gates traffic: a service with a dead Postgres dep reports NOT ready and
+  is pulled from the Service endpoints (verify with `kubectl get endpoints`).
+- Document the degradation matrix: which dependency failing degrades which feature.
+
+---
+
 ## Execution Notes
 
 ### Service Build Order (Dependency Chain)
@@ -1669,12 +1820,21 @@ Phase 4 (Inference Gateway) ← routes to model serving
     ↓
 Phase 5 (Pipeline Orchestrator) ← orchestrates registry + serving + gateway
     ↓
-Phase 6-9 (Feature Store, Experiment, Billing, Notification) ← independent of each other
+Phase 10, 11, 13 (Observability, CI/CD, E2E) ← cross-cutting over the Core services
     ↓
-Phase 10-13 (Observability, CI/CD, Terraform, E2E) ← cross-cutting
+Phase 14 (BFF + Web UI) ← composes Core services into screens
+    ↓
+Phase 15 (Operability) ← SLOs/alerts/runbook over the running platform
+    · · · · · · · · · · · · · · · · · · · · · · · · ·  CORE complete
+    ↓
+Phase 6-9 (Feature Store, Experiment, Billing, Notification) ← STRETCH, pick 1-2
+    ↓
+Phase 12 (Terraform EKS) ← STRETCH, last (high effort, low novel learning)
 ```
 
-Phases 6-9 can be built in parallel or any order — they only depend on Phase 1 (auth) and NATS events.
+Phases 6-9 can be built in parallel or any order — they only depend on Phase 1 (auth) and
+NATS events. When you build a Stretch service, fold it into the BFF dashboard and add its
+alerts/runbook entries so the Core artifacts stay consistent.
 
 ### Per-Service Checklist
 
