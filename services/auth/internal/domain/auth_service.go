@@ -114,8 +114,16 @@ type AuthService interface {
 	// RETURNS both the domain APIKey (stored metadata) AND the rawKey (shown
 	// once to the caller; never retrievable again — Stripe's model).
 	//
-	// SCOPES: Callers specify which capabilities the key should have.
-	// The interceptors enforce scopes when the key is used via ValidateToken.
+	// SCOPES: Callers specify which capabilities the key should have, encoded as
+	// "resource:action" strings (e.g. "models:read", "experiments:*"). These are
+	// carried into TokenClaims.Scopes by ValidateToken and ENFORCED by
+	// CheckPermissionForClaims, which intersects them with the owner's role
+	// permissions. A narrow-scoped key therefore grants strictly LESS than its
+	// owner's role — see CheckPermissionForClaims for the enforcement point.
+	//
+	// NOTE: enforcement happens in CheckPermissionForClaims (which has the
+	// claims), NOT in the bare CheckPermission(userID,...) RPC, which has no
+	// access to the per-credential scopes.
 	CreateAPIKey(ctx context.Context, userID string, scopes []string, expiresAt *time.Time) (apiKey APIKey, rawKey string, err error)
 
 	// -----------------------------------------------------------------------
@@ -153,12 +161,20 @@ type AuthService interface {
 	// -----------------------------------------------------------------------
 
 	// CheckPermission evaluates whether a user is allowed to perform action on
-	// resource. Called by auth interceptors after ValidateToken to enforce RBAC.
+	// resource, based on the user's ROLE alone. This is the implementation behind
+	// the CheckPermission RPC (CheckPermissionRequest carries only user_id,
+	// resource, action — no credential context), so it CANNOT see per-credential
+	// API-key scopes. Use CheckPermissionForClaims on the in-process interceptor
+	// path where the TokenClaims are available; scope narrowing is enforced there.
 	//
 	// WHAT THE IMPL DOES:
-	//   1. Load the user's Role via RoleRepository.GetUserRoles(userID).
-	//   2. Scan Role.Permissions for a Permission{Resource: resource, Action: action}.
-	//   3. Return (true, nil) if found; (false, nil) if not.
+	//   1. Load the user (UserRepository.GetByID) and DENY if !user.Active — a
+	//      suspended / soft-deleted account must lose all authorization even while
+	//      its credentials (unexpired JWT, never-expiring API key) are still
+	//      cryptographically valid. A genuine lookup error fails CLOSED (error).
+	//   2. Load the user's roles via RoleRepository.GetUserRoles(userID).
+	//   3. Scan Role.Permissions (with wildcard semantics) for a match.
+	//   4. Return (true, nil) if matched; (false, nil) if not.
 	//
 	// WHY return (bool, error) instead of just error:
 	//   - error = infrastructure failure (DB down, timeout) — the interceptor
@@ -170,6 +186,32 @@ type AuthService interface {
 	// with a short TTL. Role changes take effect within the cache window (acceptable
 	// for an ML platform where role changes are admin-level, infrequent events).
 	CheckPermission(ctx context.Context, userID, resource, action string) (allowed bool, err error)
+
+	// CheckPermissionForClaims is the credential-aware authorization decision the
+	// auth interceptors call AFTER ValidateToken (they hold the full TokenClaims).
+	// It is the correct security boundary entry point and the ONLY one that can
+	// honor per-credential API-key scopes.
+	//
+	// THE TWO GATES (both must pass to allow):
+	//   1. ROLE gate (same as CheckPermission): the user must be Active and a role
+	//      permission must match (resource, action) with wildcard semantics.
+	//   2. SCOPE gate (API keys only): when claims.TokenKind == TokenKindAPIKey,
+	//      the requested (resource, action) must ALSO be covered by one of the
+	//      key's scopes. The effective grant is the INTERSECTION of the role's
+	//      permissions and the key's scopes — never their union. A JWT (a human
+	//      session) carries the user's full role authority and skips the scope
+	//      gate.
+	//
+	// WHY this matters (the vulnerability this closes): scopes were stored and
+	// surfaced in TokenClaims but never enforced, so a key minted with a narrow
+	// scope (e.g. ["models:read"]) silently inherited the FULL permission set of
+	// its owner's role — defeating the entire scope-narrowing mechanism. This
+	// method makes the narrowing real: least privilege per credential, the same
+	// model as GitHub fine-grained PATs and AWS session policies (the effective
+	// permission is role ∩ scope).
+	//
+	// Returns (bool, error) with the same fail-closed contract as CheckPermission.
+	CheckPermissionForClaims(ctx context.Context, claims TokenClaims, resource, action string) (allowed bool, err error)
 
 	// AssignRole changes a user's role. Requires the caller to have admin permission
 	// (enforced in the handler via CheckPermission before calling this).

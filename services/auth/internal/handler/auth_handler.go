@@ -31,19 +31,20 @@
 // ============================================================================
 //
 // protoc-gen-go-grpc generates AuthServiceServer with a private method:
-//   mustEmbedUnimplementedAuthServiceServer()
+//
+//	mustEmbedUnimplementedAuthServiceServer()
 //
 // This forces every implementation to embed UnimplementedAuthServiceServer.
 // The UnimplementedAuthServiceServer base implements every RPC to return
 // codes.Unimplemented. When we embed it, AuthHandler:
 //
-//   1. Satisfies the AuthServiceServer interface at compile time — the
-//      server can be registered and started RIGHT NOW.
-//   2. Returns codes.Unimplemented for any RPC whose handler method we haven't
-//      written yet — the client gets a real, correct gRPC error, not a panic.
-//   3. Is forward-compatible: when a new RPC is added to the proto, the
-//      embedded base handles it (returning Unimplemented) until we implement it,
-//      instead of a compile error that breaks the whole service.
+//  1. Satisfies the AuthServiceServer interface at compile time — the
+//     server can be registered and started RIGHT NOW.
+//  2. Returns codes.Unimplemented for any RPC whose handler method we haven't
+//     written yet — the client gets a real, correct gRPC error, not a panic.
+//  3. Is forward-compatible: when a new RPC is added to the proto, the
+//     embedded base handles it (returning Unimplemented) until we implement it,
+//     instead of a compile error that breaks the whole service.
 //
 // This is the IDIOMATIC Go/gRPC scaffold pattern, not a placeholder or TODO.
 // It is a production-correct, running server. Per-RPC implementations are
@@ -51,12 +52,13 @@
 // each method on *AuthHandler.
 //
 // INTERVIEW: "How does grpc-go ensure forward compatibility of service servers?"
-//   The mustEmbedUnimplementedAuthServiceServer() private method forces embedding
-//   the Unimplemented base. Adding a new RPC to the proto breaks clients that
-//   generated their server interface against the old proto — they can no longer
-//   satisfy the interface — but services that embed the Unimplemented base
-//   compile fine and return Unimplemented for the new method. This is gRPC's
-//   server-side backward compatibility story.
+//
+//	The mustEmbedUnimplementedAuthServiceServer() private method forces embedding
+//	the Unimplemented base. Adding a new RPC to the proto breaks clients that
+//	generated their server interface against the old proto — they can no longer
+//	satisfy the interface — but services that embed the Unimplemented base
+//	compile fine and return Unimplemented for the new method. This is gRPC's
+//	server-side backward compatibility story.
 //
 // ============================================================================
 package handler
@@ -79,7 +81,7 @@ import (
 // never dereference svc, so this is safe.
 type AuthHandler struct {
 	authv1.UnimplementedAuthServiceServer // embedded by value, not pointer (see grpc-go note above)
-	svc domain.AuthService
+	svc                                   domain.AuthService
 }
 
 // NewAuthHandler creates an AuthHandler with the given domain service.
@@ -90,9 +92,18 @@ type AuthHandler struct {
 // The nil svc is safe here because the embedded UnimplementedAuthServiceServer
 // handles all RPCs without touching svc.
 //
-// After Task 1.5 (RPC implementations), every method will guard:
-//   if h.svc == nil { return nil, status.Error(codes.Internal, "service not wired") }
-// but during this scaffold phase the embedded Unimplemented base answers first.
+// After Task 1.5 (RPC implementations), every method will guard against a nil
+// service. The exact return shape depends on the RPC kind:
+//   - UNARY RPCs return (resp, err), so the guard is:
+//     if h.svc == nil { return nil, status.Error(codes.Internal, "service not wired") }
+//   - STREAMING RPCs return only err (the response flows via stream.Send), so
+//     there is no resp value to return — the guard is:
+//     if h.svc == nil { return status.Error(codes.Internal, "service not wired") }
+//
+// (The Auth service's RPCs are all unary today; the streaming form is noted so
+// the pattern is correct if a server-streaming RPC is ever added.) During this
+// scaffold phase the embedded Unimplemented base answers first, so svc is never
+// dereferenced.
 func NewAuthHandler(svc domain.AuthService) *AuthHandler {
 	return &AuthHandler{svc: svc}
 }
