@@ -11,11 +11,25 @@
 // WHAT'S HERE:
 //   - Domain messages: Money, RatePlan, UsageRecord, UsageSummary, Invoice,
 //     InvoiceLineItem
-//   - BillingService RPCs: RecordUsage (meter), GetUsage (aggregate, paged),
-//     GetInvoice, ListInvoices (paged)
-//   - Event payload messages: UsageRecorded, InvoiceGenerated, QuotaExceeded —
-//     the typed payloads carried in common.v1.EventEnvelope.data and published
-//     via the OUTBOX poller (see pattern note below)
+//   - BillingService RPCs:
+//       METERING:   RecordUsage (outbox-protected write)
+//       PRICING:    CreateRatePlan (admin), GetRatePlan
+//       QUOTA:      CheckQuota (gateway pre-flight)
+//       REPORTING:  GetUsage (aggregate, paged), GetInvoice, ListInvoices (paged)
+//
+// EVENT PAYLOADS LIVE IN forgepoint.events.v1 (NOT here):
+//   This service formerly defined its OWN UsageRecorded/InvoiceGenerated/
+//   QuotaExceeded payload messages inline. An adversarial cross-service review
+//   found per-service ad-hoc event messages drifting from their consumers, so the
+//   platform now has ONE canonical event contract — forgepoint.events.v1 — that
+//   both producers and consumers depend on. Those three inline messages have been
+//   DELETED from this file; billing publishes the canonical events.UsageRecorded /
+//   events.InvoiceGenerated / events.QuotaExceeded instead (see import block and
+//   the EVENT CONTRACT section near the service definition). The canonical money-
+//   bearing events (UsageRecorded, InvoiceGenerated) FLATTEN Money into
+//   cost_micros/total_micros + currency_code — no embedded billing.Money / .Invoice
+//   — precisely so a consumer (Experiment Tracker, Notification) need not compile-
+//   depend on this billing API proto just to read an event.
 //
 // PATTERN — Outbox (Transactional Outbox / reliable event publishing):
 //   The hard problem this service exists to demonstrate is the DUAL-WRITE
@@ -46,10 +60,12 @@
 //       outbox protects DB→NATS; the idempotency key protects NATS→DB. Both ends
 //       of the pipe must be idempotent for the whole thing to be exactly-once
 //       *in effect*.
-//     - The event payload messages live in THIS proto (not raw JSON) so the
-//       outbox `payload` column is a typed, versioned, buf-breaking-checked
-//       contract — the same "typed payload in a generic envelope" discipline as
-//       the registry service.
+//     - The event payloads are the canonical forgepoint.events.v1 messages
+//       (not raw JSON), so the outbox `payload` column is a typed, versioned,
+//       buf-breaking-checked contract — the same "typed payload in a generic
+//       envelope" discipline as the registry service. The poller marshals an
+//       eventsv1.* message into common.v1.EventEnvelope.data (an Any) and
+//       publishes it to the subject below.
 //
 //   REAL-WORLD COMPARISON:
 //     - This is exactly how Stripe, Shopify, and most ledger systems publish
@@ -60,13 +76,36 @@
 //       can die in the gap between commit and publish; the outbox moves the
 //       publish intent INTO the committed transaction so a crash loses nothing.
 //
-// METERING SOURCE — consumes InferenceCompleted:
-//   The primary feeder is the async event `fp.inference.completed` emitted by
-//   the Inference Gateway. The billing consumer turns each into a RecordUsage
-//   (internally) so the same metering path serves both the event consumer and
-//   any direct gRPC caller (e.g. a backfill tool). RecordUsage is therefore
-//   exposed on the gRPC surface even though, in steady state, most traffic
-//   arrives via NATS.
+// METERING SOURCES — the two events billing CONSUMES (canonical eventsv1):
+//   1. fp.inference.completed (events.InferenceCompleted) — the PRIMARY feeder,
+//      emitted by the Inference Gateway (the single canonical inference event; a
+//      serving pod must NOT emit a competing one). Each completed inference yields
+//      usage on TWO meters: METER_TYPE_INFERENCE_REQUEST (one per call) and, when
+//      token_count > 0, METER_TYPE_INFERENCE_TOKENS. The event carries token_count
+//      and api_key_id, so billing meters both axes off ONE event and resolves the
+//      billed team from api_key_id (NEVER from a client field).
+//      EXACTLY-ONCE-IN-EFFECT (inbound half): NATS is at-least-once, so the
+//      consumer DEDUPES on events.InferenceCompleted.request_id — a request_id it
+//      already metered is skipped. request_id flows into the UsageRecord as
+//      source_request_id (and into RecordUsageRequest.idempotency_key for the
+//      direct-call path). This is the NATS→DB half of exactly-once; the outbox is
+//      the DB→NATS half.
+//   2. fp.models.version.ready (events.ModelVersionReady) — emitted by the
+//      Registry when an artifact upload is verified. Billing meters
+//      METER_TYPE_STORAGE_BYTES from the event's server-measured size_bytes, so
+//      storage cost rides the same outbox pipeline as inference cost.
+//   The billing consumer turns each consumed event into a RecordUsage (internally)
+//   so the same metering path serves both the event consumers AND any direct gRPC
+//   caller (e.g. a backfill tool). RecordUsage is therefore exposed on the gRPC
+//   surface even though, in steady state, most traffic arrives via NATS.
+//
+// ENUM MAPPING — billing.MeterType <-> events.MeterType:
+//   The event bus carries a MIRROR enum (events.v1.MeterType) with byte-identical
+//   values (UNSPECIFIED=0, INFERENCE_REQUEST=1, INFERENCE_TOKENS=2,
+//   COMPUTE_SECONDS=3, STORAGE_BYTES=4). The handler maps billing.MeterType <->
+//   events.MeterType at the publish/consume boundary — a few lines of mechanical
+//   conversion that keep the API enum free to evolve independently of the wire
+//   contract (the "event schema decoupled from API schema" discipline).
 //
 // SECURITY / TRUST BOUNDARY (this is a billing service — get this right):
 //   EVERY money-bearing or attribution field is SERVER-AUTHORITATIVE. Clients
@@ -76,6 +115,24 @@
 //   discount, a cost, an invoice total, a quota, a status, a timestamp, or
 //   whose account to bill. Accepting any of those would be a mass-assignment
 //   vulnerability with a direct financial blast radius. See per-field notes.
+//
+// INTEGER OVERFLOW — a money service MUST guard its arithmetic:
+//   All money is int64 micro-units and all quantities are int64. The metering
+//   math (cost = quantity * unit_price_micros) and the invoice rollup
+//   (total = Σ line_item.amount) are MULTIPLICATIONS and SUMS over int64 that can
+//   silently WRAP on overflow — and a wrapped total is a real, signed money bug
+//   (a huge bill becomes a negative credit). The wire types stay int64 (protobuf
+//   has no int128, and int64 micro-units comfortably covers any sane bill: 2^63
+//   micro-USD ≈ 9.2 trillion USD), but the SERVER MUST:
+//     (a) bound each input `quantity` to a sane per-record maximum (see the
+//         MAX_QUANTITY_PER_RECORD note on RecordUsageRequest.quantity) and reject
+//         out-of-range values with InvalidArgument — never truncate;
+//     (b) perform every multiply/sum with CHECKED arithmetic (math/bits or an
+//         explicit overflow test) and fail the operation rather than wrap;
+//     (c) reject negative `quantity` (only server-issued credits may be negative,
+//         and those never come from a client).
+//   This guard is a server-side INVARIANT the proto documents but cannot itself
+//   enforce; the integration tests assert the rejection at the boundary.
 //
 // VERSIONING: Package path includes v1 per Buf/Google convention. Breaking
 // changes require a new forgepoint.billing.v2 package.
@@ -124,6 +181,13 @@ const (
 //	fee. Modeling them as distinct meter types lets one InferenceCompleted
 //	produce multiple priced line items, which is how OpenAI/Anthropic-style
 //	token billing actually works.
+//
+// MIRRORED ON THE BUS: events.v1.MeterType has byte-identical values. This is
+//
+//	the SERVICE/API enum; the handler maps billing.MeterType <-> events.MeterType
+//	at the publish/consume boundary so the event schema can evolve independently
+//	of this API enum (the events.proto decoupling discipline). Keep the two in
+//	lockstep when adding a meter.
 //
 // ============================================================================
 type MeterType int32
@@ -363,12 +427,17 @@ func (x *Money) GetCurrencyCode() string {
 //	after the fact via GetUsage/GetInvoice. This is the structural guarantee
 //	that "the client cannot set its own price".
 //
-// NOTE: RatePlan management RPCs (CreateRatePlan, etc.) are intentionally NOT in
-// this file's M2 surface — the platform design lists CreateRatePlan as a later
-// admin concern. The message is defined now because GetUsage/Invoice responses
-// reference the plan that was applied, and because it documents the pricing
-// model the metering math depends on. Adding the admin RPCs later is additive
-// (buf-breaking-safe).
+// RATE-PLAN MANAGEMENT RPCs: CreateRatePlan (admin) and GetRatePlan are part of
+//
+//	this surface — the platform design (Phase 8.1) lists CreateRatePlan, and the
+//	metering math is undefined without a plan to resolve. CreateRatePlan is
+//	ADMIN-ONLY (it sets prices for real money) and id/created_at are server-set
+//	(mass-assignment guard). GetRatePlan lets a client/BFF read the pricing it
+//	will be billed under. Mutating an existing plan's prices in place is
+//	deliberately NOT offered: prices are immutable once a usage record has pinned
+//	them (reproducible billing), so "changing" a plan means creating a new one —
+//	adding a versioned UpdateRatePlan later is additive (buf-breaking-safe).
+//
 // ============================================================================
 type RatePlan struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -1061,7 +1130,13 @@ type RecordUsageRequest struct {
 	// What is being metered. Must be a known, non-UNSPECIFIED meter.
 	MeterType MeterType `protobuf:"varint,1,opt,name=meter_type,json=meterType,proto3,enum=forgepoint.billing.v1.MeterType" json:"meter_type,omitempty"`
 	// How many units (requests, tokens, compute-seconds, bytes). Server validates
-	// non-negative and within sane per-record bounds.
+	// NON-NEGATIVE (a client may never submit a negative quantity; only server-
+	// issued credits are negative) and within a sane per-record cap:
+	//
+	//	MAX_QUANTITY_PER_RECORD (server constant, e.g. 1_000_000_000) — chosen so
+	//	quantity * the largest unit price still cannot overflow int64 micro-units,
+	//	so the cost multiply is provably safe. Out-of-range → InvalidArgument
+	//	(rejected, never truncated). See the INTEGER OVERFLOW note in the header.
 	Quantity int64 `protobuf:"varint,2,opt,name=quantity,proto3" json:"quantity,omitempty"`
 	// What produced the usage (for attribution / per-model reports). Optional but
 	// strongly recommended; used only for reporting, never for pricing.
@@ -1239,14 +1314,17 @@ type GetUsageRequest struct {
 	// caller's own team (cannot read another team's spend). Required for admins.
 	Team string `protobuf:"bytes,1,opt,name=team,proto3" json:"team,omitempty"`
 	// Inclusive start / exclusive end of the reporting window. Empty start =
-	// current billing period start; empty end = now. Server caps the maximum
-	// span to bound query cost.
+	// current billing period start; empty end = now. The server CAPS the maximum
+	// span to MAX_USAGE_WINDOW (server constant, e.g. 366 days) to bound query
+	// cost; a wider request is rejected with InvalidArgument rather than silently
+	// truncated, so a caller can't accidentally scan the whole ledger.
 	PeriodStart *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=period_start,json=periodStart,proto3" json:"period_start,omitempty"`
 	PeriodEnd   *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=period_end,json=periodEnd,proto3" json:"period_end,omitempty"`
 	// Optional: restrict to a single meter type. UNSPECIFIED = all meters.
 	MeterTypeFilter MeterType `protobuf:"varint,4,opt,name=meter_type_filter,json=meterTypeFilter,proto3,enum=forgepoint.billing.v1.MeterType" json:"meter_type_filter,omitempty"`
 	// Cursor-based pagination over sub-period buckets. page_size defaults to 20,
-	// capped at 100 server-side (see common.proto). See PaginationRequest.
+	// capped at MAX_PAGE_SIZE = 100 server-side (see common.proto). A request above
+	// the cap is clamped to 100, never honored as-is. See PaginationRequest.
 	Pagination    *v1.PaginationRequest `protobuf:"bytes,5,opt,name=pagination,proto3" json:"pagination,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1487,8 +1565,9 @@ type ListInvoicesRequest struct {
 	// Optional status filter (e.g. only OVERDUE for a dunning view).
 	// UNSPECIFIED = all statuses.
 	StatusFilter InvoiceStatus `protobuf:"varint,2,opt,name=status_filter,json=statusFilter,proto3,enum=forgepoint.billing.v1.InvoiceStatus" json:"status_filter,omitempty"`
-	// Cursor-based pagination. page_size defaults to 20, capped at 100
-	// server-side. See common.proto PaginationRequest for the WHY on cursors.
+	// Cursor-based pagination. page_size defaults to 20, capped at MAX_PAGE_SIZE =
+	// 100 server-side (clamped, not honored as-is). See common.proto
+	// PaginationRequest for the WHY on cursors.
 	Pagination    *v1.PaginationRequest `protobuf:"bytes,3,opt,name=pagination,proto3" json:"pagination,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1600,33 +1679,62 @@ func (x *ListInvoicesResponse) GetPagination() *v1.PaginationResponse {
 	return nil
 }
 
-// UsageRecorded — emitted after a UsageRecord commits (via the outbox).
-// CONSUMERS: Experiment Tracker (attribute cost to a run/model), and any
-// real-time usage dashboard. Carries the full priced record so consumers need
-// no callback.
-type UsageRecorded struct {
+// ============================================================================
+// CreateRatePlan  (ADMIN — sets real prices)
+// ============================================================================
+//
+// CreateRatePlanRequest defines a NEW priced plan. This is an ADMIN-ONLY write:
+// it sets the unit prices, free allowances, and quota caps the metering math
+// will apply to real money, so the server enforces an admin role before
+// accepting it. It is also the second-most security-sensitive write here, so the
+// same mass-assignment discipline as RecordUsage applies.
+//
+// SERVER-AUTHORITATIVE (absent from this request by design):
+//
+//	id          → server-assigned UUID (a client may not choose/overwrite a
+//	              plan id — that's how you'd hijack an existing plan).
+//	created_at  → server-stamped.
+//
+// The client supplies only the pricing DEFINITION (name + the three maps).
+//
+// PRICE VALIDATION (server-side invariant): every unit_prices entry must use the
+// SAME currency_code (no mixed-currency plan) and a NON-NEGATIVE amount; every
+// map key must be a valid MeterType name. Invalid → InvalidArgument.
+type CreateRatePlanRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// The committed, priced ledger record. Self-contained: includes team, meter,
-	// quantity, and server-computed cost.
-	Record        *UsageRecord `protobuf:"bytes,1,opt,name=record,proto3" json:"record,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// Human-readable plan name ("free-tier","standard","enterprise"). Unique per
+	// deployment is a server-enforced constraint, not a wire concern.
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// Per-meter unit prices. Key = MeterType name; value = price per ONE unit.
+	// All values MUST share one currency_code (server-validated).
+	UnitPrices map[string]*Money `protobuf:"bytes,2,rep,name=unit_prices,json=unitPrices,proto3" json:"unit_prices,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// Included free allowance per billing period, keyed by MeterType name.
+	// Empty = no free tier.
+	IncludedQuantities map[string]int64 `protobuf:"bytes,3,rep,name=included_quantities,json=includedQuantities,proto3" json:"included_quantities,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
+	// Hard monthly quota cap per MeterType name. Crossing it fires the
+	// events.QuotaExceeded outbox event. 0 / absent = no hard cap for that meter.
+	QuotaLimits map[string]int64 `protobuf:"bytes,4,rep,name=quota_limits,json=quotaLimits,proto3" json:"quota_limits,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
+	// Idempotency key (UUID/stable string). A retry with the same key returns the
+	// ORIGINAL plan instead of creating a duplicate — admin tooling retries too.
+	IdempotencyKey string `protobuf:"bytes,5,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
-func (x *UsageRecorded) Reset() {
-	*x = UsageRecorded{}
+func (x *CreateRatePlanRequest) Reset() {
+	*x = CreateRatePlanRequest{}
 	mi := &file_forgepoint_billing_v1_billing_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *UsageRecorded) String() string {
+func (x *CreateRatePlanRequest) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*UsageRecorded) ProtoMessage() {}
+func (*CreateRatePlanRequest) ProtoMessage() {}
 
-func (x *UsageRecorded) ProtoReflect() protoreflect.Message {
+func (x *CreateRatePlanRequest) ProtoReflect() protoreflect.Message {
 	mi := &file_forgepoint_billing_v1_billing_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -1638,143 +1746,176 @@ func (x *UsageRecorded) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use UsageRecorded.ProtoReflect.Descriptor instead.
-func (*UsageRecorded) Descriptor() ([]byte, []int) {
+// Deprecated: Use CreateRatePlanRequest.ProtoReflect.Descriptor instead.
+func (*CreateRatePlanRequest) Descriptor() ([]byte, []int) {
 	return file_forgepoint_billing_v1_billing_proto_rawDescGZIP(), []int{15}
 }
 
-func (x *UsageRecorded) GetRecord() *UsageRecord {
+func (x *CreateRatePlanRequest) GetName() string {
 	if x != nil {
-		return x.Record
-	}
-	return nil
-}
-
-// QuotaExceeded — emitted when recorded usage pushes a team OVER its rate plan's
-// quota for a meter. Written to the outbox in the SAME transaction as the usage
-// update (the canonical outbox example from the implementation plan), so the
-// alert is as durable as the usage that triggered it.
-// CONSUMERS: Notification (alert the team), Inference Gateway (flip the team's
-// quota cache to "blocked" so subsequent inferences are rejected/throttled).
-type QuotaExceeded struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// The team that exceeded quota.
-	Team string `protobuf:"bytes,1,opt,name=team,proto3" json:"team,omitempty"`
-	// The rate plan whose quota was hit.
-	RatePlanId string `protobuf:"bytes,2,opt,name=rate_plan_id,json=ratePlanId,proto3" json:"rate_plan_id,omitempty"`
-	// Which meter's quota was exceeded.
-	MeterType MeterType `protobuf:"varint,3,opt,name=meter_type,json=meterType,proto3,enum=forgepoint.billing.v1.MeterType" json:"meter_type,omitempty"`
-	// The plan's quota cap for that meter (the limit that was crossed).
-	QuotaLimit int64 `protobuf:"varint,4,opt,name=quota_limit,json=quotaLimit,proto3" json:"quota_limit,omitempty"`
-	// The team's current usage of that meter (>= quota_limit), so the consumer
-	// can show "1,012 / 1,000" without a callback.
-	CurrentUsage int64 `protobuf:"varint,5,opt,name=current_usage,json=currentUsage,proto3" json:"current_usage,omitempty"`
-	// When the threshold was crossed (event time).
-	OccurredAt    *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=occurred_at,json=occurredAt,proto3" json:"occurred_at,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *QuotaExceeded) Reset() {
-	*x = QuotaExceeded{}
-	mi := &file_forgepoint_billing_v1_billing_proto_msgTypes[16]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *QuotaExceeded) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*QuotaExceeded) ProtoMessage() {}
-
-func (x *QuotaExceeded) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_billing_v1_billing_proto_msgTypes[16]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use QuotaExceeded.ProtoReflect.Descriptor instead.
-func (*QuotaExceeded) Descriptor() ([]byte, []int) {
-	return file_forgepoint_billing_v1_billing_proto_rawDescGZIP(), []int{16}
-}
-
-func (x *QuotaExceeded) GetTeam() string {
-	if x != nil {
-		return x.Team
+		return x.Name
 	}
 	return ""
 }
 
-func (x *QuotaExceeded) GetRatePlanId() string {
+func (x *CreateRatePlanRequest) GetUnitPrices() map[string]*Money {
+	if x != nil {
+		return x.UnitPrices
+	}
+	return nil
+}
+
+func (x *CreateRatePlanRequest) GetIncludedQuantities() map[string]int64 {
+	if x != nil {
+		return x.IncludedQuantities
+	}
+	return nil
+}
+
+func (x *CreateRatePlanRequest) GetQuotaLimits() map[string]int64 {
+	if x != nil {
+		return x.QuotaLimits
+	}
+	return nil
+}
+
+func (x *CreateRatePlanRequest) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
+}
+
+// CreateRatePlanResponse returns the server-built plan (id + created_at set).
+type CreateRatePlanResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The committed plan, with its server-assigned id and created_at.
+	RatePlan *RatePlan `protobuf:"bytes,1,opt,name=rate_plan,json=ratePlan,proto3" json:"rate_plan,omitempty"`
+	// True if the idempotency key already existed and `rate_plan` is the
+	// pre-existing one rather than a newly created plan.
+	Deduplicated  bool `protobuf:"varint,2,opt,name=deduplicated,proto3" json:"deduplicated,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CreateRatePlanResponse) Reset() {
+	*x = CreateRatePlanResponse{}
+	mi := &file_forgepoint_billing_v1_billing_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CreateRatePlanResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CreateRatePlanResponse) ProtoMessage() {}
+
+func (x *CreateRatePlanResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_billing_v1_billing_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CreateRatePlanResponse.ProtoReflect.Descriptor instead.
+func (*CreateRatePlanResponse) Descriptor() ([]byte, []int) {
+	return file_forgepoint_billing_v1_billing_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *CreateRatePlanResponse) GetRatePlan() *RatePlan {
+	if x != nil {
+		return x.RatePlan
+	}
+	return nil
+}
+
+func (x *CreateRatePlanResponse) GetDeduplicated() bool {
+	if x != nil {
+		return x.Deduplicated
+	}
+	return false
+}
+
+// GetRatePlanRequest fetches a single rate plan by id. WHY expose this: a BFF /
+// the `fp` CLI needs to SHOW a team the pricing it will be billed under, and a
+// usage report references the plan that was applied. Read-only; a non-admin may
+// read the plan currently assigned to its own team (server-enforced), not an
+// arbitrary plan id.
+type GetRatePlanRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The rate plan UUID (RatePlan.id).
+	RatePlanId    string `protobuf:"bytes,1,opt,name=rate_plan_id,json=ratePlanId,proto3" json:"rate_plan_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetRatePlanRequest) Reset() {
+	*x = GetRatePlanRequest{}
+	mi := &file_forgepoint_billing_v1_billing_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetRatePlanRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetRatePlanRequest) ProtoMessage() {}
+
+func (x *GetRatePlanRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_billing_v1_billing_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetRatePlanRequest.ProtoReflect.Descriptor instead.
+func (*GetRatePlanRequest) Descriptor() ([]byte, []int) {
+	return file_forgepoint_billing_v1_billing_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *GetRatePlanRequest) GetRatePlanId() string {
 	if x != nil {
 		return x.RatePlanId
 	}
 	return ""
 }
 
-func (x *QuotaExceeded) GetMeterType() MeterType {
-	if x != nil {
-		return x.MeterType
-	}
-	return MeterType_METER_TYPE_UNSPECIFIED
-}
-
-func (x *QuotaExceeded) GetQuotaLimit() int64 {
-	if x != nil {
-		return x.QuotaLimit
-	}
-	return 0
-}
-
-func (x *QuotaExceeded) GetCurrentUsage() int64 {
-	if x != nil {
-		return x.CurrentUsage
-	}
-	return 0
-}
-
-func (x *QuotaExceeded) GetOccurredAt() *timestamppb.Timestamp {
-	if x != nil {
-		return x.OccurredAt
-	}
-	return nil
-}
-
-// InvoiceGenerated — emitted when a billing period closes and an invoice
-// transitions DRAFT → FINALIZED (totals locked). Published via the outbox.
-// CONSUMERS: Notification (email/Slack the finalized invoice), and any external
-// payment/accounting integration.
-type InvoiceGenerated struct {
+// GetRatePlanResponse wraps the plan (forward-compat per RPC_RESPONSE_STANDARD).
+type GetRatePlanResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// The finalized invoice, including line items and the server-computed total.
-	// Self-contained so the consumer can render/send it without a callback.
-	Invoice       *Invoice `protobuf:"bytes,1,opt,name=invoice,proto3" json:"invoice,omitempty"`
+	// The requested rate plan with its unit prices, allowances, and quota caps.
+	RatePlan      *RatePlan `protobuf:"bytes,1,opt,name=rate_plan,json=ratePlan,proto3" json:"rate_plan,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *InvoiceGenerated) Reset() {
-	*x = InvoiceGenerated{}
-	mi := &file_forgepoint_billing_v1_billing_proto_msgTypes[17]
+func (x *GetRatePlanResponse) Reset() {
+	*x = GetRatePlanResponse{}
+	mi := &file_forgepoint_billing_v1_billing_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *InvoiceGenerated) String() string {
+func (x *GetRatePlanResponse) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*InvoiceGenerated) ProtoMessage() {}
+func (*GetRatePlanResponse) ProtoMessage() {}
 
-func (x *InvoiceGenerated) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_billing_v1_billing_proto_msgTypes[17]
+func (x *GetRatePlanResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_billing_v1_billing_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1785,16 +1926,188 @@ func (x *InvoiceGenerated) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use InvoiceGenerated.ProtoReflect.Descriptor instead.
-func (*InvoiceGenerated) Descriptor() ([]byte, []int) {
-	return file_forgepoint_billing_v1_billing_proto_rawDescGZIP(), []int{17}
+// Deprecated: Use GetRatePlanResponse.ProtoReflect.Descriptor instead.
+func (*GetRatePlanResponse) Descriptor() ([]byte, []int) {
+	return file_forgepoint_billing_v1_billing_proto_rawDescGZIP(), []int{18}
 }
 
-func (x *InvoiceGenerated) GetInvoice() *Invoice {
+func (x *GetRatePlanResponse) GetRatePlan() *RatePlan {
 	if x != nil {
-		return x.Invoice
+		return x.RatePlan
 	}
 	return nil
+}
+
+// ============================================================================
+// CheckQuota  (gateway pre-flight)
+// ============================================================================
+//
+// CheckQuotaRequest asks "how much of its quota does this team have left on this
+// meter?". WHY this RPC exists (design Task 8.4): the Inference Gateway calls it
+// BEFORE forwarding a request, to reject/throttle a team that is over quota. The
+// gateway CACHES the answer in Redis (eventual consistency with the DB is
+// acceptable for a pre-flight) and the events.QuotaExceeded outbox event flips
+// that cache to "blocked" between calls — CheckQuota is the cache-fill / cold
+// path, the event is the invalidation.
+//
+// AUTHORIZATION/TENANCY: `team` is the team to check. For a non-admin caller the
+// server OVERRIDES it with the caller's own team derived from auth claims — the
+// field exists so the gateway (a trusted internal caller) and admins can scope
+// the check; it is NOT a way to probe another tenant's quota. Same rule as
+// GetUsage's team filter.
+type CheckQuotaRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Team to check. Server overrides with the caller's own team for non-admins.
+	Team string `protobuf:"bytes,1,opt,name=team,proto3" json:"team,omitempty"`
+	// Which meter's quota to check. Must be a known, non-UNSPECIFIED meter.
+	MeterType     MeterType `protobuf:"varint,2,opt,name=meter_type,json=meterType,proto3,enum=forgepoint.billing.v1.MeterType" json:"meter_type,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CheckQuotaRequest) Reset() {
+	*x = CheckQuotaRequest{}
+	mi := &file_forgepoint_billing_v1_billing_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CheckQuotaRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CheckQuotaRequest) ProtoMessage() {}
+
+func (x *CheckQuotaRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_billing_v1_billing_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CheckQuotaRequest.ProtoReflect.Descriptor instead.
+func (*CheckQuotaRequest) Descriptor() ([]byte, []int) {
+	return file_forgepoint_billing_v1_billing_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *CheckQuotaRequest) GetTeam() string {
+	if x != nil {
+		return x.Team
+	}
+	return ""
+}
+
+func (x *CheckQuotaRequest) GetMeterType() MeterType {
+	if x != nil {
+		return x.MeterType
+	}
+	return MeterType_METER_TYPE_UNSPECIFIED
+}
+
+// CheckQuotaResponse reports the team's standing on the requested meter. All
+// fields are SERVER-computed from the team's current plan + period usage.
+type CheckQuotaResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The team checked + the plan whose quota applies (echoed for the cache key).
+	Team       string    `protobuf:"bytes,1,opt,name=team,proto3" json:"team,omitempty"`
+	RatePlanId string    `protobuf:"bytes,2,opt,name=rate_plan_id,json=ratePlanId,proto3" json:"rate_plan_id,omitempty"`
+	MeterType  MeterType `protobuf:"varint,3,opt,name=meter_type,json=meterType,proto3,enum=forgepoint.billing.v1.MeterType" json:"meter_type,omitempty"`
+	// The plan's hard cap for this meter (0 = unlimited / no cap configured).
+	QuotaLimit int64 `protobuf:"varint,4,opt,name=quota_limit,json=quotaLimit,proto3" json:"quota_limit,omitempty"`
+	// The team's usage of this meter SO FAR in the current billing period.
+	CurrentUsage int64 `protobuf:"varint,5,opt,name=current_usage,json=currentUsage,proto3" json:"current_usage,omitempty"`
+	// remaining = max(0, quota_limit - current_usage); 0 when over or at the cap.
+	// Server-computed so the gateway needn't re-derive it.
+	Remaining int64 `protobuf:"varint,6,opt,name=remaining,proto3" json:"remaining,omitempty"`
+	// True if current_usage >= quota_limit (i.e. the team is OVER quota and the
+	// gateway should reject/throttle). False when quota_limit == 0 (no cap).
+	Exceeded      bool `protobuf:"varint,7,opt,name=exceeded,proto3" json:"exceeded,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CheckQuotaResponse) Reset() {
+	*x = CheckQuotaResponse{}
+	mi := &file_forgepoint_billing_v1_billing_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CheckQuotaResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CheckQuotaResponse) ProtoMessage() {}
+
+func (x *CheckQuotaResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_billing_v1_billing_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CheckQuotaResponse.ProtoReflect.Descriptor instead.
+func (*CheckQuotaResponse) Descriptor() ([]byte, []int) {
+	return file_forgepoint_billing_v1_billing_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *CheckQuotaResponse) GetTeam() string {
+	if x != nil {
+		return x.Team
+	}
+	return ""
+}
+
+func (x *CheckQuotaResponse) GetRatePlanId() string {
+	if x != nil {
+		return x.RatePlanId
+	}
+	return ""
+}
+
+func (x *CheckQuotaResponse) GetMeterType() MeterType {
+	if x != nil {
+		return x.MeterType
+	}
+	return MeterType_METER_TYPE_UNSPECIFIED
+}
+
+func (x *CheckQuotaResponse) GetQuotaLimit() int64 {
+	if x != nil {
+		return x.QuotaLimit
+	}
+	return 0
+}
+
+func (x *CheckQuotaResponse) GetCurrentUsage() int64 {
+	if x != nil {
+		return x.CurrentUsage
+	}
+	return 0
+}
+
+func (x *CheckQuotaResponse) GetRemaining() int64 {
+	if x != nil {
+		return x.Remaining
+	}
+	return 0
+}
+
+func (x *CheckQuotaResponse) GetExceeded() bool {
+	if x != nil {
+		return x.Exceeded
+	}
+	return false
 }
 
 var File_forgepoint_billing_v1_billing_proto protoreflect.FileDescriptor
@@ -1926,10 +2239,36 @@ const file_forgepoint_billing_v1_billing_proto_rawDesc = "" +
 	"\binvoices\x18\x01 \x03(\v2\x1e.forgepoint.billing.v1.InvoiceR\binvoices\x12H\n" +
 	"\n" +
 	"pagination\x18\x02 \x01(\v2(.forgepoint.common.v1.PaginationResponseR\n" +
-	"pagination\"K\n" +
-	"\rUsageRecorded\x12:\n" +
-	"\x06record\x18\x01 \x01(\v2\".forgepoint.billing.v1.UsageRecordR\x06record\"\x89\x02\n" +
-	"\rQuotaExceeded\x12\x12\n" +
+	"pagination\"\xf0\x04\n" +
+	"\x15CreateRatePlanRequest\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12]\n" +
+	"\vunit_prices\x18\x02 \x03(\v2<.forgepoint.billing.v1.CreateRatePlanRequest.UnitPricesEntryR\n" +
+	"unitPrices\x12u\n" +
+	"\x13included_quantities\x18\x03 \x03(\v2D.forgepoint.billing.v1.CreateRatePlanRequest.IncludedQuantitiesEntryR\x12includedQuantities\x12`\n" +
+	"\fquota_limits\x18\x04 \x03(\v2=.forgepoint.billing.v1.CreateRatePlanRequest.QuotaLimitsEntryR\vquotaLimits\x12'\n" +
+	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKey\x1a[\n" +
+	"\x0fUnitPricesEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x122\n" +
+	"\x05value\x18\x02 \x01(\v2\x1c.forgepoint.billing.v1.MoneyR\x05value:\x028\x01\x1aE\n" +
+	"\x17IncludedQuantitiesEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\x03R\x05value:\x028\x01\x1a>\n" +
+	"\x10QuotaLimitsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\x03R\x05value:\x028\x01\"z\n" +
+	"\x16CreateRatePlanResponse\x12<\n" +
+	"\trate_plan\x18\x01 \x01(\v2\x1f.forgepoint.billing.v1.RatePlanR\bratePlan\x12\"\n" +
+	"\fdeduplicated\x18\x02 \x01(\bR\fdeduplicated\"6\n" +
+	"\x12GetRatePlanRequest\x12 \n" +
+	"\frate_plan_id\x18\x01 \x01(\tR\n" +
+	"ratePlanId\"S\n" +
+	"\x13GetRatePlanResponse\x12<\n" +
+	"\trate_plan\x18\x01 \x01(\v2\x1f.forgepoint.billing.v1.RatePlanR\bratePlan\"h\n" +
+	"\x11CheckQuotaRequest\x12\x12\n" +
+	"\x04team\x18\x01 \x01(\tR\x04team\x12?\n" +
+	"\n" +
+	"meter_type\x18\x02 \x01(\x0e2 .forgepoint.billing.v1.MeterTypeR\tmeterType\"\x8b\x02\n" +
+	"\x12CheckQuotaResponse\x12\x12\n" +
 	"\x04team\x18\x01 \x01(\tR\x04team\x12 \n" +
 	"\frate_plan_id\x18\x02 \x01(\tR\n" +
 	"ratePlanId\x12?\n" +
@@ -1937,11 +2276,9 @@ const file_forgepoint_billing_v1_billing_proto_rawDesc = "" +
 	"meter_type\x18\x03 \x01(\x0e2 .forgepoint.billing.v1.MeterTypeR\tmeterType\x12\x1f\n" +
 	"\vquota_limit\x18\x04 \x01(\x03R\n" +
 	"quotaLimit\x12#\n" +
-	"\rcurrent_usage\x18\x05 \x01(\x03R\fcurrentUsage\x12;\n" +
-	"\voccurred_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
-	"occurredAt\"L\n" +
-	"\x10InvoiceGenerated\x128\n" +
-	"\ainvoice\x18\x01 \x01(\v2\x1e.forgepoint.billing.v1.InvoiceR\ainvoice*\xa8\x01\n" +
+	"\rcurrent_usage\x18\x05 \x01(\x03R\fcurrentUsage\x12\x1c\n" +
+	"\tremaining\x18\x06 \x01(\x03R\tremaining\x12\x1a\n" +
+	"\bexceeded\x18\a \x01(\bR\bexceeded*\xa8\x01\n" +
 	"\tMeterType\x12\x1a\n" +
 	"\x16METER_TYPE_UNSPECIFIED\x10\x00\x12 \n" +
 	"\x1cMETER_TYPE_INFERENCE_REQUEST\x10\x01\x12\x1f\n" +
@@ -1954,9 +2291,13 @@ const file_forgepoint_billing_v1_billing_proto_rawDesc = "" +
 	"\x18INVOICE_STATUS_FINALIZED\x10\x02\x12\x17\n" +
 	"\x13INVOICE_STATUS_PAID\x10\x03\x12\x1a\n" +
 	"\x16INVOICE_STATUS_OVERDUE\x10\x04\x12\x17\n" +
-	"\x13INVOICE_STATUS_VOID\x10\x052\x9f\x03\n" +
+	"\x13INVOICE_STATUS_VOID\x10\x052\xd7\x05\n" +
 	"\x0eBillingService\x12d\n" +
-	"\vRecordUsage\x12).forgepoint.billing.v1.RecordUsageRequest\x1a*.forgepoint.billing.v1.RecordUsageResponse\x12[\n" +
+	"\vRecordUsage\x12).forgepoint.billing.v1.RecordUsageRequest\x1a*.forgepoint.billing.v1.RecordUsageResponse\x12m\n" +
+	"\x0eCreateRatePlan\x12,.forgepoint.billing.v1.CreateRatePlanRequest\x1a-.forgepoint.billing.v1.CreateRatePlanResponse\x12d\n" +
+	"\vGetRatePlan\x12).forgepoint.billing.v1.GetRatePlanRequest\x1a*.forgepoint.billing.v1.GetRatePlanResponse\x12a\n" +
+	"\n" +
+	"CheckQuota\x12(.forgepoint.billing.v1.CheckQuotaRequest\x1a).forgepoint.billing.v1.CheckQuotaResponse\x12[\n" +
 	"\bGetUsage\x12&.forgepoint.billing.v1.GetUsageRequest\x1a'.forgepoint.billing.v1.GetUsageResponse\x12a\n" +
 	"\n" +
 	"GetInvoice\x12(.forgepoint.billing.v1.GetInvoiceRequest\x1a).forgepoint.billing.v1.GetInvoiceResponse\x12g\n" +
@@ -1975,95 +2316,111 @@ func file_forgepoint_billing_v1_billing_proto_rawDescGZIP() []byte {
 }
 
 var file_forgepoint_billing_v1_billing_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_forgepoint_billing_v1_billing_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
+var file_forgepoint_billing_v1_billing_proto_msgTypes = make([]protoimpl.MessageInfo, 28)
 var file_forgepoint_billing_v1_billing_proto_goTypes = []any{
-	(MeterType)(0),                // 0: forgepoint.billing.v1.MeterType
-	(InvoiceStatus)(0),            // 1: forgepoint.billing.v1.InvoiceStatus
-	(*Money)(nil),                 // 2: forgepoint.billing.v1.Money
-	(*RatePlan)(nil),              // 3: forgepoint.billing.v1.RatePlan
-	(*UsageRecord)(nil),           // 4: forgepoint.billing.v1.UsageRecord
-	(*UsageSummary)(nil),          // 5: forgepoint.billing.v1.UsageSummary
-	(*MeterUsage)(nil),            // 6: forgepoint.billing.v1.MeterUsage
-	(*Invoice)(nil),               // 7: forgepoint.billing.v1.Invoice
-	(*InvoiceLineItem)(nil),       // 8: forgepoint.billing.v1.InvoiceLineItem
-	(*RecordUsageRequest)(nil),    // 9: forgepoint.billing.v1.RecordUsageRequest
-	(*RecordUsageResponse)(nil),   // 10: forgepoint.billing.v1.RecordUsageResponse
-	(*GetUsageRequest)(nil),       // 11: forgepoint.billing.v1.GetUsageRequest
-	(*GetUsageResponse)(nil),      // 12: forgepoint.billing.v1.GetUsageResponse
-	(*GetInvoiceRequest)(nil),     // 13: forgepoint.billing.v1.GetInvoiceRequest
-	(*GetInvoiceResponse)(nil),    // 14: forgepoint.billing.v1.GetInvoiceResponse
-	(*ListInvoicesRequest)(nil),   // 15: forgepoint.billing.v1.ListInvoicesRequest
-	(*ListInvoicesResponse)(nil),  // 16: forgepoint.billing.v1.ListInvoicesResponse
-	(*UsageRecorded)(nil),         // 17: forgepoint.billing.v1.UsageRecorded
-	(*QuotaExceeded)(nil),         // 18: forgepoint.billing.v1.QuotaExceeded
-	(*InvoiceGenerated)(nil),      // 19: forgepoint.billing.v1.InvoiceGenerated
-	nil,                           // 20: forgepoint.billing.v1.RatePlan.UnitPricesEntry
-	nil,                           // 21: forgepoint.billing.v1.RatePlan.IncludedQuantitiesEntry
-	nil,                           // 22: forgepoint.billing.v1.RatePlan.QuotaLimitsEntry
-	nil,                           // 23: forgepoint.billing.v1.UsageSummary.ByMeterEntry
-	(*timestamppb.Timestamp)(nil), // 24: google.protobuf.Timestamp
-	(*v1.PaginationRequest)(nil),  // 25: forgepoint.common.v1.PaginationRequest
-	(*v1.PaginationResponse)(nil), // 26: forgepoint.common.v1.PaginationResponse
+	(MeterType)(0),                 // 0: forgepoint.billing.v1.MeterType
+	(InvoiceStatus)(0),             // 1: forgepoint.billing.v1.InvoiceStatus
+	(*Money)(nil),                  // 2: forgepoint.billing.v1.Money
+	(*RatePlan)(nil),               // 3: forgepoint.billing.v1.RatePlan
+	(*UsageRecord)(nil),            // 4: forgepoint.billing.v1.UsageRecord
+	(*UsageSummary)(nil),           // 5: forgepoint.billing.v1.UsageSummary
+	(*MeterUsage)(nil),             // 6: forgepoint.billing.v1.MeterUsage
+	(*Invoice)(nil),                // 7: forgepoint.billing.v1.Invoice
+	(*InvoiceLineItem)(nil),        // 8: forgepoint.billing.v1.InvoiceLineItem
+	(*RecordUsageRequest)(nil),     // 9: forgepoint.billing.v1.RecordUsageRequest
+	(*RecordUsageResponse)(nil),    // 10: forgepoint.billing.v1.RecordUsageResponse
+	(*GetUsageRequest)(nil),        // 11: forgepoint.billing.v1.GetUsageRequest
+	(*GetUsageResponse)(nil),       // 12: forgepoint.billing.v1.GetUsageResponse
+	(*GetInvoiceRequest)(nil),      // 13: forgepoint.billing.v1.GetInvoiceRequest
+	(*GetInvoiceResponse)(nil),     // 14: forgepoint.billing.v1.GetInvoiceResponse
+	(*ListInvoicesRequest)(nil),    // 15: forgepoint.billing.v1.ListInvoicesRequest
+	(*ListInvoicesResponse)(nil),   // 16: forgepoint.billing.v1.ListInvoicesResponse
+	(*CreateRatePlanRequest)(nil),  // 17: forgepoint.billing.v1.CreateRatePlanRequest
+	(*CreateRatePlanResponse)(nil), // 18: forgepoint.billing.v1.CreateRatePlanResponse
+	(*GetRatePlanRequest)(nil),     // 19: forgepoint.billing.v1.GetRatePlanRequest
+	(*GetRatePlanResponse)(nil),    // 20: forgepoint.billing.v1.GetRatePlanResponse
+	(*CheckQuotaRequest)(nil),      // 21: forgepoint.billing.v1.CheckQuotaRequest
+	(*CheckQuotaResponse)(nil),     // 22: forgepoint.billing.v1.CheckQuotaResponse
+	nil,                            // 23: forgepoint.billing.v1.RatePlan.UnitPricesEntry
+	nil,                            // 24: forgepoint.billing.v1.RatePlan.IncludedQuantitiesEntry
+	nil,                            // 25: forgepoint.billing.v1.RatePlan.QuotaLimitsEntry
+	nil,                            // 26: forgepoint.billing.v1.UsageSummary.ByMeterEntry
+	nil,                            // 27: forgepoint.billing.v1.CreateRatePlanRequest.UnitPricesEntry
+	nil,                            // 28: forgepoint.billing.v1.CreateRatePlanRequest.IncludedQuantitiesEntry
+	nil,                            // 29: forgepoint.billing.v1.CreateRatePlanRequest.QuotaLimitsEntry
+	(*timestamppb.Timestamp)(nil),  // 30: google.protobuf.Timestamp
+	(*v1.PaginationRequest)(nil),   // 31: forgepoint.common.v1.PaginationRequest
+	(*v1.PaginationResponse)(nil),  // 32: forgepoint.common.v1.PaginationResponse
 }
 var file_forgepoint_billing_v1_billing_proto_depIdxs = []int32{
-	20, // 0: forgepoint.billing.v1.RatePlan.unit_prices:type_name -> forgepoint.billing.v1.RatePlan.UnitPricesEntry
-	21, // 1: forgepoint.billing.v1.RatePlan.included_quantities:type_name -> forgepoint.billing.v1.RatePlan.IncludedQuantitiesEntry
-	22, // 2: forgepoint.billing.v1.RatePlan.quota_limits:type_name -> forgepoint.billing.v1.RatePlan.QuotaLimitsEntry
-	24, // 3: forgepoint.billing.v1.RatePlan.created_at:type_name -> google.protobuf.Timestamp
+	23, // 0: forgepoint.billing.v1.RatePlan.unit_prices:type_name -> forgepoint.billing.v1.RatePlan.UnitPricesEntry
+	24, // 1: forgepoint.billing.v1.RatePlan.included_quantities:type_name -> forgepoint.billing.v1.RatePlan.IncludedQuantitiesEntry
+	25, // 2: forgepoint.billing.v1.RatePlan.quota_limits:type_name -> forgepoint.billing.v1.RatePlan.QuotaLimitsEntry
+	30, // 3: forgepoint.billing.v1.RatePlan.created_at:type_name -> google.protobuf.Timestamp
 	0,  // 4: forgepoint.billing.v1.UsageRecord.meter_type:type_name -> forgepoint.billing.v1.MeterType
 	2,  // 5: forgepoint.billing.v1.UsageRecord.cost:type_name -> forgepoint.billing.v1.Money
-	24, // 6: forgepoint.billing.v1.UsageRecord.occurred_at:type_name -> google.protobuf.Timestamp
-	24, // 7: forgepoint.billing.v1.UsageSummary.period_start:type_name -> google.protobuf.Timestamp
-	24, // 8: forgepoint.billing.v1.UsageSummary.period_end:type_name -> google.protobuf.Timestamp
-	23, // 9: forgepoint.billing.v1.UsageSummary.by_meter:type_name -> forgepoint.billing.v1.UsageSummary.ByMeterEntry
+	30, // 6: forgepoint.billing.v1.UsageRecord.occurred_at:type_name -> google.protobuf.Timestamp
+	30, // 7: forgepoint.billing.v1.UsageSummary.period_start:type_name -> google.protobuf.Timestamp
+	30, // 8: forgepoint.billing.v1.UsageSummary.period_end:type_name -> google.protobuf.Timestamp
+	26, // 9: forgepoint.billing.v1.UsageSummary.by_meter:type_name -> forgepoint.billing.v1.UsageSummary.ByMeterEntry
 	2,  // 10: forgepoint.billing.v1.UsageSummary.total_cost:type_name -> forgepoint.billing.v1.Money
 	0,  // 11: forgepoint.billing.v1.MeterUsage.meter_type:type_name -> forgepoint.billing.v1.MeterType
 	2,  // 12: forgepoint.billing.v1.MeterUsage.total_cost:type_name -> forgepoint.billing.v1.Money
 	1,  // 13: forgepoint.billing.v1.Invoice.status:type_name -> forgepoint.billing.v1.InvoiceStatus
-	24, // 14: forgepoint.billing.v1.Invoice.period_start:type_name -> google.protobuf.Timestamp
-	24, // 15: forgepoint.billing.v1.Invoice.period_end:type_name -> google.protobuf.Timestamp
+	30, // 14: forgepoint.billing.v1.Invoice.period_start:type_name -> google.protobuf.Timestamp
+	30, // 15: forgepoint.billing.v1.Invoice.period_end:type_name -> google.protobuf.Timestamp
 	8,  // 16: forgepoint.billing.v1.Invoice.line_items:type_name -> forgepoint.billing.v1.InvoiceLineItem
 	2,  // 17: forgepoint.billing.v1.Invoice.total:type_name -> forgepoint.billing.v1.Money
-	24, // 18: forgepoint.billing.v1.Invoice.created_at:type_name -> google.protobuf.Timestamp
-	24, // 19: forgepoint.billing.v1.Invoice.finalized_at:type_name -> google.protobuf.Timestamp
-	24, // 20: forgepoint.billing.v1.Invoice.due_at:type_name -> google.protobuf.Timestamp
+	30, // 18: forgepoint.billing.v1.Invoice.created_at:type_name -> google.protobuf.Timestamp
+	30, // 19: forgepoint.billing.v1.Invoice.finalized_at:type_name -> google.protobuf.Timestamp
+	30, // 20: forgepoint.billing.v1.Invoice.due_at:type_name -> google.protobuf.Timestamp
 	0,  // 21: forgepoint.billing.v1.InvoiceLineItem.meter_type:type_name -> forgepoint.billing.v1.MeterType
 	2,  // 22: forgepoint.billing.v1.InvoiceLineItem.unit_price:type_name -> forgepoint.billing.v1.Money
 	2,  // 23: forgepoint.billing.v1.InvoiceLineItem.amount:type_name -> forgepoint.billing.v1.Money
 	0,  // 24: forgepoint.billing.v1.RecordUsageRequest.meter_type:type_name -> forgepoint.billing.v1.MeterType
-	24, // 25: forgepoint.billing.v1.RecordUsageRequest.occurred_at:type_name -> google.protobuf.Timestamp
+	30, // 25: forgepoint.billing.v1.RecordUsageRequest.occurred_at:type_name -> google.protobuf.Timestamp
 	4,  // 26: forgepoint.billing.v1.RecordUsageResponse.record:type_name -> forgepoint.billing.v1.UsageRecord
-	24, // 27: forgepoint.billing.v1.GetUsageRequest.period_start:type_name -> google.protobuf.Timestamp
-	24, // 28: forgepoint.billing.v1.GetUsageRequest.period_end:type_name -> google.protobuf.Timestamp
+	30, // 27: forgepoint.billing.v1.GetUsageRequest.period_start:type_name -> google.protobuf.Timestamp
+	30, // 28: forgepoint.billing.v1.GetUsageRequest.period_end:type_name -> google.protobuf.Timestamp
 	0,  // 29: forgepoint.billing.v1.GetUsageRequest.meter_type_filter:type_name -> forgepoint.billing.v1.MeterType
-	25, // 30: forgepoint.billing.v1.GetUsageRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
+	31, // 30: forgepoint.billing.v1.GetUsageRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
 	5,  // 31: forgepoint.billing.v1.GetUsageResponse.summaries:type_name -> forgepoint.billing.v1.UsageSummary
 	2,  // 32: forgepoint.billing.v1.GetUsageResponse.grand_total:type_name -> forgepoint.billing.v1.Money
-	26, // 33: forgepoint.billing.v1.GetUsageResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
+	32, // 33: forgepoint.billing.v1.GetUsageResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
 	7,  // 34: forgepoint.billing.v1.GetInvoiceResponse.invoice:type_name -> forgepoint.billing.v1.Invoice
 	1,  // 35: forgepoint.billing.v1.ListInvoicesRequest.status_filter:type_name -> forgepoint.billing.v1.InvoiceStatus
-	25, // 36: forgepoint.billing.v1.ListInvoicesRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
+	31, // 36: forgepoint.billing.v1.ListInvoicesRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
 	7,  // 37: forgepoint.billing.v1.ListInvoicesResponse.invoices:type_name -> forgepoint.billing.v1.Invoice
-	26, // 38: forgepoint.billing.v1.ListInvoicesResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
-	4,  // 39: forgepoint.billing.v1.UsageRecorded.record:type_name -> forgepoint.billing.v1.UsageRecord
-	0,  // 40: forgepoint.billing.v1.QuotaExceeded.meter_type:type_name -> forgepoint.billing.v1.MeterType
-	24, // 41: forgepoint.billing.v1.QuotaExceeded.occurred_at:type_name -> google.protobuf.Timestamp
-	7,  // 42: forgepoint.billing.v1.InvoiceGenerated.invoice:type_name -> forgepoint.billing.v1.Invoice
-	2,  // 43: forgepoint.billing.v1.RatePlan.UnitPricesEntry.value:type_name -> forgepoint.billing.v1.Money
-	6,  // 44: forgepoint.billing.v1.UsageSummary.ByMeterEntry.value:type_name -> forgepoint.billing.v1.MeterUsage
-	9,  // 45: forgepoint.billing.v1.BillingService.RecordUsage:input_type -> forgepoint.billing.v1.RecordUsageRequest
-	11, // 46: forgepoint.billing.v1.BillingService.GetUsage:input_type -> forgepoint.billing.v1.GetUsageRequest
-	13, // 47: forgepoint.billing.v1.BillingService.GetInvoice:input_type -> forgepoint.billing.v1.GetInvoiceRequest
-	15, // 48: forgepoint.billing.v1.BillingService.ListInvoices:input_type -> forgepoint.billing.v1.ListInvoicesRequest
-	10, // 49: forgepoint.billing.v1.BillingService.RecordUsage:output_type -> forgepoint.billing.v1.RecordUsageResponse
-	12, // 50: forgepoint.billing.v1.BillingService.GetUsage:output_type -> forgepoint.billing.v1.GetUsageResponse
-	14, // 51: forgepoint.billing.v1.BillingService.GetInvoice:output_type -> forgepoint.billing.v1.GetInvoiceResponse
-	16, // 52: forgepoint.billing.v1.BillingService.ListInvoices:output_type -> forgepoint.billing.v1.ListInvoicesResponse
-	49, // [49:53] is the sub-list for method output_type
-	45, // [45:49] is the sub-list for method input_type
-	45, // [45:45] is the sub-list for extension type_name
-	45, // [45:45] is the sub-list for extension extendee
-	0,  // [0:45] is the sub-list for field type_name
+	32, // 38: forgepoint.billing.v1.ListInvoicesResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
+	27, // 39: forgepoint.billing.v1.CreateRatePlanRequest.unit_prices:type_name -> forgepoint.billing.v1.CreateRatePlanRequest.UnitPricesEntry
+	28, // 40: forgepoint.billing.v1.CreateRatePlanRequest.included_quantities:type_name -> forgepoint.billing.v1.CreateRatePlanRequest.IncludedQuantitiesEntry
+	29, // 41: forgepoint.billing.v1.CreateRatePlanRequest.quota_limits:type_name -> forgepoint.billing.v1.CreateRatePlanRequest.QuotaLimitsEntry
+	3,  // 42: forgepoint.billing.v1.CreateRatePlanResponse.rate_plan:type_name -> forgepoint.billing.v1.RatePlan
+	3,  // 43: forgepoint.billing.v1.GetRatePlanResponse.rate_plan:type_name -> forgepoint.billing.v1.RatePlan
+	0,  // 44: forgepoint.billing.v1.CheckQuotaRequest.meter_type:type_name -> forgepoint.billing.v1.MeterType
+	0,  // 45: forgepoint.billing.v1.CheckQuotaResponse.meter_type:type_name -> forgepoint.billing.v1.MeterType
+	2,  // 46: forgepoint.billing.v1.RatePlan.UnitPricesEntry.value:type_name -> forgepoint.billing.v1.Money
+	6,  // 47: forgepoint.billing.v1.UsageSummary.ByMeterEntry.value:type_name -> forgepoint.billing.v1.MeterUsage
+	2,  // 48: forgepoint.billing.v1.CreateRatePlanRequest.UnitPricesEntry.value:type_name -> forgepoint.billing.v1.Money
+	9,  // 49: forgepoint.billing.v1.BillingService.RecordUsage:input_type -> forgepoint.billing.v1.RecordUsageRequest
+	17, // 50: forgepoint.billing.v1.BillingService.CreateRatePlan:input_type -> forgepoint.billing.v1.CreateRatePlanRequest
+	19, // 51: forgepoint.billing.v1.BillingService.GetRatePlan:input_type -> forgepoint.billing.v1.GetRatePlanRequest
+	21, // 52: forgepoint.billing.v1.BillingService.CheckQuota:input_type -> forgepoint.billing.v1.CheckQuotaRequest
+	11, // 53: forgepoint.billing.v1.BillingService.GetUsage:input_type -> forgepoint.billing.v1.GetUsageRequest
+	13, // 54: forgepoint.billing.v1.BillingService.GetInvoice:input_type -> forgepoint.billing.v1.GetInvoiceRequest
+	15, // 55: forgepoint.billing.v1.BillingService.ListInvoices:input_type -> forgepoint.billing.v1.ListInvoicesRequest
+	10, // 56: forgepoint.billing.v1.BillingService.RecordUsage:output_type -> forgepoint.billing.v1.RecordUsageResponse
+	18, // 57: forgepoint.billing.v1.BillingService.CreateRatePlan:output_type -> forgepoint.billing.v1.CreateRatePlanResponse
+	20, // 58: forgepoint.billing.v1.BillingService.GetRatePlan:output_type -> forgepoint.billing.v1.GetRatePlanResponse
+	22, // 59: forgepoint.billing.v1.BillingService.CheckQuota:output_type -> forgepoint.billing.v1.CheckQuotaResponse
+	12, // 60: forgepoint.billing.v1.BillingService.GetUsage:output_type -> forgepoint.billing.v1.GetUsageResponse
+	14, // 61: forgepoint.billing.v1.BillingService.GetInvoice:output_type -> forgepoint.billing.v1.GetInvoiceResponse
+	16, // 62: forgepoint.billing.v1.BillingService.ListInvoices:output_type -> forgepoint.billing.v1.ListInvoicesResponse
+	56, // [56:63] is the sub-list for method output_type
+	49, // [49:56] is the sub-list for method input_type
+	49, // [49:49] is the sub-list for extension type_name
+	49, // [49:49] is the sub-list for extension extendee
+	0,  // [0:49] is the sub-list for field type_name
 }
 
 func init() { file_forgepoint_billing_v1_billing_proto_init() }
@@ -2077,7 +2434,7 @@ func file_forgepoint_billing_v1_billing_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_forgepoint_billing_v1_billing_proto_rawDesc), len(file_forgepoint_billing_v1_billing_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   22,
+			NumMessages:   28,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

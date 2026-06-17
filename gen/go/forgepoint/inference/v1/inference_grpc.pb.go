@@ -13,7 +13,22 @@
 //   - Predict / BatchPredict (unary) + StreamPredict (server-streaming batch)
 //   - Routing & traffic-split admin RPCs (the canary control plane)
 //   - Circuit-breaker observability RPCs
-//   - InferenceCompletedEvent / InferenceFailedEvent — typed NATS payloads
+//   - GetModelInfo (the HTTP GET /v1/models/{model}/info backing RPC)
+//
+// WHAT IS DELIBERATELY NOT HERE (event payloads live in forgepoint.events.v1):
+//   This file used to declare its OWN InferenceCompletedEvent / InferenceFailedEvent
+//   NATS payloads. They are GONE. An adversarial cross-service review found the
+//   event schemas were authored in parallel and DISAGREED — most damningly, this
+//   gateway AND model-serving both claimed the "an inference happened, bill it"
+//   event (inference.InferenceCompletedEvent vs serving.PredictionCompletedEvent),
+//   so Billing could double-meter. The platform now has ONE canonical event
+//   contract: forgepoint/events/v1/events.proto. The gateway publishes
+//   events.InferenceCompleted / events.InferenceFailed from there and DELETES its
+//   local copies. This proto keeps only its RPC request/response/domain types —
+//   the SYNC contract — and depends on the events package for the ASYNC contract.
+//   WHY the split: the event schema is a separately-versioned PUBLISHED contract
+//   (schema-registry thinking) that must not be coupled to any one service's API
+//   types; see the long DESIGN block at the top of events.proto.
 //
 // PATTERN — API GATEWAY + RESILIENCE STACK:
 //   This service composes FOUR classic resilience patterns into one request
@@ -74,11 +89,29 @@
 //        ▼
 //   PredictResponse (outputs + served_version + latency_ms + request_id)
 //
-// EVENTS PUBLISHED (subject hierarchy from the platform design):
-//   fp.inference.completed → InferenceCompletedEvent
-//   fp.inference.failed    → InferenceFailedEvent
-//   Consumed by: Billing (meter usage), Experiment Tracker (record),
-//                Model Monitor (drift windows over features + predictions).
+// EVENTS PRODUCED (canonical — payloads defined in forgepoint.events.v1):
+//   fp.inference.completed → events.InferenceCompleted  (THE single canonical
+//        inference event — the gateway alone knows latency, the version that
+//        ACTUALLY served post-split, the billed principal api_key_id, is_canary,
+//        and token_count. serving emits NO competing event.)
+//   fp.inference.failed    → events.InferenceFailed
+//   Consumed by: Billing (meter requests + tokens, dedupe on request_id),
+//                Experiment Tracker (A/B outcomes per served version),
+//                Model Monitor (drift windows; request_id is the ground-truth
+//                join key for delayed labels).
+//
+// EVENTS CONSUMED (all canonical events.v1 payloads; gateway is a pure reactor
+// on the control plane — the routing table is driven by events, not API writes):
+//   fp.pipelines.model.deployed   → events.ModelDeployed   → ADD a route target
+//        (the deploy SAGA owns this; the gateway uses its server-resolved
+//        endpoint + initial weight_bps — never a client-supplied endpoint).
+//   fp.pipelines.model.undeployed → events.ModelUndeployed → REMOVE a route target
+//   fp.models.promoted            → events.ModelPromoted   → repoint traffic to
+//        the new PRODUCTION version (and tear down the auto-demoted old one).
+//   fp.models.archived            → events.ModelArchived   → DROP the route.
+//   fp.billing.quota.exceeded     → events.QuotaExceeded   → flip the team's
+//        Redis quota cache to "blocked" so subsequent predicts pre-flight-reject
+//        with FAILURE_REASON_QUOTA_EXCEEDED (eventual consistency is fine here).
 //
 // VERSIONING: Package path includes v1 following Buf/Google convention.
 // Breaking changes require a new forgepoint.inference.v2 package.
@@ -108,6 +141,7 @@ const (
 	InferenceGatewayService_Predict_FullMethodName           = "/forgepoint.inference.v1.InferenceGatewayService/Predict"
 	InferenceGatewayService_BatchPredict_FullMethodName      = "/forgepoint.inference.v1.InferenceGatewayService/BatchPredict"
 	InferenceGatewayService_StreamPredict_FullMethodName     = "/forgepoint.inference.v1.InferenceGatewayService/StreamPredict"
+	InferenceGatewayService_GetModelInfo_FullMethodName      = "/forgepoint.inference.v1.InferenceGatewayService/GetModelInfo"
 	InferenceGatewayService_GetRoute_FullMethodName          = "/forgepoint.inference.v1.InferenceGatewayService/GetRoute"
 	InferenceGatewayService_ListRoutes_FullMethodName        = "/forgepoint.inference.v1.InferenceGatewayService/ListRoutes"
 	InferenceGatewayService_UpsertRoute_FullMethodName       = "/forgepoint.inference.v1.InferenceGatewayService/UpsertRoute"
@@ -136,19 +170,31 @@ const (
 // RPC CATEGORIES:
 //
 //	DATA PLANE (hot path):   Predict, BatchPredict, StreamPredict
+//	MODEL METADATA (read):   GetModelInfo
 //	ROUTING CONTROL PLANE:   GetRoute, ListRoutes, UpsertRoute,
 //	                         SetTrafficSplit, DeleteRoute
 //	RESILIENCE OBSERVABILITY: GetCircuitState, ListCircuitStates
 //
-// NOTE ON THE EXTERNAL HTTP API: the platform also exposes
-// POST /v1/models/{model}/predict via an HTTP handler (JSON in/out). That
-// handler maps onto Predict here — gRPC is the canonical internal contract;
-// the HTTP edge is a thin JSON adapter over it (TensorData bytes ↔ JSON arrays).
+// NOTE ON THE EXTERNAL HTTP API: the platform exposes a thin JSON edge that
+// maps 1:1 onto these RPCs (gRPC is the canonical internal contract; the HTTP
+// adapter converts TensorData bytes ↔ JSON arrays):
 //
-// AUTH: every RPC runs behind the shared auth interceptor (ValidateToken +
-// CheckPermission). Data-plane calls require an inference scope; control-plane
-// RPCs require an elevated deploy/admin scope (only operators and the canary
-// executor reshape routes). version_override on Predict requires elevation too.
+//	POST /v1/models/{model_name}/predict                      → Predict
+//	POST /v1/models/{model_name}/versions/{version}/predict   → Predict (the
+//	     {version} path segment becomes version_override, which the edge only
+//	     forwards for callers holding the elevated scope; otherwise 403).
+//	GET  /v1/models/{model_name}/info                         → GetModelInfo
+//
+// AUTH & TENANCY (where the trust boundary is): every RPC runs behind the shared
+// auth interceptor (ValidateToken + CheckPermission). The caller's api_key_id,
+// team, and scopes are taken FROM THE VERIFIED TOKEN — never from request
+// fields. That is why no *Request here carries an api_key/team/owner: a
+// client-supplied principal would be account-takeover-for-billing (the inference
+// event meters against api_key_id). Data-plane calls require an inference scope;
+// control-plane RPCs require an elevated deploy/admin scope (only operators and
+// the canary executor reshape routes); version_override on Predict requires that
+// same elevation. The pre-flight quota check keys off the token's team against
+// the Redis cache flipped by events.QuotaExceeded — also never a request field.
 // ============================================================================
 type InferenceGatewayServiceClient interface {
 	// Predict routes a single inference request to a model-serving backend via
@@ -164,10 +210,22 @@ type InferenceGatewayServiceClient interface {
 	BatchPredict(ctx context.Context, in *BatchPredictRequest, opts ...grpc.CallOption) (*BatchPredictResponse, error)
 	// StreamPredict scores a (potentially large) batch and SERVER-STREAMS one
 	// result per item as each completes — incremental delivery with bounded
-	// gateway memory. The single request carries all items; results flow back
-	// until the stream ends. Choose this over BatchPredict when the batch is
-	// large or you want to start consuming results before the batch finishes.
+	// gateway RESPONSE memory (it never buffers the whole result set). The single
+	// request carries all items (capped at 10000 server-side — the request list is
+	// still buffered in full, so it is bounded too); results flow back until the
+	// stream ends. Choose this over BatchPredict when the batch is large or you
+	// want to start consuming results before the batch finishes.
 	StreamPredict(ctx context.Context, in *StreamPredictRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StreamPredictResponse], error)
+	// GetModelInfo returns the client-facing metadata a caller needs to construct
+	// a valid predict request WITHOUT knowing internal versions: the input/output
+	// tensor schema (names/shapes/dtypes for edge validation), the currently
+	// routable versions and their traffic weights, and whether the model is
+	// serving at all. Backs the external GET /v1/models/{model_name}/info. WHY a
+	// dedicated read RPC and not "just call GetRoute": GetRoute is the OPERATOR
+	// view (raw routing table, elevated scope); GetModelInfo is the CALLER view
+	// (the public contract of the model, inference scope) and deliberately omits
+	// server-internal fields like backend endpoints and breaker internals.
+	GetModelInfo(ctx context.Context, in *GetModelInfoRequest, opts ...grpc.CallOption) (*GetModelInfoResponse, error)
 	// GetRoute returns the current routing-table entry (versions + weights) for
 	// one model. Read-only; used by operators, the UI, and the canary executor
 	// to inspect current splits.
@@ -244,6 +302,16 @@ func (c *inferenceGatewayServiceClient) StreamPredict(ctx context.Context, in *S
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type InferenceGatewayService_StreamPredictClient = grpc.ServerStreamingClient[StreamPredictResponse]
+
+func (c *inferenceGatewayServiceClient) GetModelInfo(ctx context.Context, in *GetModelInfoRequest, opts ...grpc.CallOption) (*GetModelInfoResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetModelInfoResponse)
+	err := c.cc.Invoke(ctx, InferenceGatewayService_GetModelInfo_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
 
 func (c *inferenceGatewayServiceClient) GetRoute(ctx context.Context, in *GetRouteRequest, opts ...grpc.CallOption) (*GetRouteResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -334,19 +402,31 @@ func (c *inferenceGatewayServiceClient) ListCircuitStates(ctx context.Context, i
 // RPC CATEGORIES:
 //
 //	DATA PLANE (hot path):   Predict, BatchPredict, StreamPredict
+//	MODEL METADATA (read):   GetModelInfo
 //	ROUTING CONTROL PLANE:   GetRoute, ListRoutes, UpsertRoute,
 //	                         SetTrafficSplit, DeleteRoute
 //	RESILIENCE OBSERVABILITY: GetCircuitState, ListCircuitStates
 //
-// NOTE ON THE EXTERNAL HTTP API: the platform also exposes
-// POST /v1/models/{model}/predict via an HTTP handler (JSON in/out). That
-// handler maps onto Predict here — gRPC is the canonical internal contract;
-// the HTTP edge is a thin JSON adapter over it (TensorData bytes ↔ JSON arrays).
+// NOTE ON THE EXTERNAL HTTP API: the platform exposes a thin JSON edge that
+// maps 1:1 onto these RPCs (gRPC is the canonical internal contract; the HTTP
+// adapter converts TensorData bytes ↔ JSON arrays):
 //
-// AUTH: every RPC runs behind the shared auth interceptor (ValidateToken +
-// CheckPermission). Data-plane calls require an inference scope; control-plane
-// RPCs require an elevated deploy/admin scope (only operators and the canary
-// executor reshape routes). version_override on Predict requires elevation too.
+//	POST /v1/models/{model_name}/predict                      → Predict
+//	POST /v1/models/{model_name}/versions/{version}/predict   → Predict (the
+//	     {version} path segment becomes version_override, which the edge only
+//	     forwards for callers holding the elevated scope; otherwise 403).
+//	GET  /v1/models/{model_name}/info                         → GetModelInfo
+//
+// AUTH & TENANCY (where the trust boundary is): every RPC runs behind the shared
+// auth interceptor (ValidateToken + CheckPermission). The caller's api_key_id,
+// team, and scopes are taken FROM THE VERIFIED TOKEN — never from request
+// fields. That is why no *Request here carries an api_key/team/owner: a
+// client-supplied principal would be account-takeover-for-billing (the inference
+// event meters against api_key_id). Data-plane calls require an inference scope;
+// control-plane RPCs require an elevated deploy/admin scope (only operators and
+// the canary executor reshape routes); version_override on Predict requires that
+// same elevation. The pre-flight quota check keys off the token's team against
+// the Redis cache flipped by events.QuotaExceeded — also never a request field.
 // ============================================================================
 type InferenceGatewayServiceServer interface {
 	// Predict routes a single inference request to a model-serving backend via
@@ -362,10 +442,22 @@ type InferenceGatewayServiceServer interface {
 	BatchPredict(context.Context, *BatchPredictRequest) (*BatchPredictResponse, error)
 	// StreamPredict scores a (potentially large) batch and SERVER-STREAMS one
 	// result per item as each completes — incremental delivery with bounded
-	// gateway memory. The single request carries all items; results flow back
-	// until the stream ends. Choose this over BatchPredict when the batch is
-	// large or you want to start consuming results before the batch finishes.
+	// gateway RESPONSE memory (it never buffers the whole result set). The single
+	// request carries all items (capped at 10000 server-side — the request list is
+	// still buffered in full, so it is bounded too); results flow back until the
+	// stream ends. Choose this over BatchPredict when the batch is large or you
+	// want to start consuming results before the batch finishes.
 	StreamPredict(*StreamPredictRequest, grpc.ServerStreamingServer[StreamPredictResponse]) error
+	// GetModelInfo returns the client-facing metadata a caller needs to construct
+	// a valid predict request WITHOUT knowing internal versions: the input/output
+	// tensor schema (names/shapes/dtypes for edge validation), the currently
+	// routable versions and their traffic weights, and whether the model is
+	// serving at all. Backs the external GET /v1/models/{model_name}/info. WHY a
+	// dedicated read RPC and not "just call GetRoute": GetRoute is the OPERATOR
+	// view (raw routing table, elevated scope); GetModelInfo is the CALLER view
+	// (the public contract of the model, inference scope) and deliberately omits
+	// server-internal fields like backend endpoints and breaker internals.
+	GetModelInfo(context.Context, *GetModelInfoRequest) (*GetModelInfoResponse, error)
 	// GetRoute returns the current routing-table entry (versions + weights) for
 	// one model. Read-only; used by operators, the UI, and the canary executor
 	// to inspect current splits.
@@ -412,6 +504,9 @@ func (UnimplementedInferenceGatewayServiceServer) BatchPredict(context.Context, 
 }
 func (UnimplementedInferenceGatewayServiceServer) StreamPredict(*StreamPredictRequest, grpc.ServerStreamingServer[StreamPredictResponse]) error {
 	return status.Error(codes.Unimplemented, "method StreamPredict not implemented")
+}
+func (UnimplementedInferenceGatewayServiceServer) GetModelInfo(context.Context, *GetModelInfoRequest) (*GetModelInfoResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetModelInfo not implemented")
 }
 func (UnimplementedInferenceGatewayServiceServer) GetRoute(context.Context, *GetRouteRequest) (*GetRouteResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetRoute not implemented")
@@ -502,6 +597,24 @@ func _InferenceGatewayService_StreamPredict_Handler(srv interface{}, stream grpc
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type InferenceGatewayService_StreamPredictServer = grpc.ServerStreamingServer[StreamPredictResponse]
+
+func _InferenceGatewayService_GetModelInfo_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetModelInfoRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InferenceGatewayServiceServer).GetModelInfo(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: InferenceGatewayService_GetModelInfo_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InferenceGatewayServiceServer).GetModelInfo(ctx, req.(*GetModelInfoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
 
 func _InferenceGatewayService_GetRoute_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetRouteRequest)
@@ -643,6 +756,10 @@ var InferenceGatewayService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "BatchPredict",
 			Handler:    _InferenceGatewayService_BatchPredict_Handler,
+		},
+		{
+			MethodName: "GetModelInfo",
+			Handler:    _InferenceGatewayService_GetModelInfo_Handler,
 		},
 		{
 			MethodName: "GetRoute",

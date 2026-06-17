@@ -79,12 +79,33 @@
 // SECURITY / MASS-ASSIGNMENT POSTURE (applies to every write RPC below):
 //   Server-authoritative fields are NEVER accepted on write requests. The
 //   caller does not get to set: id, owner_id, team (derived from the caller's
-//   auth claims), stage/status (only PromoteVersion may change stage),
-//   created_at/updated_at/archived_at, or artifact_path/digest (set by the
-//   storage layer on upload). Accepting any of these would let a caller forge
-//   ownership, backdate records, or jump a version straight to production —
-//   classic mass-assignment escalation. We model only the genuinely
+//   auth claims), stage/status (only PromoteVersion may change stage, only
+//   ConfirmVersionUpload may change status), created_at/updated_at/archived_at,
+//   or artifact_path/digest/size_bytes (MEASURED by the storage layer on upload,
+//   never client-asserted — a forged digest defeats content integrity, a forged
+//   size lets a tenant dodge storage billing). Accepting any of these would let a
+//   caller forge ownership, backdate records, or jump a version straight to
+//   production — classic mass-assignment escalation. We model only the genuinely
 //   client-supplied fields on *Request messages and derive the rest server-side.
+//
+// TENANCY SCOPING (authz from claims, not the body):
+//   There is intentionally NO `team` / `owner_id` field on any list/get/write
+//   request. Team scoping and ownership are derived from the caller's validated
+//   TokenClaims server-side, so a caller can neither list another team's models
+//   nor register into another team's namespace. The few filter fields that DO
+//   stay on requests (task_type_filter, framework_filter, tag key/value) only
+//   NARROW within the caller's already-scoped view — they never widen it.
+//
+// PAGINATION / DoS BOUND (a contract invariant, not just per-RPC prose):
+//   Every list RPC takes common.v1.PaginationRequest. page_size DEFAULTS to 20
+//   and is HARD-CAPPED AT 100 server-side — a larger request is silently clamped
+//   to 100, never honored. This is the platform-wide cap documented on
+//   common.v1.PaginationRequest (default 20 / max 100) and it bounds Redis
+//   ZRANGE/SMEMBERS work and response size (a memory/CPU DoS guard). proto3 has no
+//   numeric-bound syntax and protovalidate is intentionally not a dependency here,
+//   so the cap is expressed as this explicit, uniform contract clause and enforced
+//   in the handler; it is NOT advisory. There are no batch-write RPCs in this
+//   service, so no separate batch-size cap is needed.
 //
 // VERSIONING: Package path includes v1 (Buf/Google convention). Breaking
 // changes require a new forgepoint.registry.v2 package; both coexist during
@@ -143,6 +164,17 @@ const (
 //	"production" silently fragmenting the read projection's stage index.
 //	Buf STANDARD requires the _UNSPECIFIED zero value + ENUM_NAME prefix on
 //	every value (so the int 0 never accidentally means "DEV").
+//
+// CANONICAL-EVENT MAPPING (interview-relevant decoupling point):
+//
+//	This enum is the SERVICE/API enum. The event bus carries a MIRROR enum,
+//	events.v1.ModelStage, with byte-identical values (UNSPECIFIED=0, DEV=1,
+//	STAGING=2, PRODUCTION=3, ARCHIVED=4). They are kept numerically aligned on
+//	purpose, but the handler still maps registry.ModelStage <-> events.ModelStage
+//	explicitly at the publish/consume boundary rather than casting — so that if
+//	the API enum ever evolves independently (a new internal stage that isn't a
+//	published fact), the event contract is insulated. This is the same "event
+//	schema is decoupled from API schema" discipline events.proto enforces.
 //
 // ============================================================================
 type ModelStage int32
@@ -234,9 +266,16 @@ const (
 	// returns a version in this state alongside a presigned upload URL.
 	VersionStatus_VERSION_STATUS_PENDING_UPLOAD VersionStatus = 1
 	// Artifact present in object storage and validated (checksum verified).
-	// Only READY versions are eligible to be promoted/served.
+	// Only READY versions are eligible to be promoted/served. The PENDING_UPLOAD
+	// -> READY transition is driven by ConfirmVersionUpload (below) and is the
+	// moment that publishes events.ModelVersionReady (fp.models.version.ready) —
+	// the edge serving/billing/pipeline-orchestrator wait on (see conflict #3 in
+	// events.proto). ModelVersionCreated fires earlier, at row creation; it is NOT
+	// a signal the artifact is usable.
 	VersionStatus_VERSION_STATUS_READY VersionStatus = 2
 	// Upload failed, checksum mismatch, or validation error. Not promotable.
+	// Set by ConfirmVersionUpload when verification fails (no ModelVersionReady
+	// is emitted in that case — there is nothing servable to announce).
 	VersionStatus_VERSION_STATUS_FAILED VersionStatus = 3
 )
 
@@ -308,7 +347,8 @@ type Model struct {
 	// "fraud-detector". Used as the addressable handle by serving/gateway.
 	// Client-supplied at registration; immutable afterward (rename = new model).
 	Name string `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
-	// Free-text description. Client-supplied; mutable via a future UpdateModel.
+	// Free-text description. Client-supplied at registration; mutable afterward
+	// via UpdateModel (see below). Name is NOT mutable (rename = new model).
 	Description string `protobuf:"bytes,3,opt,name=description,proto3" json:"description,omitempty"`
 	// The user_id of the registrant. SERVER-AUTHORITATIVE: derived from the
 	// caller's auth claims, NOT from the request body. Identifies accountability
@@ -799,6 +839,183 @@ func (x *RegisterModelResponse) GetModel() *Model {
 	return nil
 }
 
+// ----------------------------------------------------------------------------
+// UpdateModel (COMMAND / write path) — mutate the small mutable surface
+// ----------------------------------------------------------------------------
+//
+// WHY a dedicated UpdateModel (the design/CLI need it, and the old code only
+// hinted at it):
+//
+//	A Model's IDENTITY (id, name, owner_id, team) and its lineage timestamps are
+//	immutable/server-owned, but two fields legitimately change over a model's
+//	life: its human DESCRIPTION and its TAGS (re-classify "domain", flip a
+//	"deprecated" flag). Without an UpdateModel the only way to fix a typo'd
+//	description would be to re-register — losing the id and all version lineage.
+//
+// SECURITY / MASS-ASSIGNMENT (the whole reason this message is so small):
+//
+//	Only description and tags are accepted. name is OMITTED on purpose (renaming
+//	an addressable handle out from under serving/gateway is a footgun — a rename
+//	is modeled as a new model). id selects the target but is never itself
+//	mutated. owner_id/team/stage/status/timestamps/artifact fields are absent so
+//	a caller can NEVER reassign ownership, jump teams, or backdate via this RPC.
+//
+// PARTIAL-UPDATE SEMANTICS (interview note — "how do you patch in proto3?"):
+//
+//	proto3 scalars have no presence, so "field omitted" vs "field set to empty"
+//	are indistinguishable for a bare string. We make the contract explicit with
+//	update_mask-style booleans (update_description / replace_tags) rather than a
+//	full google.protobuf.FieldMask, because the mutable surface is tiny and two
+//	flags are clearer to read than a path-string mask. This avoids the classic
+//	PATCH bug where an unset field silently clears stored data.
+type UpdateModelRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The model to update. Required. Server-authoritative target binding (the
+	// model must belong to the caller's team — enforced from auth claims).
+	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	// New description. Applied ONLY when update_description is true (so an unset
+	// description doesn't blank an existing one — see partial-update note above).
+	Description string `protobuf:"bytes,2,opt,name=description,proto3" json:"description,omitempty"`
+	// When true, `description` (even if empty) replaces the stored description.
+	// When false, the description is left untouched.
+	UpdateDescription bool `protobuf:"varint,3,opt,name=update_description,json=updateDescription,proto3" json:"update_description,omitempty"`
+	// Replacement tag set. Applied ONLY when replace_tags is true. Tags are
+	// REPLACED wholesale (not merged) — the simplest, least-surprising semantics
+	// for a map; a caller that wants to add one tag sends the full desired set.
+	Tags map[string]string `protobuf:"bytes,4,rep,name=tags,proto3" json:"tags,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// When true, `tags` replaces the stored tag map (an empty map clears all
+	// tags). When false, tags are left untouched.
+	ReplaceTags bool `protobuf:"varint,5,opt,name=replace_tags,json=replaceTags,proto3" json:"replace_tags,omitempty"`
+	// IDEMPOTENCY KEY: an update is naturally idempotent (applying the same patch
+	// twice yields the same state), but the key still guards against a retry
+	// re-emitting any change event / double-bumping updated_at. Optional.
+	IdempotencyKey string `protobuf:"bytes,6,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *UpdateModelRequest) Reset() {
+	*x = UpdateModelRequest{}
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdateModelRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdateModelRequest) ProtoMessage() {}
+
+func (x *UpdateModelRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdateModelRequest.ProtoReflect.Descriptor instead.
+func (*UpdateModelRequest) Descriptor() ([]byte, []int) {
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *UpdateModelRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *UpdateModelRequest) GetDescription() string {
+	if x != nil {
+		return x.Description
+	}
+	return ""
+}
+
+func (x *UpdateModelRequest) GetUpdateDescription() bool {
+	if x != nil {
+		return x.UpdateDescription
+	}
+	return false
+}
+
+func (x *UpdateModelRequest) GetTags() map[string]string {
+	if x != nil {
+		return x.Tags
+	}
+	return nil
+}
+
+func (x *UpdateModelRequest) GetReplaceTags() bool {
+	if x != nil {
+		return x.ReplaceTags
+	}
+	return false
+}
+
+func (x *UpdateModelRequest) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
+}
+
+// UpdateModelResponse returns the updated Model (write path → Postgres truth, so
+// immediately consistent for the caller; the READ RPCs remain eventually
+// consistent). NOTE: UpdateModel publishes NO canonical lifecycle event —
+// description/tag edits are not in the events.proto contract (no consumer reacts
+// to them), so there is nothing to emit. The Redis projection is refreshed by an
+// internal projection refresh, not a published domain event.
+type UpdateModelResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Model         *Model                 `protobuf:"bytes,1,opt,name=model,proto3" json:"model,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UpdateModelResponse) Reset() {
+	*x = UpdateModelResponse{}
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdateModelResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdateModelResponse) ProtoMessage() {}
+
+func (x *UpdateModelResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdateModelResponse.ProtoReflect.Descriptor instead.
+func (*UpdateModelResponse) Descriptor() ([]byte, []int) {
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *UpdateModelResponse) GetModel() *Model {
+	if x != nil {
+		return x.Model
+	}
+	return nil
+}
+
 // GetModelRequest targets a model by id OR name (one of). We allow name lookup
 // because callers (serving, CLI) usually know the human name, not the UUID.
 type GetModelRequest struct {
@@ -813,7 +1030,7 @@ type GetModelRequest struct {
 
 func (x *GetModelRequest) Reset() {
 	*x = GetModelRequest{}
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[4]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -825,7 +1042,7 @@ func (x *GetModelRequest) String() string {
 func (*GetModelRequest) ProtoMessage() {}
 
 func (x *GetModelRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[4]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -838,7 +1055,7 @@ func (x *GetModelRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetModelRequest.ProtoReflect.Descriptor instead.
 func (*GetModelRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{4}
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *GetModelRequest) GetId() string {
@@ -869,7 +1086,7 @@ type GetModelResponse struct {
 
 func (x *GetModelResponse) Reset() {
 	*x = GetModelResponse{}
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[5]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -881,7 +1098,7 @@ func (x *GetModelResponse) String() string {
 func (*GetModelResponse) ProtoMessage() {}
 
 func (x *GetModelResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[5]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -894,7 +1111,7 @@ func (x *GetModelResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetModelResponse.ProtoReflect.Descriptor instead.
 func (*GetModelResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{5}
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *GetModelResponse) GetModel() *Model {
@@ -927,7 +1144,7 @@ type ListModelsRequest struct {
 
 func (x *ListModelsRequest) Reset() {
 	*x = ListModelsRequest{}
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[6]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -939,7 +1156,7 @@ func (x *ListModelsRequest) String() string {
 func (*ListModelsRequest) ProtoMessage() {}
 
 func (x *ListModelsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[6]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -952,7 +1169,7 @@ func (x *ListModelsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListModelsRequest.ProtoReflect.Descriptor instead.
 func (*ListModelsRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{6}
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ListModelsRequest) GetTaskTypeFilter() string {
@@ -997,7 +1214,7 @@ type ListModelsResponse struct {
 
 func (x *ListModelsResponse) Reset() {
 	*x = ListModelsResponse{}
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[7]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1009,7 +1226,7 @@ func (x *ListModelsResponse) String() string {
 func (*ListModelsResponse) ProtoMessage() {}
 
 func (x *ListModelsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[7]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1022,7 +1239,7 @@ func (x *ListModelsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListModelsResponse.ProtoReflect.Descriptor instead.
 func (*ListModelsResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{7}
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ListModelsResponse) GetModels() []*Model {
@@ -1066,7 +1283,7 @@ type SearchByTagRequest struct {
 
 func (x *SearchByTagRequest) Reset() {
 	*x = SearchByTagRequest{}
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[8]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1078,7 +1295,7 @@ func (x *SearchByTagRequest) String() string {
 func (*SearchByTagRequest) ProtoMessage() {}
 
 func (x *SearchByTagRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[8]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1091,7 +1308,7 @@ func (x *SearchByTagRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SearchByTagRequest.ProtoReflect.Descriptor instead.
 func (*SearchByTagRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{8}
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *SearchByTagRequest) GetKey() string {
@@ -1128,7 +1345,7 @@ type SearchByTagResponse struct {
 
 func (x *SearchByTagResponse) Reset() {
 	*x = SearchByTagResponse{}
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[9]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1140,7 +1357,7 @@ func (x *SearchByTagResponse) String() string {
 func (*SearchByTagResponse) ProtoMessage() {}
 
 func (x *SearchByTagResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[9]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1153,7 +1370,7 @@ func (x *SearchByTagResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SearchByTagResponse.ProtoReflect.Descriptor instead.
 func (*SearchByTagResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{9}
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *SearchByTagResponse) GetModels() []*Model {
@@ -1205,7 +1422,7 @@ type CreateVersionRequest struct {
 
 func (x *CreateVersionRequest) Reset() {
 	*x = CreateVersionRequest{}
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[10]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1217,7 +1434,7 @@ func (x *CreateVersionRequest) String() string {
 func (*CreateVersionRequest) ProtoMessage() {}
 
 func (x *CreateVersionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[10]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1230,7 +1447,7 @@ func (x *CreateVersionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateVersionRequest.ProtoReflect.Descriptor instead.
 func (*CreateVersionRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{10}
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *CreateVersionRequest) GetModelId() string {
@@ -1286,10 +1503,14 @@ type CreateVersionResponse struct {
 	// upload is confirmed; stage is MODEL_STAGE_DEV.
 	Version *ModelVersion `protobuf:"bytes,1,opt,name=version,proto3" json:"version,omitempty"`
 	// Presigned PUT URL for the artifact. Single-use, time-limited. The bytes
-	// never traverse this gRPC service — they go straight to MinIO/S3. After a
-	// successful upload the storage layer flips status to READY.
+	// never traverse this gRPC service — they go straight to MinIO/S3. After the
+	// PUT completes, the client (or an S3/MinIO bucket-notification bridge) calls
+	// ConfirmVersionUpload, which server-side verifies the object and flips status
+	// to READY (publishing events.ModelVersionReady). If this URL expires before
+	// the upload finishes, GetUploadURL re-issues a fresh one for the same version.
 	UploadUrl string `protobuf:"bytes,2,opt,name=upload_url,json=uploadUrl,proto3" json:"upload_url,omitempty"`
-	// When upload_url stops being valid. Client must complete the PUT before this.
+	// When upload_url stops being valid. Client must complete the PUT before this
+	// (or call GetUploadURL for a fresh URL).
 	UploadUrlExpiresAt *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=upload_url_expires_at,json=uploadUrlExpiresAt,proto3" json:"upload_url_expires_at,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
@@ -1297,7 +1518,7 @@ type CreateVersionResponse struct {
 
 func (x *CreateVersionResponse) Reset() {
 	*x = CreateVersionResponse{}
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[11]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1309,7 +1530,7 @@ func (x *CreateVersionResponse) String() string {
 func (*CreateVersionResponse) ProtoMessage() {}
 
 func (x *CreateVersionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[11]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1322,7 +1543,7 @@ func (x *CreateVersionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateVersionResponse.ProtoReflect.Descriptor instead.
 func (*CreateVersionResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{11}
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *CreateVersionResponse) GetVersion() *ModelVersion {
@@ -1346,6 +1567,286 @@ func (x *CreateVersionResponse) GetUploadUrlExpiresAt() *timestamppb.Timestamp {
 	return nil
 }
 
+// ----------------------------------------------------------------------------
+// GetUploadURL (STORAGE) — (re)issue a presigned upload URL for a version
+// ----------------------------------------------------------------------------
+//
+// WHY a standalone RPC when CreateVersion already returns an upload URL:
+//
+//	The create-then-PUT flow can break between the two steps — the presigned URL
+//	expires (TTL elapsed), the client crashed before uploading, or a CI runner
+//	was preempted. Without a way to RE-ISSUE the URL, the only recovery would be
+//	to mint a NEW version (wasting a version number and a storage slot). This RPC
+//	re-issues a fresh presigned PUT for an EXISTING version that is still
+//	PENDING_UPLOAD, making the upload step resumable. It is idempotent/read-only
+//	with respect to registry STATE (it grants a credential; it does not change
+//	the version row), so no idempotency key is needed.
+//
+// SECURITY: rejected with FAILED_PRECONDITION if the version is already READY
+//
+//	(no overwriting a verified artifact) or FAILED. The storage KEY is computed
+//	server-side from the version's identity — never client-supplied — so this
+//	cannot be used to obtain a write credential for an arbitrary object (path
+//	traversal / cross-model overwrite guard).
+type GetUploadURLRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The PENDING_UPLOAD version to (re)issue an upload URL for. Required.
+	VersionId string `protobuf:"bytes,1,opt,name=version_id,json=versionId,proto3" json:"version_id,omitempty"`
+	// Requested URL validity in seconds; server clamps to a max (e.g. 3600s) to
+	// bound how long the write credential is usable. 0 = server default.
+	TtlSeconds    int64 `protobuf:"varint,2,opt,name=ttl_seconds,json=ttlSeconds,proto3" json:"ttl_seconds,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetUploadURLRequest) Reset() {
+	*x = GetUploadURLRequest{}
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetUploadURLRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetUploadURLRequest) ProtoMessage() {}
+
+func (x *GetUploadURLRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetUploadURLRequest.ProtoReflect.Descriptor instead.
+func (*GetUploadURLRequest) Descriptor() ([]byte, []int) {
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *GetUploadURLRequest) GetVersionId() string {
+	if x != nil {
+		return x.VersionId
+	}
+	return ""
+}
+
+func (x *GetUploadURLRequest) GetTtlSeconds() int64 {
+	if x != nil {
+		return x.TtlSeconds
+	}
+	return 0
+}
+
+type GetUploadURLResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Fresh presigned PUT URL for the artifact. Single-use, time-limited. Bytes go
+	// straight to MinIO/S3 — never through this control-plane service.
+	UploadUrl string `protobuf:"bytes,1,opt,name=upload_url,json=uploadUrl,proto3" json:"upload_url,omitempty"`
+	// When upload_url stops being valid.
+	UploadUrlExpiresAt *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=upload_url_expires_at,json=uploadUrlExpiresAt,proto3" json:"upload_url_expires_at,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *GetUploadURLResponse) Reset() {
+	*x = GetUploadURLResponse{}
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetUploadURLResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetUploadURLResponse) ProtoMessage() {}
+
+func (x *GetUploadURLResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetUploadURLResponse.ProtoReflect.Descriptor instead.
+func (*GetUploadURLResponse) Descriptor() ([]byte, []int) {
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *GetUploadURLResponse) GetUploadUrl() string {
+	if x != nil {
+		return x.UploadUrl
+	}
+	return ""
+}
+
+func (x *GetUploadURLResponse) GetUploadUrlExpiresAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.UploadUrlExpiresAt
+	}
+	return nil
+}
+
+// ----------------------------------------------------------------------------
+// ConfirmVersionUpload (COMMAND / write path) — the PENDING_UPLOAD → READY edge
+// ----------------------------------------------------------------------------
+//
+// WHY this RPC exists (the missing READY trigger):
+//
+//	CreateVersion lands a version at status=PENDING_UPLOAD and hands back a
+//	presigned PUT URL; the bytes then flow DIRECTLY to MinIO/S3, bypassing this
+//	service. Something must tell the registry "the upload finished, go verify
+//	it" so the status can advance to READY (or FAILED). That trigger is this RPC.
+//	It is what publishes events.ModelVersionReady (fp.models.version.ready) — the
+//	edge serving/billing/pipeline-orchestrator consume (conflict #3). Before this
+//	RPC existed, the proto's prose claimed "the storage layer flips status to
+//	READY" but exposed no surface to do it — a real gap this fix closes.
+//
+// WHO CALLS IT: typically the uploader (CLI/CI) after a successful PUT, OR an
+//
+//	S3/MinIO bucket-notification webhook bridged into this RPC. Either way the
+//	server RE-VERIFIES the object server-side (existence + checksum + size) —
+//	it does NOT trust the caller's claim that the upload succeeded.
+//
+// SECURITY / MASS-ASSIGNMENT (critical): the caller does NOT supply
+//
+//	artifact_path, artifact_digest, or size_bytes. Those are MEASURED by the
+//	server from the stored object. Accepting a client-asserted digest would let
+//	a caller register a "verified" artifact whose bytes don't match — defeating
+//	the entire content-integrity guarantee — and a client-asserted size would let
+//	a tenant under-report storage to dodge billing. The ONLY input is which
+//	version to confirm. The expected_digest field below is an OPTIONAL assertion
+//	the server CHECKS AGAINST (cross-check), never one it stores blindly.
+type ConfirmVersionUploadRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The PENDING_UPLOAD version whose artifact upload just completed. Required.
+	VersionId string `protobuf:"bytes,1,opt,name=version_id,json=versionId,proto3" json:"version_id,omitempty"`
+	// OPTIONAL client-asserted content digest ("sha256:..."). If set, the server
+	// computes the object's digest and FAILS the confirmation (status→FAILED) on
+	// mismatch — a cross-check, not a stored value. If empty, the server simply
+	// records the digest it computes. Never trusted as the source of truth.
+	ExpectedDigest string `protobuf:"bytes,2,opt,name=expected_digest,json=expectedDigest,proto3" json:"expected_digest,omitempty"`
+	// IDEMPOTENCY KEY: confirmation triggers the ModelVersionReady event and
+	// billing's storage metering. A retry with the same key is a no-op returning
+	// the current version state — so a duplicate webhook delivery cannot double-fire
+	// ModelVersionReady or double-meter storage. Optional but recommended.
+	IdempotencyKey string `protobuf:"bytes,3,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *ConfirmVersionUploadRequest) Reset() {
+	*x = ConfirmVersionUploadRequest{}
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ConfirmVersionUploadRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ConfirmVersionUploadRequest) ProtoMessage() {}
+
+func (x *ConfirmVersionUploadRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ConfirmVersionUploadRequest.ProtoReflect.Descriptor instead.
+func (*ConfirmVersionUploadRequest) Descriptor() ([]byte, []int) {
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *ConfirmVersionUploadRequest) GetVersionId() string {
+	if x != nil {
+		return x.VersionId
+	}
+	return ""
+}
+
+func (x *ConfirmVersionUploadRequest) GetExpectedDigest() string {
+	if x != nil {
+		return x.ExpectedDigest
+	}
+	return ""
+}
+
+func (x *ConfirmVersionUploadRequest) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
+}
+
+// ConfirmVersionUploadResponse returns the version with status now READY (on a
+// successful verify) or FAILED (on checksum/size mismatch or missing object).
+// On READY, the server has populated artifact_path/artifact_digest/size_bytes —
+// all server-measured — and has published events.ModelVersionReady.
+type ConfirmVersionUploadResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The version reflecting its post-verification status (READY or FAILED) and,
+	// when READY, the server-measured artifact_path/artifact_digest/size_bytes.
+	Version       *ModelVersion `protobuf:"bytes,1,opt,name=version,proto3" json:"version,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ConfirmVersionUploadResponse) Reset() {
+	*x = ConfirmVersionUploadResponse{}
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ConfirmVersionUploadResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ConfirmVersionUploadResponse) ProtoMessage() {}
+
+func (x *ConfirmVersionUploadResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ConfirmVersionUploadResponse.ProtoReflect.Descriptor instead.
+func (*ConfirmVersionUploadResponse) Descriptor() ([]byte, []int) {
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *ConfirmVersionUploadResponse) GetVersion() *ModelVersion {
+	if x != nil {
+		return x.Version
+	}
+	return nil
+}
+
 // GetVersionRequest fetches one version, either by its version id, or by the
 // (model_id, version-label) pair — whichever the caller has on hand.
 type GetVersionRequest struct {
@@ -1362,7 +1863,7 @@ type GetVersionRequest struct {
 
 func (x *GetVersionRequest) Reset() {
 	*x = GetVersionRequest{}
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[12]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1374,7 +1875,7 @@ func (x *GetVersionRequest) String() string {
 func (*GetVersionRequest) ProtoMessage() {}
 
 func (x *GetVersionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[12]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1387,7 +1888,7 @@ func (x *GetVersionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetVersionRequest.ProtoReflect.Descriptor instead.
 func (*GetVersionRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{12}
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *GetVersionRequest) GetId() string {
@@ -1422,7 +1923,7 @@ type GetVersionResponse struct {
 
 func (x *GetVersionResponse) Reset() {
 	*x = GetVersionResponse{}
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[13]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1434,7 +1935,7 @@ func (x *GetVersionResponse) String() string {
 func (*GetVersionResponse) ProtoMessage() {}
 
 func (x *GetVersionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[13]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1447,7 +1948,7 @@ func (x *GetVersionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetVersionResponse.ProtoReflect.Descriptor instead.
 func (*GetVersionResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{13}
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *GetVersionResponse) GetVersion() *ModelVersion {
@@ -1472,7 +1973,7 @@ type ListVersionsRequest struct {
 
 func (x *ListVersionsRequest) Reset() {
 	*x = ListVersionsRequest{}
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[14]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1484,7 +1985,7 @@ func (x *ListVersionsRequest) String() string {
 func (*ListVersionsRequest) ProtoMessage() {}
 
 func (x *ListVersionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[14]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1497,7 +1998,7 @@ func (x *ListVersionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListVersionsRequest.ProtoReflect.Descriptor instead.
 func (*ListVersionsRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{14}
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *ListVersionsRequest) GetModelId() string {
@@ -1532,7 +2033,7 @@ type ListVersionsResponse struct {
 
 func (x *ListVersionsResponse) Reset() {
 	*x = ListVersionsResponse{}
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[15]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1544,7 +2045,7 @@ func (x *ListVersionsResponse) String() string {
 func (*ListVersionsResponse) ProtoMessage() {}
 
 func (x *ListVersionsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[15]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1557,7 +2058,7 @@ func (x *ListVersionsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListVersionsResponse.ProtoReflect.Descriptor instead.
 func (*ListVersionsResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{15}
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *ListVersionsResponse) GetVersions() []*ModelVersion {
@@ -1616,7 +2117,7 @@ type PromoteVersionRequest struct {
 
 func (x *PromoteVersionRequest) Reset() {
 	*x = PromoteVersionRequest{}
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[16]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1628,7 +2129,7 @@ func (x *PromoteVersionRequest) String() string {
 func (*PromoteVersionRequest) ProtoMessage() {}
 
 func (x *PromoteVersionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[16]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1641,7 +2142,7 @@ func (x *PromoteVersionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PromoteVersionRequest.ProtoReflect.Descriptor instead.
 func (*PromoteVersionRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{16}
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *PromoteVersionRequest) GetVersionId() string {
@@ -1681,7 +2182,7 @@ type PromoteVersionResponse struct {
 
 func (x *PromoteVersionResponse) Reset() {
 	*x = PromoteVersionResponse{}
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[17]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1693,7 +2194,7 @@ func (x *PromoteVersionResponse) String() string {
 func (*PromoteVersionResponse) ProtoMessage() {}
 
 func (x *PromoteVersionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[17]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1706,7 +2207,7 @@ func (x *PromoteVersionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PromoteVersionResponse.ProtoReflect.Descriptor instead.
 func (*PromoteVersionResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{17}
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *PromoteVersionResponse) GetVersion() *ModelVersion {
@@ -1751,7 +2252,7 @@ type DeleteModelRequest struct {
 
 func (x *DeleteModelRequest) Reset() {
 	*x = DeleteModelRequest{}
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[18]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1763,7 +2264,7 @@ func (x *DeleteModelRequest) String() string {
 func (*DeleteModelRequest) ProtoMessage() {}
 
 func (x *DeleteModelRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[18]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1776,7 +2277,7 @@ func (x *DeleteModelRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteModelRequest.ProtoReflect.Descriptor instead.
 func (*DeleteModelRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{18}
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *DeleteModelRequest) GetId() string {
@@ -1806,7 +2307,7 @@ type DeleteModelResponse struct {
 
 func (x *DeleteModelResponse) Reset() {
 	*x = DeleteModelResponse{}
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[19]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1818,7 +2319,7 @@ func (x *DeleteModelResponse) String() string {
 func (*DeleteModelResponse) ProtoMessage() {}
 
 func (x *DeleteModelResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[19]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1831,7 +2332,7 @@ func (x *DeleteModelResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteModelResponse.ProtoReflect.Descriptor instead.
 func (*DeleteModelResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{19}
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{25}
 }
 
 // ----------------------------------------------------------------------------
@@ -1860,7 +2361,7 @@ type GetDownloadURLRequest struct {
 
 func (x *GetDownloadURLRequest) Reset() {
 	*x = GetDownloadURLRequest{}
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[20]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1872,7 +2373,7 @@ func (x *GetDownloadURLRequest) String() string {
 func (*GetDownloadURLRequest) ProtoMessage() {}
 
 func (x *GetDownloadURLRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[20]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1885,7 +2386,7 @@ func (x *GetDownloadURLRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetDownloadURLRequest.ProtoReflect.Descriptor instead.
 func (*GetDownloadURLRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{20}
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *GetDownloadURLRequest) GetVersionId() string {
@@ -1917,7 +2418,7 @@ type GetDownloadURLResponse struct {
 
 func (x *GetDownloadURLResponse) Reset() {
 	*x = GetDownloadURLResponse{}
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[21]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1929,7 +2430,7 @@ func (x *GetDownloadURLResponse) String() string {
 func (*GetDownloadURLResponse) ProtoMessage() {}
 
 func (x *GetDownloadURLResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[21]
+	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1942,7 +2443,7 @@ func (x *GetDownloadURLResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetDownloadURLResponse.ProtoReflect.Descriptor instead.
 func (*GetDownloadURLResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{21}
+	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *GetDownloadURLResponse) GetDownloadUrl() string {
@@ -1964,324 +2465,6 @@ func (x *GetDownloadURLResponse) GetArtifactDigest() string {
 		return x.ArtifactDigest
 	}
 	return ""
-}
-
-// ModelRegistered — emitted after RegisterModel commits to Postgres.
-// CONSUMERS: Pipeline Orchestrator (a registered model can become a pipeline
-// input), Experiment Tracker (link runs to the model), Notification (announce).
-type ModelRegistered struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// The full model as committed (authoritative snapshot at registration time).
-	// Carrying the whole object lets consumers act without a callback.
-	Model         *Model `protobuf:"bytes,1,opt,name=model,proto3" json:"model,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ModelRegistered) Reset() {
-	*x = ModelRegistered{}
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[22]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ModelRegistered) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ModelRegistered) ProtoMessage() {}
-
-func (x *ModelRegistered) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[22]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ModelRegistered.ProtoReflect.Descriptor instead.
-func (*ModelRegistered) Descriptor() ([]byte, []int) {
-	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{22}
-}
-
-func (x *ModelRegistered) GetModel() *Model {
-	if x != nil {
-		return x.Model
-	}
-	return nil
-}
-
-// ModelVersionCreated — emitted after CreateVersion commits. Note: emitted at
-// version-row creation (status=PENDING_UPLOAD), so consumers that care about a
-// USABLE artifact must also watch for the READY transition (a future
-// ModelVersionReady event) rather than assuming the artifact is present.
-// CONSUMERS: Experiment Tracker (associate the training run), Billing (begin
-// metering storage once READY), Notification.
-type ModelVersionCreated struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// The owning model's id (denormalized so consumers needn't join).
-	ModelId string `protobuf:"bytes,1,opt,name=model_id,json=modelId,proto3" json:"model_id,omitempty"`
-	// The owning model's name (saves consumers a lookup for display/routing).
-	ModelName string `protobuf:"bytes,2,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
-	// The full created version snapshot.
-	Version       *ModelVersion `protobuf:"bytes,3,opt,name=version,proto3" json:"version,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ModelVersionCreated) Reset() {
-	*x = ModelVersionCreated{}
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[23]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ModelVersionCreated) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ModelVersionCreated) ProtoMessage() {}
-
-func (x *ModelVersionCreated) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[23]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ModelVersionCreated.ProtoReflect.Descriptor instead.
-func (*ModelVersionCreated) Descriptor() ([]byte, []int) {
-	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{23}
-}
-
-func (x *ModelVersionCreated) GetModelId() string {
-	if x != nil {
-		return x.ModelId
-	}
-	return ""
-}
-
-func (x *ModelVersionCreated) GetModelName() string {
-	if x != nil {
-		return x.ModelName
-	}
-	return ""
-}
-
-func (x *ModelVersionCreated) GetVersion() *ModelVersion {
-	if x != nil {
-		return x.Version
-	}
-	return nil
-}
-
-// ModelPromoted — emitted after PromoteVersion commits the atomic stage swap.
-// This is the highest-impact event in the service: it's how serving learns to
-// load new weights, how the gateway re-points traffic, how monitor re-baselines
-// drift, and how billing changes what it meters.
-// CONSUMERS: Model Serving (reload/route to the new production version),
-// Inference Gateway (update routing table), Model Monitor (reset drift baseline
-// to the new version's training distribution), Billing (re-meter), Notification.
-type ModelPromoted struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// The model whose production version changed.
-	ModelId string `protobuf:"bytes,1,opt,name=model_id,json=modelId,proto3" json:"model_id,omitempty"`
-	// The model's name (for routing/display without a lookup).
-	ModelName string `protobuf:"bytes,2,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
-	// The version that was promoted (id + label).
-	VersionId string `protobuf:"bytes,3,opt,name=version_id,json=versionId,proto3" json:"version_id,omitempty"`
-	Version   string `protobuf:"bytes,4,opt,name=version,proto3" json:"version,omitempty"`
-	// The stage it moved FROM and the stage it moved TO. Including both makes the
-	// event self-describing for audit and lets a consumer ignore transitions it
-	// doesn't care about (e.g., monitor only reacts when to_stage == PRODUCTION).
-	FromStage ModelStage `protobuf:"varint,5,opt,name=from_stage,json=fromStage,proto3,enum=forgepoint.registry.v1.ModelStage" json:"from_stage,omitempty"`
-	ToStage   ModelStage `protobuf:"varint,6,opt,name=to_stage,json=toStage,proto3,enum=forgepoint.registry.v1.ModelStage" json:"to_stage,omitempty"`
-	// If this promotion auto-demoted a previous production version (the
-	// single-production invariant), its id/label so consumers can tear down the
-	// old deployment. Empty when there was no prior production version.
-	DemotedVersionId string `protobuf:"bytes,7,opt,name=demoted_version_id,json=demotedVersionId,proto3" json:"demoted_version_id,omitempty"`
-	DemotedVersion   string `protobuf:"bytes,8,opt,name=demoted_version,json=demotedVersion,proto3" json:"demoted_version,omitempty"`
-	// Who initiated the promotion (from auth claims) — for audit trails.
-	PromotedBy    string `protobuf:"bytes,9,opt,name=promoted_by,json=promotedBy,proto3" json:"promoted_by,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ModelPromoted) Reset() {
-	*x = ModelPromoted{}
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[24]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ModelPromoted) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ModelPromoted) ProtoMessage() {}
-
-func (x *ModelPromoted) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[24]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ModelPromoted.ProtoReflect.Descriptor instead.
-func (*ModelPromoted) Descriptor() ([]byte, []int) {
-	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{24}
-}
-
-func (x *ModelPromoted) GetModelId() string {
-	if x != nil {
-		return x.ModelId
-	}
-	return ""
-}
-
-func (x *ModelPromoted) GetModelName() string {
-	if x != nil {
-		return x.ModelName
-	}
-	return ""
-}
-
-func (x *ModelPromoted) GetVersionId() string {
-	if x != nil {
-		return x.VersionId
-	}
-	return ""
-}
-
-func (x *ModelPromoted) GetVersion() string {
-	if x != nil {
-		return x.Version
-	}
-	return ""
-}
-
-func (x *ModelPromoted) GetFromStage() ModelStage {
-	if x != nil {
-		return x.FromStage
-	}
-	return ModelStage_MODEL_STAGE_UNSPECIFIED
-}
-
-func (x *ModelPromoted) GetToStage() ModelStage {
-	if x != nil {
-		return x.ToStage
-	}
-	return ModelStage_MODEL_STAGE_UNSPECIFIED
-}
-
-func (x *ModelPromoted) GetDemotedVersionId() string {
-	if x != nil {
-		return x.DemotedVersionId
-	}
-	return ""
-}
-
-func (x *ModelPromoted) GetDemotedVersion() string {
-	if x != nil {
-		return x.DemotedVersion
-	}
-	return ""
-}
-
-func (x *ModelPromoted) GetPromotedBy() string {
-	if x != nil {
-		return x.PromotedBy
-	}
-	return ""
-}
-
-// ModelArchived — emitted after DeleteModel soft-deletes the model.
-// CONSUMERS: Inference Gateway (stop routing to it), Model Serving (tear down
-// any running instances), Billing (stop metering), Notification.
-type ModelArchived struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// The archived model's id.
-	ModelId string `protobuf:"bytes,1,opt,name=model_id,json=modelId,proto3" json:"model_id,omitempty"`
-	// The archived model's name.
-	ModelName string `protobuf:"bytes,2,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
-	// Who archived it (auth claims) — for audit.
-	ArchivedBy string `protobuf:"bytes,3,opt,name=archived_by,json=archivedBy,proto3" json:"archived_by,omitempty"`
-	// When the archive committed (matches Model.archived_at).
-	ArchivedAt    *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=archived_at,json=archivedAt,proto3" json:"archived_at,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ModelArchived) Reset() {
-	*x = ModelArchived{}
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[25]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ModelArchived) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ModelArchived) ProtoMessage() {}
-
-func (x *ModelArchived) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_registry_v1_registry_proto_msgTypes[25]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ModelArchived.ProtoReflect.Descriptor instead.
-func (*ModelArchived) Descriptor() ([]byte, []int) {
-	return file_forgepoint_registry_v1_registry_proto_rawDescGZIP(), []int{25}
-}
-
-func (x *ModelArchived) GetModelId() string {
-	if x != nil {
-		return x.ModelId
-	}
-	return ""
-}
-
-func (x *ModelArchived) GetModelName() string {
-	if x != nil {
-		return x.ModelName
-	}
-	return ""
-}
-
-func (x *ModelArchived) GetArchivedBy() string {
-	if x != nil {
-		return x.ArchivedBy
-	}
-	return ""
-}
-
-func (x *ModelArchived) GetArchivedAt() *timestamppb.Timestamp {
-	if x != nil {
-		return x.ArchivedAt
-	}
-	return nil
 }
 
 var File_forgepoint_registry_v1_registry_proto protoreflect.FileDescriptor
@@ -2338,6 +2521,18 @@ const file_forgepoint_registry_v1_registry_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"L\n" +
 	"\x15RegisterModelResponse\x123\n" +
+	"\x05model\x18\x01 \x01(\v2\x1d.forgepoint.registry.v1.ModelR\x05model\"\xc4\x02\n" +
+	"\x12UpdateModelRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12 \n" +
+	"\vdescription\x18\x02 \x01(\tR\vdescription\x12-\n" +
+	"\x12update_description\x18\x03 \x01(\bR\x11updateDescription\x12H\n" +
+	"\x04tags\x18\x04 \x03(\v24.forgepoint.registry.v1.UpdateModelRequest.TagsEntryR\x04tags\x12!\n" +
+	"\freplace_tags\x18\x05 \x01(\bR\vreplaceTags\x12'\n" +
+	"\x0fidempotency_key\x18\x06 \x01(\tR\x0eidempotencyKey\x1a7\n" +
+	"\tTagsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"J\n" +
+	"\x13UpdateModelResponse\x123\n" +
 	"\x05model\x18\x01 \x01(\v2\x1d.forgepoint.registry.v1.ModelR\x05model\"5\n" +
 	"\x0fGetModelRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
@@ -2378,7 +2573,23 @@ const file_forgepoint_registry_v1_registry_proto_rawDesc = "" +
 	"\aversion\x18\x01 \x01(\v2$.forgepoint.registry.v1.ModelVersionR\aversion\x12\x1d\n" +
 	"\n" +
 	"upload_url\x18\x02 \x01(\tR\tuploadUrl\x12M\n" +
-	"\x15upload_url_expires_at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\x12uploadUrlExpiresAt\"X\n" +
+	"\x15upload_url_expires_at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\x12uploadUrlExpiresAt\"U\n" +
+	"\x13GetUploadURLRequest\x12\x1d\n" +
+	"\n" +
+	"version_id\x18\x01 \x01(\tR\tversionId\x12\x1f\n" +
+	"\vttl_seconds\x18\x02 \x01(\x03R\n" +
+	"ttlSeconds\"\x84\x01\n" +
+	"\x14GetUploadURLResponse\x12\x1d\n" +
+	"\n" +
+	"upload_url\x18\x01 \x01(\tR\tuploadUrl\x12M\n" +
+	"\x15upload_url_expires_at\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\x12uploadUrlExpiresAt\"\x8e\x01\n" +
+	"\x1bConfirmVersionUploadRequest\x12\x1d\n" +
+	"\n" +
+	"version_id\x18\x01 \x01(\tR\tversionId\x12'\n" +
+	"\x0fexpected_digest\x18\x02 \x01(\tR\x0eexpectedDigest\x12'\n" +
+	"\x0fidempotency_key\x18\x03 \x01(\tR\x0eidempotencyKey\"^\n" +
+	"\x1cConfirmVersionUploadResponse\x12>\n" +
+	"\aversion\x18\x01 \x01(\v2$.forgepoint.registry.v1.ModelVersionR\aversion\"X\n" +
 	"\x11GetVersionRequest\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x19\n" +
 	"\bmodel_id\x18\x02 \x01(\tR\amodelId\x12\x18\n" +
@@ -2417,36 +2628,7 @@ const file_forgepoint_registry_v1_registry_proto_rawDesc = "" +
 	"\fdownload_url\x18\x01 \x01(\tR\vdownloadUrl\x129\n" +
 	"\n" +
 	"expires_at\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt\x12'\n" +
-	"\x0fartifact_digest\x18\x03 \x01(\tR\x0eartifactDigest\"F\n" +
-	"\x0fModelRegistered\x123\n" +
-	"\x05model\x18\x01 \x01(\v2\x1d.forgepoint.registry.v1.ModelR\x05model\"\x8f\x01\n" +
-	"\x13ModelVersionCreated\x12\x19\n" +
-	"\bmodel_id\x18\x01 \x01(\tR\amodelId\x12\x1d\n" +
-	"\n" +
-	"model_name\x18\x02 \x01(\tR\tmodelName\x12>\n" +
-	"\aversion\x18\x03 \x01(\v2$.forgepoint.registry.v1.ModelVersionR\aversion\"\xfc\x02\n" +
-	"\rModelPromoted\x12\x19\n" +
-	"\bmodel_id\x18\x01 \x01(\tR\amodelId\x12\x1d\n" +
-	"\n" +
-	"model_name\x18\x02 \x01(\tR\tmodelName\x12\x1d\n" +
-	"\n" +
-	"version_id\x18\x03 \x01(\tR\tversionId\x12\x18\n" +
-	"\aversion\x18\x04 \x01(\tR\aversion\x12A\n" +
-	"\n" +
-	"from_stage\x18\x05 \x01(\x0e2\".forgepoint.registry.v1.ModelStageR\tfromStage\x12=\n" +
-	"\bto_stage\x18\x06 \x01(\x0e2\".forgepoint.registry.v1.ModelStageR\atoStage\x12,\n" +
-	"\x12demoted_version_id\x18\a \x01(\tR\x10demotedVersionId\x12'\n" +
-	"\x0fdemoted_version\x18\b \x01(\tR\x0edemotedVersion\x12\x1f\n" +
-	"\vpromoted_by\x18\t \x01(\tR\n" +
-	"promotedBy\"\xa7\x01\n" +
-	"\rModelArchived\x12\x19\n" +
-	"\bmodel_id\x18\x01 \x01(\tR\amodelId\x12\x1d\n" +
-	"\n" +
-	"model_name\x18\x02 \x01(\tR\tmodelName\x12\x1f\n" +
-	"\varchived_by\x18\x03 \x01(\tR\n" +
-	"archivedBy\x12;\n" +
-	"\varchived_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
-	"archivedAt*\x8d\x01\n" +
+	"\x0fartifact_digest\x18\x03 \x01(\tR\x0eartifactDigest*\x8d\x01\n" +
 	"\n" +
 	"ModelStage\x12\x1b\n" +
 	"\x17MODEL_STAGE_UNSPECIFIED\x10\x00\x12\x13\n" +
@@ -2458,10 +2640,12 @@ const file_forgepoint_registry_v1_registry_proto_rawDesc = "" +
 	"\x1aVERSION_STATUS_UNSPECIFIED\x10\x00\x12!\n" +
 	"\x1dVERSION_STATUS_PENDING_UPLOAD\x10\x01\x12\x18\n" +
 	"\x14VERSION_STATUS_READY\x10\x02\x12\x19\n" +
-	"\x15VERSION_STATUS_FAILED\x10\x032\xb3\b\n" +
+	"\x15VERSION_STATUS_FAILED\x10\x032\x8a\v\n" +
 	"\x0fRegistryService\x12l\n" +
-	"\rRegisterModel\x12,.forgepoint.registry.v1.RegisterModelRequest\x1a-.forgepoint.registry.v1.RegisterModelResponse\x12l\n" +
-	"\rCreateVersion\x12,.forgepoint.registry.v1.CreateVersionRequest\x1a-.forgepoint.registry.v1.CreateVersionResponse\x12o\n" +
+	"\rRegisterModel\x12,.forgepoint.registry.v1.RegisterModelRequest\x1a-.forgepoint.registry.v1.RegisterModelResponse\x12f\n" +
+	"\vUpdateModel\x12*.forgepoint.registry.v1.UpdateModelRequest\x1a+.forgepoint.registry.v1.UpdateModelResponse\x12l\n" +
+	"\rCreateVersion\x12,.forgepoint.registry.v1.CreateVersionRequest\x1a-.forgepoint.registry.v1.CreateVersionResponse\x12\x81\x01\n" +
+	"\x14ConfirmVersionUpload\x123.forgepoint.registry.v1.ConfirmVersionUploadRequest\x1a4.forgepoint.registry.v1.ConfirmVersionUploadResponse\x12o\n" +
 	"\x0ePromoteVersion\x12-.forgepoint.registry.v1.PromoteVersionRequest\x1a..forgepoint.registry.v1.PromoteVersionResponse\x12f\n" +
 	"\vDeleteModel\x12*.forgepoint.registry.v1.DeleteModelRequest\x1a+.forgepoint.registry.v1.DeleteModelResponse\x12]\n" +
 	"\bGetModel\x12'.forgepoint.registry.v1.GetModelRequest\x1a(.forgepoint.registry.v1.GetModelResponse\x12c\n" +
@@ -2470,7 +2654,8 @@ const file_forgepoint_registry_v1_registry_proto_rawDesc = "" +
 	"\vSearchByTag\x12*.forgepoint.registry.v1.SearchByTagRequest\x1a+.forgepoint.registry.v1.SearchByTagResponse\x12c\n" +
 	"\n" +
 	"GetVersion\x12).forgepoint.registry.v1.GetVersionRequest\x1a*.forgepoint.registry.v1.GetVersionResponse\x12i\n" +
-	"\fListVersions\x12+.forgepoint.registry.v1.ListVersionsRequest\x1a,.forgepoint.registry.v1.ListVersionsResponse\x12o\n" +
+	"\fListVersions\x12+.forgepoint.registry.v1.ListVersionsRequest\x1a,.forgepoint.registry.v1.ListVersionsResponse\x12i\n" +
+	"\fGetUploadURL\x12+.forgepoint.registry.v1.GetUploadURLRequest\x1a,.forgepoint.registry.v1.GetUploadURLResponse\x12o\n" +
 	"\x0eGetDownloadURL\x12-.forgepoint.registry.v1.GetDownloadURLRequest\x1a..forgepoint.registry.v1.GetDownloadURLResponseBLZJgithub.com/abd-ulbasit/forgepoint/gen/go/forgepoint/registry/v1;registryv1b\x06proto3"
 
 var (
@@ -2486,103 +2671,111 @@ func file_forgepoint_registry_v1_registry_proto_rawDescGZIP() []byte {
 }
 
 var file_forgepoint_registry_v1_registry_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_forgepoint_registry_v1_registry_proto_msgTypes = make([]protoimpl.MessageInfo, 28)
+var file_forgepoint_registry_v1_registry_proto_msgTypes = make([]protoimpl.MessageInfo, 31)
 var file_forgepoint_registry_v1_registry_proto_goTypes = []any{
-	(ModelStage)(0),                // 0: forgepoint.registry.v1.ModelStage
-	(VersionStatus)(0),             // 1: forgepoint.registry.v1.VersionStatus
-	(*Model)(nil),                  // 2: forgepoint.registry.v1.Model
-	(*ModelVersion)(nil),           // 3: forgepoint.registry.v1.ModelVersion
-	(*RegisterModelRequest)(nil),   // 4: forgepoint.registry.v1.RegisterModelRequest
-	(*RegisterModelResponse)(nil),  // 5: forgepoint.registry.v1.RegisterModelResponse
-	(*GetModelRequest)(nil),        // 6: forgepoint.registry.v1.GetModelRequest
-	(*GetModelResponse)(nil),       // 7: forgepoint.registry.v1.GetModelResponse
-	(*ListModelsRequest)(nil),      // 8: forgepoint.registry.v1.ListModelsRequest
-	(*ListModelsResponse)(nil),     // 9: forgepoint.registry.v1.ListModelsResponse
-	(*SearchByTagRequest)(nil),     // 10: forgepoint.registry.v1.SearchByTagRequest
-	(*SearchByTagResponse)(nil),    // 11: forgepoint.registry.v1.SearchByTagResponse
-	(*CreateVersionRequest)(nil),   // 12: forgepoint.registry.v1.CreateVersionRequest
-	(*CreateVersionResponse)(nil),  // 13: forgepoint.registry.v1.CreateVersionResponse
-	(*GetVersionRequest)(nil),      // 14: forgepoint.registry.v1.GetVersionRequest
-	(*GetVersionResponse)(nil),     // 15: forgepoint.registry.v1.GetVersionResponse
-	(*ListVersionsRequest)(nil),    // 16: forgepoint.registry.v1.ListVersionsRequest
-	(*ListVersionsResponse)(nil),   // 17: forgepoint.registry.v1.ListVersionsResponse
-	(*PromoteVersionRequest)(nil),  // 18: forgepoint.registry.v1.PromoteVersionRequest
-	(*PromoteVersionResponse)(nil), // 19: forgepoint.registry.v1.PromoteVersionResponse
-	(*DeleteModelRequest)(nil),     // 20: forgepoint.registry.v1.DeleteModelRequest
-	(*DeleteModelResponse)(nil),    // 21: forgepoint.registry.v1.DeleteModelResponse
-	(*GetDownloadURLRequest)(nil),  // 22: forgepoint.registry.v1.GetDownloadURLRequest
-	(*GetDownloadURLResponse)(nil), // 23: forgepoint.registry.v1.GetDownloadURLResponse
-	(*ModelRegistered)(nil),        // 24: forgepoint.registry.v1.ModelRegistered
-	(*ModelVersionCreated)(nil),    // 25: forgepoint.registry.v1.ModelVersionCreated
-	(*ModelPromoted)(nil),          // 26: forgepoint.registry.v1.ModelPromoted
-	(*ModelArchived)(nil),          // 27: forgepoint.registry.v1.ModelArchived
-	nil,                            // 28: forgepoint.registry.v1.Model.TagsEntry
-	nil,                            // 29: forgepoint.registry.v1.RegisterModelRequest.TagsEntry
-	(*timestamppb.Timestamp)(nil),  // 30: google.protobuf.Timestamp
-	(*structpb.Struct)(nil),        // 31: google.protobuf.Struct
-	(*v1.PaginationRequest)(nil),   // 32: forgepoint.common.v1.PaginationRequest
-	(*v1.PaginationResponse)(nil),  // 33: forgepoint.common.v1.PaginationResponse
+	(ModelStage)(0),                      // 0: forgepoint.registry.v1.ModelStage
+	(VersionStatus)(0),                   // 1: forgepoint.registry.v1.VersionStatus
+	(*Model)(nil),                        // 2: forgepoint.registry.v1.Model
+	(*ModelVersion)(nil),                 // 3: forgepoint.registry.v1.ModelVersion
+	(*RegisterModelRequest)(nil),         // 4: forgepoint.registry.v1.RegisterModelRequest
+	(*RegisterModelResponse)(nil),        // 5: forgepoint.registry.v1.RegisterModelResponse
+	(*UpdateModelRequest)(nil),           // 6: forgepoint.registry.v1.UpdateModelRequest
+	(*UpdateModelResponse)(nil),          // 7: forgepoint.registry.v1.UpdateModelResponse
+	(*GetModelRequest)(nil),              // 8: forgepoint.registry.v1.GetModelRequest
+	(*GetModelResponse)(nil),             // 9: forgepoint.registry.v1.GetModelResponse
+	(*ListModelsRequest)(nil),            // 10: forgepoint.registry.v1.ListModelsRequest
+	(*ListModelsResponse)(nil),           // 11: forgepoint.registry.v1.ListModelsResponse
+	(*SearchByTagRequest)(nil),           // 12: forgepoint.registry.v1.SearchByTagRequest
+	(*SearchByTagResponse)(nil),          // 13: forgepoint.registry.v1.SearchByTagResponse
+	(*CreateVersionRequest)(nil),         // 14: forgepoint.registry.v1.CreateVersionRequest
+	(*CreateVersionResponse)(nil),        // 15: forgepoint.registry.v1.CreateVersionResponse
+	(*GetUploadURLRequest)(nil),          // 16: forgepoint.registry.v1.GetUploadURLRequest
+	(*GetUploadURLResponse)(nil),         // 17: forgepoint.registry.v1.GetUploadURLResponse
+	(*ConfirmVersionUploadRequest)(nil),  // 18: forgepoint.registry.v1.ConfirmVersionUploadRequest
+	(*ConfirmVersionUploadResponse)(nil), // 19: forgepoint.registry.v1.ConfirmVersionUploadResponse
+	(*GetVersionRequest)(nil),            // 20: forgepoint.registry.v1.GetVersionRequest
+	(*GetVersionResponse)(nil),           // 21: forgepoint.registry.v1.GetVersionResponse
+	(*ListVersionsRequest)(nil),          // 22: forgepoint.registry.v1.ListVersionsRequest
+	(*ListVersionsResponse)(nil),         // 23: forgepoint.registry.v1.ListVersionsResponse
+	(*PromoteVersionRequest)(nil),        // 24: forgepoint.registry.v1.PromoteVersionRequest
+	(*PromoteVersionResponse)(nil),       // 25: forgepoint.registry.v1.PromoteVersionResponse
+	(*DeleteModelRequest)(nil),           // 26: forgepoint.registry.v1.DeleteModelRequest
+	(*DeleteModelResponse)(nil),          // 27: forgepoint.registry.v1.DeleteModelResponse
+	(*GetDownloadURLRequest)(nil),        // 28: forgepoint.registry.v1.GetDownloadURLRequest
+	(*GetDownloadURLResponse)(nil),       // 29: forgepoint.registry.v1.GetDownloadURLResponse
+	nil,                                  // 30: forgepoint.registry.v1.Model.TagsEntry
+	nil,                                  // 31: forgepoint.registry.v1.RegisterModelRequest.TagsEntry
+	nil,                                  // 32: forgepoint.registry.v1.UpdateModelRequest.TagsEntry
+	(*timestamppb.Timestamp)(nil),        // 33: google.protobuf.Timestamp
+	(*structpb.Struct)(nil),              // 34: google.protobuf.Struct
+	(*v1.PaginationRequest)(nil),         // 35: forgepoint.common.v1.PaginationRequest
+	(*v1.PaginationResponse)(nil),        // 36: forgepoint.common.v1.PaginationResponse
 }
 var file_forgepoint_registry_v1_registry_proto_depIdxs = []int32{
-	28, // 0: forgepoint.registry.v1.Model.tags:type_name -> forgepoint.registry.v1.Model.TagsEntry
-	30, // 1: forgepoint.registry.v1.Model.created_at:type_name -> google.protobuf.Timestamp
-	30, // 2: forgepoint.registry.v1.Model.updated_at:type_name -> google.protobuf.Timestamp
-	30, // 3: forgepoint.registry.v1.Model.archived_at:type_name -> google.protobuf.Timestamp
-	31, // 4: forgepoint.registry.v1.ModelVersion.metrics:type_name -> google.protobuf.Struct
+	30, // 0: forgepoint.registry.v1.Model.tags:type_name -> forgepoint.registry.v1.Model.TagsEntry
+	33, // 1: forgepoint.registry.v1.Model.created_at:type_name -> google.protobuf.Timestamp
+	33, // 2: forgepoint.registry.v1.Model.updated_at:type_name -> google.protobuf.Timestamp
+	33, // 3: forgepoint.registry.v1.Model.archived_at:type_name -> google.protobuf.Timestamp
+	34, // 4: forgepoint.registry.v1.ModelVersion.metrics:type_name -> google.protobuf.Struct
 	0,  // 5: forgepoint.registry.v1.ModelVersion.stage:type_name -> forgepoint.registry.v1.ModelStage
 	1,  // 6: forgepoint.registry.v1.ModelVersion.status:type_name -> forgepoint.registry.v1.VersionStatus
-	30, // 7: forgepoint.registry.v1.ModelVersion.created_at:type_name -> google.protobuf.Timestamp
-	29, // 8: forgepoint.registry.v1.RegisterModelRequest.tags:type_name -> forgepoint.registry.v1.RegisterModelRequest.TagsEntry
+	33, // 7: forgepoint.registry.v1.ModelVersion.created_at:type_name -> google.protobuf.Timestamp
+	31, // 8: forgepoint.registry.v1.RegisterModelRequest.tags:type_name -> forgepoint.registry.v1.RegisterModelRequest.TagsEntry
 	2,  // 9: forgepoint.registry.v1.RegisterModelResponse.model:type_name -> forgepoint.registry.v1.Model
-	2,  // 10: forgepoint.registry.v1.GetModelResponse.model:type_name -> forgepoint.registry.v1.Model
-	32, // 11: forgepoint.registry.v1.ListModelsRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
-	2,  // 12: forgepoint.registry.v1.ListModelsResponse.models:type_name -> forgepoint.registry.v1.Model
-	33, // 13: forgepoint.registry.v1.ListModelsResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
-	32, // 14: forgepoint.registry.v1.SearchByTagRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
-	2,  // 15: forgepoint.registry.v1.SearchByTagResponse.models:type_name -> forgepoint.registry.v1.Model
-	33, // 16: forgepoint.registry.v1.SearchByTagResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
-	31, // 17: forgepoint.registry.v1.CreateVersionRequest.metrics:type_name -> google.protobuf.Struct
-	3,  // 18: forgepoint.registry.v1.CreateVersionResponse.version:type_name -> forgepoint.registry.v1.ModelVersion
-	30, // 19: forgepoint.registry.v1.CreateVersionResponse.upload_url_expires_at:type_name -> google.protobuf.Timestamp
-	3,  // 20: forgepoint.registry.v1.GetVersionResponse.version:type_name -> forgepoint.registry.v1.ModelVersion
-	0,  // 21: forgepoint.registry.v1.ListVersionsRequest.stage_filter:type_name -> forgepoint.registry.v1.ModelStage
-	32, // 22: forgepoint.registry.v1.ListVersionsRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
-	3,  // 23: forgepoint.registry.v1.ListVersionsResponse.versions:type_name -> forgepoint.registry.v1.ModelVersion
-	33, // 24: forgepoint.registry.v1.ListVersionsResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
-	0,  // 25: forgepoint.registry.v1.PromoteVersionRequest.target_stage:type_name -> forgepoint.registry.v1.ModelStage
-	3,  // 26: forgepoint.registry.v1.PromoteVersionResponse.version:type_name -> forgepoint.registry.v1.ModelVersion
-	3,  // 27: forgepoint.registry.v1.PromoteVersionResponse.demoted_version:type_name -> forgepoint.registry.v1.ModelVersion
-	30, // 28: forgepoint.registry.v1.GetDownloadURLResponse.expires_at:type_name -> google.protobuf.Timestamp
-	2,  // 29: forgepoint.registry.v1.ModelRegistered.model:type_name -> forgepoint.registry.v1.Model
-	3,  // 30: forgepoint.registry.v1.ModelVersionCreated.version:type_name -> forgepoint.registry.v1.ModelVersion
-	0,  // 31: forgepoint.registry.v1.ModelPromoted.from_stage:type_name -> forgepoint.registry.v1.ModelStage
-	0,  // 32: forgepoint.registry.v1.ModelPromoted.to_stage:type_name -> forgepoint.registry.v1.ModelStage
-	30, // 33: forgepoint.registry.v1.ModelArchived.archived_at:type_name -> google.protobuf.Timestamp
-	4,  // 34: forgepoint.registry.v1.RegistryService.RegisterModel:input_type -> forgepoint.registry.v1.RegisterModelRequest
-	12, // 35: forgepoint.registry.v1.RegistryService.CreateVersion:input_type -> forgepoint.registry.v1.CreateVersionRequest
-	18, // 36: forgepoint.registry.v1.RegistryService.PromoteVersion:input_type -> forgepoint.registry.v1.PromoteVersionRequest
-	20, // 37: forgepoint.registry.v1.RegistryService.DeleteModel:input_type -> forgepoint.registry.v1.DeleteModelRequest
-	6,  // 38: forgepoint.registry.v1.RegistryService.GetModel:input_type -> forgepoint.registry.v1.GetModelRequest
-	8,  // 39: forgepoint.registry.v1.RegistryService.ListModels:input_type -> forgepoint.registry.v1.ListModelsRequest
-	10, // 40: forgepoint.registry.v1.RegistryService.SearchByTag:input_type -> forgepoint.registry.v1.SearchByTagRequest
-	14, // 41: forgepoint.registry.v1.RegistryService.GetVersion:input_type -> forgepoint.registry.v1.GetVersionRequest
-	16, // 42: forgepoint.registry.v1.RegistryService.ListVersions:input_type -> forgepoint.registry.v1.ListVersionsRequest
-	22, // 43: forgepoint.registry.v1.RegistryService.GetDownloadURL:input_type -> forgepoint.registry.v1.GetDownloadURLRequest
-	5,  // 44: forgepoint.registry.v1.RegistryService.RegisterModel:output_type -> forgepoint.registry.v1.RegisterModelResponse
-	13, // 45: forgepoint.registry.v1.RegistryService.CreateVersion:output_type -> forgepoint.registry.v1.CreateVersionResponse
-	19, // 46: forgepoint.registry.v1.RegistryService.PromoteVersion:output_type -> forgepoint.registry.v1.PromoteVersionResponse
-	21, // 47: forgepoint.registry.v1.RegistryService.DeleteModel:output_type -> forgepoint.registry.v1.DeleteModelResponse
-	7,  // 48: forgepoint.registry.v1.RegistryService.GetModel:output_type -> forgepoint.registry.v1.GetModelResponse
-	9,  // 49: forgepoint.registry.v1.RegistryService.ListModels:output_type -> forgepoint.registry.v1.ListModelsResponse
-	11, // 50: forgepoint.registry.v1.RegistryService.SearchByTag:output_type -> forgepoint.registry.v1.SearchByTagResponse
-	15, // 51: forgepoint.registry.v1.RegistryService.GetVersion:output_type -> forgepoint.registry.v1.GetVersionResponse
-	17, // 52: forgepoint.registry.v1.RegistryService.ListVersions:output_type -> forgepoint.registry.v1.ListVersionsResponse
-	23, // 53: forgepoint.registry.v1.RegistryService.GetDownloadURL:output_type -> forgepoint.registry.v1.GetDownloadURLResponse
-	44, // [44:54] is the sub-list for method output_type
-	34, // [34:44] is the sub-list for method input_type
-	34, // [34:34] is the sub-list for extension type_name
-	34, // [34:34] is the sub-list for extension extendee
-	0,  // [0:34] is the sub-list for field type_name
+	32, // 10: forgepoint.registry.v1.UpdateModelRequest.tags:type_name -> forgepoint.registry.v1.UpdateModelRequest.TagsEntry
+	2,  // 11: forgepoint.registry.v1.UpdateModelResponse.model:type_name -> forgepoint.registry.v1.Model
+	2,  // 12: forgepoint.registry.v1.GetModelResponse.model:type_name -> forgepoint.registry.v1.Model
+	35, // 13: forgepoint.registry.v1.ListModelsRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
+	2,  // 14: forgepoint.registry.v1.ListModelsResponse.models:type_name -> forgepoint.registry.v1.Model
+	36, // 15: forgepoint.registry.v1.ListModelsResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
+	35, // 16: forgepoint.registry.v1.SearchByTagRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
+	2,  // 17: forgepoint.registry.v1.SearchByTagResponse.models:type_name -> forgepoint.registry.v1.Model
+	36, // 18: forgepoint.registry.v1.SearchByTagResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
+	34, // 19: forgepoint.registry.v1.CreateVersionRequest.metrics:type_name -> google.protobuf.Struct
+	3,  // 20: forgepoint.registry.v1.CreateVersionResponse.version:type_name -> forgepoint.registry.v1.ModelVersion
+	33, // 21: forgepoint.registry.v1.CreateVersionResponse.upload_url_expires_at:type_name -> google.protobuf.Timestamp
+	33, // 22: forgepoint.registry.v1.GetUploadURLResponse.upload_url_expires_at:type_name -> google.protobuf.Timestamp
+	3,  // 23: forgepoint.registry.v1.ConfirmVersionUploadResponse.version:type_name -> forgepoint.registry.v1.ModelVersion
+	3,  // 24: forgepoint.registry.v1.GetVersionResponse.version:type_name -> forgepoint.registry.v1.ModelVersion
+	0,  // 25: forgepoint.registry.v1.ListVersionsRequest.stage_filter:type_name -> forgepoint.registry.v1.ModelStage
+	35, // 26: forgepoint.registry.v1.ListVersionsRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
+	3,  // 27: forgepoint.registry.v1.ListVersionsResponse.versions:type_name -> forgepoint.registry.v1.ModelVersion
+	36, // 28: forgepoint.registry.v1.ListVersionsResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
+	0,  // 29: forgepoint.registry.v1.PromoteVersionRequest.target_stage:type_name -> forgepoint.registry.v1.ModelStage
+	3,  // 30: forgepoint.registry.v1.PromoteVersionResponse.version:type_name -> forgepoint.registry.v1.ModelVersion
+	3,  // 31: forgepoint.registry.v1.PromoteVersionResponse.demoted_version:type_name -> forgepoint.registry.v1.ModelVersion
+	33, // 32: forgepoint.registry.v1.GetDownloadURLResponse.expires_at:type_name -> google.protobuf.Timestamp
+	4,  // 33: forgepoint.registry.v1.RegistryService.RegisterModel:input_type -> forgepoint.registry.v1.RegisterModelRequest
+	6,  // 34: forgepoint.registry.v1.RegistryService.UpdateModel:input_type -> forgepoint.registry.v1.UpdateModelRequest
+	14, // 35: forgepoint.registry.v1.RegistryService.CreateVersion:input_type -> forgepoint.registry.v1.CreateVersionRequest
+	18, // 36: forgepoint.registry.v1.RegistryService.ConfirmVersionUpload:input_type -> forgepoint.registry.v1.ConfirmVersionUploadRequest
+	24, // 37: forgepoint.registry.v1.RegistryService.PromoteVersion:input_type -> forgepoint.registry.v1.PromoteVersionRequest
+	26, // 38: forgepoint.registry.v1.RegistryService.DeleteModel:input_type -> forgepoint.registry.v1.DeleteModelRequest
+	8,  // 39: forgepoint.registry.v1.RegistryService.GetModel:input_type -> forgepoint.registry.v1.GetModelRequest
+	10, // 40: forgepoint.registry.v1.RegistryService.ListModels:input_type -> forgepoint.registry.v1.ListModelsRequest
+	12, // 41: forgepoint.registry.v1.RegistryService.SearchByTag:input_type -> forgepoint.registry.v1.SearchByTagRequest
+	20, // 42: forgepoint.registry.v1.RegistryService.GetVersion:input_type -> forgepoint.registry.v1.GetVersionRequest
+	22, // 43: forgepoint.registry.v1.RegistryService.ListVersions:input_type -> forgepoint.registry.v1.ListVersionsRequest
+	16, // 44: forgepoint.registry.v1.RegistryService.GetUploadURL:input_type -> forgepoint.registry.v1.GetUploadURLRequest
+	28, // 45: forgepoint.registry.v1.RegistryService.GetDownloadURL:input_type -> forgepoint.registry.v1.GetDownloadURLRequest
+	5,  // 46: forgepoint.registry.v1.RegistryService.RegisterModel:output_type -> forgepoint.registry.v1.RegisterModelResponse
+	7,  // 47: forgepoint.registry.v1.RegistryService.UpdateModel:output_type -> forgepoint.registry.v1.UpdateModelResponse
+	15, // 48: forgepoint.registry.v1.RegistryService.CreateVersion:output_type -> forgepoint.registry.v1.CreateVersionResponse
+	19, // 49: forgepoint.registry.v1.RegistryService.ConfirmVersionUpload:output_type -> forgepoint.registry.v1.ConfirmVersionUploadResponse
+	25, // 50: forgepoint.registry.v1.RegistryService.PromoteVersion:output_type -> forgepoint.registry.v1.PromoteVersionResponse
+	27, // 51: forgepoint.registry.v1.RegistryService.DeleteModel:output_type -> forgepoint.registry.v1.DeleteModelResponse
+	9,  // 52: forgepoint.registry.v1.RegistryService.GetModel:output_type -> forgepoint.registry.v1.GetModelResponse
+	11, // 53: forgepoint.registry.v1.RegistryService.ListModels:output_type -> forgepoint.registry.v1.ListModelsResponse
+	13, // 54: forgepoint.registry.v1.RegistryService.SearchByTag:output_type -> forgepoint.registry.v1.SearchByTagResponse
+	21, // 55: forgepoint.registry.v1.RegistryService.GetVersion:output_type -> forgepoint.registry.v1.GetVersionResponse
+	23, // 56: forgepoint.registry.v1.RegistryService.ListVersions:output_type -> forgepoint.registry.v1.ListVersionsResponse
+	17, // 57: forgepoint.registry.v1.RegistryService.GetUploadURL:output_type -> forgepoint.registry.v1.GetUploadURLResponse
+	29, // 58: forgepoint.registry.v1.RegistryService.GetDownloadURL:output_type -> forgepoint.registry.v1.GetDownloadURLResponse
+	46, // [46:59] is the sub-list for method output_type
+	33, // [33:46] is the sub-list for method input_type
+	33, // [33:33] is the sub-list for extension type_name
+	33, // [33:33] is the sub-list for extension extendee
+	0,  // [0:33] is the sub-list for field type_name
 }
 
 func init() { file_forgepoint_registry_v1_registry_proto_init() }
@@ -2596,7 +2789,7 @@ func file_forgepoint_registry_v1_registry_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_forgepoint_registry_v1_registry_proto_rawDesc), len(file_forgepoint_registry_v1_registry_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   28,
+			NumMessages:   31,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

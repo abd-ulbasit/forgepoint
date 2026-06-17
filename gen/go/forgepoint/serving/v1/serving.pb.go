@@ -11,8 +11,46 @@
 //   - Tensor primitives: TensorData, DataType (the wire format for ML I/O)
 //   - Domain messages: ModelInfo, TensorSpec, ServingMetrics, ModelState
 //   - RPCs: Predict, StreamPredict (data plane) + LoadModel, UnloadModel,
-//     GetModelStatus, GetModelInfo, GetServingMetrics, HealthCheck (control plane)
-//   - Event payloads: ModelLoadedEvent, PredictionCompletedEvent, ModelUnloadedEvent
+//     GetModelStatus, GetModelInfo, ListLoadedModels, GetServingMetrics,
+//     HealthCheck (control plane)
+//   - NO event-payload messages. Serving is a PURE EVENT CONSUMER (see the
+//     EVENTING block below) — it publishes nothing on the bus.
+//
+// EVENTING ROLE — PURE CONSUMER, ZERO PRODUCED EVENTS (read this):
+//   An earlier draft of this proto defined ModelLoadedEvent,
+//   PredictionCompletedEvent, and ModelUnloadedEvent. ALL THREE ARE DELETED.
+//   The platform's canonical event contract (proto/forgepoint/events/v1/
+//   events.proto) makes serving a pure consumer:
+//     - The ONE inference/metering event is the gateway's
+//       events.InferenceCompleted (fp.inference.completed) — the gateway alone
+//       knows latency, the served version post traffic-split, the billed
+//       principal, and canary status. A serving pod must NOT emit a competing
+//       metering event (it would double-count and disagree on the served
+//       version). So PredictionCompletedEvent is gone (conflict #1).
+//     - The AUTHORITATIVE deploy lifecycle is the orchestrator saga's
+//       events.ModelDeployed / events.ModelUndeployed (fp.pipelines.model.*),
+//       NOT a serving-pod ModelLoaded/ModelUnloaded side note. A pod loading a
+//       model is an IMPLEMENTATION DETAIL of a deploy the saga owns; emitting a
+//       second "loaded" fact would race the saga's authoritative one and create
+//       two sources of truth for "is version X live?" (conflict #2). So
+//       ModelLoadedEvent / ModelUnloadedEvent are gone.
+//   WHAT SERVING CONSUMES (all defined in events.proto, unmarshalled in Go at
+//   the consume boundary — this proto declares none of them, so it does NOT
+//   import events.proto; redeclaring or importing-without-use would violate the
+//   decoupling rule and Buf's import hygiene):
+//     - fp.models.version.ready    (events.ModelVersionReady)  → a version is
+//          now loadable; pre-warm / be ready to LoadModel it.
+//     - fp.pipelines.model.deployed (events.ModelDeployed)     → ensure this
+//          version is LOADED (the controller reconciles the pod to READY).
+//     - fp.pipelines.model.undeployed (events.ModelUndeployed) → UNLOAD the
+//          version to free memory.
+//     - fp.models.promoted         (events.ModelPromoted)      → the prod
+//          pointer moved; (re)load/route to the new prod weights.
+//     - fp.models.archived         (events.ModelArchived)      → tear down the
+//          running instance(s) of the archived model.
+//   These reactions are realized by the LoadModel / UnloadModel control-plane
+//   RPCs below, driven by the per-version-Deployment controller that owns the
+//   subscription. The data-plane Predict path emits nothing.
 //
 // PATTERN — Sidecar + Horizontal Autoscaling (HPA on custom metrics):
 //
@@ -70,8 +108,13 @@
 //        (gateway does: auth, rate-limit, circuit-breaker, traffic-split)
 //                          └──gRPC──► ModelServing.Predict()  [this service]
 //                                        └─ ONNX runtime in-memory inference
-//                          └──publishes──► fp.serving.prediction_completed
-//                                          (billing + monitor consume it)
+//        ◄──PredictResponse── (returns to the gateway; the POD emits NO event)
+//                          └──the GATEWAY publishes──► fp.inference.completed
+//                                          (events.InferenceCompleted —
+//                                           billing + monitor consume it).
+//   The serving pod is intentionally outside the event path: it does math and
+//   returns; the gateway, which owns latency/served-version/principal/canary,
+//   is the single producer of the inference fact. See the EVENTING block above.
 //
 // VERSIONING: Package path includes v1 (Buf/Google convention). Breaking
 // changes require a new forgepoint.serving.v2 package.
@@ -86,6 +129,7 @@
 package servingv1
 
 import (
+	v1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/common/v1"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	durationpb "google.golang.org/protobuf/types/known/durationpb"
@@ -708,10 +752,21 @@ func (x *ServingMetrics) GetModelMemoryBytes() int64 {
 //	routing bugs and stale connections instead of silently serving the wrong
 //	model. version may be empty to mean "whatever this pod serves".
 //
-// SECURITY: no auth/owner/billing fields. Identity is established by the
-// gateway's auth interceptor and propagated as context, NOT trusted from the
-// request body (avoids a client spoofing user_id to dodge billing). The
-// serving pod is intentionally auth-agnostic — see the Sidecar rationale up top.
+// SECURITY (mass-assignment + spoofing): the request body carries NO
+// auth/owner/principal/billing/api-key fields, and there is nothing here a
+// caller could set to attribute, charge, or authorize the call. Identity is
+// established by the gateway's auth interceptor and propagated as gRPC context
+// metadata, NEVER trusted from the request body — the serving pod is
+// intentionally auth-agnostic (see the Sidecar rationale up top). Because the
+// pod emits NO event, there is also no billed-principal field to spoof here
+// (metering happens entirely off the gateway's events.InferenceCompleted).
+//
+// INPUT-SIZE BOUND (DoS guard, in the contract not just prose): a Predict call
+// may carry AT MOST 64 named input tensors (map entries), and the server
+// rejects any single TensorData whose `data` exceeds the configured max tensor
+// bytes (default 16 MiB) with INVALID_ARGUMENT. These caps are server-enforced
+// (a map cardinality cap cannot be expressed in proto3), preventing a hostile
+// or buggy client from OOM-ing a pod with a giant/fan-out request.
 type PredictRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Target model logical name. Validated against the pod's loaded model.
@@ -722,19 +777,23 @@ type PredictRequest struct {
 	// Named input tensors, keyed by TensorSpec.name from the model's input_schema.
 	// WHY a map (not repeated): models name their inputs; a map makes the binding
 	// explicit and order-independent, matching ONNX's named-input API exactly.
+	// SERVER-CAPPED at 64 entries (see INPUT-SIZE BOUND above).
 	Inputs map[string]*TensorData `protobuf:"bytes,3,rep,name=inputs,proto3" json:"inputs,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	// Client-supplied idempotency key. WHY on a read-ish predict call:
+	// Client-supplied idempotency key. WHY it still matters even though Predict
+	// emits NO event now:
 	//
-	//	Predict has a SIDE EFFECT — it emits a PredictionCompleted event that
-	//	bills the caller. On a network retry, a duplicate request must NOT
-	//	double-bill. The pod (or gateway) caches the result/event-emission keyed
-	//	by this id so a retry returns the prior result without re-emitting.
-	//	Optional: if empty, the request is treated as non-idempotent (billed each
-	//	time). Recommended for any client that retries.
+	//	Predict is effectively pure (in→out math), but a NETWORK RETRY after a
+	//	successful inference whose response was lost still pays the full compute
+	//	cost again. The pod keeps a short-lived result cache keyed by this id so a
+	//	retry returns the prior result without re-running the ONNX session — pure
+	//	latency/compute savings, not a correctness/billing concern (billing is the
+	//	gateway's, off events.InferenceCompleted). Optional: empty = recompute
+	//	every time. Recommended for any client that retries.
 	IdempotencyKey string `protobuf:"bytes,4,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
-	// Optional correlation id propagated from the gateway for distributed
-	// tracing; echoed into the PredictionCompleted event's envelope so the async
-	// billing/monitor path links back to the original sync request.
+	// Optional correlation id propagated from the gateway for distributed tracing.
+	// Echoed back in PredictResponse so the gateway can stitch this pod's span to
+	// the request it will later report on events.InferenceCompleted. Purely a
+	// trace/correlation handle — carries no authority.
 	CorrelationId string `protobuf:"bytes,5,opt,name=correlation_id,json=correlationId,proto3" json:"correlation_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -817,11 +876,13 @@ type PredictResponse struct {
 	// Server-measured inference wall time for THIS call (not including network).
 	// Lets the gateway record per-call latency and the client display it.
 	InferenceLatency *durationpb.Duration `protobuf:"bytes,3,opt,name=inference_latency,json=inferenceLatency,proto3" json:"inference_latency,omitempty"`
-	// Echo of the request id (mirrors EventEnvelope.correlation_id) for tracing.
+	// Echo of the request's correlation_id for distributed tracing. The gateway
+	// uses it to link this pod's inference span to the request it will report on
+	// events.InferenceCompleted.
 	CorrelationId string `protobuf:"bytes,4,opt,name=correlation_id,json=correlationId,proto3" json:"correlation_id,omitempty"`
-	// True if this response was served from the idempotency cache (a retry) rather
-	// than freshly computed. Lets the caller/observer know no new billing event
-	// was emitted for this call.
+	// True if this response was served from the pod's result cache (an idempotent
+	// retry) rather than freshly computed. Purely an observability/latency signal
+	// for the caller (no event is emitted either way — metering is the gateway's).
 	FromCache     bool `protobuf:"varint,5,opt,name=from_cache,json=fromCache,proto3" json:"from_cache,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -925,11 +986,22 @@ func (x *PredictResponse) GetFromCache() bool {
 // independently.
 type StreamPredictRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// One inference's inputs, same semantics as PredictRequest.inputs.
+	// One inference's inputs, same semantics (and the same server-side 64-entry /
+	// max-tensor-bytes caps) as PredictRequest.inputs. The server additionally
+	// bounds total in-flight stream messages per connection (default 256) to keep
+	// HPA inflight accounting and per-pod memory bounded — a slow consumer cannot
+	// make the pod buffer unboundedly.
 	Inputs map[string]*TensorData `protobuf:"bytes,1,rep,name=inputs,proto3" json:"inputs,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	// Per-message idempotency key — REQUIRED on streams because retried/duplicated
-	// stream messages must not double-bill, and because it pairs each response to
-	// its request (responses may be out of order).
+	// Per-message idempotency key. It serves TWO purposes on a stream:
+	//
+	//	(1) it PAIRS each response to its request (responses are not 1:1-ordered
+	//	    with requests), and
+	//	(2) it makes a retried/duplicated stream message a cache hit instead of a
+	//	    recompute (same pure latency/compute saving as unary — NOT a billing
+	//	    concern; the pod emits no event).
+	//
+	// Recommended on every message; if empty, that message is always recomputed
+	// and the client must rely on send order to pair its response.
 	IdempotencyKey string `protobuf:"bytes,2,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
 	// Optional per-message correlation id for tracing individual predictions
 	// within the stream.
@@ -1180,6 +1252,143 @@ func (x *GetModelInfoResponse) GetModelInfo() *ModelInfo {
 	return nil
 }
 
+// ============================================================================
+// ListLoadedModels (control plane — fleet/pod introspection)
+// ============================================================================
+//
+// WHY this RPC exists even though it's one-model-per-pod TODAY:
+//
+//	The per-version-Deployment controller and admin/`fp` CLI need a uniform way
+//	to ask a pod "what do you currently have resident, and in what state?" —
+//	without N separate GetModelStatus calls and without assuming the pod holds
+//	exactly one model. On today's single-model pod this returns 0 or 1 entry;
+//	it is also the forward-compatible seam if a future multi-model pod variant
+//	(the rejected Triton-style server) ever appears. The reconcile loop reads
+//	this to detect drift between desired (the Deployment spec / consumed
+//	ModelDeployed events) and actual (resident) models.
+//
+// PAGINATION (reuse common.v1, mandated for every list): even though a serving
+// pod holds a tiny number of models, the contract requires pagination on ALL
+// list RPCs for uniformity and so the same SDK list helpers work everywhere.
+// PAGE-SIZE CAP IS PART OF THE CONTRACT: server clamps page_size to [1, 100]
+// (default 20) — a request for more returns at most 100. This is the same cap
+// common.PaginationRequest documents; stated here so it is a contract promise,
+// not an implementation accident.
+type ListLoadedModelsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Cursor + page-size envelope (common.v1). page_size is server-clamped to
+	// [1,100], default 20; page_token is the opaque cursor from a prior response.
+	Pagination *v1.PaginationRequest `protobuf:"bytes,1,opt,name=pagination,proto3" json:"pagination,omitempty"`
+	// Optional state filter: when set, only models in this lifecycle state are
+	// returned (e.g. list only READY models the pod can actually serve). Empty/
+	// UNSPECIFIED = all states. A FILTER, not an authority field.
+	StateFilter   ModelState `protobuf:"varint,2,opt,name=state_filter,json=stateFilter,proto3,enum=forgepoint.serving.v1.ModelState" json:"state_filter,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListLoadedModelsRequest) Reset() {
+	*x = ListLoadedModelsRequest{}
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListLoadedModelsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListLoadedModelsRequest) ProtoMessage() {}
+
+func (x *ListLoadedModelsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListLoadedModelsRequest.ProtoReflect.Descriptor instead.
+func (*ListLoadedModelsRequest) Descriptor() ([]byte, []int) {
+	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *ListLoadedModelsRequest) GetPagination() *v1.PaginationRequest {
+	if x != nil {
+		return x.Pagination
+	}
+	return nil
+}
+
+func (x *ListLoadedModelsRequest) GetStateFilter() ModelState {
+	if x != nil {
+		return x.StateFilter
+	}
+	return ModelState_MODEL_STATE_UNSPECIFIED
+}
+
+// ListLoadedModelsResponse returns the resident models' live status plus the
+// pagination cursor. Returns ModelStatus (the live view), not ModelInfo, because
+// the fleet view cares about state/health, not full I/O schema (fetch that per
+// model via GetModelInfo when needed).
+type ListLoadedModelsResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The resident models' live lifecycle status (0..page_size entries).
+	Models []*ModelStatus `protobuf:"bytes,1,rep,name=models,proto3" json:"models,omitempty"`
+	// next_page_token (empty = last page) + total_count (resident model count).
+	Pagination    *v1.PaginationResponse `protobuf:"bytes,2,opt,name=pagination,proto3" json:"pagination,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListLoadedModelsResponse) Reset() {
+	*x = ListLoadedModelsResponse{}
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListLoadedModelsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListLoadedModelsResponse) ProtoMessage() {}
+
+func (x *ListLoadedModelsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListLoadedModelsResponse.ProtoReflect.Descriptor instead.
+func (*ListLoadedModelsResponse) Descriptor() ([]byte, []int) {
+	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *ListLoadedModelsResponse) GetModels() []*ModelStatus {
+	if x != nil {
+		return x.Models
+	}
+	return nil
+}
+
+func (x *ListLoadedModelsResponse) GetPagination() *v1.PaginationResponse {
+	if x != nil {
+		return x.Pagination
+	}
+	return nil
+}
+
 // LoadModelRequest tells the pod to fetch an artifact from object storage and
 // load it into the ONNX runtime. Used by the operator/controller that manages
 // per-version Deployments (and at startup the pod self-loads from env vars).
@@ -1218,7 +1427,7 @@ type LoadModelRequest struct {
 
 func (x *LoadModelRequest) Reset() {
 	*x = LoadModelRequest{}
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[10]
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1230,7 +1439,7 @@ func (x *LoadModelRequest) String() string {
 func (*LoadModelRequest) ProtoMessage() {}
 
 func (x *LoadModelRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[10]
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1243,7 +1452,7 @@ func (x *LoadModelRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LoadModelRequest.ProtoReflect.Descriptor instead.
 func (*LoadModelRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{10}
+	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *LoadModelRequest) GetModelName() string {
@@ -1295,7 +1504,7 @@ type LoadModelResponse struct {
 
 func (x *LoadModelResponse) Reset() {
 	*x = LoadModelResponse{}
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[11]
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1307,7 +1516,7 @@ func (x *LoadModelResponse) String() string {
 func (*LoadModelResponse) ProtoMessage() {}
 
 func (x *LoadModelResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[11]
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1320,7 +1529,7 @@ func (x *LoadModelResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LoadModelResponse.ProtoReflect.Descriptor instead.
 func (*LoadModelResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{11}
+	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *LoadModelResponse) GetStatus() *ModelStatus {
@@ -1332,20 +1541,31 @@ func (x *LoadModelResponse) GetStatus() *ModelStatus {
 
 // UnloadModelRequest frees a model from memory (e.g. before shutdown or to
 // reclaim RAM). After unload the pod reports MODEL_STATE_UNLOADED and Predict
-// returns FAILED_PRECONDITION until reloaded.
+// returns FAILED_PRECONDITION until reloaded. Admin/controller-only — the
+// caller's authority comes from the auth interceptor, never from this body.
 type UnloadModelRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Model to unload. Empty fields = the pod's single loaded model.
 	ModelName string `protobuf:"bytes,1,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
 	// Version to unload; empty = the pod's current version.
-	Version       string `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Version string `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
+	// Optional reason for audit/observability ("undeployed", "shutdown",
+	// "evicted"). Free-form but small; lets operators distinguish an intentional
+	// unload from an eviction in logs. NOT published as an event (serving emits
+	// none) — the authoritative teardown fact is the orchestrator's
+	// events.ModelUndeployed.reason that TRIGGERED this call.
+	Reason string `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`
+	// Idempotency key so a retried UnloadModel (controller re-reconcile after the
+	// model is already UNLOADED) is a no-op returning the current status rather
+	// than an error. Optional.
+	IdempotencyKey string `protobuf:"bytes,4,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *UnloadModelRequest) Reset() {
 	*x = UnloadModelRequest{}
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[12]
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1357,7 +1577,7 @@ func (x *UnloadModelRequest) String() string {
 func (*UnloadModelRequest) ProtoMessage() {}
 
 func (x *UnloadModelRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[12]
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1370,7 +1590,7 @@ func (x *UnloadModelRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UnloadModelRequest.ProtoReflect.Descriptor instead.
 func (*UnloadModelRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{12}
+	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *UnloadModelRequest) GetModelName() string {
@@ -1387,6 +1607,20 @@ func (x *UnloadModelRequest) GetVersion() string {
 	return ""
 }
 
+func (x *UnloadModelRequest) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+func (x *UnloadModelRequest) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
+}
+
 // UnloadModelResponse is intentionally minimal but named (Buf RPC_RESPONSE_
 // STANDARD_NAME) and forward-compatible.
 type UnloadModelResponse struct {
@@ -1399,7 +1633,7 @@ type UnloadModelResponse struct {
 
 func (x *UnloadModelResponse) Reset() {
 	*x = UnloadModelResponse{}
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[13]
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1411,7 +1645,7 @@ func (x *UnloadModelResponse) String() string {
 func (*UnloadModelResponse) ProtoMessage() {}
 
 func (x *UnloadModelResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[13]
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1424,7 +1658,7 @@ func (x *UnloadModelResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UnloadModelResponse.ProtoReflect.Descriptor instead.
 func (*UnloadModelResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{13}
+	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *UnloadModelResponse) GetStatus() *ModelStatus {
@@ -1456,7 +1690,7 @@ type ModelStatus struct {
 
 func (x *ModelStatus) Reset() {
 	*x = ModelStatus{}
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[14]
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1468,7 +1702,7 @@ func (x *ModelStatus) String() string {
 func (*ModelStatus) ProtoMessage() {}
 
 func (x *ModelStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[14]
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1481,7 +1715,7 @@ func (x *ModelStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ModelStatus.ProtoReflect.Descriptor instead.
 func (*ModelStatus) Descriptor() ([]byte, []int) {
-	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{14}
+	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *ModelStatus) GetModelName() string {
@@ -1532,7 +1766,7 @@ type GetModelStatusRequest struct {
 
 func (x *GetModelStatusRequest) Reset() {
 	*x = GetModelStatusRequest{}
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[15]
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1544,7 +1778,7 @@ func (x *GetModelStatusRequest) String() string {
 func (*GetModelStatusRequest) ProtoMessage() {}
 
 func (x *GetModelStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[15]
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1557,7 +1791,7 @@ func (x *GetModelStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetModelStatusRequest.ProtoReflect.Descriptor instead.
 func (*GetModelStatusRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{15}
+	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *GetModelStatusRequest) GetModelName() string {
@@ -1585,7 +1819,7 @@ type GetModelStatusResponse struct {
 
 func (x *GetModelStatusResponse) Reset() {
 	*x = GetModelStatusResponse{}
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[16]
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1597,7 +1831,7 @@ func (x *GetModelStatusResponse) String() string {
 func (*GetModelStatusResponse) ProtoMessage() {}
 
 func (x *GetModelStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[16]
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1610,7 +1844,7 @@ func (x *GetModelStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetModelStatusResponse.ProtoReflect.Descriptor instead.
 func (*GetModelStatusResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{16}
+	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *GetModelStatusResponse) GetStatus() *ModelStatus {
@@ -1630,7 +1864,7 @@ type GetServingMetricsRequest struct {
 
 func (x *GetServingMetricsRequest) Reset() {
 	*x = GetServingMetricsRequest{}
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[17]
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1642,7 +1876,7 @@ func (x *GetServingMetricsRequest) String() string {
 func (*GetServingMetricsRequest) ProtoMessage() {}
 
 func (x *GetServingMetricsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[17]
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1655,7 +1889,7 @@ func (x *GetServingMetricsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetServingMetricsRequest.ProtoReflect.Descriptor instead.
 func (*GetServingMetricsRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{17}
+	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{19}
 }
 
 // GetServingMetricsResponse wraps the metrics snapshot used for autoscaling and
@@ -1671,7 +1905,7 @@ type GetServingMetricsResponse struct {
 
 func (x *GetServingMetricsResponse) Reset() {
 	*x = GetServingMetricsResponse{}
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[18]
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1683,7 +1917,7 @@ func (x *GetServingMetricsResponse) String() string {
 func (*GetServingMetricsResponse) ProtoMessage() {}
 
 func (x *GetServingMetricsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[18]
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1696,7 +1930,7 @@ func (x *GetServingMetricsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetServingMetricsResponse.ProtoReflect.Descriptor instead.
 func (*GetServingMetricsResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{18}
+	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *GetServingMetricsResponse) GetMetrics() *ServingMetrics {
@@ -1718,7 +1952,7 @@ type HealthCheckRequest struct {
 
 func (x *HealthCheckRequest) Reset() {
 	*x = HealthCheckRequest{}
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[19]
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1730,7 +1964,7 @@ func (x *HealthCheckRequest) String() string {
 func (*HealthCheckRequest) ProtoMessage() {}
 
 func (x *HealthCheckRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[19]
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1743,7 +1977,7 @@ func (x *HealthCheckRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthCheckRequest.ProtoReflect.Descriptor instead.
 func (*HealthCheckRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{19}
+	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *HealthCheckRequest) GetModelName() string {
@@ -1769,7 +2003,7 @@ type HealthCheckResponse struct {
 
 func (x *HealthCheckResponse) Reset() {
 	*x = HealthCheckResponse{}
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[20]
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1781,7 +2015,7 @@ func (x *HealthCheckResponse) String() string {
 func (*HealthCheckResponse) ProtoMessage() {}
 
 func (x *HealthCheckResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[20]
+	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1794,7 +2028,7 @@ func (x *HealthCheckResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthCheckResponse.ProtoReflect.Descriptor instead.
 func (*HealthCheckResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{20}
+	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *HealthCheckResponse) GetStatus() HealthStatus {
@@ -1818,305 +2052,11 @@ func (x *HealthCheckResponse) GetLastInferenceLatency() *durationpb.Duration {
 	return nil
 }
 
-// ModelLoadedEvent is published when a pod finishes loading a model (READY).
-// CONSUMERS: registry (mark version "serving"), monitor (start a drift window),
-// notification (optional "model live" alert). Subject: fp.serving.model_loaded.
-type ModelLoadedEvent struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// The model now serving.
-	ModelName string `protobuf:"bytes,1,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
-	// The version now serving.
-	Version string `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
-	// Artifact integrity digest of what was loaded (matches ModelInfo).
-	ArtifactDigest string `protobuf:"bytes,3,opt,name=artifact_digest,json=artifactDigest,proto3" json:"artifact_digest,omitempty"`
-	// The K8s pod identity serving it (e.g. "fraud-v3-7c9d-abcde"). Lets
-	// consumers attribute traffic/health to a specific replica.
-	ServingInstance string `protobuf:"bytes,4,opt,name=serving_instance,json=servingInstance,proto3" json:"serving_instance,omitempty"`
-	// When it became READY. Server-authoritative.
-	LoadedAt      *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=loaded_at,json=loadedAt,proto3" json:"loaded_at,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ModelLoadedEvent) Reset() {
-	*x = ModelLoadedEvent{}
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[21]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ModelLoadedEvent) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ModelLoadedEvent) ProtoMessage() {}
-
-func (x *ModelLoadedEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[21]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ModelLoadedEvent.ProtoReflect.Descriptor instead.
-func (*ModelLoadedEvent) Descriptor() ([]byte, []int) {
-	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{21}
-}
-
-func (x *ModelLoadedEvent) GetModelName() string {
-	if x != nil {
-		return x.ModelName
-	}
-	return ""
-}
-
-func (x *ModelLoadedEvent) GetVersion() string {
-	if x != nil {
-		return x.Version
-	}
-	return ""
-}
-
-func (x *ModelLoadedEvent) GetArtifactDigest() string {
-	if x != nil {
-		return x.ArtifactDigest
-	}
-	return ""
-}
-
-func (x *ModelLoadedEvent) GetServingInstance() string {
-	if x != nil {
-		return x.ServingInstance
-	}
-	return ""
-}
-
-func (x *ModelLoadedEvent) GetLoadedAt() *timestamppb.Timestamp {
-	if x != nil {
-		return x.LoadedAt
-	}
-	return nil
-}
-
-// PredictionCompletedEvent is published after each served prediction (or batch).
-// THIS IS THE LOAD-BEARING EVENT of the closed loop:
-//   - BILLING consumes it (outbox pattern) to record usage → invoice.
-//   - MONITOR consumes it to feed drift detection (prediction distribution).
-//
-// Subject: fp.serving.prediction_completed.
-//
-// SECURITY/BILLING: amounts here are SERVER-authoritative (the pod counts what
-// it actually served). request_count cannot be inflated by a client to over- or
-// under-bill. No raw tensors are included (PII) — only the digest + sizes.
-type PredictionCompletedEvent struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// Model that produced the prediction(s).
-	ModelName string `protobuf:"bytes,1,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
-	// Exact version that answered (for per-version billing and canary attribution).
-	Version string `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
-	// Number of predictions in this event. 1 for a unary Predict; N for a batched
-	// StreamPredict flush. Billing multiplies this by the per-prediction price.
-	RequestCount int64 `protobuf:"varint,3,opt,name=request_count,json=requestCount,proto3" json:"request_count,omitempty"`
-	// Server-measured aggregate inference time for these predictions. Billing may
-	// price on compute-time; monitor uses it for latency drift.
-	TotalInferenceLatency *durationpb.Duration `protobuf:"bytes,4,opt,name=total_inference_latency,json=totalInferenceLatency,proto3" json:"total_inference_latency,omitempty"`
-	// The authenticated principal the gateway attributed this call to (user_id or
-	// api-key id), propagated from the gateway's auth context — NOT from the
-	// client request body. Billing keys usage off this. Server-authoritative.
-	BilledPrincipal string `protobuf:"bytes,5,opt,name=billed_principal,json=billedPrincipal,proto3" json:"billed_principal,omitempty"`
-	// Hash of the inputs (not the inputs themselves) so the monitor can dedup /
-	// correlate without ingesting raw, possibly-PII feature values.
-	InputDigest string `protobuf:"bytes,6,opt,name=input_digest,json=inputDigest,proto3" json:"input_digest,omitempty"`
-	// The serving pod that handled it (for per-replica observability).
-	ServingInstance string `protobuf:"bytes,7,opt,name=serving_instance,json=servingInstance,proto3" json:"serving_instance,omitempty"`
-	// When the prediction(s) completed. Server-authoritative; drives time-windowed
-	// drift aggregation and billing periods.
-	CompletedAt   *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=completed_at,json=completedAt,proto3" json:"completed_at,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *PredictionCompletedEvent) Reset() {
-	*x = PredictionCompletedEvent{}
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[22]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *PredictionCompletedEvent) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*PredictionCompletedEvent) ProtoMessage() {}
-
-func (x *PredictionCompletedEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[22]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use PredictionCompletedEvent.ProtoReflect.Descriptor instead.
-func (*PredictionCompletedEvent) Descriptor() ([]byte, []int) {
-	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{22}
-}
-
-func (x *PredictionCompletedEvent) GetModelName() string {
-	if x != nil {
-		return x.ModelName
-	}
-	return ""
-}
-
-func (x *PredictionCompletedEvent) GetVersion() string {
-	if x != nil {
-		return x.Version
-	}
-	return ""
-}
-
-func (x *PredictionCompletedEvent) GetRequestCount() int64 {
-	if x != nil {
-		return x.RequestCount
-	}
-	return 0
-}
-
-func (x *PredictionCompletedEvent) GetTotalInferenceLatency() *durationpb.Duration {
-	if x != nil {
-		return x.TotalInferenceLatency
-	}
-	return nil
-}
-
-func (x *PredictionCompletedEvent) GetBilledPrincipal() string {
-	if x != nil {
-		return x.BilledPrincipal
-	}
-	return ""
-}
-
-func (x *PredictionCompletedEvent) GetInputDigest() string {
-	if x != nil {
-		return x.InputDigest
-	}
-	return ""
-}
-
-func (x *PredictionCompletedEvent) GetServingInstance() string {
-	if x != nil {
-		return x.ServingInstance
-	}
-	return ""
-}
-
-func (x *PredictionCompletedEvent) GetCompletedAt() *timestamppb.Timestamp {
-	if x != nil {
-		return x.CompletedAt
-	}
-	return nil
-}
-
-// ModelUnloadedEvent is published when a model is unloaded (admin action or
-// graceful shutdown). CONSUMERS: registry/operator (a version left rotation),
-// monitor (close/flush its window). Subject: fp.serving.model_unloaded.
-type ModelUnloadedEvent struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// The model that was unloaded.
-	ModelName string `protobuf:"bytes,1,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
-	// The version that was unloaded.
-	Version string `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
-	// The pod that unloaded it.
-	ServingInstance string `protobuf:"bytes,3,opt,name=serving_instance,json=servingInstance,proto3" json:"serving_instance,omitempty"`
-	// Why it was unloaded ("admin_request", "shutdown", "evicted"). Lets
-	// consumers distinguish intentional unloads from failures for alerting.
-	Reason string `protobuf:"bytes,4,opt,name=reason,proto3" json:"reason,omitempty"`
-	// When the unload happened.
-	UnloadedAt    *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=unloaded_at,json=unloadedAt,proto3" json:"unloaded_at,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ModelUnloadedEvent) Reset() {
-	*x = ModelUnloadedEvent{}
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[23]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ModelUnloadedEvent) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ModelUnloadedEvent) ProtoMessage() {}
-
-func (x *ModelUnloadedEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_serving_v1_serving_proto_msgTypes[23]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ModelUnloadedEvent.ProtoReflect.Descriptor instead.
-func (*ModelUnloadedEvent) Descriptor() ([]byte, []int) {
-	return file_forgepoint_serving_v1_serving_proto_rawDescGZIP(), []int{23}
-}
-
-func (x *ModelUnloadedEvent) GetModelName() string {
-	if x != nil {
-		return x.ModelName
-	}
-	return ""
-}
-
-func (x *ModelUnloadedEvent) GetVersion() string {
-	if x != nil {
-		return x.Version
-	}
-	return ""
-}
-
-func (x *ModelUnloadedEvent) GetServingInstance() string {
-	if x != nil {
-		return x.ServingInstance
-	}
-	return ""
-}
-
-func (x *ModelUnloadedEvent) GetReason() string {
-	if x != nil {
-		return x.Reason
-	}
-	return ""
-}
-
-func (x *ModelUnloadedEvent) GetUnloadedAt() *timestamppb.Timestamp {
-	if x != nil {
-		return x.UnloadedAt
-	}
-	return nil
-}
-
 var File_forgepoint_serving_v1_serving_proto protoreflect.FileDescriptor
 
 const file_forgepoint_serving_v1_serving_proto_rawDesc = "" +
 	"\n" +
-	"#forgepoint/serving/v1/serving.proto\x12\x15forgepoint.serving.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1egoogle/protobuf/duration.proto\"m\n" +
+	"#forgepoint/serving/v1/serving.proto\x12\x15forgepoint.serving.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1egoogle/protobuf/duration.proto\x1a!forgepoint/common/v1/common.proto\"m\n" +
 	"\n" +
 	"TensorData\x12\x14\n" +
 	"\x05shape\x18\x01 \x03(\x03R\x05shape\x12\x12\n" +
@@ -2185,7 +2125,17 @@ const file_forgepoint_serving_v1_serving_proto_rawDesc = "" +
 	"\aversion\x18\x02 \x01(\tR\aversion\"W\n" +
 	"\x14GetModelInfoResponse\x12?\n" +
 	"\n" +
-	"model_info\x18\x01 \x01(\v2 .forgepoint.serving.v1.ModelInfoR\tmodelInfo\"\xc0\x01\n" +
+	"model_info\x18\x01 \x01(\v2 .forgepoint.serving.v1.ModelInfoR\tmodelInfo\"\xa8\x01\n" +
+	"\x17ListLoadedModelsRequest\x12G\n" +
+	"\n" +
+	"pagination\x18\x01 \x01(\v2'.forgepoint.common.v1.PaginationRequestR\n" +
+	"pagination\x12D\n" +
+	"\fstate_filter\x18\x02 \x01(\x0e2!.forgepoint.serving.v1.ModelStateR\vstateFilter\"\xa0\x01\n" +
+	"\x18ListLoadedModelsResponse\x12:\n" +
+	"\x06models\x18\x01 \x03(\v2\".forgepoint.serving.v1.ModelStatusR\x06models\x12H\n" +
+	"\n" +
+	"pagination\x18\x02 \x01(\v2(.forgepoint.common.v1.PaginationResponseR\n" +
+	"pagination\"\xc0\x01\n" +
 	"\x10LoadModelRequest\x12\x1d\n" +
 	"\n" +
 	"model_name\x18\x01 \x01(\tR\tmodelName\x12\x18\n" +
@@ -2194,11 +2144,13 @@ const file_forgepoint_serving_v1_serving_proto_rawDesc = "" +
 	"\x0fexpected_digest\x18\x04 \x01(\tR\x0eexpectedDigest\x12'\n" +
 	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKey\"O\n" +
 	"\x11LoadModelResponse\x12:\n" +
-	"\x06status\x18\x01 \x01(\v2\".forgepoint.serving.v1.ModelStatusR\x06status\"M\n" +
+	"\x06status\x18\x01 \x01(\v2\".forgepoint.serving.v1.ModelStatusR\x06status\"\x8e\x01\n" +
 	"\x12UnloadModelRequest\x12\x1d\n" +
 	"\n" +
 	"model_name\x18\x01 \x01(\tR\tmodelName\x12\x18\n" +
-	"\aversion\x18\x02 \x01(\tR\aversion\"Q\n" +
+	"\aversion\x18\x02 \x01(\tR\aversion\x12\x16\n" +
+	"\x06reason\x18\x03 \x01(\tR\x06reason\x12'\n" +
+	"\x0fidempotency_key\x18\x04 \x01(\tR\x0eidempotencyKey\"Q\n" +
 	"\x13UnloadModelResponse\x12:\n" +
 	"\x06status\x18\x01 \x01(\v2\".forgepoint.serving.v1.ModelStatusR\x06status\"\xd4\x01\n" +
 	"\vModelStatus\x12\x1d\n" +
@@ -2225,32 +2177,7 @@ const file_forgepoint_serving_v1_serving_proto_rawDesc = "" +
 	"\x06status\x18\x01 \x01(\x0e2#.forgepoint.serving.v1.HealthStatusR\x06status\x12B\n" +
 	"\vmodel_state\x18\x02 \x01(\x0e2!.forgepoint.serving.v1.ModelStateR\n" +
 	"modelState\x12O\n" +
-	"\x16last_inference_latency\x18\x03 \x01(\v2\x19.google.protobuf.DurationR\x14lastInferenceLatency\"\xd8\x01\n" +
-	"\x10ModelLoadedEvent\x12\x1d\n" +
-	"\n" +
-	"model_name\x18\x01 \x01(\tR\tmodelName\x12\x18\n" +
-	"\aversion\x18\x02 \x01(\tR\aversion\x12'\n" +
-	"\x0fartifact_digest\x18\x03 \x01(\tR\x0eartifactDigest\x12)\n" +
-	"\x10serving_instance\x18\x04 \x01(\tR\x0fservingInstance\x127\n" +
-	"\tloaded_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\bloadedAt\"\x83\x03\n" +
-	"\x18PredictionCompletedEvent\x12\x1d\n" +
-	"\n" +
-	"model_name\x18\x01 \x01(\tR\tmodelName\x12\x18\n" +
-	"\aversion\x18\x02 \x01(\tR\aversion\x12#\n" +
-	"\rrequest_count\x18\x03 \x01(\x03R\frequestCount\x12Q\n" +
-	"\x17total_inference_latency\x18\x04 \x01(\v2\x19.google.protobuf.DurationR\x15totalInferenceLatency\x12)\n" +
-	"\x10billed_principal\x18\x05 \x01(\tR\x0fbilledPrincipal\x12!\n" +
-	"\finput_digest\x18\x06 \x01(\tR\vinputDigest\x12)\n" +
-	"\x10serving_instance\x18\a \x01(\tR\x0fservingInstance\x12=\n" +
-	"\fcompleted_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\vcompletedAt\"\xcd\x01\n" +
-	"\x12ModelUnloadedEvent\x12\x1d\n" +
-	"\n" +
-	"model_name\x18\x01 \x01(\tR\tmodelName\x12\x18\n" +
-	"\aversion\x18\x02 \x01(\tR\aversion\x12)\n" +
-	"\x10serving_instance\x18\x03 \x01(\tR\x0fservingInstance\x12\x16\n" +
-	"\x06reason\x18\x04 \x01(\tR\x06reason\x12;\n" +
-	"\vunloaded_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
-	"unloadedAt*\xa7\x01\n" +
+	"\x16last_inference_latency\x18\x03 \x01(\v2\x19.google.protobuf.DurationR\x14lastInferenceLatency*\xa7\x01\n" +
 	"\bDataType\x12\x19\n" +
 	"\x15DATA_TYPE_UNSPECIFIED\x10\x00\x12\x15\n" +
 	"\x11DATA_TYPE_FLOAT32\x10\x01\x12\x15\n" +
@@ -2270,11 +2197,12 @@ const file_forgepoint_serving_v1_serving_proto_rawDesc = "" +
 	"\fHealthStatus\x12\x1d\n" +
 	"\x19HEALTH_STATUS_UNSPECIFIED\x10\x00\x12\x19\n" +
 	"\x15HEALTH_STATUS_SERVING\x10\x01\x12\x1d\n" +
-	"\x19HEALTH_STATUS_NOT_SERVING\x10\x022\xdb\x06\n" +
+	"\x19HEALTH_STATUS_NOT_SERVING\x10\x022\xd0\a\n" +
 	"\x13ModelServingService\x12X\n" +
 	"\aPredict\x12%.forgepoint.serving.v1.PredictRequest\x1a&.forgepoint.serving.v1.PredictResponse\x12n\n" +
 	"\rStreamPredict\x12+.forgepoint.serving.v1.StreamPredictRequest\x1a,.forgepoint.serving.v1.StreamPredictResponse(\x010\x01\x12g\n" +
-	"\fGetModelInfo\x12*.forgepoint.serving.v1.GetModelInfoRequest\x1a+.forgepoint.serving.v1.GetModelInfoResponse\x12^\n" +
+	"\fGetModelInfo\x12*.forgepoint.serving.v1.GetModelInfoRequest\x1a+.forgepoint.serving.v1.GetModelInfoResponse\x12s\n" +
+	"\x10ListLoadedModels\x12..forgepoint.serving.v1.ListLoadedModelsRequest\x1a/.forgepoint.serving.v1.ListLoadedModelsResponse\x12^\n" +
 	"\tLoadModel\x12'.forgepoint.serving.v1.LoadModelRequest\x1a(.forgepoint.serving.v1.LoadModelResponse\x12d\n" +
 	"\vUnloadModel\x12).forgepoint.serving.v1.UnloadModelRequest\x1a*.forgepoint.serving.v1.UnloadModelResponse\x12m\n" +
 	"\x0eGetModelStatus\x12,.forgepoint.serving.v1.GetModelStatusRequest\x1a-.forgepoint.serving.v1.GetModelStatusResponse\x12v\n" +
@@ -2294,7 +2222,7 @@ func file_forgepoint_serving_v1_serving_proto_rawDescGZIP() []byte {
 }
 
 var file_forgepoint_serving_v1_serving_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_forgepoint_serving_v1_serving_proto_msgTypes = make([]protoimpl.MessageInfo, 28)
+var file_forgepoint_serving_v1_serving_proto_msgTypes = make([]protoimpl.MessageInfo, 27)
 var file_forgepoint_serving_v1_serving_proto_goTypes = []any{
 	(DataType)(0),                     // 0: forgepoint.serving.v1.DataType
 	(ModelState)(0),                   // 1: forgepoint.serving.v1.ModelState
@@ -2309,55 +2237,56 @@ var file_forgepoint_serving_v1_serving_proto_goTypes = []any{
 	(*StreamPredictResponse)(nil),     // 10: forgepoint.serving.v1.StreamPredictResponse
 	(*GetModelInfoRequest)(nil),       // 11: forgepoint.serving.v1.GetModelInfoRequest
 	(*GetModelInfoResponse)(nil),      // 12: forgepoint.serving.v1.GetModelInfoResponse
-	(*LoadModelRequest)(nil),          // 13: forgepoint.serving.v1.LoadModelRequest
-	(*LoadModelResponse)(nil),         // 14: forgepoint.serving.v1.LoadModelResponse
-	(*UnloadModelRequest)(nil),        // 15: forgepoint.serving.v1.UnloadModelRequest
-	(*UnloadModelResponse)(nil),       // 16: forgepoint.serving.v1.UnloadModelResponse
-	(*ModelStatus)(nil),               // 17: forgepoint.serving.v1.ModelStatus
-	(*GetModelStatusRequest)(nil),     // 18: forgepoint.serving.v1.GetModelStatusRequest
-	(*GetModelStatusResponse)(nil),    // 19: forgepoint.serving.v1.GetModelStatusResponse
-	(*GetServingMetricsRequest)(nil),  // 20: forgepoint.serving.v1.GetServingMetricsRequest
-	(*GetServingMetricsResponse)(nil), // 21: forgepoint.serving.v1.GetServingMetricsResponse
-	(*HealthCheckRequest)(nil),        // 22: forgepoint.serving.v1.HealthCheckRequest
-	(*HealthCheckResponse)(nil),       // 23: forgepoint.serving.v1.HealthCheckResponse
-	(*ModelLoadedEvent)(nil),          // 24: forgepoint.serving.v1.ModelLoadedEvent
-	(*PredictionCompletedEvent)(nil),  // 25: forgepoint.serving.v1.PredictionCompletedEvent
-	(*ModelUnloadedEvent)(nil),        // 26: forgepoint.serving.v1.ModelUnloadedEvent
-	nil,                               // 27: forgepoint.serving.v1.PredictRequest.InputsEntry
-	nil,                               // 28: forgepoint.serving.v1.PredictResponse.OutputsEntry
-	nil,                               // 29: forgepoint.serving.v1.StreamPredictRequest.InputsEntry
-	nil,                               // 30: forgepoint.serving.v1.StreamPredictResponse.OutputsEntry
-	(*timestamppb.Timestamp)(nil),     // 31: google.protobuf.Timestamp
-	(*durationpb.Duration)(nil),       // 32: google.protobuf.Duration
+	(*ListLoadedModelsRequest)(nil),   // 13: forgepoint.serving.v1.ListLoadedModelsRequest
+	(*ListLoadedModelsResponse)(nil),  // 14: forgepoint.serving.v1.ListLoadedModelsResponse
+	(*LoadModelRequest)(nil),          // 15: forgepoint.serving.v1.LoadModelRequest
+	(*LoadModelResponse)(nil),         // 16: forgepoint.serving.v1.LoadModelResponse
+	(*UnloadModelRequest)(nil),        // 17: forgepoint.serving.v1.UnloadModelRequest
+	(*UnloadModelResponse)(nil),       // 18: forgepoint.serving.v1.UnloadModelResponse
+	(*ModelStatus)(nil),               // 19: forgepoint.serving.v1.ModelStatus
+	(*GetModelStatusRequest)(nil),     // 20: forgepoint.serving.v1.GetModelStatusRequest
+	(*GetModelStatusResponse)(nil),    // 21: forgepoint.serving.v1.GetModelStatusResponse
+	(*GetServingMetricsRequest)(nil),  // 22: forgepoint.serving.v1.GetServingMetricsRequest
+	(*GetServingMetricsResponse)(nil), // 23: forgepoint.serving.v1.GetServingMetricsResponse
+	(*HealthCheckRequest)(nil),        // 24: forgepoint.serving.v1.HealthCheckRequest
+	(*HealthCheckResponse)(nil),       // 25: forgepoint.serving.v1.HealthCheckResponse
+	nil,                               // 26: forgepoint.serving.v1.PredictRequest.InputsEntry
+	nil,                               // 27: forgepoint.serving.v1.PredictResponse.OutputsEntry
+	nil,                               // 28: forgepoint.serving.v1.StreamPredictRequest.InputsEntry
+	nil,                               // 29: forgepoint.serving.v1.StreamPredictResponse.OutputsEntry
+	(*timestamppb.Timestamp)(nil),     // 30: google.protobuf.Timestamp
+	(*durationpb.Duration)(nil),       // 31: google.protobuf.Duration
+	(*v1.PaginationRequest)(nil),      // 32: forgepoint.common.v1.PaginationRequest
+	(*v1.PaginationResponse)(nil),     // 33: forgepoint.common.v1.PaginationResponse
 }
 var file_forgepoint_serving_v1_serving_proto_depIdxs = []int32{
 	0,  // 0: forgepoint.serving.v1.TensorData.dtype:type_name -> forgepoint.serving.v1.DataType
 	0,  // 1: forgepoint.serving.v1.TensorSpec.dtype:type_name -> forgepoint.serving.v1.DataType
 	4,  // 2: forgepoint.serving.v1.ModelInfo.input_schema:type_name -> forgepoint.serving.v1.TensorSpec
 	4,  // 3: forgepoint.serving.v1.ModelInfo.output_schema:type_name -> forgepoint.serving.v1.TensorSpec
-	31, // 4: forgepoint.serving.v1.ModelInfo.loaded_at:type_name -> google.protobuf.Timestamp
-	32, // 5: forgepoint.serving.v1.ServingMetrics.p50_latency:type_name -> google.protobuf.Duration
-	32, // 6: forgepoint.serving.v1.ServingMetrics.p99_latency:type_name -> google.protobuf.Duration
-	27, // 7: forgepoint.serving.v1.PredictRequest.inputs:type_name -> forgepoint.serving.v1.PredictRequest.InputsEntry
-	28, // 8: forgepoint.serving.v1.PredictResponse.outputs:type_name -> forgepoint.serving.v1.PredictResponse.OutputsEntry
-	32, // 9: forgepoint.serving.v1.PredictResponse.inference_latency:type_name -> google.protobuf.Duration
-	29, // 10: forgepoint.serving.v1.StreamPredictRequest.inputs:type_name -> forgepoint.serving.v1.StreamPredictRequest.InputsEntry
-	30, // 11: forgepoint.serving.v1.StreamPredictResponse.outputs:type_name -> forgepoint.serving.v1.StreamPredictResponse.OutputsEntry
-	32, // 12: forgepoint.serving.v1.StreamPredictResponse.inference_latency:type_name -> google.protobuf.Duration
+	30, // 4: forgepoint.serving.v1.ModelInfo.loaded_at:type_name -> google.protobuf.Timestamp
+	31, // 5: forgepoint.serving.v1.ServingMetrics.p50_latency:type_name -> google.protobuf.Duration
+	31, // 6: forgepoint.serving.v1.ServingMetrics.p99_latency:type_name -> google.protobuf.Duration
+	26, // 7: forgepoint.serving.v1.PredictRequest.inputs:type_name -> forgepoint.serving.v1.PredictRequest.InputsEntry
+	27, // 8: forgepoint.serving.v1.PredictResponse.outputs:type_name -> forgepoint.serving.v1.PredictResponse.OutputsEntry
+	31, // 9: forgepoint.serving.v1.PredictResponse.inference_latency:type_name -> google.protobuf.Duration
+	28, // 10: forgepoint.serving.v1.StreamPredictRequest.inputs:type_name -> forgepoint.serving.v1.StreamPredictRequest.InputsEntry
+	29, // 11: forgepoint.serving.v1.StreamPredictResponse.outputs:type_name -> forgepoint.serving.v1.StreamPredictResponse.OutputsEntry
+	31, // 12: forgepoint.serving.v1.StreamPredictResponse.inference_latency:type_name -> google.protobuf.Duration
 	5,  // 13: forgepoint.serving.v1.GetModelInfoResponse.model_info:type_name -> forgepoint.serving.v1.ModelInfo
-	17, // 14: forgepoint.serving.v1.LoadModelResponse.status:type_name -> forgepoint.serving.v1.ModelStatus
-	17, // 15: forgepoint.serving.v1.UnloadModelResponse.status:type_name -> forgepoint.serving.v1.ModelStatus
-	1,  // 16: forgepoint.serving.v1.ModelStatus.state:type_name -> forgepoint.serving.v1.ModelState
-	31, // 17: forgepoint.serving.v1.ModelStatus.updated_at:type_name -> google.protobuf.Timestamp
-	17, // 18: forgepoint.serving.v1.GetModelStatusResponse.status:type_name -> forgepoint.serving.v1.ModelStatus
-	6,  // 19: forgepoint.serving.v1.GetServingMetricsResponse.metrics:type_name -> forgepoint.serving.v1.ServingMetrics
-	2,  // 20: forgepoint.serving.v1.HealthCheckResponse.status:type_name -> forgepoint.serving.v1.HealthStatus
-	1,  // 21: forgepoint.serving.v1.HealthCheckResponse.model_state:type_name -> forgepoint.serving.v1.ModelState
-	32, // 22: forgepoint.serving.v1.HealthCheckResponse.last_inference_latency:type_name -> google.protobuf.Duration
-	31, // 23: forgepoint.serving.v1.ModelLoadedEvent.loaded_at:type_name -> google.protobuf.Timestamp
-	32, // 24: forgepoint.serving.v1.PredictionCompletedEvent.total_inference_latency:type_name -> google.protobuf.Duration
-	31, // 25: forgepoint.serving.v1.PredictionCompletedEvent.completed_at:type_name -> google.protobuf.Timestamp
-	31, // 26: forgepoint.serving.v1.ModelUnloadedEvent.unloaded_at:type_name -> google.protobuf.Timestamp
+	32, // 14: forgepoint.serving.v1.ListLoadedModelsRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
+	1,  // 15: forgepoint.serving.v1.ListLoadedModelsRequest.state_filter:type_name -> forgepoint.serving.v1.ModelState
+	19, // 16: forgepoint.serving.v1.ListLoadedModelsResponse.models:type_name -> forgepoint.serving.v1.ModelStatus
+	33, // 17: forgepoint.serving.v1.ListLoadedModelsResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
+	19, // 18: forgepoint.serving.v1.LoadModelResponse.status:type_name -> forgepoint.serving.v1.ModelStatus
+	19, // 19: forgepoint.serving.v1.UnloadModelResponse.status:type_name -> forgepoint.serving.v1.ModelStatus
+	1,  // 20: forgepoint.serving.v1.ModelStatus.state:type_name -> forgepoint.serving.v1.ModelState
+	30, // 21: forgepoint.serving.v1.ModelStatus.updated_at:type_name -> google.protobuf.Timestamp
+	19, // 22: forgepoint.serving.v1.GetModelStatusResponse.status:type_name -> forgepoint.serving.v1.ModelStatus
+	6,  // 23: forgepoint.serving.v1.GetServingMetricsResponse.metrics:type_name -> forgepoint.serving.v1.ServingMetrics
+	2,  // 24: forgepoint.serving.v1.HealthCheckResponse.status:type_name -> forgepoint.serving.v1.HealthStatus
+	1,  // 25: forgepoint.serving.v1.HealthCheckResponse.model_state:type_name -> forgepoint.serving.v1.ModelState
+	31, // 26: forgepoint.serving.v1.HealthCheckResponse.last_inference_latency:type_name -> google.protobuf.Duration
 	3,  // 27: forgepoint.serving.v1.PredictRequest.InputsEntry.value:type_name -> forgepoint.serving.v1.TensorData
 	3,  // 28: forgepoint.serving.v1.PredictResponse.OutputsEntry.value:type_name -> forgepoint.serving.v1.TensorData
 	3,  // 29: forgepoint.serving.v1.StreamPredictRequest.InputsEntry.value:type_name -> forgepoint.serving.v1.TensorData
@@ -2365,21 +2294,23 @@ var file_forgepoint_serving_v1_serving_proto_depIdxs = []int32{
 	7,  // 31: forgepoint.serving.v1.ModelServingService.Predict:input_type -> forgepoint.serving.v1.PredictRequest
 	9,  // 32: forgepoint.serving.v1.ModelServingService.StreamPredict:input_type -> forgepoint.serving.v1.StreamPredictRequest
 	11, // 33: forgepoint.serving.v1.ModelServingService.GetModelInfo:input_type -> forgepoint.serving.v1.GetModelInfoRequest
-	13, // 34: forgepoint.serving.v1.ModelServingService.LoadModel:input_type -> forgepoint.serving.v1.LoadModelRequest
-	15, // 35: forgepoint.serving.v1.ModelServingService.UnloadModel:input_type -> forgepoint.serving.v1.UnloadModelRequest
-	18, // 36: forgepoint.serving.v1.ModelServingService.GetModelStatus:input_type -> forgepoint.serving.v1.GetModelStatusRequest
-	20, // 37: forgepoint.serving.v1.ModelServingService.GetServingMetrics:input_type -> forgepoint.serving.v1.GetServingMetricsRequest
-	22, // 38: forgepoint.serving.v1.ModelServingService.HealthCheck:input_type -> forgepoint.serving.v1.HealthCheckRequest
-	8,  // 39: forgepoint.serving.v1.ModelServingService.Predict:output_type -> forgepoint.serving.v1.PredictResponse
-	10, // 40: forgepoint.serving.v1.ModelServingService.StreamPredict:output_type -> forgepoint.serving.v1.StreamPredictResponse
-	12, // 41: forgepoint.serving.v1.ModelServingService.GetModelInfo:output_type -> forgepoint.serving.v1.GetModelInfoResponse
-	14, // 42: forgepoint.serving.v1.ModelServingService.LoadModel:output_type -> forgepoint.serving.v1.LoadModelResponse
-	16, // 43: forgepoint.serving.v1.ModelServingService.UnloadModel:output_type -> forgepoint.serving.v1.UnloadModelResponse
-	19, // 44: forgepoint.serving.v1.ModelServingService.GetModelStatus:output_type -> forgepoint.serving.v1.GetModelStatusResponse
-	21, // 45: forgepoint.serving.v1.ModelServingService.GetServingMetrics:output_type -> forgepoint.serving.v1.GetServingMetricsResponse
-	23, // 46: forgepoint.serving.v1.ModelServingService.HealthCheck:output_type -> forgepoint.serving.v1.HealthCheckResponse
-	39, // [39:47] is the sub-list for method output_type
-	31, // [31:39] is the sub-list for method input_type
+	13, // 34: forgepoint.serving.v1.ModelServingService.ListLoadedModels:input_type -> forgepoint.serving.v1.ListLoadedModelsRequest
+	15, // 35: forgepoint.serving.v1.ModelServingService.LoadModel:input_type -> forgepoint.serving.v1.LoadModelRequest
+	17, // 36: forgepoint.serving.v1.ModelServingService.UnloadModel:input_type -> forgepoint.serving.v1.UnloadModelRequest
+	20, // 37: forgepoint.serving.v1.ModelServingService.GetModelStatus:input_type -> forgepoint.serving.v1.GetModelStatusRequest
+	22, // 38: forgepoint.serving.v1.ModelServingService.GetServingMetrics:input_type -> forgepoint.serving.v1.GetServingMetricsRequest
+	24, // 39: forgepoint.serving.v1.ModelServingService.HealthCheck:input_type -> forgepoint.serving.v1.HealthCheckRequest
+	8,  // 40: forgepoint.serving.v1.ModelServingService.Predict:output_type -> forgepoint.serving.v1.PredictResponse
+	10, // 41: forgepoint.serving.v1.ModelServingService.StreamPredict:output_type -> forgepoint.serving.v1.StreamPredictResponse
+	12, // 42: forgepoint.serving.v1.ModelServingService.GetModelInfo:output_type -> forgepoint.serving.v1.GetModelInfoResponse
+	14, // 43: forgepoint.serving.v1.ModelServingService.ListLoadedModels:output_type -> forgepoint.serving.v1.ListLoadedModelsResponse
+	16, // 44: forgepoint.serving.v1.ModelServingService.LoadModel:output_type -> forgepoint.serving.v1.LoadModelResponse
+	18, // 45: forgepoint.serving.v1.ModelServingService.UnloadModel:output_type -> forgepoint.serving.v1.UnloadModelResponse
+	21, // 46: forgepoint.serving.v1.ModelServingService.GetModelStatus:output_type -> forgepoint.serving.v1.GetModelStatusResponse
+	23, // 47: forgepoint.serving.v1.ModelServingService.GetServingMetrics:output_type -> forgepoint.serving.v1.GetServingMetricsResponse
+	25, // 48: forgepoint.serving.v1.ModelServingService.HealthCheck:output_type -> forgepoint.serving.v1.HealthCheckResponse
+	40, // [40:49] is the sub-list for method output_type
+	31, // [31:40] is the sub-list for method input_type
 	31, // [31:31] is the sub-list for extension type_name
 	31, // [31:31] is the sub-list for extension extendee
 	0,  // [0:31] is the sub-list for field type_name
@@ -2396,7 +2327,7 @@ func file_forgepoint_serving_v1_serving_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_forgepoint_serving_v1_serving_proto_rawDesc), len(file_forgepoint_serving_v1_serving_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   28,
+			NumMessages:   27,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

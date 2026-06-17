@@ -79,12 +79,33 @@
 // SECURITY / MASS-ASSIGNMENT POSTURE (applies to every write RPC below):
 //   Server-authoritative fields are NEVER accepted on write requests. The
 //   caller does not get to set: id, owner_id, team (derived from the caller's
-//   auth claims), stage/status (only PromoteVersion may change stage),
-//   created_at/updated_at/archived_at, or artifact_path/digest (set by the
-//   storage layer on upload). Accepting any of these would let a caller forge
-//   ownership, backdate records, or jump a version straight to production —
-//   classic mass-assignment escalation. We model only the genuinely
+//   auth claims), stage/status (only PromoteVersion may change stage, only
+//   ConfirmVersionUpload may change status), created_at/updated_at/archived_at,
+//   or artifact_path/digest/size_bytes (MEASURED by the storage layer on upload,
+//   never client-asserted — a forged digest defeats content integrity, a forged
+//   size lets a tenant dodge storage billing). Accepting any of these would let a
+//   caller forge ownership, backdate records, or jump a version straight to
+//   production — classic mass-assignment escalation. We model only the genuinely
 //   client-supplied fields on *Request messages and derive the rest server-side.
+//
+// TENANCY SCOPING (authz from claims, not the body):
+//   There is intentionally NO `team` / `owner_id` field on any list/get/write
+//   request. Team scoping and ownership are derived from the caller's validated
+//   TokenClaims server-side, so a caller can neither list another team's models
+//   nor register into another team's namespace. The few filter fields that DO
+//   stay on requests (task_type_filter, framework_filter, tag key/value) only
+//   NARROW within the caller's already-scoped view — they never widen it.
+//
+// PAGINATION / DoS BOUND (a contract invariant, not just per-RPC prose):
+//   Every list RPC takes common.v1.PaginationRequest. page_size DEFAULTS to 20
+//   and is HARD-CAPPED AT 100 server-side — a larger request is silently clamped
+//   to 100, never honored. This is the platform-wide cap documented on
+//   common.v1.PaginationRequest (default 20 / max 100) and it bounds Redis
+//   ZRANGE/SMEMBERS work and response size (a memory/CPU DoS guard). proto3 has no
+//   numeric-bound syntax and protovalidate is intentionally not a dependency here,
+//   so the cap is expressed as this explicit, uniform contract clause and enforced
+//   in the handler; it is NOT advisory. There are no batch-write RPCs in this
+//   service, so no separate batch-size cap is needed.
 //
 // VERSIONING: Package path includes v1 (Buf/Google convention). Breaking
 // changes require a new forgepoint.registry.v2 package; both coexist during
@@ -104,6 +125,20 @@ option go_package = "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/registr
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/struct.proto";
 import "forgepoint/common/v1/common.proto";
+// NOTE — we deliberately do NOT import forgepoint/events/v1/events.proto here.
+// forgepoint.events.v1 is the SINGLE SOURCE OF TRUTH for every NATS event
+// payload on the platform (see proto/forgepoint/events/v1/events.proto). This
+// service formerly defined its OWN ModelRegistered/ModelVersionCreated/
+// ModelPromoted/ModelArchived payloads here; an adversarial cross-service review
+// found those ad-hoc messages drifting from their consumers, so they have been
+// DELETED and we depend on the canonical eventsv1 types instead. But that
+// dependency is satisfied in GENERATED GO (the handler marshals an eventsv1.*
+// message into common.v1.EventEnvelope.data at publish time, and maps
+// registry.ModelStage <-> events.ModelStage at the boundary) — this API .proto
+// references no events.v1 TYPE, so importing it here would be an unused proto
+// import (Buf IMPORT_USED) and a dead compile-time coupling of the API schema to
+// the event schema. The SUBJECT/MESSAGE names in the comments below are the
+// documented contract; the wire types live in events.proto, pulled in by Go.
 
 // ============================================================================
 // ENUMS
@@ -132,6 +167,16 @@ import "forgepoint/common/v1/common.proto";
 //   "production" silently fragmenting the read projection's stage index.
 //   Buf STANDARD requires the _UNSPECIFIED zero value + ENUM_NAME prefix on
 //   every value (so the int 0 never accidentally means "DEV").
+//
+// CANONICAL-EVENT MAPPING (interview-relevant decoupling point):
+//   This enum is the SERVICE/API enum. The event bus carries a MIRROR enum,
+//   events.v1.ModelStage, with byte-identical values (UNSPECIFIED=0, DEV=1,
+//   STAGING=2, PRODUCTION=3, ARCHIVED=4). They are kept numerically aligned on
+//   purpose, but the handler still maps registry.ModelStage <-> events.ModelStage
+//   explicitly at the publish/consume boundary rather than casting — so that if
+//   the API enum ever evolves independently (a new internal stage that isn't a
+//   published fact), the event contract is insulated. This is the same "event
+//   schema is decoupled from API schema" discipline events.proto enforces.
 // ============================================================================
 enum ModelStage {
   // Default zero value. Means "stage not set / unknown". A freshly created
@@ -177,10 +222,17 @@ enum VersionStatus {
   VERSION_STATUS_PENDING_UPLOAD = 1;
 
   // Artifact present in object storage and validated (checksum verified).
-  // Only READY versions are eligible to be promoted/served.
+  // Only READY versions are eligible to be promoted/served. The PENDING_UPLOAD
+  // -> READY transition is driven by ConfirmVersionUpload (below) and is the
+  // moment that publishes events.ModelVersionReady (fp.models.version.ready) —
+  // the edge serving/billing/pipeline-orchestrator wait on (see conflict #3 in
+  // events.proto). ModelVersionCreated fires earlier, at row creation; it is NOT
+  // a signal the artifact is usable.
   VERSION_STATUS_READY = 2;
 
   // Upload failed, checksum mismatch, or validation error. Not promotable.
+  // Set by ConfirmVersionUpload when verification fails (no ModelVersionReady
+  // is emitted in that case — there is nothing servable to announce).
   VERSION_STATUS_FAILED = 3;
 }
 
@@ -213,7 +265,8 @@ message Model {
   // Client-supplied at registration; immutable afterward (rename = new model).
   string name = 2;
 
-  // Free-text description. Client-supplied; mutable via a future UpdateModel.
+  // Free-text description. Client-supplied at registration; mutable afterward
+  // via UpdateModel (see below). Name is NOT mutable (rename = new model).
   string description = 3;
 
   // The user_id of the registrant. SERVER-AUTHORITATIVE: derived from the
@@ -389,6 +442,70 @@ message RegisterModelResponse {
 }
 
 // ----------------------------------------------------------------------------
+// UpdateModel (COMMAND / write path) — mutate the small mutable surface
+// ----------------------------------------------------------------------------
+//
+// WHY a dedicated UpdateModel (the design/CLI need it, and the old code only
+// hinted at it):
+//   A Model's IDENTITY (id, name, owner_id, team) and its lineage timestamps are
+//   immutable/server-owned, but two fields legitimately change over a model's
+//   life: its human DESCRIPTION and its TAGS (re-classify "domain", flip a
+//   "deprecated" flag). Without an UpdateModel the only way to fix a typo'd
+//   description would be to re-register — losing the id and all version lineage.
+//
+// SECURITY / MASS-ASSIGNMENT (the whole reason this message is so small):
+//   Only description and tags are accepted. name is OMITTED on purpose (renaming
+//   an addressable handle out from under serving/gateway is a footgun — a rename
+//   is modeled as a new model). id selects the target but is never itself
+//   mutated. owner_id/team/stage/status/timestamps/artifact fields are absent so
+//   a caller can NEVER reassign ownership, jump teams, or backdate via this RPC.
+//
+// PARTIAL-UPDATE SEMANTICS (interview note — "how do you patch in proto3?"):
+//   proto3 scalars have no presence, so "field omitted" vs "field set to empty"
+//   are indistinguishable for a bare string. We make the contract explicit with
+//   update_mask-style booleans (update_description / replace_tags) rather than a
+//   full google.protobuf.FieldMask, because the mutable surface is tiny and two
+//   flags are clearer to read than a path-string mask. This avoids the classic
+//   PATCH bug where an unset field silently clears stored data.
+message UpdateModelRequest {
+  // The model to update. Required. Server-authoritative target binding (the
+  // model must belong to the caller's team — enforced from auth claims).
+  string id = 1;
+
+  // New description. Applied ONLY when update_description is true (so an unset
+  // description doesn't blank an existing one — see partial-update note above).
+  string description = 2;
+
+  // When true, `description` (even if empty) replaces the stored description.
+  // When false, the description is left untouched.
+  bool update_description = 3;
+
+  // Replacement tag set. Applied ONLY when replace_tags is true. Tags are
+  // REPLACED wholesale (not merged) — the simplest, least-surprising semantics
+  // for a map; a caller that wants to add one tag sends the full desired set.
+  map<string, string> tags = 4;
+
+  // When true, `tags` replaces the stored tag map (an empty map clears all
+  // tags). When false, tags are left untouched.
+  bool replace_tags = 5;
+
+  // IDEMPOTENCY KEY: an update is naturally idempotent (applying the same patch
+  // twice yields the same state), but the key still guards against a retry
+  // re-emitting any change event / double-bumping updated_at. Optional.
+  string idempotency_key = 6;
+}
+
+// UpdateModelResponse returns the updated Model (write path → Postgres truth, so
+// immediately consistent for the caller; the READ RPCs remain eventually
+// consistent). NOTE: UpdateModel publishes NO canonical lifecycle event —
+// description/tag edits are not in the events.proto contract (no consumer reacts
+// to them), so there is nothing to emit. The Redis projection is refreshed by an
+// internal projection refresh, not a published domain event.
+message UpdateModelResponse {
+  Model model = 1;
+}
+
+// ----------------------------------------------------------------------------
 // GetModel (QUERY / read path — Redis projection)
 // ----------------------------------------------------------------------------
 
@@ -526,12 +643,107 @@ message CreateVersionResponse {
   ModelVersion version = 1;
 
   // Presigned PUT URL for the artifact. Single-use, time-limited. The bytes
-  // never traverse this gRPC service — they go straight to MinIO/S3. After a
-  // successful upload the storage layer flips status to READY.
+  // never traverse this gRPC service — they go straight to MinIO/S3. After the
+  // PUT completes, the client (or an S3/MinIO bucket-notification bridge) calls
+  // ConfirmVersionUpload, which server-side verifies the object and flips status
+  // to READY (publishing events.ModelVersionReady). If this URL expires before
+  // the upload finishes, GetUploadURL re-issues a fresh one for the same version.
   string upload_url = 2;
 
-  // When upload_url stops being valid. Client must complete the PUT before this.
+  // When upload_url stops being valid. Client must complete the PUT before this
+  // (or call GetUploadURL for a fresh URL).
   google.protobuf.Timestamp upload_url_expires_at = 3;
+}
+
+// ----------------------------------------------------------------------------
+// GetUploadURL (STORAGE) — (re)issue a presigned upload URL for a version
+// ----------------------------------------------------------------------------
+//
+// WHY a standalone RPC when CreateVersion already returns an upload URL:
+//   The create-then-PUT flow can break between the two steps — the presigned URL
+//   expires (TTL elapsed), the client crashed before uploading, or a CI runner
+//   was preempted. Without a way to RE-ISSUE the URL, the only recovery would be
+//   to mint a NEW version (wasting a version number and a storage slot). This RPC
+//   re-issues a fresh presigned PUT for an EXISTING version that is still
+//   PENDING_UPLOAD, making the upload step resumable. It is idempotent/read-only
+//   with respect to registry STATE (it grants a credential; it does not change
+//   the version row), so no idempotency key is needed.
+//
+// SECURITY: rejected with FAILED_PRECONDITION if the version is already READY
+//   (no overwriting a verified artifact) or FAILED. The storage KEY is computed
+//   server-side from the version's identity — never client-supplied — so this
+//   cannot be used to obtain a write credential for an arbitrary object (path
+//   traversal / cross-model overwrite guard).
+message GetUploadURLRequest {
+  // The PENDING_UPLOAD version to (re)issue an upload URL for. Required.
+  string version_id = 1;
+
+  // Requested URL validity in seconds; server clamps to a max (e.g. 3600s) to
+  // bound how long the write credential is usable. 0 = server default.
+  int64 ttl_seconds = 2;
+}
+
+message GetUploadURLResponse {
+  // Fresh presigned PUT URL for the artifact. Single-use, time-limited. Bytes go
+  // straight to MinIO/S3 — never through this control-plane service.
+  string upload_url = 1;
+
+  // When upload_url stops being valid.
+  google.protobuf.Timestamp upload_url_expires_at = 2;
+}
+
+// ----------------------------------------------------------------------------
+// ConfirmVersionUpload (COMMAND / write path) — the PENDING_UPLOAD → READY edge
+// ----------------------------------------------------------------------------
+//
+// WHY this RPC exists (the missing READY trigger):
+//   CreateVersion lands a version at status=PENDING_UPLOAD and hands back a
+//   presigned PUT URL; the bytes then flow DIRECTLY to MinIO/S3, bypassing this
+//   service. Something must tell the registry "the upload finished, go verify
+//   it" so the status can advance to READY (or FAILED). That trigger is this RPC.
+//   It is what publishes events.ModelVersionReady (fp.models.version.ready) — the
+//   edge serving/billing/pipeline-orchestrator consume (conflict #3). Before this
+//   RPC existed, the proto's prose claimed "the storage layer flips status to
+//   READY" but exposed no surface to do it — a real gap this fix closes.
+//
+// WHO CALLS IT: typically the uploader (CLI/CI) after a successful PUT, OR an
+//   S3/MinIO bucket-notification webhook bridged into this RPC. Either way the
+//   server RE-VERIFIES the object server-side (existence + checksum + size) —
+//   it does NOT trust the caller's claim that the upload succeeded.
+//
+// SECURITY / MASS-ASSIGNMENT (critical): the caller does NOT supply
+//   artifact_path, artifact_digest, or size_bytes. Those are MEASURED by the
+//   server from the stored object. Accepting a client-asserted digest would let
+//   a caller register a "verified" artifact whose bytes don't match — defeating
+//   the entire content-integrity guarantee — and a client-asserted size would let
+//   a tenant under-report storage to dodge billing. The ONLY input is which
+//   version to confirm. The expected_digest field below is an OPTIONAL assertion
+//   the server CHECKS AGAINST (cross-check), never one it stores blindly.
+message ConfirmVersionUploadRequest {
+  // The PENDING_UPLOAD version whose artifact upload just completed. Required.
+  string version_id = 1;
+
+  // OPTIONAL client-asserted content digest ("sha256:..."). If set, the server
+  // computes the object's digest and FAILS the confirmation (status→FAILED) on
+  // mismatch — a cross-check, not a stored value. If empty, the server simply
+  // records the digest it computes. Never trusted as the source of truth.
+  string expected_digest = 2;
+
+  // IDEMPOTENCY KEY: confirmation triggers the ModelVersionReady event and
+  // billing's storage metering. A retry with the same key is a no-op returning
+  // the current version state — so a duplicate webhook delivery cannot double-fire
+  // ModelVersionReady or double-meter storage. Optional but recommended.
+  string idempotency_key = 3;
+}
+
+// ConfirmVersionUploadResponse returns the version with status now READY (on a
+// successful verify) or FAILED (on checksum/size mismatch or missing object).
+// On READY, the server has populated artifact_path/artifact_digest/size_bytes —
+// all server-measured — and has published events.ModelVersionReady.
+message ConfirmVersionUploadResponse {
+  // The version reflecting its post-verification status (READY or FAILED) and,
+  // when READY, the server-measured artifact_path/artifact_digest/size_bytes.
+  ModelVersion version = 1;
 }
 
 // ----------------------------------------------------------------------------
@@ -689,109 +901,50 @@ message GetDownloadURLResponse {
 }
 
 // ============================================================================
-// EVENT PAYLOAD MESSAGES (published to NATS, carried in EventEnvelope.data)
+// EVENTS THIS SERVICE PUBLISHES — defined in forgepoint.events.v1, NOT here
 // ============================================================================
 //
-// WHY typed event payloads (not raw JSON):
-//   These messages are packed into common.v1.EventEnvelope.data (a
-//   google.protobuf.Any). Defining them as protos gives consumers — serving,
-//   monitor, billing, notification, experiment-tracker — a typed, versioned,
-//   backward-compatibility-checked contract. The Any's type_url tells a
-//   consumer exactly which message to unmarshal. This is the "typed payload in
-//   a generic envelope" pattern from common.proto's EventEnvelope docs.
+// WHY THERE ARE NO EVENT MESSAGES IN THIS FILE ANYMORE (this is deliberate):
+//   This proto previously defined its OWN ModelRegistered / ModelVersionCreated /
+//   ModelPromoted / ModelArchived payloads. An adversarial cross-service review
+//   found per-service event messages DRIFTING from the consumers that read them
+//   (mismatched names, missing fields, two services both claiming one event).
+//   The fix: ONE canonical event package, forgepoint.events.v1, owned and
+//   buf-breaking-guarded independently of any service's API. Those four ad-hoc
+//   messages have been DELETED from this file and now live, canonically, in
+//   proto/forgepoint/events/v1/events.proto. The registry handler marshals an
+//   eventsv1.* message into common.v1.EventEnvelope.data (an Any) at publish time.
 //
-// WHY duplicate some fields here instead of embedding the full Model/Version:
-//   Events should be SELF-CONTAINED and STABLE — a consumer must be able to act
-//   on the event WITHOUT calling back into the registry (which would also defeat
-//   the async decoupling and risk reading a not-yet-projected state). We embed
-//   the full domain object where the consumer genuinely needs it (registered/
-//   created), and only the identifying + changed fields where that's enough
-//   (promoted/archived). This is a deliberate "fat enough" event design — not so
-//   thin consumers must call back, not so fat it leaks unrelated churn.
+//   This also realizes the "event schema is DECOUPLED from API schema" rule: the
+//   old registry events EMBEDDED the full registry.Model / registry.ModelVersion,
+//   which coupled every consumer's build to this proto. The canonical events
+//   instead carry FLAT ids + the specific fields consumers need, so a consumer
+//   depends only on eventsv1 + common — never on registry's API types.
 //
-// SUBJECT MAPPING (from the platform design's NATS hierarchy):
-//   ModelRegistered      → fp.models.registered
-//   ModelVersionCreated  → fp.models.version.created
-//   ModelPromoted        → fp.models.promoted   (drives serving reload + billing)
-//   ModelArchived        → fp.models.archived
+// THE FIVE EVENTS REGISTRY PRODUCES (subject · canonical message · key consumers):
+//   fp.models.registered       · events.ModelRegistered     · pipeline-orchestrator, experiment-tracker
+//   fp.models.version.created  · events.ModelVersionCreated · experiment-tracker
+//   fp.models.version.ready    · events.ModelVersionReady   · serving, billing, pipeline-orchestrator   (NEW)
+//   fp.models.promoted         · events.ModelPromoted       · inference-gateway, serving, model-monitor, billing
+//   fp.models.archived         · events.ModelArchived       · inference-gateway, serving, billing
+//
+//   RPC → EVENT(S) it emits on commit:
+//     RegisterModel        → events.ModelRegistered
+//     CreateVersion        → events.ModelVersionCreated   (status=PENDING_UPLOAD)
+//     ConfirmVersionUpload → events.ModelVersionReady     (status PENDING_UPLOAD→READY; NONE on →FAILED)
+//     PromoteVersion       → events.ModelPromoted         (carries from/to + demoted version — the atomic swap)
+//     DeleteModel          → events.ModelArchived
+//     UpdateModel          → (no canonical event — description/tag edits aren't a published fact)
+//
+//   ENUM MAPPING AT THE BOUNDARY: registry.ModelStage values are mapped to the
+//   mirror events.ModelStage explicitly in the handler (not cast), per the
+//   decoupling note on the ModelStage enum above. CONSUMERS that need the
+//   PENDING_UPLOAD→READY distinction watch ModelVersionReady, NOT ModelVersionCreated.
+//
+// REGISTRY CONSUMES NO EVENTS. Its read-side projection consumer reacts to its
+// OWN published events to build the Redis read model (the CQRS loop), but the
+// service subscribes to no OTHER service's events — there is no inbound coupling.
 // ============================================================================
-
-// ModelRegistered — emitted after RegisterModel commits to Postgres.
-// CONSUMERS: Pipeline Orchestrator (a registered model can become a pipeline
-// input), Experiment Tracker (link runs to the model), Notification (announce).
-message ModelRegistered {
-  // The full model as committed (authoritative snapshot at registration time).
-  // Carrying the whole object lets consumers act without a callback.
-  Model model = 1;
-}
-
-// ModelVersionCreated — emitted after CreateVersion commits. Note: emitted at
-// version-row creation (status=PENDING_UPLOAD), so consumers that care about a
-// USABLE artifact must also watch for the READY transition (a future
-// ModelVersionReady event) rather than assuming the artifact is present.
-// CONSUMERS: Experiment Tracker (associate the training run), Billing (begin
-// metering storage once READY), Notification.
-message ModelVersionCreated {
-  // The owning model's id (denormalized so consumers needn't join).
-  string model_id = 1;
-
-  // The owning model's name (saves consumers a lookup for display/routing).
-  string model_name = 2;
-
-  // The full created version snapshot.
-  ModelVersion version = 3;
-}
-
-// ModelPromoted — emitted after PromoteVersion commits the atomic stage swap.
-// This is the highest-impact event in the service: it's how serving learns to
-// load new weights, how the gateway re-points traffic, how monitor re-baselines
-// drift, and how billing changes what it meters.
-// CONSUMERS: Model Serving (reload/route to the new production version),
-// Inference Gateway (update routing table), Model Monitor (reset drift baseline
-// to the new version's training distribution), Billing (re-meter), Notification.
-message ModelPromoted {
-  // The model whose production version changed.
-  string model_id = 1;
-
-  // The model's name (for routing/display without a lookup).
-  string model_name = 2;
-
-  // The version that was promoted (id + label).
-  string version_id = 3;
-  string version = 4;
-
-  // The stage it moved FROM and the stage it moved TO. Including both makes the
-  // event self-describing for audit and lets a consumer ignore transitions it
-  // doesn't care about (e.g., monitor only reacts when to_stage == PRODUCTION).
-  ModelStage from_stage = 5;
-  ModelStage to_stage = 6;
-
-  // If this promotion auto-demoted a previous production version (the
-  // single-production invariant), its id/label so consumers can tear down the
-  // old deployment. Empty when there was no prior production version.
-  string demoted_version_id = 7;
-  string demoted_version = 8;
-
-  // Who initiated the promotion (from auth claims) — for audit trails.
-  string promoted_by = 9;
-}
-
-// ModelArchived — emitted after DeleteModel soft-deletes the model.
-// CONSUMERS: Inference Gateway (stop routing to it), Model Serving (tear down
-// any running instances), Billing (stop metering), Notification.
-message ModelArchived {
-  // The archived model's id.
-  string model_id = 1;
-
-  // The archived model's name.
-  string model_name = 2;
-
-  // Who archived it (auth claims) — for audit.
-  string archived_by = 3;
-
-  // When the archive committed (matches Model.archived_at).
-  google.protobuf.Timestamp archived_at = 4;
-}
 
 // ============================================================================
 // REGISTRY SERVICE
@@ -819,36 +972,56 @@ message ModelArchived {
 //   ListModels?" → backpressure + resumable cursor + simpler caching).
 //
 // RPC GROUPS:
-//   COMMANDS (Postgres write, then publish NATS event):
-//     RegisterModel, CreateVersion, PromoteVersion, DeleteModel
+//   COMMANDS (Postgres write, then publish a canonical events.v1 NATS event):
+//     RegisterModel, UpdateModel, CreateVersion, ConfirmVersionUpload,
+//     PromoteVersion, DeleteModel
 //   QUERIES (Redis read projection, eventually consistent):
 //     GetModel, ListModels, SearchByTag, GetVersion, ListVersions
 //   STORAGE (object store, presigned URLs — bytes bypass this service):
-//     GetDownloadURL  (upload URL is returned inline by CreateVersion)
+//     GetUploadURL (re-issue), GetDownloadURL  (the FIRST upload URL is returned
+//     inline by CreateVersion; GetUploadURL re-issues an expired one)
 // ============================================================================
 service RegistryService {
   // --- COMMANDS (write path → Postgres → NATS event) ---
 
   // RegisterModel creates a new model (the identity, no versions yet). Writes to
-  // Postgres and publishes ModelRegistered. owner_id/team are taken from the
-  // caller's auth claims, never the request. Idempotent via idempotency_key.
+  // Postgres and publishes events.ModelRegistered (fp.models.registered).
+  // owner_id/team are taken from the caller's auth claims, never the request.
+  // Idempotent via idempotency_key.
   rpc RegisterModel(RegisterModelRequest) returns (RegisterModelResponse);
+
+  // UpdateModel mutates the small mutable surface (description and/or tags) of an
+  // existing model, using explicit update_description/replace_tags flags so an
+  // omitted field never silently clears stored data. name/owner/team/timestamps
+  // are NOT mutable here (mass-assignment guard). Publishes NO canonical event —
+  // these edits are not a published platform fact — but refreshes the read model.
+  rpc UpdateModel(UpdateModelRequest) returns (UpdateModelResponse);
 
   // CreateVersion cuts a new immutable version of an existing model. Writes the
   // version row (status=PENDING_UPLOAD, stage=DEV), returns a presigned upload
-  // URL for the artifact, and publishes ModelVersionCreated. The artifact bytes
-  // never flow through this RPC.
+  // URL for the artifact, and publishes events.ModelVersionCreated
+  // (fp.models.version.created). The artifact bytes never flow through this RPC.
   rpc CreateVersion(CreateVersionRequest) returns (CreateVersionResponse);
+
+  // ConfirmVersionUpload drives the PENDING_UPLOAD → READY (or FAILED) transition
+  // after the artifact has been PUT directly to object storage. The server
+  // RE-VERIFIES the object (existence + server-measured digest + size — never a
+  // client-asserted value), and on success flips status to READY and publishes
+  // events.ModelVersionReady (fp.models.version.ready) carrying the server-measured
+  // artifact_path/artifact_digest/size_bytes that serving/billing/orchestrator
+  // need. This is the READY edge that was previously unreachable (conflict #3).
+  rpc ConfirmVersionUpload(ConfirmVersionUploadRequest) returns (ConfirmVersionUploadResponse);
 
   // PromoteVersion advances a version through the stage state machine
   // (DEV→STAGING→PRODUCTION→ARCHIVED), enforcing legal transitions and the
   // single-production invariant in ONE Postgres transaction, then publishes
-  // ModelPromoted. This is what drives serving/gateway/monitor/billing reactions.
+  // events.ModelPromoted (fp.models.promoted). This is what drives
+  // serving/gateway/monitor/billing reactions.
   rpc PromoteVersion(PromoteVersionRequest) returns (PromoteVersionResponse);
 
   // DeleteModel soft-deletes (archives) a model and all its versions, removes it
-  // from active read lists, and publishes ModelArchived. Rows are retained for
-  // lineage/audit — this is not a hard delete.
+  // from active read lists, and publishes events.ModelArchived
+  // (fp.models.archived). Rows are retained for lineage/audit — not a hard delete.
   rpc DeleteModel(DeleteModelRequest) returns (DeleteModelResponse);
 
   // --- QUERIES (read path → Redis projection; EVENTUALLY CONSISTENT) ---
@@ -875,6 +1048,12 @@ service RegistryService {
   rpc ListVersions(ListVersionsRequest) returns (ListVersionsResponse);
 
   // --- STORAGE (object store; bytes bypass this control-plane service) ---
+
+  // GetUploadURL re-issues a fresh presigned PUT URL for an existing version that
+  // is still PENDING_UPLOAD (e.g. the original URL from CreateVersion expired, or
+  // the client crashed before uploading). Makes the upload step resumable without
+  // minting a duplicate version. Rejected if the version is already READY/FAILED.
+  rpc GetUploadURL(GetUploadURLRequest) returns (GetUploadURLResponse);
 
   // GetDownloadURL returns a short-lived presigned URL to fetch a READY
   // version's artifact directly from MinIO/S3, plus the expected digest for

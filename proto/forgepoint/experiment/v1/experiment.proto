@@ -12,11 +12,20 @@
 //
 // WHAT'S HERE:
 //   - Domain messages: Experiment, Run, Param, MetricPoint, MetricSeries
-//   - RPCs: CreateExperiment/ListExperiments/GetExperiment,
-//           StartRun/UpdateRunStatus/GetRun/ListRuns,
-//           LogMetrics (BATCH), LogParams, CompareRuns
-//   - Event-payload messages this service PUBLISHES (RunCreated, RunFinished)
-//     so the common EventEnvelope's google.protobuf.Any can carry typed data.
+//   - RPCs: CreateExperiment/ListExperiments/GetExperiment/ArchiveExperiment,
+//           StartRun/UpdateRunStatus/GetRun/ListRuns/DeleteRun,
+//           LogMetrics (BATCH), LogParams, GetMetricHistory, CompareRuns,
+//           SetRunArtifacts (free-form attachments)
+//
+// WHAT'S NOT HERE (deliberately): the event PAYLOAD messages this service
+// publishes/consumes. They are NOT redefined locally — they live in the SINGLE
+// canonical contract forgepoint/events/v1/events.proto and are imported below.
+// This service PUBLISHES events.RunCreated (fp.experiments.run.created) and
+// events.RunFinished (fp.experiments.run.finished); it CONSUMES a wide slice of
+// the platform firehose (see the async-consumer note at the service definition).
+// Defining event payloads here once led to producer/consumer schema drift across
+// services (e.g. FeaturesWritten vs FeaturesIngested) — the events package fixes
+// that by being the one place both ends of every pipe agree on.
 //
 // ============================================================================
 // PATTERN — Event-Driven (Async Batch Ingestion)
@@ -30,12 +39,22 @@
 //      Used while a human or a training pod is actively driving a run.
 //
 //   2) ASYNC (NOT in this proto — it's a NATS consumer): the tracker also
-//      SUBSCRIBES to high-volume platform events — fp.inference.completed,
-//      fp.models.version.created, fp.pipeline.step.completed,
-//      fp.features.ingested — buffers them in memory, and FLUSHES to Postgres
-//      in batches (every N ms or every M events, whichever first). If the DB
-//      falls behind, the buffer fills and the consumer NAKs / stops acking,
-//      which makes NATS JetStream slow delivery: that is BACK-PRESSURE.
+//      SUBSCRIBES to high-volume platform events (the canonical subjects, see
+//      forgepoint/events/v1/events.proto) — fp.inference.completed,
+//      fp.models.version.created, fp.pipelines.step.completed,
+//      fp.pipelines.completed, fp.features.written, fp.billing.usage.recorded,
+//      fp.models.drift.detected, fp.pipelines.model.deployed,
+//      fp.notifications.delivered/failed — buffers them in memory, and FLUSHES
+//      to Postgres in batches (every N ms or every M events, whichever first).
+//      If the DB falls behind, the buffer fills and the consumer NAKs / stops
+//      acking, which makes NATS JetStream slow delivery: that is BACK-PRESSURE.
+//
+//      CRITICAL SUBJECT FIXES (event-contract alignment): the async consumer
+//      subscribes to fp.features.WRITTEN (NOT the old fp.features.ingested — that
+//      subject has no producer and would never deliver) and to the PLURAL
+//      fp.pipelines.step.completed (NOT fp.pipeline.step.completed). These were
+//      reconciled against events.proto so every subject we subscribe to actually
+//      has a matching producer.
 //
 // WHY ASYNC FOR THE HOT PATH:
 //   Inference happens thousands of times per second. If the inference gateway
@@ -84,7 +103,17 @@ package forgepoint.experiment.v1;
 option go_package = "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/experiment/v1;experimentv1";
 
 import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
 import "forgepoint/common/v1/common.proto";
+// NOTE — we deliberately do NOT import forgepoint/events/v1/events.proto here.
+// The canonical event contract owns the wire types this service PUBLISHES —
+// events.RunCreated / events.RunFinished — and the wide slice it CONSUMES, so
+// producer and consumer share the EXACT same generated types. But that sharing
+// happens in GENERATED GO: this API .proto declares and references no events.v1
+// TYPE, so importing events.proto here would be an unused proto import (Buf
+// IMPORT_USED) and would compile-couple our API schema to the event schema —
+// precisely the re-coupling events.proto's DESIGN block exists to prevent. The
+// Go event consumer/publisher imports forgepoint/events/v1; this file does not.
 
 // ============================================================================
 // ENUMS
@@ -191,6 +220,17 @@ message Experiment {
 
   // When the experiment was created. SERVER-set, immutable.
   google.protobuf.Timestamp created_at = 7;
+
+  // When the experiment was last mutated (name/description/tags edit, or
+  // archive). SERVER-set on every write. Lets clients cache/ETag and lets the
+  // UI sort by recency.
+  google.protobuf.Timestamp updated_at = 8;
+
+  // SERVER-set archive timestamp. Unset = active. We SOFT-DELETE experiments
+  // (set this, hide from default lists) rather than hard-delete: runs/metrics
+  // are an audit trail and may be referenced by model lineage in the Registry.
+  // ArchiveExperiment sets this; it is never client-supplied.
+  google.protobuf.Timestamp archived_at = 9;
 }
 
 // ============================================================================
@@ -262,6 +302,12 @@ message Run {
 
   // When the run reached a terminal state. SERVER-set; unset while RUNNING.
   google.protobuf.Timestamp ended_at = 11;
+
+  // Free-form, JSON-shaped side-artifacts (confusion matrix, feature-importance,
+  // artifact manifest, eval report). Attached via SetRunArtifacts; size-capped
+  // server-side. Struct (not bytes) so it stays inspectable/renderable. Unset
+  // for runs that never attach any. NOT a metrics channel — metrics are typed.
+  google.protobuf.Struct artifacts = 12;
 }
 
 // ============================================================================
@@ -403,12 +449,23 @@ message GetExperimentResponse {
 // cursor-vs-offset rationale). Page size is capped SERVER-SIDE (default 20,
 // max 100) to prevent a client from requesting an unbounded page.
 message ListExperimentsRequest {
-  // Optional filter: only experiments owned by this team. Empty = caller's own
-  // team (the server scopes results to the caller's team regardless).
+  // Optional NARROWING filter only — NOT an authorization scope. The server
+  // ALWAYS constrains results to the team(s) the caller's auth claims permit;
+  // team_filter can only narrow WITHIN that permitted set, never widen it. WHY
+  // the field still exists: an admin whose claims span several teams may want to
+  // view one team's experiments. A client cannot use this to read another
+  // team's data — the auth interceptor's claim, not this field, is the security
+  // boundary. (Mass-assignment/IDOR guard: tenancy derives from claims.)
   string team_filter = 1;
 
+  // Include soft-archived experiments. Default false (active only). WHY a flag,
+  // not a separate RPC: archive is a visibility toggle, not a different query.
+  bool include_archived = 2;
+
   // Cursor-based pagination. page_size defaults to 20, max 100 (server-enforced).
-  forgepoint.common.v1.PaginationRequest pagination = 2;
+  // See common.PaginationRequest — the cap is enforced server-side, not trusted
+  // from the client (an unbounded page is a DoS lever).
+  forgepoint.common.v1.PaginationRequest pagination = 3;
 }
 
 message ListExperimentsResponse {
@@ -417,6 +474,65 @@ message ListExperimentsResponse {
 
   // Pagination metadata (next_page_token + total_count).
   forgepoint.common.v1.PaginationResponse pagination = 2;
+}
+
+// ============================================================================
+// UpdateExperiment
+// ============================================================================
+
+// UpdateExperimentRequest edits the MUTABLE, client-owned fields of an
+// experiment (name/description/tags). Note what is ABSENT and therefore
+// NOT editable by a client: id (the target, but immutable as data), owner_id,
+// team, created_at, archived_at — all server-authoritative. You cannot
+// "re-home" an experiment to another owner/team via this RPC (mass-assignment
+// guard). WHY a field mask: a client editing only the description must not have
+// to round-trip name/tags and risk clobbering a concurrent edit.
+message UpdateExperimentRequest {
+  // The experiment to update. The id selects the row; it is never changed.
+  string id = 1;
+
+  // New name (applied only if "name" is in update_fields).
+  string name = 2;
+
+  // New description (applied only if "description" is in update_fields).
+  string description = 3;
+
+  // New tags — REPLACES the whole map (applied only if "tags" is in
+  // update_fields). WHY replace-not-merge: merge semantics make it impossible to
+  // DELETE a tag; a full replace is unambiguous and the client sends the desired
+  // final set.
+  map<string, string> tags = 4;
+
+  // Field mask of which of {name, description, tags} to apply. WHY a string
+  // list rather than google.protobuf.FieldMask: keeps the import surface minimal
+  // and the allowed set is tiny and validated server-side; an unknown field name
+  // is rejected with INVALID_ARGUMENT.
+  repeated string update_fields = 5;
+}
+
+message UpdateExperimentResponse {
+  // The experiment after the edit (updated_at refreshed).
+  Experiment experiment = 1;
+}
+
+// ============================================================================
+// ArchiveExperiment  (SOFT delete)
+// ============================================================================
+
+// ArchiveExperimentRequest soft-deletes an experiment: it sets archived_at and
+// hides it from default lists, but PRESERVES its runs and metrics. WHY soft (not
+// hard) delete: an experiment's runs are an audit trail and may be referenced by
+// model-lineage in the Registry (a run carries the model_version_id it produced).
+// Hard-deleting would orphan those references and destroy provenance. This is the
+// design's "Delete/Archive where the design calls for it" done safely.
+message ArchiveExperimentRequest {
+  // The experiment to archive. Must be visible to the caller's team.
+  string id = 1;
+}
+
+message ArchiveExperimentResponse {
+  // The experiment after archiving (archived_at now set).
+  Experiment experiment = 1;
 }
 
 // ============================================================================
@@ -467,8 +583,9 @@ message GetRunRequest {
 }
 
 // GetRunResponse returns run metadata + params + the denormalized headline
-// metrics. It does NOT return the full metric time-series (that can be huge);
-// use CompareRuns or a dedicated metric-history read for the curve.
+// metrics + any attached artifacts. It does NOT return the full metric
+// time-series (that can be huge); use GetMetricHistory for one run's curve, or
+// CompareRuns to overlay several runs.
 message GetRunResponse {
   // The requested run. NOT_FOUND if missing or not visible to the caller.
   Run run = 1;
@@ -502,6 +619,35 @@ message ListRunsResponse {
   // Pagination metadata.
   forgepoint.common.v1.PaginationResponse pagination = 2;
 }
+
+// ============================================================================
+// DeleteRun
+// ============================================================================
+
+// DeleteRunRequest removes a single run and ITS metrics/params. WHY this is
+// allowed to HARD-delete where ArchiveExperiment is not: a run is the unit of
+// experimental noise — a mis-launched job, a smoke test, a duplicate — and the
+// design's run leaderboard is unusable if garbage runs can't be pruned. SAFETY
+// RAIL: the server REJECTS deleting a run whose model_version_id is set and is
+// still referenced by a live (non-archived) model version in the Registry — that
+// would sever lineage; such a run must be Archived at the experiment level
+// instead. A run with no downstream model reference is safe to delete.
+// Only the run's owner or a team admin may delete (enforced from auth claims).
+message DeleteRunRequest {
+  // The run to delete.
+  string run_id = 1;
+
+  // Idempotency: a retried delete after a network blip must not error just
+  // because the run is already gone. WHY a key (not "treat NOT_FOUND as success"):
+  // a key distinguishes "my earlier delete succeeded" from "someone else's run id
+  // typo" — the server returns OK on replay of the SAME key, NOT_FOUND otherwise.
+  string idempotency_key = 2;
+}
+
+// DeleteRunResponse is a named-empty response (Buf forbids returning
+// google.protobuf.Empty and forbids reusing a domain message as a response).
+// Empty body = success; failures surface as gRPC status codes.
+message DeleteRunResponse {}
 
 // ============================================================================
 // UpdateRunStatus
@@ -633,88 +779,128 @@ message CompareRunsResponse {
 }
 
 // ============================================================================
-// EVENT-PAYLOAD MESSAGES (published to NATS via the common EventEnvelope)
+// GetMetricHistory  (the time-series read the rest of the proto refers to)
 // ============================================================================
 //
-// WHY these live in the proto: the common EventEnvelope carries its payload as
-// google.protobuf.Any. For that Any to be TYPE-SAFE (decodable by consumers
-// via its type_url), the payload must be a real, registered proto message —
-// these are the experiment tracker's published-event payloads. Defining them
-// here (vs a generic JSON blob) gives consumers a compile-time contract and
-// keeps the subject hierarchy fp.experiments.* meaningful.
+// WHY this exists as its own RPC: GetRun deliberately returns only the
+// denormalized final_metrics (headline numbers), and CompareRuns is multi-run.
+// Several places in this contract say "use a dedicated metric-history read for
+// the curve" — this is that RPC. It returns the FULL time-series for ONE run,
+// PAGINATED, because a single run's "loss" curve can be millions of points and
+// must never be returned unbounded (that is both an OOM and a DoS hazard).
 //
-// SUBJECTS (matching the design doc's fp.{service}.{event} hierarchy):
-//   fp.experiments.run.created   → RunCreatedEvent
-//   fp.experiments.run.finished  → RunFinishedEvent
-//
-// CONSUMERS: e.g., the Notification service can alert on a finished run; a BFF
-// can invalidate a cached leaderboard. Note this service is mostly a CONSUMER
-// of events (inference/pipeline/registry), but it also PUBLISHES these so the
-// rest of the platform can react to run lifecycle.
-//
-// SECURITY IN EVENTS: payloads carry IDs and headline metrics only — never
-// secrets/PII. owner_id is an opaque UUID, not an email.
-// ============================================================================
-
-// RunCreatedEvent announces a new run opened (sync StartRun or async
-// materialization). WHY emit on create (not only on finish): downstream tools
-// (a live dashboard) want to show in-flight runs immediately.
-message RunCreatedEvent {
-  // The run that was created.
+// WHY paginated rather than server-streaming: the metrics table is RANGE-
+// partitioned by timestamp, so a cursor (page_token encoding the last
+// (key,step,timestamp) seen) maps cleanly onto an indexed keyset scan and is
+// trivially retryable. A server-stream would be fine too, but pagination reuses
+// the platform-wide common.Pagination contract and lets a BFF/UI fetch one
+// screenful at a time. (Streaming is reserved for genuinely push-shaped APIs,
+// e.g. a future WatchRun; a historical read is pull-shaped.)
+message GetMetricHistoryRequest {
+  // The run whose metric history to read.
   string run_id = 1;
 
-  // The experiment it belongs to.
-  string experiment_id = 2;
+  // Optional: restrict to these metric keys (e.g. ["loss","val_auc"]). Empty =
+  // all keys on the run. The main lever for keeping the response bounded.
+  repeated string metric_keys = 2;
 
-  // The model version it targets, if any (opaque Registry ID).
-  string model_version_id = 3;
+  // Optional inclusive step window [min_step, max_step]. Both 0 = no step bound.
+  // Lets a UI fetch "epochs 100–200" without scanning the whole curve.
+  int64 min_step = 3;
+  int64 max_step = 4;
 
-  // Which ingestion path created it (API vs EVENT) — useful for consumers
-  // that only care about first-party training runs.
-  RunSource source = 4;
-
-  // When the run started (server time).
-  google.protobuf.Timestamp started_at = 5;
+  // Cursor pagination. page_size defaults to 1000 here (curves are dense), max
+  // 5000 — a HIGHER cap than list RPCs because points are tiny and charts want
+  // many; still server-enforced so the page can't be unbounded.
+  forgepoint.common.v1.PaginationRequest pagination = 5;
 }
 
-// RunFinishedEvent announces a run reaching a terminal state, carrying the
-// headline metrics so consumers can react WITHOUT a follow-up RPC (the classic
-// "fat event" choice: include enough data to act, avoiding a thundering herd of
-// GetRun callbacks). Tradeoff: the event is larger and may go stale if metrics
-// are later recomputed — acceptable since terminal-run metrics are final.
-message RunFinishedEvent {
-  // The run that finished.
-  string run_id = 1;
+message GetMetricHistoryResponse {
+  // The requested points, grouped per metric key (chart-ready). Within a series,
+  // points are ordered by step then timestamp.
+  repeated MetricSeries series = 1;
 
-  // The experiment it belongs to.
-  string experiment_id = 2;
-
-  // The model version it produced/evaluated, if any (opaque Registry ID).
-  string model_version_id = 3;
-
-  // Terminal status (FINISHED / FAILED / KILLED).
-  RunStatus status = 4;
-
-  // Denormalized headline metrics at finish (final/best per key). Lets a
-  // consumer rank/alert without calling back into the tracker.
-  repeated MetricPoint final_metrics = 5;
-
-  // When the run ended (server time).
-  google.protobuf.Timestamp ended_at = 6;
+  // Pagination metadata. next_page_token encodes the last (key,step,timestamp)
+  // read so the next page resumes via an indexed keyset scan.
+  forgepoint.common.v1.PaginationResponse pagination = 2;
 }
 
 // ============================================================================
-// FREE-FORM PAYLOAD NOTE (google.protobuf.Struct)
+// SetRunArtifacts  (the typed home for the google.protobuf.Struct import)
 // ============================================================================
 //
-// We import google/protobuf/struct.proto for callers/consumers that need to
-// attach unstructured JSON-shaped context to a run without a schema change
-// (e.g., an artifact manifest, a confusion matrix dump). It is intentionally
-// NOT on the strict create/log requests (those are typed and validated) — it's
-// available for a future SetRunArtifacts-style RPC. We keep the import here so
-// the contract documents the chosen free-form type (Struct, which round-trips
-// to JSON) rather than reaching for raw bytes. Using it is opt-in per future
-// RPC; nothing in v1 forces unstructured data into the hot ingestion path.
+// WHY this RPC exists (and why Struct): a run produces unstructured side-artifacts
+// whose shape varies and isn't worth a schema change per kind — a confusion
+// matrix, a feature-importance map, an artifact manifest, a small eval report.
+// google.protobuf.Struct round-trips to/from JSON, so callers attach arbitrary
+// JSON-shaped context WITHOUT us reaching for opaque bytes (which a UI can't
+// render) and WITHOUT bloating the hot LogMetrics path with free-form data.
+//
+// SECURITY / SIZE: this is NOT a dumping ground. The server caps the serialized
+// Struct size (e.g. 256 KiB) and REJECTS larger payloads with INVALID_ARGUMENT —
+// large blobs belong in object storage with a URI referenced here, not inline on
+// NATS-adjacent state. Artifacts are write-once-ish: re-setting the same key
+// replaces it; keys are namespaced strings the run owns.
+message SetRunArtifactsRequest {
+  // The run to attach artifacts to.
+  string run_id = 1;
+
+  // Free-form, JSON-shaped artifacts (e.g.
+  // {"confusion_matrix": [[...]], "manifest_uri": "s3://..."}). Server-size-capped.
+  // Struct (not bytes) so it is inspectable/renderable and stays human-readable.
+  google.protobuf.Struct artifacts = 2;
+
+  // Idempotency key — SetRunArtifacts is a mutation a client may retry; the same
+  // key replays to the same effect rather than re-applying.
+  string idempotency_key = 3;
+}
+
+message SetRunArtifactsResponse {
+  // The run after the attachment (carries the merged artifacts back for confirm).
+  Run run = 1;
+}
+
+// ============================================================================
+// EVENT PAYLOADS — DEFINED ELSEWHERE (forgepoint/events/v1/events.proto)
+// ============================================================================
+//
+// This service's two PUBLISHED events are NOT redefined here. They live in the
+// canonical event contract and are imported at the top of this file:
+//
+//   PUBLISHES:
+//     fp.experiments.run.created   → events.RunCreated
+//     fp.experiments.run.finished  → events.RunFinished   (fat event: carries
+//        final_metrics so a leaderboard/Notification consumer ranks/alerts with
+//        NO GetRun callback — see events.proto's RunFinished).
+//
+// WHY NOT here (the lesson): the previous version defined local RunCreatedEvent
+// / RunFinishedEvent messages. That is exactly the pattern that caused
+// platform-wide event-schema DRIFT (a producer and a consumer ending up with
+// two incompatible shapes for the "same" event). The events package is now the
+// SINGLE source of truth: the handler maps this service's domain RunStatus to
+// events.RunStatus (a few lines of mechanical conversion at the publish
+// boundary — the mirror enums are intentionally identical) and marshals
+// events.RunCreated / events.RunFinished into common.EventEnvelope.data.
+//
+// CONSUMED events (no payload types belong here — we depend on events.* for
+// decoding; the subscriptions themselves are wired in the events package, not
+// the gRPC surface):
+//   fp.inference.completed         events.InferenceCompleted
+//   fp.models.version.created      events.ModelVersionCreated
+//   fp.pipelines.step.completed    events.StepCompleted
+//   fp.pipelines.completed         events.PipelineCompleted
+//   fp.features.written            events.FeaturesWritten   (REPOINTED from the
+//      dead fp.features.ingested subject — conflict #4 in events.proto)
+//   fp.billing.usage.recorded      events.UsageRecorded     (cost attribution)
+//   fp.models.drift.detected       events.ModelDriftDetected (record drift in
+//      the model's run history)
+//   fp.pipelines.model.deployed    events.ModelDeployed     (record deploys)
+//   fp.notifications.delivered     events.NotificationDelivered (delivery health)
+//   fp.notifications.failed        events.NotificationFailed
+//
+// SECURITY IN EVENTS: every payload carries IDs + headline numbers only — never
+// secrets/PII (owner_id is an opaque UUID, not an email). That guarantee is
+// enforced in events.proto, not duplicated here.
 // ============================================================================
 
 // ============================================================================
@@ -728,17 +914,25 @@ message RunFinishedEvent {
 // its time-partitioned metrics table.
 //
 // RPC CATEGORIES:
-//   EXPERIMENTS: CreateExperiment, GetExperiment, ListExperiments
-//   RUN LIFECYCLE: StartRun, UpdateRunStatus, GetRun, ListRuns
-//   INGESTION (sync path): LogMetrics (batch), LogParams
-//   ANALYSIS: CompareRuns
+//   EXPERIMENTS: CreateExperiment, GetExperiment, ListExperiments,
+//                UpdateExperiment, ArchiveExperiment (soft delete)
+//   RUN LIFECYCLE: StartRun, UpdateRunStatus, GetRun, ListRuns, DeleteRun
+//   INGESTION (sync path): LogMetrics (batch), LogParams, SetRunArtifacts
+//   ANALYSIS / READ: GetMetricHistory (paginated curve), CompareRuns
 //
-// NOT IN THIS PROTO (by design): the NATS batch consumer that ingests
-// fp.inference.completed / fp.models.version.created / fp.pipeline.step.completed
-// / fp.features.ingested. That's the async, high-volume path with back-pressure
-// — it has no RPC surface; it's wired in the service's events package. The
-// gRPC API above is the sync, first-party + read/analysis surface. Keeping the
-// hot loop OFF gRPC is the entire point of the event-driven pattern.
+// NOT IN THIS PROTO (by design): the NATS batch consumer that ingests the
+// canonical subjects — fp.inference.completed / fp.models.version.created /
+// fp.pipelines.step.completed / fp.pipelines.completed / fp.features.written /
+// fp.billing.usage.recorded / fp.models.drift.detected /
+// fp.pipelines.model.deployed / fp.notifications.delivered|failed. That's the
+// async, high-volume path with back-pressure — it has no RPC surface; it's wired
+// in the service's events package (decoding events.* payloads). The gRPC API
+// above is the sync, first-party + read/analysis surface. Keeping the hot loop
+// OFF gRPC is the entire point of the event-driven pattern.
+//
+// SUBJECT-NAME FIXES baked into the list above (vs the old draft): plural
+// fp.pipelines.step.completed (was fp.pipeline.*) and fp.features.WRITTEN (was
+// the producerless fp.features.ingested) — reconciled against events.proto.
 //
 // ASCII — Dual ingestion (the pattern in one picture):
 //
@@ -758,25 +952,42 @@ service ExperimentTrackerService {
   rpc GetExperiment(GetExperimentRequest) returns (GetExperimentResponse);
 
   // ListExperiments returns a paginated list (cursor-based, page size capped
-  // server-side at 100). Optionally filtered by team.
+  // server-side at 100). team_filter only NARROWS within the caller's permitted
+  // teams; include_archived toggles soft-deleted rows.
   rpc ListExperiments(ListExperimentsRequest) returns (ListExperimentsResponse);
+
+  // UpdateExperiment edits mutable fields (name/description/tags) via a field
+  // mask. owner_id/team/timestamps are server-authoritative and cannot be set.
+  rpc UpdateExperiment(UpdateExperimentRequest) returns (UpdateExperimentResponse);
+
+  // ArchiveExperiment SOFT-deletes an experiment (sets archived_at, hides from
+  // default lists) while preserving its runs/metrics for lineage/audit.
+  rpc ArchiveExperiment(ArchiveExperimentRequest) returns (ArchiveExperimentResponse);
 
   // StartRun opens a new run (status RUNNING) in an experiment. Supports an
   // idempotency_key so retries don't create duplicate runs. This is the
-  // design doc's StartRun/CreateRun.
+  // design doc's StartRun/CreateRun. On success the server PUBLISHES
+  // events.RunCreated (fp.experiments.run.created).
   rpc StartRun(StartRunRequest) returns (StartRunResponse);
 
   // UpdateRunStatus transitions a run to a terminal state (FINISHED/FAILED/
-  // KILLED). Server validates the state-machine transition and stamps ended_at.
+  // KILLED). Server validates the state-machine transition, stamps ended_at, and
+  // PUBLISHES events.RunFinished (fp.experiments.run.finished) carrying the
+  // run's final_metrics (fat event — consumers rank/alert with no callback).
   rpc UpdateRunStatus(UpdateRunStatusRequest) returns (UpdateRunStatusResponse);
 
-  // GetRun fetches a run's metadata, params, and headline metrics (NOT the
-  // full metric time-series — use CompareRuns for curves).
+  // GetRun fetches a run's metadata, params, headline metrics, and artifacts
+  // (NOT the full metric time-series — use GetMetricHistory for the curve).
   rpc GetRun(GetRunRequest) returns (GetRunResponse);
 
   // ListRuns returns a paginated list of runs, normally within one experiment,
   // optionally filtered by status. Cursor-based; page size capped server-side.
   rpc ListRuns(ListRunsRequest) returns (ListRunsResponse);
+
+  // DeleteRun hard-deletes one run + its metrics/params (pruning experimental
+  // noise). Rejected if the run's model_version_id is still referenced by a live
+  // Registry version (lineage guard); idempotent via idempotency_key.
+  rpc DeleteRun(DeleteRunRequest) returns (DeleteRunResponse);
 
   // LogMetrics is the high-throughput BATCH ingestion RPC: a training job
   // flushes many MetricPoints in one idempotent, transactional call. Timestamps
@@ -786,6 +997,16 @@ service ExperimentTrackerService {
 
   // LogParams appends write-once hyperparameters to a RUNNING run.
   rpc LogParams(LogParamsRequest) returns (LogParamsResponse);
+
+  // SetRunArtifacts attaches free-form JSON-shaped artifacts (confusion matrix,
+  // manifest, eval report) to a run. Struct payload, server-size-capped.
+  rpc SetRunArtifacts(SetRunArtifactsRequest) returns (SetRunArtifactsResponse);
+
+  // GetMetricHistory returns the FULL metric time-series for ONE run, PAGINATED
+  // (page size capped server-side, default 1000 / max 5000) with optional key
+  // and step-window filters. This is the "metric-history read" the rest of the
+  // proto refers to — the pull-shaped curve read GetRun deliberately omits.
+  rpc GetMetricHistory(GetMetricHistoryRequest) returns (GetMetricHistoryResponse);
 
   // CompareRuns returns the metric series of several runs side-by-side — the
   // data behind "which run/model version wins?". Run count and payload bounded

@@ -11,12 +11,15 @@
 //
 // WHAT'S HERE:
 //   - Domain messages: Monitor (config + baseline), DriftReport, DriftMetric,
-//     MonitorStatus, GroundTruthLabel
-//   - MonitorService RPCs: configure monitors, read drift reports (one +
-//     paginated list), read live status, submit delayed ground truth, and
-//     stream drift events live (server-streaming)
-//   - Event-payload messages: ModelDriftDetectedEvent — the typed payload that
-//     rides inside the common EventEnvelope's Any field on fp.models.drift.detected
+//     MonitorStatus, ModelHealth, GroundTruthLabel
+//   - MonitorService RPCs: configure / list / delete monitors, read model health
+//     and drift reports (one + paginated list), read live status, reset the
+//     baseline, submit delayed ground truth, and stream drift events live
+//     (server-streaming)
+//   - NO event-payload messages: the drift event this service produces
+//     (ModelDriftDetected on fp.models.drift.detected) is defined ONCE in the
+//     canonical forgepoint.events.v1 contract and imported, NOT redefined here.
+//     See the EVENT CONTRACT note near the bottom of this file for the mapping.
 //
 // PATTERN — Streaming Aggregation + Closed-Loop Control:
 //   This is the most "alive" part of the platform. Two ideas combine:
@@ -98,7 +101,11 @@ const _ = grpc.SupportPackageIsVersion9
 
 const (
 	MonitorService_ConfigureMonitor_FullMethodName  = "/forgepoint.monitor.v1.MonitorService/ConfigureMonitor"
+	MonitorService_DeleteMonitor_FullMethodName     = "/forgepoint.monitor.v1.MonitorService/DeleteMonitor"
+	MonitorService_ResetBaseline_FullMethodName     = "/forgepoint.monitor.v1.MonitorService/ResetBaseline"
+	MonitorService_GetModelHealth_FullMethodName    = "/forgepoint.monitor.v1.MonitorService/GetModelHealth"
 	MonitorService_GetMonitorStatus_FullMethodName  = "/forgepoint.monitor.v1.MonitorService/GetMonitorStatus"
+	MonitorService_ListMonitors_FullMethodName      = "/forgepoint.monitor.v1.MonitorService/ListMonitors"
 	MonitorService_GetDriftReport_FullMethodName    = "/forgepoint.monitor.v1.MonitorService/GetDriftReport"
 	MonitorService_ListDriftReports_FullMethodName  = "/forgepoint.monitor.v1.MonitorService/ListDriftReports"
 	MonitorService_SubmitGroundTruth_FullMethodName = "/forgepoint.monitor.v1.MonitorService/SubmitGroundTruth"
@@ -127,23 +134,43 @@ const (
 //
 // RPC CATEGORIES:
 //
-//	CONFIG:        ConfigureMonitor  (set thresholds + auto-retrain toggle)
-//	OBSERVABILITY: GetMonitorStatus, GetDriftReport, ListDriftReports, StreamDriftEvents
+//	CONFIG:        ConfigureMonitor, DeleteMonitor, ResetBaseline
+//	OBSERVABILITY: GetModelHealth, GetMonitorStatus, ListMonitors,
+//	               GetDriftReport, ListDriftReports, StreamDriftEvents
 //	FEEDBACK:      SubmitGroundTruth (delayed labels → performance decay)
 //
 // AUTH: every RPC is guarded by the shared auth interceptor (see auth.proto).
 // Drift scores and config are operationally sensitive; reads require monitoring
-// read scope, writes (ConfigureMonitor, SubmitGroundTruth) require write scope.
+// read scope, writes (ConfigureMonitor, DeleteMonitor, ResetBaseline,
+// SubmitGroundTruth) require write scope. EVERY RPC is additionally TEAM-SCOPED
+// by the interceptor from the caller's auth claims — no request carries a team or
+// tenancy field (those would be cross-tenant footguns; see per-request notes).
 // ============================================================================
 type MonitorServiceClient interface {
 	// ConfigureMonitor upserts a model's monitor: window shape, per-drift-type
 	// thresholds, and the auto-retrain switch. The ONLY config write path.
-	// SERVER-authoritative fields (id, state, baseline_*) are not accepted here.
+	// SERVER-authoritative fields (id, owner_team, state, baseline_*) are not
+	// accepted here (mass-assignment guard).
 	ConfigureMonitor(ctx context.Context, in *ConfigureMonitorRequest, opts ...grpc.CallOption) (*ConfigureMonitorResponse, error)
+	// DeleteMonitor stops monitoring a model (soft-delete by default; optionally
+	// purges drift history). Idempotent on idempotency_key.
+	DeleteMonitor(ctx context.Context, in *DeleteMonitorRequest, opts ...grpc.CallOption) (*DeleteMonitorResponse, error)
+	// ResetBaseline manually re-pins the drift baseline to a model version's
+	// training distribution (operator escape hatch; auto-reset happens on
+	// ModelPromoted). The baseline is server-resolved from the named version.
+	ResetBaseline(ctx context.Context, in *ResetBaselineRequest, opts ...grpc.CallOption) (*ResetBaselineResponse, error)
+	// GetModelHealth returns the at-a-glance health verdict for one model (overall
+	// severity + per-type lights + state). The one-line "is this model healthy?"
+	// read for dashboards and `fp monitor <model>`.
+	GetModelHealth(ctx context.Context, in *GetModelHealthRequest, opts ...grpc.CallOption) (*GetModelHealthResponse, error)
 	// GetMonitorStatus returns the live status for a model: lifecycle state,
 	// current-window fill, the latest report, and lifetime drift count. The
-	// cheapest "is this model healthy right now?" read (hits the live Redis window).
+	// operator drill-in view (hits the live Redis window).
 	GetMonitorStatus(ctx context.Context, in *GetMonitorStatusRequest, opts ...grpc.CallOption) (*GetMonitorStatusResponse, error)
+	// ListMonitors returns the caller team's monitored-model FLEET (config + current
+	// health per row), paginated, with optional severity/state filters. Powers the
+	// Web UI monitoring table and `fp monitor` (no arg). Page size capped at 100.
+	ListMonitors(ctx context.Context, in *ListMonitorsRequest, opts ...grpc.CallOption) (*ListMonitorsResponse, error)
 	// GetDriftReport fetches a single persisted drift report by id (the handle the
 	// ModelDriftDetected event and UI deep-links reference).
 	GetDriftReport(ctx context.Context, in *GetDriftReportRequest, opts ...grpc.CallOption) (*GetDriftReportResponse, error)
@@ -180,10 +207,50 @@ func (c *monitorServiceClient) ConfigureMonitor(ctx context.Context, in *Configu
 	return out, nil
 }
 
+func (c *monitorServiceClient) DeleteMonitor(ctx context.Context, in *DeleteMonitorRequest, opts ...grpc.CallOption) (*DeleteMonitorResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteMonitorResponse)
+	err := c.cc.Invoke(ctx, MonitorService_DeleteMonitor_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *monitorServiceClient) ResetBaseline(ctx context.Context, in *ResetBaselineRequest, opts ...grpc.CallOption) (*ResetBaselineResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ResetBaselineResponse)
+	err := c.cc.Invoke(ctx, MonitorService_ResetBaseline_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *monitorServiceClient) GetModelHealth(ctx context.Context, in *GetModelHealthRequest, opts ...grpc.CallOption) (*GetModelHealthResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetModelHealthResponse)
+	err := c.cc.Invoke(ctx, MonitorService_GetModelHealth_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *monitorServiceClient) GetMonitorStatus(ctx context.Context, in *GetMonitorStatusRequest, opts ...grpc.CallOption) (*GetMonitorStatusResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetMonitorStatusResponse)
 	err := c.cc.Invoke(ctx, MonitorService_GetMonitorStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *monitorServiceClient) ListMonitors(ctx context.Context, in *ListMonitorsRequest, opts ...grpc.CallOption) (*ListMonitorsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListMonitorsResponse)
+	err := c.cc.Invoke(ctx, MonitorService_ListMonitors_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -261,23 +328,43 @@ type MonitorService_StreamDriftEventsClient = grpc.ServerStreamingClient[StreamD
 //
 // RPC CATEGORIES:
 //
-//	CONFIG:        ConfigureMonitor  (set thresholds + auto-retrain toggle)
-//	OBSERVABILITY: GetMonitorStatus, GetDriftReport, ListDriftReports, StreamDriftEvents
+//	CONFIG:        ConfigureMonitor, DeleteMonitor, ResetBaseline
+//	OBSERVABILITY: GetModelHealth, GetMonitorStatus, ListMonitors,
+//	               GetDriftReport, ListDriftReports, StreamDriftEvents
 //	FEEDBACK:      SubmitGroundTruth (delayed labels → performance decay)
 //
 // AUTH: every RPC is guarded by the shared auth interceptor (see auth.proto).
 // Drift scores and config are operationally sensitive; reads require monitoring
-// read scope, writes (ConfigureMonitor, SubmitGroundTruth) require write scope.
+// read scope, writes (ConfigureMonitor, DeleteMonitor, ResetBaseline,
+// SubmitGroundTruth) require write scope. EVERY RPC is additionally TEAM-SCOPED
+// by the interceptor from the caller's auth claims — no request carries a team or
+// tenancy field (those would be cross-tenant footguns; see per-request notes).
 // ============================================================================
 type MonitorServiceServer interface {
 	// ConfigureMonitor upserts a model's monitor: window shape, per-drift-type
 	// thresholds, and the auto-retrain switch. The ONLY config write path.
-	// SERVER-authoritative fields (id, state, baseline_*) are not accepted here.
+	// SERVER-authoritative fields (id, owner_team, state, baseline_*) are not
+	// accepted here (mass-assignment guard).
 	ConfigureMonitor(context.Context, *ConfigureMonitorRequest) (*ConfigureMonitorResponse, error)
+	// DeleteMonitor stops monitoring a model (soft-delete by default; optionally
+	// purges drift history). Idempotent on idempotency_key.
+	DeleteMonitor(context.Context, *DeleteMonitorRequest) (*DeleteMonitorResponse, error)
+	// ResetBaseline manually re-pins the drift baseline to a model version's
+	// training distribution (operator escape hatch; auto-reset happens on
+	// ModelPromoted). The baseline is server-resolved from the named version.
+	ResetBaseline(context.Context, *ResetBaselineRequest) (*ResetBaselineResponse, error)
+	// GetModelHealth returns the at-a-glance health verdict for one model (overall
+	// severity + per-type lights + state). The one-line "is this model healthy?"
+	// read for dashboards and `fp monitor <model>`.
+	GetModelHealth(context.Context, *GetModelHealthRequest) (*GetModelHealthResponse, error)
 	// GetMonitorStatus returns the live status for a model: lifecycle state,
 	// current-window fill, the latest report, and lifetime drift count. The
-	// cheapest "is this model healthy right now?" read (hits the live Redis window).
+	// operator drill-in view (hits the live Redis window).
 	GetMonitorStatus(context.Context, *GetMonitorStatusRequest) (*GetMonitorStatusResponse, error)
+	// ListMonitors returns the caller team's monitored-model FLEET (config + current
+	// health per row), paginated, with optional severity/state filters. Powers the
+	// Web UI monitoring table and `fp monitor` (no arg). Page size capped at 100.
+	ListMonitors(context.Context, *ListMonitorsRequest) (*ListMonitorsResponse, error)
 	// GetDriftReport fetches a single persisted drift report by id (the handle the
 	// ModelDriftDetected event and UI deep-links reference).
 	GetDriftReport(context.Context, *GetDriftReportRequest) (*GetDriftReportResponse, error)
@@ -307,8 +394,20 @@ type UnimplementedMonitorServiceServer struct{}
 func (UnimplementedMonitorServiceServer) ConfigureMonitor(context.Context, *ConfigureMonitorRequest) (*ConfigureMonitorResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ConfigureMonitor not implemented")
 }
+func (UnimplementedMonitorServiceServer) DeleteMonitor(context.Context, *DeleteMonitorRequest) (*DeleteMonitorResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteMonitor not implemented")
+}
+func (UnimplementedMonitorServiceServer) ResetBaseline(context.Context, *ResetBaselineRequest) (*ResetBaselineResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ResetBaseline not implemented")
+}
+func (UnimplementedMonitorServiceServer) GetModelHealth(context.Context, *GetModelHealthRequest) (*GetModelHealthResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetModelHealth not implemented")
+}
 func (UnimplementedMonitorServiceServer) GetMonitorStatus(context.Context, *GetMonitorStatusRequest) (*GetMonitorStatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetMonitorStatus not implemented")
+}
+func (UnimplementedMonitorServiceServer) ListMonitors(context.Context, *ListMonitorsRequest) (*ListMonitorsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListMonitors not implemented")
 }
 func (UnimplementedMonitorServiceServer) GetDriftReport(context.Context, *GetDriftReportRequest) (*GetDriftReportResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetDriftReport not implemented")
@@ -361,6 +460,60 @@ func _MonitorService_ConfigureMonitor_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MonitorService_DeleteMonitor_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeleteMonitorRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MonitorServiceServer).DeleteMonitor(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MonitorService_DeleteMonitor_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MonitorServiceServer).DeleteMonitor(ctx, req.(*DeleteMonitorRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _MonitorService_ResetBaseline_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ResetBaselineRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MonitorServiceServer).ResetBaseline(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MonitorService_ResetBaseline_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MonitorServiceServer).ResetBaseline(ctx, req.(*ResetBaselineRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _MonitorService_GetModelHealth_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetModelHealthRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MonitorServiceServer).GetModelHealth(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MonitorService_GetModelHealth_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MonitorServiceServer).GetModelHealth(ctx, req.(*GetModelHealthRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _MonitorService_GetMonitorStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetMonitorStatusRequest)
 	if err := dec(in); err != nil {
@@ -375,6 +528,24 @@ func _MonitorService_GetMonitorStatus_Handler(srv interface{}, ctx context.Conte
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(MonitorServiceServer).GetMonitorStatus(ctx, req.(*GetMonitorStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _MonitorService_ListMonitors_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListMonitorsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MonitorServiceServer).ListMonitors(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MonitorService_ListMonitors_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MonitorServiceServer).ListMonitors(ctx, req.(*ListMonitorsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -456,8 +627,24 @@ var MonitorService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _MonitorService_ConfigureMonitor_Handler,
 		},
 		{
+			MethodName: "DeleteMonitor",
+			Handler:    _MonitorService_DeleteMonitor_Handler,
+		},
+		{
+			MethodName: "ResetBaseline",
+			Handler:    _MonitorService_ResetBaseline_Handler,
+		},
+		{
+			MethodName: "GetModelHealth",
+			Handler:    _MonitorService_GetModelHealth_Handler,
+		},
+		{
 			MethodName: "GetMonitorStatus",
 			Handler:    _MonitorService_GetMonitorStatus_Handler,
+		},
+		{
+			MethodName: "ListMonitors",
+			Handler:    _MonitorService_ListMonitors_Handler,
 		},
 		{
 			MethodName: "GetDriftReport",

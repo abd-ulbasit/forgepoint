@@ -12,11 +12,20 @@
 //
 // WHAT'S HERE:
 //   - Domain messages: Experiment, Run, Param, MetricPoint, MetricSeries
-//   - RPCs: CreateExperiment/ListExperiments/GetExperiment,
-//           StartRun/UpdateRunStatus/GetRun/ListRuns,
-//           LogMetrics (BATCH), LogParams, CompareRuns
-//   - Event-payload messages this service PUBLISHES (RunCreated, RunFinished)
-//     so the common EventEnvelope's google.protobuf.Any can carry typed data.
+//   - RPCs: CreateExperiment/ListExperiments/GetExperiment/ArchiveExperiment,
+//           StartRun/UpdateRunStatus/GetRun/ListRuns/DeleteRun,
+//           LogMetrics (BATCH), LogParams, GetMetricHistory, CompareRuns,
+//           SetRunArtifacts (free-form attachments)
+//
+// WHAT'S NOT HERE (deliberately): the event PAYLOAD messages this service
+// publishes/consumes. They are NOT redefined locally — they live in the SINGLE
+// canonical contract forgepoint/events/v1/events.proto and are imported below.
+// This service PUBLISHES events.RunCreated (fp.experiments.run.created) and
+// events.RunFinished (fp.experiments.run.finished); it CONSUMES a wide slice of
+// the platform firehose (see the async-consumer note at the service definition).
+// Defining event payloads here once led to producer/consumer schema drift across
+// services (e.g. FeaturesWritten vs FeaturesIngested) — the events package fixes
+// that by being the one place both ends of every pipe agree on.
 //
 // ============================================================================
 // PATTERN — Event-Driven (Async Batch Ingestion)
@@ -30,12 +39,22 @@
 //      Used while a human or a training pod is actively driving a run.
 //
 //   2) ASYNC (NOT in this proto — it's a NATS consumer): the tracker also
-//      SUBSCRIBES to high-volume platform events — fp.inference.completed,
-//      fp.models.version.created, fp.pipeline.step.completed,
-//      fp.features.ingested — buffers them in memory, and FLUSHES to Postgres
-//      in batches (every N ms or every M events, whichever first). If the DB
-//      falls behind, the buffer fills and the consumer NAKs / stops acking,
-//      which makes NATS JetStream slow delivery: that is BACK-PRESSURE.
+//      SUBSCRIBES to high-volume platform events (the canonical subjects, see
+//      forgepoint/events/v1/events.proto) — fp.inference.completed,
+//      fp.models.version.created, fp.pipelines.step.completed,
+//      fp.pipelines.completed, fp.features.written, fp.billing.usage.recorded,
+//      fp.models.drift.detected, fp.pipelines.model.deployed,
+//      fp.notifications.delivered/failed — buffers them in memory, and FLUSHES
+//      to Postgres in batches (every N ms or every M events, whichever first).
+//      If the DB falls behind, the buffer fills and the consumer NAKs / stops
+//      acking, which makes NATS JetStream slow delivery: that is BACK-PRESSURE.
+//
+//      CRITICAL SUBJECT FIXES (event-contract alignment): the async consumer
+//      subscribes to fp.features.WRITTEN (NOT the old fp.features.ingested — that
+//      subject has no producer and would never deliver) and to the PLURAL
+//      fp.pipelines.step.completed (NOT fp.pipeline.step.completed). These were
+//      reconciled against events.proto so every subject we subscribe to actually
+//      has a matching producer.
 //
 // WHY ASYNC FOR THE HOT PATH:
 //   Inference happens thousands of times per second. If the inference gateway
@@ -85,6 +104,7 @@ import (
 	v1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/common/v1"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
+	structpb "google.golang.org/protobuf/types/known/structpb"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	reflect "reflect"
 	sync "sync"
@@ -273,7 +293,16 @@ type Experiment struct {
 	// The owning team (namespacing + access). SERVER-set from auth context.
 	Team string `protobuf:"bytes,6,opt,name=team,proto3" json:"team,omitempty"`
 	// When the experiment was created. SERVER-set, immutable.
-	CreatedAt     *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	CreatedAt *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	// When the experiment was last mutated (name/description/tags edit, or
+	// archive). SERVER-set on every write. Lets clients cache/ETag and lets the
+	// UI sort by recency.
+	UpdatedAt *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	// SERVER-set archive timestamp. Unset = active. We SOFT-DELETE experiments
+	// (set this, hide from default lists) rather than hard-delete: runs/metrics
+	// are an audit trail and may be referenced by model lineage in the Registry.
+	// ArchiveExperiment sets this; it is never client-supplied.
+	ArchivedAt    *timestamppb.Timestamp `protobuf:"bytes,9,opt,name=archived_at,json=archivedAt,proto3" json:"archived_at,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -357,6 +386,20 @@ func (x *Experiment) GetCreatedAt() *timestamppb.Timestamp {
 	return nil
 }
 
+func (x *Experiment) GetUpdatedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.UpdatedAt
+	}
+	return nil
+}
+
+func (x *Experiment) GetArchivedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ArchivedAt
+	}
+	return nil
+}
+
 // ============================================================================
 // Run
 // ============================================================================
@@ -418,7 +461,12 @@ type Run struct {
 	// When the run started. SERVER-set at StartRun, immutable.
 	StartedAt *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=started_at,json=startedAt,proto3" json:"started_at,omitempty"`
 	// When the run reached a terminal state. SERVER-set; unset while RUNNING.
-	EndedAt       *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=ended_at,json=endedAt,proto3" json:"ended_at,omitempty"`
+	EndedAt *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=ended_at,json=endedAt,proto3" json:"ended_at,omitempty"`
+	// Free-form, JSON-shaped side-artifacts (confusion matrix, feature-importance,
+	// artifact manifest, eval report). Attached via SetRunArtifacts; size-capped
+	// server-side. Struct (not bytes) so it stays inspectable/renderable. Unset
+	// for runs that never attach any. NOT a metrics channel — metrics are typed.
+	Artifacts     *structpb.Struct `protobuf:"bytes,12,opt,name=artifacts,proto3" json:"artifacts,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -526,6 +574,13 @@ func (x *Run) GetStartedAt() *timestamppb.Timestamp {
 func (x *Run) GetEndedAt() *timestamppb.Timestamp {
 	if x != nil {
 		return x.EndedAt
+	}
+	return nil
+}
+
+func (x *Run) GetArtifacts() *structpb.Struct {
+	if x != nil {
+		return x.Artifacts
 	}
 	return nil
 }
@@ -978,11 +1033,21 @@ func (x *GetExperimentResponse) GetExperiment() *Experiment {
 // max 100) to prevent a client from requesting an unbounded page.
 type ListExperimentsRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Optional filter: only experiments owned by this team. Empty = caller's own
-	// team (the server scopes results to the caller's team regardless).
+	// Optional NARROWING filter only — NOT an authorization scope. The server
+	// ALWAYS constrains results to the team(s) the caller's auth claims permit;
+	// team_filter can only narrow WITHIN that permitted set, never widen it. WHY
+	// the field still exists: an admin whose claims span several teams may want to
+	// view one team's experiments. A client cannot use this to read another
+	// team's data — the auth interceptor's claim, not this field, is the security
+	// boundary. (Mass-assignment/IDOR guard: tenancy derives from claims.)
 	TeamFilter string `protobuf:"bytes,1,opt,name=team_filter,json=teamFilter,proto3" json:"team_filter,omitempty"`
+	// Include soft-archived experiments. Default false (active only). WHY a flag,
+	// not a separate RPC: archive is a visibility toggle, not a different query.
+	IncludeArchived bool `protobuf:"varint,2,opt,name=include_archived,json=includeArchived,proto3" json:"include_archived,omitempty"`
 	// Cursor-based pagination. page_size defaults to 20, max 100 (server-enforced).
-	Pagination    *v1.PaginationRequest `protobuf:"bytes,2,opt,name=pagination,proto3" json:"pagination,omitempty"`
+	// See common.PaginationRequest — the cap is enforced server-side, not trusted
+	// from the client (an unbounded page is a DoS lever).
+	Pagination    *v1.PaginationRequest `protobuf:"bytes,3,opt,name=pagination,proto3" json:"pagination,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1022,6 +1087,13 @@ func (x *ListExperimentsRequest) GetTeamFilter() string {
 		return x.TeamFilter
 	}
 	return ""
+}
+
+func (x *ListExperimentsRequest) GetIncludeArchived() bool {
+	if x != nil {
+		return x.IncludeArchived
+	}
+	return false
 }
 
 func (x *ListExperimentsRequest) GetPagination() *v1.PaginationRequest {
@@ -1085,6 +1157,241 @@ func (x *ListExperimentsResponse) GetPagination() *v1.PaginationResponse {
 	return nil
 }
 
+// UpdateExperimentRequest edits the MUTABLE, client-owned fields of an
+// experiment (name/description/tags). Note what is ABSENT and therefore
+// NOT editable by a client: id (the target, but immutable as data), owner_id,
+// team, created_at, archived_at — all server-authoritative. You cannot
+// "re-home" an experiment to another owner/team via this RPC (mass-assignment
+// guard). WHY a field mask: a client editing only the description must not have
+// to round-trip name/tags and risk clobbering a concurrent edit.
+type UpdateExperimentRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The experiment to update. The id selects the row; it is never changed.
+	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	// New name (applied only if "name" is in update_fields).
+	Name string `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	// New description (applied only if "description" is in update_fields).
+	Description string `protobuf:"bytes,3,opt,name=description,proto3" json:"description,omitempty"`
+	// New tags — REPLACES the whole map (applied only if "tags" is in
+	// update_fields). WHY replace-not-merge: merge semantics make it impossible to
+	// DELETE a tag; a full replace is unambiguous and the client sends the desired
+	// final set.
+	Tags map[string]string `protobuf:"bytes,4,rep,name=tags,proto3" json:"tags,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// Field mask of which of {name, description, tags} to apply. WHY a string
+	// list rather than google.protobuf.FieldMask: keeps the import surface minimal
+	// and the allowed set is tiny and validated server-side; an unknown field name
+	// is rejected with INVALID_ARGUMENT.
+	UpdateFields  []string `protobuf:"bytes,5,rep,name=update_fields,json=updateFields,proto3" json:"update_fields,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UpdateExperimentRequest) Reset() {
+	*x = UpdateExperimentRequest{}
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdateExperimentRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdateExperimentRequest) ProtoMessage() {}
+
+func (x *UpdateExperimentRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdateExperimentRequest.ProtoReflect.Descriptor instead.
+func (*UpdateExperimentRequest) Descriptor() ([]byte, []int) {
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *UpdateExperimentRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *UpdateExperimentRequest) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *UpdateExperimentRequest) GetDescription() string {
+	if x != nil {
+		return x.Description
+	}
+	return ""
+}
+
+func (x *UpdateExperimentRequest) GetTags() map[string]string {
+	if x != nil {
+		return x.Tags
+	}
+	return nil
+}
+
+func (x *UpdateExperimentRequest) GetUpdateFields() []string {
+	if x != nil {
+		return x.UpdateFields
+	}
+	return nil
+}
+
+type UpdateExperimentResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The experiment after the edit (updated_at refreshed).
+	Experiment    *Experiment `protobuf:"bytes,1,opt,name=experiment,proto3" json:"experiment,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UpdateExperimentResponse) Reset() {
+	*x = UpdateExperimentResponse{}
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdateExperimentResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdateExperimentResponse) ProtoMessage() {}
+
+func (x *UpdateExperimentResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdateExperimentResponse.ProtoReflect.Descriptor instead.
+func (*UpdateExperimentResponse) Descriptor() ([]byte, []int) {
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *UpdateExperimentResponse) GetExperiment() *Experiment {
+	if x != nil {
+		return x.Experiment
+	}
+	return nil
+}
+
+// ArchiveExperimentRequest soft-deletes an experiment: it sets archived_at and
+// hides it from default lists, but PRESERVES its runs and metrics. WHY soft (not
+// hard) delete: an experiment's runs are an audit trail and may be referenced by
+// model-lineage in the Registry (a run carries the model_version_id it produced).
+// Hard-deleting would orphan those references and destroy provenance. This is the
+// design's "Delete/Archive where the design calls for it" done safely.
+type ArchiveExperimentRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The experiment to archive. Must be visible to the caller's team.
+	Id            string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ArchiveExperimentRequest) Reset() {
+	*x = ArchiveExperimentRequest{}
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ArchiveExperimentRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ArchiveExperimentRequest) ProtoMessage() {}
+
+func (x *ArchiveExperimentRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ArchiveExperimentRequest.ProtoReflect.Descriptor instead.
+func (*ArchiveExperimentRequest) Descriptor() ([]byte, []int) {
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *ArchiveExperimentRequest) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+type ArchiveExperimentResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The experiment after archiving (archived_at now set).
+	Experiment    *Experiment `protobuf:"bytes,1,opt,name=experiment,proto3" json:"experiment,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ArchiveExperimentResponse) Reset() {
+	*x = ArchiveExperimentResponse{}
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ArchiveExperimentResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ArchiveExperimentResponse) ProtoMessage() {}
+
+func (x *ArchiveExperimentResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ArchiveExperimentResponse.ProtoReflect.Descriptor instead.
+func (*ArchiveExperimentResponse) Descriptor() ([]byte, []int) {
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *ArchiveExperimentResponse) GetExperiment() *Experiment {
+	if x != nil {
+		return x.Experiment
+	}
+	return nil
+}
+
 // StartRunRequest opens a new run inside an experiment.
 // SERVER-AUTHORITATIVE and therefore ABSENT here: id, status (always created
 // RUNNING), source (set to API), owner_id (from claims), started_at,
@@ -1115,7 +1422,7 @@ type StartRunRequest struct {
 
 func (x *StartRunRequest) Reset() {
 	*x = StartRunRequest{}
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[11]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1127,7 +1434,7 @@ func (x *StartRunRequest) String() string {
 func (*StartRunRequest) ProtoMessage() {}
 
 func (x *StartRunRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[11]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1140,7 +1447,7 @@ func (x *StartRunRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartRunRequest.ProtoReflect.Descriptor instead.
 func (*StartRunRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{11}
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *StartRunRequest) GetExperimentId() string {
@@ -1188,7 +1495,7 @@ type StartRunResponse struct {
 
 func (x *StartRunResponse) Reset() {
 	*x = StartRunResponse{}
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[12]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1200,7 +1507,7 @@ func (x *StartRunResponse) String() string {
 func (*StartRunResponse) ProtoMessage() {}
 
 func (x *StartRunResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[12]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1213,7 +1520,7 @@ func (x *StartRunResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StartRunResponse.ProtoReflect.Descriptor instead.
 func (*StartRunResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{12}
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *StartRunResponse) GetRun() *Run {
@@ -1233,7 +1540,7 @@ type GetRunRequest struct {
 
 func (x *GetRunRequest) Reset() {
 	*x = GetRunRequest{}
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[13]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1245,7 +1552,7 @@ func (x *GetRunRequest) String() string {
 func (*GetRunRequest) ProtoMessage() {}
 
 func (x *GetRunRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[13]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1258,7 +1565,7 @@ func (x *GetRunRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRunRequest.ProtoReflect.Descriptor instead.
 func (*GetRunRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{13}
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *GetRunRequest) GetId() string {
@@ -1269,8 +1576,9 @@ func (x *GetRunRequest) GetId() string {
 }
 
 // GetRunResponse returns run metadata + params + the denormalized headline
-// metrics. It does NOT return the full metric time-series (that can be huge);
-// use CompareRuns or a dedicated metric-history read for the curve.
+// metrics + any attached artifacts. It does NOT return the full metric
+// time-series (that can be huge); use GetMetricHistory for one run's curve, or
+// CompareRuns to overlay several runs.
 type GetRunResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The requested run. NOT_FOUND if missing or not visible to the caller.
@@ -1281,7 +1589,7 @@ type GetRunResponse struct {
 
 func (x *GetRunResponse) Reset() {
 	*x = GetRunResponse{}
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[14]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1293,7 +1601,7 @@ func (x *GetRunResponse) String() string {
 func (*GetRunResponse) ProtoMessage() {}
 
 func (x *GetRunResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[14]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1306,7 +1614,7 @@ func (x *GetRunResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRunResponse.ProtoReflect.Descriptor instead.
 func (*GetRunResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{14}
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *GetRunResponse) GetRun() *Run {
@@ -1335,7 +1643,7 @@ type ListRunsRequest struct {
 
 func (x *ListRunsRequest) Reset() {
 	*x = ListRunsRequest{}
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[15]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1347,7 +1655,7 @@ func (x *ListRunsRequest) String() string {
 func (*ListRunsRequest) ProtoMessage() {}
 
 func (x *ListRunsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[15]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1360,7 +1668,7 @@ func (x *ListRunsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRunsRequest.ProtoReflect.Descriptor instead.
 func (*ListRunsRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{15}
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *ListRunsRequest) GetExperimentId() string {
@@ -1397,7 +1705,7 @@ type ListRunsResponse struct {
 
 func (x *ListRunsResponse) Reset() {
 	*x = ListRunsResponse{}
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[16]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1409,7 +1717,7 @@ func (x *ListRunsResponse) String() string {
 func (*ListRunsResponse) ProtoMessage() {}
 
 func (x *ListRunsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[16]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1422,7 +1730,7 @@ func (x *ListRunsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRunsResponse.ProtoReflect.Descriptor instead.
 func (*ListRunsResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{16}
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *ListRunsResponse) GetRuns() []*Run {
@@ -1437,6 +1745,111 @@ func (x *ListRunsResponse) GetPagination() *v1.PaginationResponse {
 		return x.Pagination
 	}
 	return nil
+}
+
+// DeleteRunRequest removes a single run and ITS metrics/params. WHY this is
+// allowed to HARD-delete where ArchiveExperiment is not: a run is the unit of
+// experimental noise — a mis-launched job, a smoke test, a duplicate — and the
+// design's run leaderboard is unusable if garbage runs can't be pruned. SAFETY
+// RAIL: the server REJECTS deleting a run whose model_version_id is set and is
+// still referenced by a live (non-archived) model version in the Registry — that
+// would sever lineage; such a run must be Archived at the experiment level
+// instead. A run with no downstream model reference is safe to delete.
+// Only the run's owner or a team admin may delete (enforced from auth claims).
+type DeleteRunRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The run to delete.
+	RunId string `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
+	// Idempotency: a retried delete after a network blip must not error just
+	// because the run is already gone. WHY a key (not "treat NOT_FOUND as success"):
+	// a key distinguishes "my earlier delete succeeded" from "someone else's run id
+	// typo" — the server returns OK on replay of the SAME key, NOT_FOUND otherwise.
+	IdempotencyKey string `protobuf:"bytes,2,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *DeleteRunRequest) Reset() {
+	*x = DeleteRunRequest{}
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteRunRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteRunRequest) ProtoMessage() {}
+
+func (x *DeleteRunRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteRunRequest.ProtoReflect.Descriptor instead.
+func (*DeleteRunRequest) Descriptor() ([]byte, []int) {
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *DeleteRunRequest) GetRunId() string {
+	if x != nil {
+		return x.RunId
+	}
+	return ""
+}
+
+func (x *DeleteRunRequest) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
+}
+
+// DeleteRunResponse is a named-empty response (Buf forbids returning
+// google.protobuf.Empty and forbids reusing a domain message as a response).
+// Empty body = success; failures surface as gRPC status codes.
+type DeleteRunResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteRunResponse) Reset() {
+	*x = DeleteRunResponse{}
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteRunResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteRunResponse) ProtoMessage() {}
+
+func (x *DeleteRunResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteRunResponse.ProtoReflect.Descriptor instead.
+func (*DeleteRunResponse) Descriptor() ([]byte, []int) {
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{22}
 }
 
 // UpdateRunStatusRequest transitions a run to a terminal state (FINISHED /
@@ -1458,7 +1871,7 @@ type UpdateRunStatusRequest struct {
 
 func (x *UpdateRunStatusRequest) Reset() {
 	*x = UpdateRunStatusRequest{}
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[17]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1470,7 +1883,7 @@ func (x *UpdateRunStatusRequest) String() string {
 func (*UpdateRunStatusRequest) ProtoMessage() {}
 
 func (x *UpdateRunStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[17]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1483,7 +1896,7 @@ func (x *UpdateRunStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateRunStatusRequest.ProtoReflect.Descriptor instead.
 func (*UpdateRunStatusRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{17}
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *UpdateRunStatusRequest) GetRunId() string {
@@ -1510,7 +1923,7 @@ type UpdateRunStatusResponse struct {
 
 func (x *UpdateRunStatusResponse) Reset() {
 	*x = UpdateRunStatusResponse{}
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[18]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1522,7 +1935,7 @@ func (x *UpdateRunStatusResponse) String() string {
 func (*UpdateRunStatusResponse) ProtoMessage() {}
 
 func (x *UpdateRunStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[18]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1535,7 +1948,7 @@ func (x *UpdateRunStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateRunStatusResponse.ProtoReflect.Descriptor instead.
 func (*UpdateRunStatusResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{18}
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *UpdateRunStatusResponse) GetRun() *Run {
@@ -1589,7 +2002,7 @@ type LogMetricsRequest struct {
 
 func (x *LogMetricsRequest) Reset() {
 	*x = LogMetricsRequest{}
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[19]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1601,7 +2014,7 @@ func (x *LogMetricsRequest) String() string {
 func (*LogMetricsRequest) ProtoMessage() {}
 
 func (x *LogMetricsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[19]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1614,7 +2027,7 @@ func (x *LogMetricsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogMetricsRequest.ProtoReflect.Descriptor instead.
 func (*LogMetricsRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{19}
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *LogMetricsRequest) GetRunId() string {
@@ -1652,7 +2065,7 @@ type LogMetricsResponse struct {
 
 func (x *LogMetricsResponse) Reset() {
 	*x = LogMetricsResponse{}
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[20]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1664,7 +2077,7 @@ func (x *LogMetricsResponse) String() string {
 func (*LogMetricsResponse) ProtoMessage() {}
 
 func (x *LogMetricsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[20]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1677,7 +2090,7 @@ func (x *LogMetricsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogMetricsResponse.ProtoReflect.Descriptor instead.
 func (*LogMetricsResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{20}
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *LogMetricsResponse) GetAcceptedCount() int32 {
@@ -1702,7 +2115,7 @@ type LogParamsRequest struct {
 
 func (x *LogParamsRequest) Reset() {
 	*x = LogParamsRequest{}
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[21]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1714,7 +2127,7 @@ func (x *LogParamsRequest) String() string {
 func (*LogParamsRequest) ProtoMessage() {}
 
 func (x *LogParamsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[21]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1727,7 +2140,7 @@ func (x *LogParamsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogParamsRequest.ProtoReflect.Descriptor instead.
 func (*LogParamsRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{21}
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *LogParamsRequest) GetRunId() string {
@@ -1755,7 +2168,7 @@ type LogParamsResponse struct {
 
 func (x *LogParamsResponse) Reset() {
 	*x = LogParamsResponse{}
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[22]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1767,7 +2180,7 @@ func (x *LogParamsResponse) String() string {
 func (*LogParamsResponse) ProtoMessage() {}
 
 func (x *LogParamsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[22]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1780,7 +2193,7 @@ func (x *LogParamsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LogParamsResponse.ProtoReflect.Descriptor instead.
 func (*LogParamsResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{22}
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *LogParamsResponse) GetAcceptedCount() int32 {
@@ -1808,7 +2221,7 @@ type CompareRunsRequest struct {
 
 func (x *CompareRunsRequest) Reset() {
 	*x = CompareRunsRequest{}
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[23]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1820,7 +2233,7 @@ func (x *CompareRunsRequest) String() string {
 func (*CompareRunsRequest) ProtoMessage() {}
 
 func (x *CompareRunsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[23]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1833,7 +2246,7 @@ func (x *CompareRunsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CompareRunsRequest.ProtoReflect.Descriptor instead.
 func (*CompareRunsRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{23}
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *CompareRunsRequest) GetRunIds() []string {
@@ -1864,7 +2277,7 @@ type RunComparison struct {
 
 func (x *RunComparison) Reset() {
 	*x = RunComparison{}
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[24]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1876,7 +2289,7 @@ func (x *RunComparison) String() string {
 func (*RunComparison) ProtoMessage() {}
 
 func (x *RunComparison) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[24]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1889,7 +2302,7 @@ func (x *RunComparison) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RunComparison.ProtoReflect.Descriptor instead.
 func (*RunComparison) Descriptor() ([]byte, []int) {
-	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{24}
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *RunComparison) GetRun() *Run {
@@ -1918,7 +2331,7 @@ type CompareRunsResponse struct {
 
 func (x *CompareRunsResponse) Reset() {
 	*x = CompareRunsResponse{}
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[25]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1930,7 +2343,7 @@ func (x *CompareRunsResponse) String() string {
 func (*CompareRunsResponse) ProtoMessage() {}
 
 func (x *CompareRunsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[25]
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1943,7 +2356,7 @@ func (x *CompareRunsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CompareRunsResponse.ProtoReflect.Descriptor instead.
 func (*CompareRunsResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{25}
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *CompareRunsResponse) GetComparisons() []*RunComparison {
@@ -1953,41 +2366,58 @@ func (x *CompareRunsResponse) GetComparisons() []*RunComparison {
 	return nil
 }
 
-// RunCreatedEvent announces a new run opened (sync StartRun or async
-// materialization). WHY emit on create (not only on finish): downstream tools
-// (a live dashboard) want to show in-flight runs immediately.
-type RunCreatedEvent struct {
+// ============================================================================
+// GetMetricHistory  (the time-series read the rest of the proto refers to)
+// ============================================================================
+//
+// WHY this exists as its own RPC: GetRun deliberately returns only the
+// denormalized final_metrics (headline numbers), and CompareRuns is multi-run.
+// Several places in this contract say "use a dedicated metric-history read for
+// the curve" — this is that RPC. It returns the FULL time-series for ONE run,
+// PAGINATED, because a single run's "loss" curve can be millions of points and
+// must never be returned unbounded (that is both an OOM and a DoS hazard).
+//
+// WHY paginated rather than server-streaming: the metrics table is RANGE-
+// partitioned by timestamp, so a cursor (page_token encoding the last
+// (key,step,timestamp) seen) maps cleanly onto an indexed keyset scan and is
+// trivially retryable. A server-stream would be fine too, but pagination reuses
+// the platform-wide common.Pagination contract and lets a BFF/UI fetch one
+// screenful at a time. (Streaming is reserved for genuinely push-shaped APIs,
+// e.g. a future WatchRun; a historical read is pull-shaped.)
+type GetMetricHistoryRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// The run that was created.
+	// The run whose metric history to read.
 	RunId string `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
-	// The experiment it belongs to.
-	ExperimentId string `protobuf:"bytes,2,opt,name=experiment_id,json=experimentId,proto3" json:"experiment_id,omitempty"`
-	// The model version it targets, if any (opaque Registry ID).
-	ModelVersionId string `protobuf:"bytes,3,opt,name=model_version_id,json=modelVersionId,proto3" json:"model_version_id,omitempty"`
-	// Which ingestion path created it (API vs EVENT) — useful for consumers
-	// that only care about first-party training runs.
-	Source RunSource `protobuf:"varint,4,opt,name=source,proto3,enum=forgepoint.experiment.v1.RunSource" json:"source,omitempty"`
-	// When the run started (server time).
-	StartedAt     *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=started_at,json=startedAt,proto3" json:"started_at,omitempty"`
+	// Optional: restrict to these metric keys (e.g. ["loss","val_auc"]). Empty =
+	// all keys on the run. The main lever for keeping the response bounded.
+	MetricKeys []string `protobuf:"bytes,2,rep,name=metric_keys,json=metricKeys,proto3" json:"metric_keys,omitempty"`
+	// Optional inclusive step window [min_step, max_step]. Both 0 = no step bound.
+	// Lets a UI fetch "epochs 100–200" without scanning the whole curve.
+	MinStep int64 `protobuf:"varint,3,opt,name=min_step,json=minStep,proto3" json:"min_step,omitempty"`
+	MaxStep int64 `protobuf:"varint,4,opt,name=max_step,json=maxStep,proto3" json:"max_step,omitempty"`
+	// Cursor pagination. page_size defaults to 1000 here (curves are dense), max
+	// 5000 — a HIGHER cap than list RPCs because points are tiny and charts want
+	// many; still server-enforced so the page can't be unbounded.
+	Pagination    *v1.PaginationRequest `protobuf:"bytes,5,opt,name=pagination,proto3" json:"pagination,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *RunCreatedEvent) Reset() {
-	*x = RunCreatedEvent{}
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[26]
+func (x *GetMetricHistoryRequest) Reset() {
+	*x = GetMetricHistoryRequest{}
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *RunCreatedEvent) String() string {
+func (x *GetMetricHistoryRequest) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*RunCreatedEvent) ProtoMessage() {}
+func (*GetMetricHistoryRequest) ProtoMessage() {}
 
-func (x *RunCreatedEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[26]
+func (x *GetMetricHistoryRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1998,85 +2428,73 @@ func (x *RunCreatedEvent) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use RunCreatedEvent.ProtoReflect.Descriptor instead.
-func (*RunCreatedEvent) Descriptor() ([]byte, []int) {
-	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{26}
+// Deprecated: Use GetMetricHistoryRequest.ProtoReflect.Descriptor instead.
+func (*GetMetricHistoryRequest) Descriptor() ([]byte, []int) {
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{32}
 }
 
-func (x *RunCreatedEvent) GetRunId() string {
+func (x *GetMetricHistoryRequest) GetRunId() string {
 	if x != nil {
 		return x.RunId
 	}
 	return ""
 }
 
-func (x *RunCreatedEvent) GetExperimentId() string {
+func (x *GetMetricHistoryRequest) GetMetricKeys() []string {
 	if x != nil {
-		return x.ExperimentId
-	}
-	return ""
-}
-
-func (x *RunCreatedEvent) GetModelVersionId() string {
-	if x != nil {
-		return x.ModelVersionId
-	}
-	return ""
-}
-
-func (x *RunCreatedEvent) GetSource() RunSource {
-	if x != nil {
-		return x.Source
-	}
-	return RunSource_RUN_SOURCE_UNSPECIFIED
-}
-
-func (x *RunCreatedEvent) GetStartedAt() *timestamppb.Timestamp {
-	if x != nil {
-		return x.StartedAt
+		return x.MetricKeys
 	}
 	return nil
 }
 
-// RunFinishedEvent announces a run reaching a terminal state, carrying the
-// headline metrics so consumers can react WITHOUT a follow-up RPC (the classic
-// "fat event" choice: include enough data to act, avoiding a thundering herd of
-// GetRun callbacks). Tradeoff: the event is larger and may go stale if metrics
-// are later recomputed — acceptable since terminal-run metrics are final.
-type RunFinishedEvent struct {
+func (x *GetMetricHistoryRequest) GetMinStep() int64 {
+	if x != nil {
+		return x.MinStep
+	}
+	return 0
+}
+
+func (x *GetMetricHistoryRequest) GetMaxStep() int64 {
+	if x != nil {
+		return x.MaxStep
+	}
+	return 0
+}
+
+func (x *GetMetricHistoryRequest) GetPagination() *v1.PaginationRequest {
+	if x != nil {
+		return x.Pagination
+	}
+	return nil
+}
+
+type GetMetricHistoryResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// The run that finished.
-	RunId string `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
-	// The experiment it belongs to.
-	ExperimentId string `protobuf:"bytes,2,opt,name=experiment_id,json=experimentId,proto3" json:"experiment_id,omitempty"`
-	// The model version it produced/evaluated, if any (opaque Registry ID).
-	ModelVersionId string `protobuf:"bytes,3,opt,name=model_version_id,json=modelVersionId,proto3" json:"model_version_id,omitempty"`
-	// Terminal status (FINISHED / FAILED / KILLED).
-	Status RunStatus `protobuf:"varint,4,opt,name=status,proto3,enum=forgepoint.experiment.v1.RunStatus" json:"status,omitempty"`
-	// Denormalized headline metrics at finish (final/best per key). Lets a
-	// consumer rank/alert without calling back into the tracker.
-	FinalMetrics []*MetricPoint `protobuf:"bytes,5,rep,name=final_metrics,json=finalMetrics,proto3" json:"final_metrics,omitempty"`
-	// When the run ended (server time).
-	EndedAt       *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=ended_at,json=endedAt,proto3" json:"ended_at,omitempty"`
+	// The requested points, grouped per metric key (chart-ready). Within a series,
+	// points are ordered by step then timestamp.
+	Series []*MetricSeries `protobuf:"bytes,1,rep,name=series,proto3" json:"series,omitempty"`
+	// Pagination metadata. next_page_token encodes the last (key,step,timestamp)
+	// read so the next page resumes via an indexed keyset scan.
+	Pagination    *v1.PaginationResponse `protobuf:"bytes,2,opt,name=pagination,proto3" json:"pagination,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *RunFinishedEvent) Reset() {
-	*x = RunFinishedEvent{}
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[27]
+func (x *GetMetricHistoryResponse) Reset() {
+	*x = GetMetricHistoryResponse{}
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *RunFinishedEvent) String() string {
+func (x *GetMetricHistoryResponse) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*RunFinishedEvent) ProtoMessage() {}
+func (*GetMetricHistoryResponse) ProtoMessage() {}
 
-func (x *RunFinishedEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[27]
+func (x *GetMetricHistoryResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2087,49 +2505,148 @@ func (x *RunFinishedEvent) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use RunFinishedEvent.ProtoReflect.Descriptor instead.
-func (*RunFinishedEvent) Descriptor() ([]byte, []int) {
-	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{27}
+// Deprecated: Use GetMetricHistoryResponse.ProtoReflect.Descriptor instead.
+func (*GetMetricHistoryResponse) Descriptor() ([]byte, []int) {
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{33}
 }
 
-func (x *RunFinishedEvent) GetRunId() string {
+func (x *GetMetricHistoryResponse) GetSeries() []*MetricSeries {
+	if x != nil {
+		return x.Series
+	}
+	return nil
+}
+
+func (x *GetMetricHistoryResponse) GetPagination() *v1.PaginationResponse {
+	if x != nil {
+		return x.Pagination
+	}
+	return nil
+}
+
+// ============================================================================
+// SetRunArtifacts  (the typed home for the google.protobuf.Struct import)
+// ============================================================================
+//
+// WHY this RPC exists (and why Struct): a run produces unstructured side-artifacts
+// whose shape varies and isn't worth a schema change per kind — a confusion
+// matrix, a feature-importance map, an artifact manifest, a small eval report.
+// google.protobuf.Struct round-trips to/from JSON, so callers attach arbitrary
+// JSON-shaped context WITHOUT us reaching for opaque bytes (which a UI can't
+// render) and WITHOUT bloating the hot LogMetrics path with free-form data.
+//
+// SECURITY / SIZE: this is NOT a dumping ground. The server caps the serialized
+// Struct size (e.g. 256 KiB) and REJECTS larger payloads with INVALID_ARGUMENT —
+// large blobs belong in object storage with a URI referenced here, not inline on
+// NATS-adjacent state. Artifacts are write-once-ish: re-setting the same key
+// replaces it; keys are namespaced strings the run owns.
+type SetRunArtifactsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The run to attach artifacts to.
+	RunId string `protobuf:"bytes,1,opt,name=run_id,json=runId,proto3" json:"run_id,omitempty"`
+	// Free-form, JSON-shaped artifacts (e.g.
+	// {"confusion_matrix": [[...]], "manifest_uri": "s3://..."}). Server-size-capped.
+	// Struct (not bytes) so it is inspectable/renderable and stays human-readable.
+	Artifacts *structpb.Struct `protobuf:"bytes,2,opt,name=artifacts,proto3" json:"artifacts,omitempty"`
+	// Idempotency key — SetRunArtifacts is a mutation a client may retry; the same
+	// key replays to the same effect rather than re-applying.
+	IdempotencyKey string `protobuf:"bytes,3,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *SetRunArtifactsRequest) Reset() {
+	*x = SetRunArtifactsRequest{}
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[34]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetRunArtifactsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetRunArtifactsRequest) ProtoMessage() {}
+
+func (x *SetRunArtifactsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[34]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetRunArtifactsRequest.ProtoReflect.Descriptor instead.
+func (*SetRunArtifactsRequest) Descriptor() ([]byte, []int) {
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{34}
+}
+
+func (x *SetRunArtifactsRequest) GetRunId() string {
 	if x != nil {
 		return x.RunId
 	}
 	return ""
 }
 
-func (x *RunFinishedEvent) GetExperimentId() string {
+func (x *SetRunArtifactsRequest) GetArtifacts() *structpb.Struct {
 	if x != nil {
-		return x.ExperimentId
-	}
-	return ""
-}
-
-func (x *RunFinishedEvent) GetModelVersionId() string {
-	if x != nil {
-		return x.ModelVersionId
-	}
-	return ""
-}
-
-func (x *RunFinishedEvent) GetStatus() RunStatus {
-	if x != nil {
-		return x.Status
-	}
-	return RunStatus_RUN_STATUS_UNSPECIFIED
-}
-
-func (x *RunFinishedEvent) GetFinalMetrics() []*MetricPoint {
-	if x != nil {
-		return x.FinalMetrics
+		return x.Artifacts
 	}
 	return nil
 }
 
-func (x *RunFinishedEvent) GetEndedAt() *timestamppb.Timestamp {
+func (x *SetRunArtifactsRequest) GetIdempotencyKey() string {
 	if x != nil {
-		return x.EndedAt
+		return x.IdempotencyKey
+	}
+	return ""
+}
+
+type SetRunArtifactsResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The run after the attachment (carries the merged artifacts back for confirm).
+	Run           *Run `protobuf:"bytes,1,opt,name=run,proto3" json:"run,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetRunArtifactsResponse) Reset() {
+	*x = SetRunArtifactsResponse{}
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[35]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetRunArtifactsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetRunArtifactsResponse) ProtoMessage() {}
+
+func (x *SetRunArtifactsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_experiment_v1_experiment_proto_msgTypes[35]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetRunArtifactsResponse.ProtoReflect.Descriptor instead.
+func (*SetRunArtifactsResponse) Descriptor() ([]byte, []int) {
+	return file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP(), []int{35}
+}
+
+func (x *SetRunArtifactsResponse) GetRun() *Run {
+	if x != nil {
+		return x.Run
 	}
 	return nil
 }
@@ -2138,7 +2655,7 @@ var File_forgepoint_experiment_v1_experiment_proto protoreflect.FileDescriptor
 
 const file_forgepoint_experiment_v1_experiment_proto_rawDesc = "" +
 	"\n" +
-	")forgepoint/experiment/v1/experiment.proto\x12\x18forgepoint.experiment.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a!forgepoint/common/v1/common.proto\"\xb9\x02\n" +
+	")forgepoint/experiment/v1/experiment.proto\x12\x18forgepoint.experiment.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1cgoogle/protobuf/struct.proto\x1a!forgepoint/common/v1/common.proto\"\xb1\x03\n" +
 	"\n" +
 	"Experiment\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
@@ -2148,10 +2665,14 @@ const file_forgepoint_experiment_v1_experiment_proto_rawDesc = "" +
 	"\bowner_id\x18\x05 \x01(\tR\aownerId\x12\x12\n" +
 	"\x04team\x18\x06 \x01(\tR\x04team\x129\n" +
 	"\n" +
-	"created_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x1a7\n" +
+	"created_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x129\n" +
+	"\n" +
+	"updated_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\x12;\n" +
+	"\varchived_at\x18\t \x01(\v2\x1a.google.protobuf.TimestampR\n" +
+	"archivedAt\x1a7\n" +
 	"\tTagsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x93\x04\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xca\x04\n" +
 	"\x03Run\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12#\n" +
 	"\rexperiment_id\x18\x02 \x01(\tR\fexperimentId\x12!\n" +
@@ -2165,7 +2686,8 @@ const file_forgepoint_experiment_v1_experiment_proto_rawDesc = "" +
 	"\n" +
 	"started_at\x18\n" +
 	" \x01(\v2\x1a.google.protobuf.TimestampR\tstartedAt\x125\n" +
-	"\bended_at\x18\v \x01(\v2\x1a.google.protobuf.TimestampR\aendedAt\"/\n" +
+	"\bended_at\x18\v \x01(\v2\x1a.google.protobuf.TimestampR\aendedAt\x125\n" +
+	"\tartifacts\x18\f \x01(\v2\x17.google.protobuf.StructR\tartifacts\"/\n" +
 	"\x05Param\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value\"\x83\x01\n" +
@@ -2193,18 +2715,38 @@ const file_forgepoint_experiment_v1_experiment_proto_rawDesc = "" +
 	"\x15GetExperimentResponse\x12D\n" +
 	"\n" +
 	"experiment\x18\x01 \x01(\v2$.forgepoint.experiment.v1.ExperimentR\n" +
-	"experiment\"\x82\x01\n" +
+	"experiment\"\xad\x01\n" +
 	"\x16ListExperimentsRequest\x12\x1f\n" +
 	"\vteam_filter\x18\x01 \x01(\tR\n" +
-	"teamFilter\x12G\n" +
+	"teamFilter\x12)\n" +
+	"\x10include_archived\x18\x02 \x01(\bR\x0fincludeArchived\x12G\n" +
 	"\n" +
-	"pagination\x18\x02 \x01(\v2'.forgepoint.common.v1.PaginationRequestR\n" +
+	"pagination\x18\x03 \x01(\v2'.forgepoint.common.v1.PaginationRequestR\n" +
 	"pagination\"\xab\x01\n" +
 	"\x17ListExperimentsResponse\x12F\n" +
 	"\vexperiments\x18\x01 \x03(\v2$.forgepoint.experiment.v1.ExperimentR\vexperiments\x12H\n" +
 	"\n" +
 	"pagination\x18\x02 \x01(\v2(.forgepoint.common.v1.PaginationResponseR\n" +
-	"pagination\"\xe5\x01\n" +
+	"pagination\"\x8e\x02\n" +
+	"\x17UpdateExperimentRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\x12 \n" +
+	"\vdescription\x18\x03 \x01(\tR\vdescription\x12O\n" +
+	"\x04tags\x18\x04 \x03(\v2;.forgepoint.experiment.v1.UpdateExperimentRequest.TagsEntryR\x04tags\x12#\n" +
+	"\rupdate_fields\x18\x05 \x03(\tR\fupdateFields\x1a7\n" +
+	"\tTagsEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"`\n" +
+	"\x18UpdateExperimentResponse\x12D\n" +
+	"\n" +
+	"experiment\x18\x01 \x01(\v2$.forgepoint.experiment.v1.ExperimentR\n" +
+	"experiment\"*\n" +
+	"\x18ArchiveExperimentRequest\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\"a\n" +
+	"\x19ArchiveExperimentResponse\x12D\n" +
+	"\n" +
+	"experiment\x18\x01 \x01(\v2$.forgepoint.experiment.v1.ExperimentR\n" +
+	"experiment\"\xe5\x01\n" +
 	"\x0fStartRunRequest\x12#\n" +
 	"\rexperiment_id\x18\x01 \x01(\tR\fexperimentId\x12!\n" +
 	"\fdisplay_name\x18\x02 \x01(\tR\vdisplayName\x12(\n" +
@@ -2227,7 +2769,11 @@ const file_forgepoint_experiment_v1_experiment_proto_rawDesc = "" +
 	"\x04runs\x18\x01 \x03(\v2\x1d.forgepoint.experiment.v1.RunR\x04runs\x12H\n" +
 	"\n" +
 	"pagination\x18\x02 \x01(\v2(.forgepoint.common.v1.PaginationResponseR\n" +
-	"pagination\"l\n" +
+	"pagination\"R\n" +
+	"\x10DeleteRunRequest\x12\x15\n" +
+	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12'\n" +
+	"\x0fidempotency_key\x18\x02 \x01(\tR\x0eidempotencyKey\"\x13\n" +
+	"\x11DeleteRunResponse\"l\n" +
 	"\x16UpdateRunStatusRequest\x12\x15\n" +
 	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12;\n" +
 	"\x06status\x18\x02 \x01(\x0e2#.forgepoint.experiment.v1.RunStatusR\x06status\"J\n" +
@@ -2252,21 +2798,27 @@ const file_forgepoint_experiment_v1_experiment_proto_rawDesc = "" +
 	"\x03run\x18\x01 \x01(\v2\x1d.forgepoint.experiment.v1.RunR\x03run\x12>\n" +
 	"\x06series\x18\x02 \x03(\v2&.forgepoint.experiment.v1.MetricSeriesR\x06series\"`\n" +
 	"\x13CompareRunsResponse\x12I\n" +
-	"\vcomparisons\x18\x01 \x03(\v2'.forgepoint.experiment.v1.RunComparisonR\vcomparisons\"\xef\x01\n" +
-	"\x0fRunCreatedEvent\x12\x15\n" +
-	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12#\n" +
-	"\rexperiment_id\x18\x02 \x01(\tR\fexperimentId\x12(\n" +
-	"\x10model_version_id\x18\x03 \x01(\tR\x0emodelVersionId\x12;\n" +
-	"\x06source\x18\x04 \x01(\x0e2#.forgepoint.experiment.v1.RunSourceR\x06source\x129\n" +
+	"\vcomparisons\x18\x01 \x03(\v2'.forgepoint.experiment.v1.RunComparisonR\vcomparisons\"\xd0\x01\n" +
+	"\x17GetMetricHistoryRequest\x12\x15\n" +
+	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12\x1f\n" +
+	"\vmetric_keys\x18\x02 \x03(\tR\n" +
+	"metricKeys\x12\x19\n" +
+	"\bmin_step\x18\x03 \x01(\x03R\aminStep\x12\x19\n" +
+	"\bmax_step\x18\x04 \x01(\x03R\amaxStep\x12G\n" +
 	"\n" +
-	"started_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\tstartedAt\"\xb8\x02\n" +
-	"\x10RunFinishedEvent\x12\x15\n" +
-	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12#\n" +
-	"\rexperiment_id\x18\x02 \x01(\tR\fexperimentId\x12(\n" +
-	"\x10model_version_id\x18\x03 \x01(\tR\x0emodelVersionId\x12;\n" +
-	"\x06status\x18\x04 \x01(\x0e2#.forgepoint.experiment.v1.RunStatusR\x06status\x12J\n" +
-	"\rfinal_metrics\x18\x05 \x03(\v2%.forgepoint.experiment.v1.MetricPointR\ffinalMetrics\x125\n" +
-	"\bended_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\aendedAt*\x86\x01\n" +
+	"pagination\x18\x05 \x01(\v2'.forgepoint.common.v1.PaginationRequestR\n" +
+	"pagination\"\xa4\x01\n" +
+	"\x18GetMetricHistoryResponse\x12>\n" +
+	"\x06series\x18\x01 \x03(\v2&.forgepoint.experiment.v1.MetricSeriesR\x06series\x12H\n" +
+	"\n" +
+	"pagination\x18\x02 \x01(\v2(.forgepoint.common.v1.PaginationResponseR\n" +
+	"pagination\"\x8f\x01\n" +
+	"\x16SetRunArtifactsRequest\x12\x15\n" +
+	"\x06run_id\x18\x01 \x01(\tR\x05runId\x125\n" +
+	"\tartifacts\x18\x02 \x01(\v2\x17.google.protobuf.StructR\tartifacts\x12'\n" +
+	"\x0fidempotency_key\x18\x03 \x01(\tR\x0eidempotencyKey\"J\n" +
+	"\x17SetRunArtifactsResponse\x12/\n" +
+	"\x03run\x18\x01 \x01(\v2\x1d.forgepoint.experiment.v1.RunR\x03run*\x86\x01\n" +
 	"\tRunStatus\x12\x1a\n" +
 	"\x16RUN_STATUS_UNSPECIFIED\x10\x00\x12\x16\n" +
 	"\x12RUN_STATUS_RUNNING\x10\x01\x12\x17\n" +
@@ -2276,18 +2828,23 @@ const file_forgepoint_experiment_v1_experiment_proto_rawDesc = "" +
 	"\tRunSource\x12\x1a\n" +
 	"\x16RUN_SOURCE_UNSPECIFIED\x10\x00\x12\x12\n" +
 	"\x0eRUN_SOURCE_API\x10\x01\x12\x14\n" +
-	"\x10RUN_SOURCE_EVENT\x10\x022\xd5\b\n" +
+	"\x10RUN_SOURCE_EVENT\x10\x022\xa7\r\n" +
 	"\x18ExperimentTrackerService\x12y\n" +
 	"\x10CreateExperiment\x121.forgepoint.experiment.v1.CreateExperimentRequest\x1a2.forgepoint.experiment.v1.CreateExperimentResponse\x12p\n" +
 	"\rGetExperiment\x12..forgepoint.experiment.v1.GetExperimentRequest\x1a/.forgepoint.experiment.v1.GetExperimentResponse\x12v\n" +
-	"\x0fListExperiments\x120.forgepoint.experiment.v1.ListExperimentsRequest\x1a1.forgepoint.experiment.v1.ListExperimentsResponse\x12a\n" +
+	"\x0fListExperiments\x120.forgepoint.experiment.v1.ListExperimentsRequest\x1a1.forgepoint.experiment.v1.ListExperimentsResponse\x12y\n" +
+	"\x10UpdateExperiment\x121.forgepoint.experiment.v1.UpdateExperimentRequest\x1a2.forgepoint.experiment.v1.UpdateExperimentResponse\x12|\n" +
+	"\x11ArchiveExperiment\x122.forgepoint.experiment.v1.ArchiveExperimentRequest\x1a3.forgepoint.experiment.v1.ArchiveExperimentResponse\x12a\n" +
 	"\bStartRun\x12).forgepoint.experiment.v1.StartRunRequest\x1a*.forgepoint.experiment.v1.StartRunResponse\x12v\n" +
 	"\x0fUpdateRunStatus\x120.forgepoint.experiment.v1.UpdateRunStatusRequest\x1a1.forgepoint.experiment.v1.UpdateRunStatusResponse\x12[\n" +
 	"\x06GetRun\x12'.forgepoint.experiment.v1.GetRunRequest\x1a(.forgepoint.experiment.v1.GetRunResponse\x12a\n" +
-	"\bListRuns\x12).forgepoint.experiment.v1.ListRunsRequest\x1a*.forgepoint.experiment.v1.ListRunsResponse\x12g\n" +
+	"\bListRuns\x12).forgepoint.experiment.v1.ListRunsRequest\x1a*.forgepoint.experiment.v1.ListRunsResponse\x12d\n" +
+	"\tDeleteRun\x12*.forgepoint.experiment.v1.DeleteRunRequest\x1a+.forgepoint.experiment.v1.DeleteRunResponse\x12g\n" +
 	"\n" +
 	"LogMetrics\x12+.forgepoint.experiment.v1.LogMetricsRequest\x1a,.forgepoint.experiment.v1.LogMetricsResponse\x12d\n" +
-	"\tLogParams\x12*.forgepoint.experiment.v1.LogParamsRequest\x1a+.forgepoint.experiment.v1.LogParamsResponse\x12j\n" +
+	"\tLogParams\x12*.forgepoint.experiment.v1.LogParamsRequest\x1a+.forgepoint.experiment.v1.LogParamsResponse\x12v\n" +
+	"\x0fSetRunArtifacts\x120.forgepoint.experiment.v1.SetRunArtifactsRequest\x1a1.forgepoint.experiment.v1.SetRunArtifactsResponse\x12y\n" +
+	"\x10GetMetricHistory\x121.forgepoint.experiment.v1.GetMetricHistoryRequest\x1a2.forgepoint.experiment.v1.GetMetricHistoryResponse\x12j\n" +
 	"\vCompareRuns\x12,.forgepoint.experiment.v1.CompareRunsRequest\x1a-.forgepoint.experiment.v1.CompareRunsResponseBPZNgithub.com/abd-ulbasit/forgepoint/gen/go/forgepoint/experiment/v1;experimentv1b\x06proto3"
 
 var (
@@ -2303,105 +2860,131 @@ func file_forgepoint_experiment_v1_experiment_proto_rawDescGZIP() []byte {
 }
 
 var file_forgepoint_experiment_v1_experiment_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_forgepoint_experiment_v1_experiment_proto_msgTypes = make([]protoimpl.MessageInfo, 30)
+var file_forgepoint_experiment_v1_experiment_proto_msgTypes = make([]protoimpl.MessageInfo, 39)
 var file_forgepoint_experiment_v1_experiment_proto_goTypes = []any{
-	(RunStatus)(0),                   // 0: forgepoint.experiment.v1.RunStatus
-	(RunSource)(0),                   // 1: forgepoint.experiment.v1.RunSource
-	(*Experiment)(nil),               // 2: forgepoint.experiment.v1.Experiment
-	(*Run)(nil),                      // 3: forgepoint.experiment.v1.Run
-	(*Param)(nil),                    // 4: forgepoint.experiment.v1.Param
-	(*MetricPoint)(nil),              // 5: forgepoint.experiment.v1.MetricPoint
-	(*MetricSeries)(nil),             // 6: forgepoint.experiment.v1.MetricSeries
-	(*CreateExperimentRequest)(nil),  // 7: forgepoint.experiment.v1.CreateExperimentRequest
-	(*CreateExperimentResponse)(nil), // 8: forgepoint.experiment.v1.CreateExperimentResponse
-	(*GetExperimentRequest)(nil),     // 9: forgepoint.experiment.v1.GetExperimentRequest
-	(*GetExperimentResponse)(nil),    // 10: forgepoint.experiment.v1.GetExperimentResponse
-	(*ListExperimentsRequest)(nil),   // 11: forgepoint.experiment.v1.ListExperimentsRequest
-	(*ListExperimentsResponse)(nil),  // 12: forgepoint.experiment.v1.ListExperimentsResponse
-	(*StartRunRequest)(nil),          // 13: forgepoint.experiment.v1.StartRunRequest
-	(*StartRunResponse)(nil),         // 14: forgepoint.experiment.v1.StartRunResponse
-	(*GetRunRequest)(nil),            // 15: forgepoint.experiment.v1.GetRunRequest
-	(*GetRunResponse)(nil),           // 16: forgepoint.experiment.v1.GetRunResponse
-	(*ListRunsRequest)(nil),          // 17: forgepoint.experiment.v1.ListRunsRequest
-	(*ListRunsResponse)(nil),         // 18: forgepoint.experiment.v1.ListRunsResponse
-	(*UpdateRunStatusRequest)(nil),   // 19: forgepoint.experiment.v1.UpdateRunStatusRequest
-	(*UpdateRunStatusResponse)(nil),  // 20: forgepoint.experiment.v1.UpdateRunStatusResponse
-	(*LogMetricsRequest)(nil),        // 21: forgepoint.experiment.v1.LogMetricsRequest
-	(*LogMetricsResponse)(nil),       // 22: forgepoint.experiment.v1.LogMetricsResponse
-	(*LogParamsRequest)(nil),         // 23: forgepoint.experiment.v1.LogParamsRequest
-	(*LogParamsResponse)(nil),        // 24: forgepoint.experiment.v1.LogParamsResponse
-	(*CompareRunsRequest)(nil),       // 25: forgepoint.experiment.v1.CompareRunsRequest
-	(*RunComparison)(nil),            // 26: forgepoint.experiment.v1.RunComparison
-	(*CompareRunsResponse)(nil),      // 27: forgepoint.experiment.v1.CompareRunsResponse
-	(*RunCreatedEvent)(nil),          // 28: forgepoint.experiment.v1.RunCreatedEvent
-	(*RunFinishedEvent)(nil),         // 29: forgepoint.experiment.v1.RunFinishedEvent
-	nil,                              // 30: forgepoint.experiment.v1.Experiment.TagsEntry
-	nil,                              // 31: forgepoint.experiment.v1.CreateExperimentRequest.TagsEntry
-	(*timestamppb.Timestamp)(nil),    // 32: google.protobuf.Timestamp
-	(*v1.PaginationRequest)(nil),     // 33: forgepoint.common.v1.PaginationRequest
-	(*v1.PaginationResponse)(nil),    // 34: forgepoint.common.v1.PaginationResponse
+	(RunStatus)(0),                    // 0: forgepoint.experiment.v1.RunStatus
+	(RunSource)(0),                    // 1: forgepoint.experiment.v1.RunSource
+	(*Experiment)(nil),                // 2: forgepoint.experiment.v1.Experiment
+	(*Run)(nil),                       // 3: forgepoint.experiment.v1.Run
+	(*Param)(nil),                     // 4: forgepoint.experiment.v1.Param
+	(*MetricPoint)(nil),               // 5: forgepoint.experiment.v1.MetricPoint
+	(*MetricSeries)(nil),              // 6: forgepoint.experiment.v1.MetricSeries
+	(*CreateExperimentRequest)(nil),   // 7: forgepoint.experiment.v1.CreateExperimentRequest
+	(*CreateExperimentResponse)(nil),  // 8: forgepoint.experiment.v1.CreateExperimentResponse
+	(*GetExperimentRequest)(nil),      // 9: forgepoint.experiment.v1.GetExperimentRequest
+	(*GetExperimentResponse)(nil),     // 10: forgepoint.experiment.v1.GetExperimentResponse
+	(*ListExperimentsRequest)(nil),    // 11: forgepoint.experiment.v1.ListExperimentsRequest
+	(*ListExperimentsResponse)(nil),   // 12: forgepoint.experiment.v1.ListExperimentsResponse
+	(*UpdateExperimentRequest)(nil),   // 13: forgepoint.experiment.v1.UpdateExperimentRequest
+	(*UpdateExperimentResponse)(nil),  // 14: forgepoint.experiment.v1.UpdateExperimentResponse
+	(*ArchiveExperimentRequest)(nil),  // 15: forgepoint.experiment.v1.ArchiveExperimentRequest
+	(*ArchiveExperimentResponse)(nil), // 16: forgepoint.experiment.v1.ArchiveExperimentResponse
+	(*StartRunRequest)(nil),           // 17: forgepoint.experiment.v1.StartRunRequest
+	(*StartRunResponse)(nil),          // 18: forgepoint.experiment.v1.StartRunResponse
+	(*GetRunRequest)(nil),             // 19: forgepoint.experiment.v1.GetRunRequest
+	(*GetRunResponse)(nil),            // 20: forgepoint.experiment.v1.GetRunResponse
+	(*ListRunsRequest)(nil),           // 21: forgepoint.experiment.v1.ListRunsRequest
+	(*ListRunsResponse)(nil),          // 22: forgepoint.experiment.v1.ListRunsResponse
+	(*DeleteRunRequest)(nil),          // 23: forgepoint.experiment.v1.DeleteRunRequest
+	(*DeleteRunResponse)(nil),         // 24: forgepoint.experiment.v1.DeleteRunResponse
+	(*UpdateRunStatusRequest)(nil),    // 25: forgepoint.experiment.v1.UpdateRunStatusRequest
+	(*UpdateRunStatusResponse)(nil),   // 26: forgepoint.experiment.v1.UpdateRunStatusResponse
+	(*LogMetricsRequest)(nil),         // 27: forgepoint.experiment.v1.LogMetricsRequest
+	(*LogMetricsResponse)(nil),        // 28: forgepoint.experiment.v1.LogMetricsResponse
+	(*LogParamsRequest)(nil),          // 29: forgepoint.experiment.v1.LogParamsRequest
+	(*LogParamsResponse)(nil),         // 30: forgepoint.experiment.v1.LogParamsResponse
+	(*CompareRunsRequest)(nil),        // 31: forgepoint.experiment.v1.CompareRunsRequest
+	(*RunComparison)(nil),             // 32: forgepoint.experiment.v1.RunComparison
+	(*CompareRunsResponse)(nil),       // 33: forgepoint.experiment.v1.CompareRunsResponse
+	(*GetMetricHistoryRequest)(nil),   // 34: forgepoint.experiment.v1.GetMetricHistoryRequest
+	(*GetMetricHistoryResponse)(nil),  // 35: forgepoint.experiment.v1.GetMetricHistoryResponse
+	(*SetRunArtifactsRequest)(nil),    // 36: forgepoint.experiment.v1.SetRunArtifactsRequest
+	(*SetRunArtifactsResponse)(nil),   // 37: forgepoint.experiment.v1.SetRunArtifactsResponse
+	nil,                               // 38: forgepoint.experiment.v1.Experiment.TagsEntry
+	nil,                               // 39: forgepoint.experiment.v1.CreateExperimentRequest.TagsEntry
+	nil,                               // 40: forgepoint.experiment.v1.UpdateExperimentRequest.TagsEntry
+	(*timestamppb.Timestamp)(nil),     // 41: google.protobuf.Timestamp
+	(*structpb.Struct)(nil),           // 42: google.protobuf.Struct
+	(*v1.PaginationRequest)(nil),      // 43: forgepoint.common.v1.PaginationRequest
+	(*v1.PaginationResponse)(nil),     // 44: forgepoint.common.v1.PaginationResponse
 }
 var file_forgepoint_experiment_v1_experiment_proto_depIdxs = []int32{
-	30, // 0: forgepoint.experiment.v1.Experiment.tags:type_name -> forgepoint.experiment.v1.Experiment.TagsEntry
-	32, // 1: forgepoint.experiment.v1.Experiment.created_at:type_name -> google.protobuf.Timestamp
-	0,  // 2: forgepoint.experiment.v1.Run.status:type_name -> forgepoint.experiment.v1.RunStatus
-	1,  // 3: forgepoint.experiment.v1.Run.source:type_name -> forgepoint.experiment.v1.RunSource
-	4,  // 4: forgepoint.experiment.v1.Run.params:type_name -> forgepoint.experiment.v1.Param
-	5,  // 5: forgepoint.experiment.v1.Run.final_metrics:type_name -> forgepoint.experiment.v1.MetricPoint
-	32, // 6: forgepoint.experiment.v1.Run.started_at:type_name -> google.protobuf.Timestamp
-	32, // 7: forgepoint.experiment.v1.Run.ended_at:type_name -> google.protobuf.Timestamp
-	32, // 8: forgepoint.experiment.v1.MetricPoint.timestamp:type_name -> google.protobuf.Timestamp
-	5,  // 9: forgepoint.experiment.v1.MetricSeries.points:type_name -> forgepoint.experiment.v1.MetricPoint
-	31, // 10: forgepoint.experiment.v1.CreateExperimentRequest.tags:type_name -> forgepoint.experiment.v1.CreateExperimentRequest.TagsEntry
-	2,  // 11: forgepoint.experiment.v1.CreateExperimentResponse.experiment:type_name -> forgepoint.experiment.v1.Experiment
-	2,  // 12: forgepoint.experiment.v1.GetExperimentResponse.experiment:type_name -> forgepoint.experiment.v1.Experiment
-	33, // 13: forgepoint.experiment.v1.ListExperimentsRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
-	2,  // 14: forgepoint.experiment.v1.ListExperimentsResponse.experiments:type_name -> forgepoint.experiment.v1.Experiment
-	34, // 15: forgepoint.experiment.v1.ListExperimentsResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
-	4,  // 16: forgepoint.experiment.v1.StartRunRequest.params:type_name -> forgepoint.experiment.v1.Param
-	3,  // 17: forgepoint.experiment.v1.StartRunResponse.run:type_name -> forgepoint.experiment.v1.Run
-	3,  // 18: forgepoint.experiment.v1.GetRunResponse.run:type_name -> forgepoint.experiment.v1.Run
-	0,  // 19: forgepoint.experiment.v1.ListRunsRequest.status_filter:type_name -> forgepoint.experiment.v1.RunStatus
-	33, // 20: forgepoint.experiment.v1.ListRunsRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
-	3,  // 21: forgepoint.experiment.v1.ListRunsResponse.runs:type_name -> forgepoint.experiment.v1.Run
-	34, // 22: forgepoint.experiment.v1.ListRunsResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
-	0,  // 23: forgepoint.experiment.v1.UpdateRunStatusRequest.status:type_name -> forgepoint.experiment.v1.RunStatus
-	3,  // 24: forgepoint.experiment.v1.UpdateRunStatusResponse.run:type_name -> forgepoint.experiment.v1.Run
-	5,  // 25: forgepoint.experiment.v1.LogMetricsRequest.points:type_name -> forgepoint.experiment.v1.MetricPoint
-	4,  // 26: forgepoint.experiment.v1.LogParamsRequest.params:type_name -> forgepoint.experiment.v1.Param
-	3,  // 27: forgepoint.experiment.v1.RunComparison.run:type_name -> forgepoint.experiment.v1.Run
-	6,  // 28: forgepoint.experiment.v1.RunComparison.series:type_name -> forgepoint.experiment.v1.MetricSeries
-	26, // 29: forgepoint.experiment.v1.CompareRunsResponse.comparisons:type_name -> forgepoint.experiment.v1.RunComparison
-	1,  // 30: forgepoint.experiment.v1.RunCreatedEvent.source:type_name -> forgepoint.experiment.v1.RunSource
-	32, // 31: forgepoint.experiment.v1.RunCreatedEvent.started_at:type_name -> google.protobuf.Timestamp
-	0,  // 32: forgepoint.experiment.v1.RunFinishedEvent.status:type_name -> forgepoint.experiment.v1.RunStatus
-	5,  // 33: forgepoint.experiment.v1.RunFinishedEvent.final_metrics:type_name -> forgepoint.experiment.v1.MetricPoint
-	32, // 34: forgepoint.experiment.v1.RunFinishedEvent.ended_at:type_name -> google.protobuf.Timestamp
-	7,  // 35: forgepoint.experiment.v1.ExperimentTrackerService.CreateExperiment:input_type -> forgepoint.experiment.v1.CreateExperimentRequest
-	9,  // 36: forgepoint.experiment.v1.ExperimentTrackerService.GetExperiment:input_type -> forgepoint.experiment.v1.GetExperimentRequest
-	11, // 37: forgepoint.experiment.v1.ExperimentTrackerService.ListExperiments:input_type -> forgepoint.experiment.v1.ListExperimentsRequest
-	13, // 38: forgepoint.experiment.v1.ExperimentTrackerService.StartRun:input_type -> forgepoint.experiment.v1.StartRunRequest
-	19, // 39: forgepoint.experiment.v1.ExperimentTrackerService.UpdateRunStatus:input_type -> forgepoint.experiment.v1.UpdateRunStatusRequest
-	15, // 40: forgepoint.experiment.v1.ExperimentTrackerService.GetRun:input_type -> forgepoint.experiment.v1.GetRunRequest
-	17, // 41: forgepoint.experiment.v1.ExperimentTrackerService.ListRuns:input_type -> forgepoint.experiment.v1.ListRunsRequest
-	21, // 42: forgepoint.experiment.v1.ExperimentTrackerService.LogMetrics:input_type -> forgepoint.experiment.v1.LogMetricsRequest
-	23, // 43: forgepoint.experiment.v1.ExperimentTrackerService.LogParams:input_type -> forgepoint.experiment.v1.LogParamsRequest
-	25, // 44: forgepoint.experiment.v1.ExperimentTrackerService.CompareRuns:input_type -> forgepoint.experiment.v1.CompareRunsRequest
-	8,  // 45: forgepoint.experiment.v1.ExperimentTrackerService.CreateExperiment:output_type -> forgepoint.experiment.v1.CreateExperimentResponse
-	10, // 46: forgepoint.experiment.v1.ExperimentTrackerService.GetExperiment:output_type -> forgepoint.experiment.v1.GetExperimentResponse
-	12, // 47: forgepoint.experiment.v1.ExperimentTrackerService.ListExperiments:output_type -> forgepoint.experiment.v1.ListExperimentsResponse
-	14, // 48: forgepoint.experiment.v1.ExperimentTrackerService.StartRun:output_type -> forgepoint.experiment.v1.StartRunResponse
-	20, // 49: forgepoint.experiment.v1.ExperimentTrackerService.UpdateRunStatus:output_type -> forgepoint.experiment.v1.UpdateRunStatusResponse
-	16, // 50: forgepoint.experiment.v1.ExperimentTrackerService.GetRun:output_type -> forgepoint.experiment.v1.GetRunResponse
-	18, // 51: forgepoint.experiment.v1.ExperimentTrackerService.ListRuns:output_type -> forgepoint.experiment.v1.ListRunsResponse
-	22, // 52: forgepoint.experiment.v1.ExperimentTrackerService.LogMetrics:output_type -> forgepoint.experiment.v1.LogMetricsResponse
-	24, // 53: forgepoint.experiment.v1.ExperimentTrackerService.LogParams:output_type -> forgepoint.experiment.v1.LogParamsResponse
-	27, // 54: forgepoint.experiment.v1.ExperimentTrackerService.CompareRuns:output_type -> forgepoint.experiment.v1.CompareRunsResponse
-	45, // [45:55] is the sub-list for method output_type
-	35, // [35:45] is the sub-list for method input_type
-	35, // [35:35] is the sub-list for extension type_name
-	35, // [35:35] is the sub-list for extension extendee
-	0,  // [0:35] is the sub-list for field type_name
+	38, // 0: forgepoint.experiment.v1.Experiment.tags:type_name -> forgepoint.experiment.v1.Experiment.TagsEntry
+	41, // 1: forgepoint.experiment.v1.Experiment.created_at:type_name -> google.protobuf.Timestamp
+	41, // 2: forgepoint.experiment.v1.Experiment.updated_at:type_name -> google.protobuf.Timestamp
+	41, // 3: forgepoint.experiment.v1.Experiment.archived_at:type_name -> google.protobuf.Timestamp
+	0,  // 4: forgepoint.experiment.v1.Run.status:type_name -> forgepoint.experiment.v1.RunStatus
+	1,  // 5: forgepoint.experiment.v1.Run.source:type_name -> forgepoint.experiment.v1.RunSource
+	4,  // 6: forgepoint.experiment.v1.Run.params:type_name -> forgepoint.experiment.v1.Param
+	5,  // 7: forgepoint.experiment.v1.Run.final_metrics:type_name -> forgepoint.experiment.v1.MetricPoint
+	41, // 8: forgepoint.experiment.v1.Run.started_at:type_name -> google.protobuf.Timestamp
+	41, // 9: forgepoint.experiment.v1.Run.ended_at:type_name -> google.protobuf.Timestamp
+	42, // 10: forgepoint.experiment.v1.Run.artifacts:type_name -> google.protobuf.Struct
+	41, // 11: forgepoint.experiment.v1.MetricPoint.timestamp:type_name -> google.protobuf.Timestamp
+	5,  // 12: forgepoint.experiment.v1.MetricSeries.points:type_name -> forgepoint.experiment.v1.MetricPoint
+	39, // 13: forgepoint.experiment.v1.CreateExperimentRequest.tags:type_name -> forgepoint.experiment.v1.CreateExperimentRequest.TagsEntry
+	2,  // 14: forgepoint.experiment.v1.CreateExperimentResponse.experiment:type_name -> forgepoint.experiment.v1.Experiment
+	2,  // 15: forgepoint.experiment.v1.GetExperimentResponse.experiment:type_name -> forgepoint.experiment.v1.Experiment
+	43, // 16: forgepoint.experiment.v1.ListExperimentsRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
+	2,  // 17: forgepoint.experiment.v1.ListExperimentsResponse.experiments:type_name -> forgepoint.experiment.v1.Experiment
+	44, // 18: forgepoint.experiment.v1.ListExperimentsResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
+	40, // 19: forgepoint.experiment.v1.UpdateExperimentRequest.tags:type_name -> forgepoint.experiment.v1.UpdateExperimentRequest.TagsEntry
+	2,  // 20: forgepoint.experiment.v1.UpdateExperimentResponse.experiment:type_name -> forgepoint.experiment.v1.Experiment
+	2,  // 21: forgepoint.experiment.v1.ArchiveExperimentResponse.experiment:type_name -> forgepoint.experiment.v1.Experiment
+	4,  // 22: forgepoint.experiment.v1.StartRunRequest.params:type_name -> forgepoint.experiment.v1.Param
+	3,  // 23: forgepoint.experiment.v1.StartRunResponse.run:type_name -> forgepoint.experiment.v1.Run
+	3,  // 24: forgepoint.experiment.v1.GetRunResponse.run:type_name -> forgepoint.experiment.v1.Run
+	0,  // 25: forgepoint.experiment.v1.ListRunsRequest.status_filter:type_name -> forgepoint.experiment.v1.RunStatus
+	43, // 26: forgepoint.experiment.v1.ListRunsRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
+	3,  // 27: forgepoint.experiment.v1.ListRunsResponse.runs:type_name -> forgepoint.experiment.v1.Run
+	44, // 28: forgepoint.experiment.v1.ListRunsResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
+	0,  // 29: forgepoint.experiment.v1.UpdateRunStatusRequest.status:type_name -> forgepoint.experiment.v1.RunStatus
+	3,  // 30: forgepoint.experiment.v1.UpdateRunStatusResponse.run:type_name -> forgepoint.experiment.v1.Run
+	5,  // 31: forgepoint.experiment.v1.LogMetricsRequest.points:type_name -> forgepoint.experiment.v1.MetricPoint
+	4,  // 32: forgepoint.experiment.v1.LogParamsRequest.params:type_name -> forgepoint.experiment.v1.Param
+	3,  // 33: forgepoint.experiment.v1.RunComparison.run:type_name -> forgepoint.experiment.v1.Run
+	6,  // 34: forgepoint.experiment.v1.RunComparison.series:type_name -> forgepoint.experiment.v1.MetricSeries
+	32, // 35: forgepoint.experiment.v1.CompareRunsResponse.comparisons:type_name -> forgepoint.experiment.v1.RunComparison
+	43, // 36: forgepoint.experiment.v1.GetMetricHistoryRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
+	6,  // 37: forgepoint.experiment.v1.GetMetricHistoryResponse.series:type_name -> forgepoint.experiment.v1.MetricSeries
+	44, // 38: forgepoint.experiment.v1.GetMetricHistoryResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
+	42, // 39: forgepoint.experiment.v1.SetRunArtifactsRequest.artifacts:type_name -> google.protobuf.Struct
+	3,  // 40: forgepoint.experiment.v1.SetRunArtifactsResponse.run:type_name -> forgepoint.experiment.v1.Run
+	7,  // 41: forgepoint.experiment.v1.ExperimentTrackerService.CreateExperiment:input_type -> forgepoint.experiment.v1.CreateExperimentRequest
+	9,  // 42: forgepoint.experiment.v1.ExperimentTrackerService.GetExperiment:input_type -> forgepoint.experiment.v1.GetExperimentRequest
+	11, // 43: forgepoint.experiment.v1.ExperimentTrackerService.ListExperiments:input_type -> forgepoint.experiment.v1.ListExperimentsRequest
+	13, // 44: forgepoint.experiment.v1.ExperimentTrackerService.UpdateExperiment:input_type -> forgepoint.experiment.v1.UpdateExperimentRequest
+	15, // 45: forgepoint.experiment.v1.ExperimentTrackerService.ArchiveExperiment:input_type -> forgepoint.experiment.v1.ArchiveExperimentRequest
+	17, // 46: forgepoint.experiment.v1.ExperimentTrackerService.StartRun:input_type -> forgepoint.experiment.v1.StartRunRequest
+	25, // 47: forgepoint.experiment.v1.ExperimentTrackerService.UpdateRunStatus:input_type -> forgepoint.experiment.v1.UpdateRunStatusRequest
+	19, // 48: forgepoint.experiment.v1.ExperimentTrackerService.GetRun:input_type -> forgepoint.experiment.v1.GetRunRequest
+	21, // 49: forgepoint.experiment.v1.ExperimentTrackerService.ListRuns:input_type -> forgepoint.experiment.v1.ListRunsRequest
+	23, // 50: forgepoint.experiment.v1.ExperimentTrackerService.DeleteRun:input_type -> forgepoint.experiment.v1.DeleteRunRequest
+	27, // 51: forgepoint.experiment.v1.ExperimentTrackerService.LogMetrics:input_type -> forgepoint.experiment.v1.LogMetricsRequest
+	29, // 52: forgepoint.experiment.v1.ExperimentTrackerService.LogParams:input_type -> forgepoint.experiment.v1.LogParamsRequest
+	36, // 53: forgepoint.experiment.v1.ExperimentTrackerService.SetRunArtifacts:input_type -> forgepoint.experiment.v1.SetRunArtifactsRequest
+	34, // 54: forgepoint.experiment.v1.ExperimentTrackerService.GetMetricHistory:input_type -> forgepoint.experiment.v1.GetMetricHistoryRequest
+	31, // 55: forgepoint.experiment.v1.ExperimentTrackerService.CompareRuns:input_type -> forgepoint.experiment.v1.CompareRunsRequest
+	8,  // 56: forgepoint.experiment.v1.ExperimentTrackerService.CreateExperiment:output_type -> forgepoint.experiment.v1.CreateExperimentResponse
+	10, // 57: forgepoint.experiment.v1.ExperimentTrackerService.GetExperiment:output_type -> forgepoint.experiment.v1.GetExperimentResponse
+	12, // 58: forgepoint.experiment.v1.ExperimentTrackerService.ListExperiments:output_type -> forgepoint.experiment.v1.ListExperimentsResponse
+	14, // 59: forgepoint.experiment.v1.ExperimentTrackerService.UpdateExperiment:output_type -> forgepoint.experiment.v1.UpdateExperimentResponse
+	16, // 60: forgepoint.experiment.v1.ExperimentTrackerService.ArchiveExperiment:output_type -> forgepoint.experiment.v1.ArchiveExperimentResponse
+	18, // 61: forgepoint.experiment.v1.ExperimentTrackerService.StartRun:output_type -> forgepoint.experiment.v1.StartRunResponse
+	26, // 62: forgepoint.experiment.v1.ExperimentTrackerService.UpdateRunStatus:output_type -> forgepoint.experiment.v1.UpdateRunStatusResponse
+	20, // 63: forgepoint.experiment.v1.ExperimentTrackerService.GetRun:output_type -> forgepoint.experiment.v1.GetRunResponse
+	22, // 64: forgepoint.experiment.v1.ExperimentTrackerService.ListRuns:output_type -> forgepoint.experiment.v1.ListRunsResponse
+	24, // 65: forgepoint.experiment.v1.ExperimentTrackerService.DeleteRun:output_type -> forgepoint.experiment.v1.DeleteRunResponse
+	28, // 66: forgepoint.experiment.v1.ExperimentTrackerService.LogMetrics:output_type -> forgepoint.experiment.v1.LogMetricsResponse
+	30, // 67: forgepoint.experiment.v1.ExperimentTrackerService.LogParams:output_type -> forgepoint.experiment.v1.LogParamsResponse
+	37, // 68: forgepoint.experiment.v1.ExperimentTrackerService.SetRunArtifacts:output_type -> forgepoint.experiment.v1.SetRunArtifactsResponse
+	35, // 69: forgepoint.experiment.v1.ExperimentTrackerService.GetMetricHistory:output_type -> forgepoint.experiment.v1.GetMetricHistoryResponse
+	33, // 70: forgepoint.experiment.v1.ExperimentTrackerService.CompareRuns:output_type -> forgepoint.experiment.v1.CompareRunsResponse
+	56, // [56:71] is the sub-list for method output_type
+	41, // [41:56] is the sub-list for method input_type
+	41, // [41:41] is the sub-list for extension type_name
+	41, // [41:41] is the sub-list for extension extendee
+	0,  // [0:41] is the sub-list for field type_name
 }
 
 func init() { file_forgepoint_experiment_v1_experiment_proto_init() }
@@ -2415,7 +2998,7 @@ func file_forgepoint_experiment_v1_experiment_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_forgepoint_experiment_v1_experiment_proto_rawDesc), len(file_forgepoint_experiment_v1_experiment_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   30,
+			NumMessages:   39,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

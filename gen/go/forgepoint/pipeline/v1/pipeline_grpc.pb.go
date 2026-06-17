@@ -52,8 +52,54 @@
 // concurrently. The API here is the durable, queryable face of that state.
 //
 // CLOSED LOOP: this service is what makes Forgepoint a closed loop. The Model
-// Monitor calls TriggerExecution on a model's training pipeline when drift is
-// detected (retrain → canary → promote), which closes serve → monitor → retrain.
+// Monitor publishes fp.models.drift.detected (events.ModelDriftDetected); this
+// service CONSUMES it and, on a CRITICAL report with auto_retrain armed, calls
+// its OWN TriggerExecution on the model's retrain pipeline (retrain → canary →
+// promote). That closes serve → monitor → retrain WITHOUT a synchronous callback
+// — the orchestrator reacts to a fat-but-flat event, not a gRPC poke.
+//
+// EVENT CONTRACT (single source of truth): this service's NATS payloads are
+// defined in forgepoint/events/v1/events.proto, NOT here. We deliberately do NOT
+// re-declare event-payload messages in this API proto, and we do NOT even import
+// events.proto into this file (the generated Go event types are imported by the
+// Go publisher/consumer code instead — keeping the API-proto surface uncoupled
+// from the event schema). WHY: an event is a PUBLISHED CONTRACT with its own
+// lifecycle and its own buf-breaking guarantee, decoupled from the RPC types — a
+// consumer (Notification, Experiment Tracker) depends only on the events package,
+// never on this service's API proto. See the long DESIGN block in events.proto
+// for the schema-registry reasoning. The handler maps this proto's domain enums
+// (PipelineType, StepType) to/from the mirrored events enums at the publish
+// boundary (a few lines of mechanical conversion — the price of decoupling).
+//
+//   PRODUCES (subject → events.v1 message):
+//     fp.pipelines.started                  → events.PipelineStarted
+//     fp.pipelines.step.completed           → events.StepCompleted
+//     fp.pipelines.step.failed              → events.StepFailed
+//     fp.pipelines.completed                → events.PipelineCompleted
+//     fp.pipelines.failed                   → events.PipelineFailed
+//     fp.pipelines.compensation.triggered   → events.CompensationTriggered
+//     fp.pipelines.model.deployed           → events.ModelDeployed     (NEW — see below)
+//     fp.pipelines.model.undeployed         → events.ModelUndeployed   (NEW — see below)
+//
+//   CONSUMES:
+//     fp.models.drift.detected              → events.ModelDriftDetected
+//       (on severity == CRITICAL && auto_retrain, TriggerExecution(retrain_pipeline_id))
+//
+// MODEL-DEPLOY LIFECYCLE OWNERSHIP (events.proto conflict #2): the DEPLOY /
+// PROMOTE saga steps — and the compensation that rolls them back — are the
+// AUTHORITATIVE source of "a model version is now (un)deployed". This service
+// therefore OWNS and publishes events.ModelDeployed / events.ModelUndeployed
+// under fp.pipelines.model.* (the deploy is a WORKFLOW outcome, so it lives in
+// the pipelines domain even though it concerns a model — EventEnvelope.source
+// records "pipeline-orchestrator" as the real producer). The Inference Gateway
+// and Model Serving CONSUME these to add/remove routes and (un)load versions; a
+// serving pod must NOT emit a competing ModelLoaded/Unloaded lifecycle event.
+//   SSRF GUARD (interview-critical): events.ModelDeployed.endpoint is the serving
+//   backend address. It is RESOLVED SERVER-SIDE by the DEPLOY executor (from the
+//   model version + the K8s Service it created), NEVER taken from client-supplied
+//   step `config`. Accepting a client URL as the route target would let a caller
+//   point gateway traffic at an arbitrary internal host (SSRF). The executor only
+//   ever emits an endpoint it constructed itself, against the fp-models namespace.
 //
 // VERSIONING: Package path includes v1 following Buf/Google convention.
 // Breaking changes require a new forgepoint.pipeline.v2 package.
@@ -82,6 +128,9 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	PipelineOrchestratorService_CreatePipeline_FullMethodName   = "/forgepoint.pipeline.v1.PipelineOrchestratorService/CreatePipeline"
 	PipelineOrchestratorService_ListPipelines_FullMethodName    = "/forgepoint.pipeline.v1.PipelineOrchestratorService/ListPipelines"
+	PipelineOrchestratorService_GetPipeline_FullMethodName      = "/forgepoint.pipeline.v1.PipelineOrchestratorService/GetPipeline"
+	PipelineOrchestratorService_UpdatePipeline_FullMethodName   = "/forgepoint.pipeline.v1.PipelineOrchestratorService/UpdatePipeline"
+	PipelineOrchestratorService_DeletePipeline_FullMethodName   = "/forgepoint.pipeline.v1.PipelineOrchestratorService/DeletePipeline"
 	PipelineOrchestratorService_TriggerExecution_FullMethodName = "/forgepoint.pipeline.v1.PipelineOrchestratorService/TriggerExecution"
 	PipelineOrchestratorService_GetExecution_FullMethodName     = "/forgepoint.pipeline.v1.PipelineOrchestratorService/GetExecution"
 	PipelineOrchestratorService_WatchExecution_FullMethodName   = "/forgepoint.pipeline.v1.PipelineOrchestratorService/WatchExecution"
@@ -138,6 +187,16 @@ type PipelineOrchestratorServiceClient interface {
 	// ListPipelines returns a paginated list of pipeline templates within the
 	// caller's team/RBAC scope, optionally filtered by type.
 	ListPipelines(ctx context.Context, in *ListPipelinesRequest, opts ...grpc.CallOption) (*ListPipelinesResponse, error)
+	// GetPipeline fetches one pipeline TEMPLATE by id (full step graph), scoped to
+	// the caller's team/RBAC. Point lookup for the CLI/UI before triggering a run.
+	GetPipeline(ctx context.Context, in *GetPipelineRequest, opts ...grpc.CallOption) (*GetPipelineResponse, error)
+	// UpdatePipeline edits a template's name/steps in place (id and execution
+	// history preserved). Re-validates the step graph; type is immutable.
+	UpdatePipeline(ctx context.Context, in *UpdatePipelineRequest, opts ...grpc.CallOption) (*UpdatePipelineResponse, error)
+	// DeletePipeline soft-deletes (archives) a template so it can no longer be
+	// listed or triggered, while preserving past executions' lineage. Rejected if
+	// a non-terminal execution of the pipeline is still in flight.
+	DeletePipeline(ctx context.Context, in *DeletePipelineRequest, opts ...grpc.CallOption) (*DeletePipelineResponse, error)
 	// TriggerExecution starts a new run of a pipeline. Supports an idempotency_key
 	// so retries don't double-trigger (exactly-once from the caller's view). The
 	// orchestrator owns the resulting Execution's lifecycle.
@@ -183,6 +242,36 @@ func (c *pipelineOrchestratorServiceClient) ListPipelines(ctx context.Context, i
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListPipelinesResponse)
 	err := c.cc.Invoke(ctx, PipelineOrchestratorService_ListPipelines_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *pipelineOrchestratorServiceClient) GetPipeline(ctx context.Context, in *GetPipelineRequest, opts ...grpc.CallOption) (*GetPipelineResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetPipelineResponse)
+	err := c.cc.Invoke(ctx, PipelineOrchestratorService_GetPipeline_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *pipelineOrchestratorServiceClient) UpdatePipeline(ctx context.Context, in *UpdatePipelineRequest, opts ...grpc.CallOption) (*UpdatePipelineResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpdatePipelineResponse)
+	err := c.cc.Invoke(ctx, PipelineOrchestratorService_UpdatePipeline_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *pipelineOrchestratorServiceClient) DeletePipeline(ctx context.Context, in *DeletePipelineRequest, opts ...grpc.CallOption) (*DeletePipelineResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeletePipelineResponse)
+	err := c.cc.Invoke(ctx, PipelineOrchestratorService_DeletePipeline_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -297,6 +386,16 @@ type PipelineOrchestratorServiceServer interface {
 	// ListPipelines returns a paginated list of pipeline templates within the
 	// caller's team/RBAC scope, optionally filtered by type.
 	ListPipelines(context.Context, *ListPipelinesRequest) (*ListPipelinesResponse, error)
+	// GetPipeline fetches one pipeline TEMPLATE by id (full step graph), scoped to
+	// the caller's team/RBAC. Point lookup for the CLI/UI before triggering a run.
+	GetPipeline(context.Context, *GetPipelineRequest) (*GetPipelineResponse, error)
+	// UpdatePipeline edits a template's name/steps in place (id and execution
+	// history preserved). Re-validates the step graph; type is immutable.
+	UpdatePipeline(context.Context, *UpdatePipelineRequest) (*UpdatePipelineResponse, error)
+	// DeletePipeline soft-deletes (archives) a template so it can no longer be
+	// listed or triggered, while preserving past executions' lineage. Rejected if
+	// a non-terminal execution of the pipeline is still in flight.
+	DeletePipeline(context.Context, *DeletePipelineRequest) (*DeletePipelineResponse, error)
 	// TriggerExecution starts a new run of a pipeline. Supports an idempotency_key
 	// so retries don't double-trigger (exactly-once from the caller's view). The
 	// orchestrator owns the resulting Execution's lifecycle.
@@ -333,6 +432,15 @@ func (UnimplementedPipelineOrchestratorServiceServer) CreatePipeline(context.Con
 }
 func (UnimplementedPipelineOrchestratorServiceServer) ListPipelines(context.Context, *ListPipelinesRequest) (*ListPipelinesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListPipelines not implemented")
+}
+func (UnimplementedPipelineOrchestratorServiceServer) GetPipeline(context.Context, *GetPipelineRequest) (*GetPipelineResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetPipeline not implemented")
+}
+func (UnimplementedPipelineOrchestratorServiceServer) UpdatePipeline(context.Context, *UpdatePipelineRequest) (*UpdatePipelineResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdatePipeline not implemented")
+}
+func (UnimplementedPipelineOrchestratorServiceServer) DeletePipeline(context.Context, *DeletePipelineRequest) (*DeletePipelineResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeletePipeline not implemented")
 }
 func (UnimplementedPipelineOrchestratorServiceServer) TriggerExecution(context.Context, *TriggerExecutionRequest) (*TriggerExecutionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method TriggerExecution not implemented")
@@ -403,6 +511,60 @@ func _PipelineOrchestratorService_ListPipelines_Handler(srv interface{}, ctx con
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(PipelineOrchestratorServiceServer).ListPipelines(ctx, req.(*ListPipelinesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PipelineOrchestratorService_GetPipeline_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetPipelineRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PipelineOrchestratorServiceServer).GetPipeline(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PipelineOrchestratorService_GetPipeline_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PipelineOrchestratorServiceServer).GetPipeline(ctx, req.(*GetPipelineRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PipelineOrchestratorService_UpdatePipeline_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdatePipelineRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PipelineOrchestratorServiceServer).UpdatePipeline(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PipelineOrchestratorService_UpdatePipeline_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PipelineOrchestratorServiceServer).UpdatePipeline(ctx, req.(*UpdatePipelineRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _PipelineOrchestratorService_DeletePipeline_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeletePipelineRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(PipelineOrchestratorServiceServer).DeletePipeline(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: PipelineOrchestratorService_DeletePipeline_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(PipelineOrchestratorServiceServer).DeletePipeline(ctx, req.(*DeletePipelineRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -504,6 +666,18 @@ var PipelineOrchestratorService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListPipelines",
 			Handler:    _PipelineOrchestratorService_ListPipelines_Handler,
+		},
+		{
+			MethodName: "GetPipeline",
+			Handler:    _PipelineOrchestratorService_GetPipeline_Handler,
+		},
+		{
+			MethodName: "UpdatePipeline",
+			Handler:    _PipelineOrchestratorService_UpdatePipeline_Handler,
+		},
+		{
+			MethodName: "DeletePipeline",
+			Handler:    _PipelineOrchestratorService_DeletePipeline_Handler,
 		},
 		{
 			MethodName: "TriggerExecution",

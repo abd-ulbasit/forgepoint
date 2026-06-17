@@ -11,12 +11,15 @@
 //
 // WHAT'S HERE:
 //   - Domain messages: Monitor (config + baseline), DriftReport, DriftMetric,
-//     MonitorStatus, GroundTruthLabel
-//   - MonitorService RPCs: configure monitors, read drift reports (one +
-//     paginated list), read live status, submit delayed ground truth, and
-//     stream drift events live (server-streaming)
-//   - Event-payload messages: ModelDriftDetectedEvent — the typed payload that
-//     rides inside the common EventEnvelope's Any field on fp.models.drift.detected
+//     MonitorStatus, ModelHealth, GroundTruthLabel
+//   - MonitorService RPCs: configure / list / delete monitors, read model health
+//     and drift reports (one + paginated list), read live status, reset the
+//     baseline, submit delayed ground truth, and stream drift events live
+//     (server-streaming)
+//   - NO event-payload messages: the drift event this service produces
+//     (ModelDriftDetected on fp.models.drift.detected) is defined ONCE in the
+//     canonical forgepoint.events.v1 contract and imported, NOT redefined here.
+//     See the EVENT CONTRACT note near the bottom of this file for the mapping.
 //
 // PATTERN — Streaming Aggregation + Closed-Loop Control:
 //   This is the most "alive" part of the platform. Two ideas combine:
@@ -87,8 +90,20 @@ option go_package = "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/monitor
 
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/duration.proto";
-import "google/protobuf/struct.proto";
 import "forgepoint/common/v1/common.proto";
+// NOTE — we deliberately do NOT import forgepoint/events/v1/events.proto here.
+// The canonical event contract owns the payloads this service PRODUCES
+// (forgepoint.events.v1.ModelDriftDetected on fp.models.drift.detected) and
+// CONSUMES (InferenceCompleted / FeaturesWritten / ModelPromoted). They are
+// defined ONCE there and reused via the GENERATED GO types, never redefined
+// locally — that is the whole point of the events package (a mini schema
+// registry: the event wire contract evolves independently of this service's
+// RPC/domain types). Because this API .proto references no events.v1 TYPE,
+// importing events.proto here would be an unused proto import (Buf IMPORT_USED)
+// and a dead compile-time coupling of the API schema to the event schema. For
+// the same hygiene reason this proto also does NOT import google/protobuf/struct.proto:
+// the only Struct field on the platform's drift surface (retrain_context) lives on
+// events.ModelDriftDetected, so Struct is imported by events.proto, not here.
 
 // ============================================================================
 // ENUMS
@@ -288,6 +303,15 @@ message Monitor {
   // the Model Registry; combined with the live serving version at event time.
   string model_name = 2;
 
+  // SERVER-AUTHORITATIVE. The team that owns this monitor, derived from the
+  // creator's auth claims on ConfigureMonitor — NEVER from a request field.
+  // WHY it is server-set and not in the request: tenancy is an authz fact, and a
+  // client that could name its own team could create/read monitors for another
+  // tenant's models (a cross-tenant data leak). All reads (List/Get/Status) are
+  // additionally scoped to the caller's team by the auth interceptor; this field
+  // only RECORDS the owner for display/audit, it is not the access-control input.
+  string owner_team = 14;
+
   // Window length over which drift is computed. Two ways to bound a sliding
   // window — by TIME (this field) or by COUNT (window_size below). The monitor
   // uses whichever is set; if both are set, a window closes when EITHER bound is
@@ -297,11 +321,20 @@ message Monitor {
 
   // Max number of inference events per window (count-based bound). See above for
   // how it interacts with window_duration. 0 = unbounded by count (time only).
+  // BOUNDS (server-validated on write): must be >= 0 and <= 1_000_000. The upper
+  // cap is a MEMORY guard — the live window is held in Redis, so an unbounded or
+  // absurd window_size would let a single monitor pin gigabytes of RAM. Values
+  // above the cap are rejected with INVALID_ARGUMENT (not silently clamped, so
+  // the operator notices). int32 (max ~2.1B) comfortably covers the 1M cap with
+  // no overflow risk in window-fill arithmetic.
   int32 window_size = 4;
 
   // Minimum samples before the monitor will SCORE a window. Below this the
   // monitor stays WARMING_UP — comparing a near-empty window to a large baseline
   // yields noise, so we refuse to emit a verdict until the sample is sound.
+  // BOUNDS (server-validated): 0 <= min_samples <= window_size when window_size>0
+  // (you cannot require more samples than the window can hold, else it never
+  // scores). Rejected with INVALID_ARGUMENT otherwise.
   int32 min_samples = 5;
 
   // Per-drift-type thresholds (data / prediction / performance). A monitor may
@@ -384,8 +417,10 @@ message DriftMetric {
 // WHY a first-class, persisted report (not just an event): the report is the
 // durable record of a single window's verdict. It backs the paginated history
 // (ListDriftReports), the Web UI time series, and the audit trail ("why did the
-// model retrain at 03:14?"). The ModelDriftDetected event carries a *reference*
-// to this report; the report itself is the source of truth.
+// model retrain at 03:14?"). The canonical events.ModelDriftDetected event
+// carries a *flattened copy* of this report's fields + its report_id (it does NOT
+// embed monitor.DriftReport — events are decoupled from API types); this
+// persisted report is the source of truth a consumer deep-links back to.
 //
 // IDEMPOTENCY — window_id is the natural key: each closed window has a stable
 // id, and a report is persisted idempotently on it (Task 16.3: "idempotent on
@@ -470,6 +505,58 @@ message MonitorStatus {
 }
 
 // ============================================================================
+// ModelHealth
+// ============================================================================
+//
+// WHY a dedicated health rollup distinct from MonitorStatus: the design doc and
+// the `fp monitor <model>` CLI ask a SIMPLER question than MonitorStatus answers
+// — "is this model healthy right now, in one line?". MonitorStatus exposes the
+// raw live machinery (window fill, latest report, lifecycle state) for an
+// operator drilling in; ModelHealth is the AT-A-GLANCE verdict a dashboard tile,
+// a CLI summary, or a Rollouts AnalysisTemplate (Phase 22) consumes. Splitting
+// them keeps GetModelHealth a cheap, cacheable read and lets the health verdict
+// evolve (e.g., fold error-rate from InferenceFailed in later) without bloating
+// the status view.
+//
+// SERVER-AUTHORITATIVE: every field here is computed by the monitor. A client
+// cannot assert its own model "healthy".
+message ModelHealth {
+  // The model this health verdict is for.
+  string model_name = 1;
+
+  // The version currently judged (the live production/served version the monitor
+  // is scoring). Empty if no traffic has been seen yet.
+  string model_version = 2;
+
+  // The headline verdict: the MAX severity across all active drift signals
+  // (data / prediction / performance) in the most recent scored window. OK means
+  // healthy; WARNING/CRITICAL surface the worst signal. This is the single value
+  // a dashboard tile colors on. SERVER-computed.
+  DriftSeverity overall_severity = 3;
+
+  // The most recent severity per drift type, so a UI can render a 3-light panel
+  // (data / prediction / performance) without fetching every report. Keyed by
+  // the DriftType enum's integer value (proto3 map keys cannot be enums). A type
+  // absent from the map is simply not configured/scored for this model.
+  map<int32, DriftSeverity> severity_by_type = 4;
+
+  // Live lifecycle state (mirrors Monitor.state) — distinguishes "healthy" from
+  // "not scoring yet" (WARMING_UP), which a bare severity of OK would conflate.
+  MonitorState state = 5;
+
+  // The most recent drift report id, a deep-link handle for "see why". Empty
+  // until the first window closes.
+  string latest_report_id = 6;
+
+  // When the monitor last consumed an inference event for this model. A stale
+  // value means the model is getting no traffic (its own kind of alert).
+  google.protobuf.Timestamp last_event_at = 7;
+
+  // Count of CRITICAL reports in this monitor's lifetime — a cheap trend KPI.
+  int64 drift_events_total = 8;
+}
+
+// ============================================================================
 // GroundTruthLabel
 // ============================================================================
 //
@@ -492,6 +579,10 @@ message GroundTruthLabel {
 
   // The actual observed outcome (e.g., "fraud" / "not_fraud", or a regression
   // target as a string). Compared against the recorded prediction for that id.
+  // SECURITY/PII: this is a LABEL, not a free-form blob — the server caps its
+  // length (e.g. 256 bytes) and it must not be used to smuggle PII; the monitor
+  // stores only the label↔request_id pairing it needs for rolling accuracy, the
+  // same PII-free trust boundary as the inference event.
   string actual_label = 2;
 
   // When the true outcome became known (NOT when the prediction was made). Lets
@@ -511,19 +602,27 @@ message GroundTruthLabel {
 // model_name). This is the ONLY write path for monitor config.
 //
 // SECURITY — MASS-ASSIGNMENT GUARD: this request deliberately accepts ONLY the
-// operator-owned fields. It does NOT accept id, state, baseline_version,
-// baseline_captured_at, created_at, or updated_at — all of those are SERVER-
-// authoritative on the Monitor (see Monitor's security note). Accepting them
-// here would let a client point a monitor at a hand-picked baseline or fake its
-// state to force/suppress retrains. We model the writable surface explicitly as
-// scalar fields rather than embedding a Monitor, precisely so unwritable fields
-// cannot even be expressed on the wire.
+// operator-owned fields. It does NOT accept id, owner_team, state,
+// baseline_version, baseline_captured_at, created_at, or updated_at — all of
+// those are SERVER-authoritative on the Monitor (see Monitor's security note).
+//   - owner_team is derived from the caller's AUTH CLAIMS, never a request field
+//     (a client that could name its own team could create a monitor against
+//     another tenant's model — cross-tenant write).
+//   - Accepting id/state/baseline_* would let a client point a monitor at a
+//     hand-picked baseline or fake its state to force/suppress retrains.
+// We model the writable surface explicitly as scalar fields rather than embedding
+// a Monitor, precisely so unwritable fields cannot even be expressed on the wire.
 message ConfigureMonitorRequest {
   // The model to monitor. Identifies the monitor for upsert (one monitor per
-  // model name). Required.
+  // model name, WITHIN the caller's team). Required. The server additionally
+  // verifies the caller's team owns this model (via Registry) before creating —
+  // model_name here is the WHICH, not the authorization input.
   string model_name = 1;
 
-  // Window shape (see Monitor.window_duration / window_size / min_samples).
+  // Window shape (see Monitor.window_duration / window_size / min_samples). The
+  // same server-side BOUNDS apply as on the Monitor fields: window_size in
+  // [0, 1_000_000]; 0 <= min_samples <= window_size (when window_size>0);
+  // window_duration must be positive when set. Out-of-range → INVALID_ARGUMENT.
   google.protobuf.Duration window_duration = 2;
   int32 window_size = 3;
   int32 min_samples = 4;
@@ -580,6 +679,141 @@ message GetMonitorStatusRequest {
 // WHY wrap: RPC_RESPONSE_STANDARD_NAME + forward compatibility.
 message GetMonitorStatusResponse {
   MonitorStatus status = 1;
+}
+
+// ============================================================================
+// GetModelHealth
+// ============================================================================
+
+// GetModelHealthRequest reads the at-a-glance health verdict for one model.
+// WHY a distinct RPC from GetMonitorStatus (design doc lists GetModelHealth
+// explicitly, and `fp monitor <model>` wants a one-line answer): see ModelHealth.
+message GetModelHealthRequest {
+  // The model whose health to read. Required. Authorization (caller's team owns
+  // the model) is enforced by the auth interceptor, not by this field.
+  string model_name = 1;
+}
+
+// GetModelHealthResponse wraps the health rollup.
+// WHY wrap: RPC_RESPONSE_STANDARD_NAME + forward compatibility.
+message GetModelHealthResponse {
+  ModelHealth health = 1;
+}
+
+// ============================================================================
+// ListMonitors  (fleet view)
+// ============================================================================
+
+// ListMonitorsRequest returns the monitors the caller's team owns — the FLEET
+// view the Web UI's "Monitoring" page and `fp monitor` (no arg) render. WHY this
+// RPC exists: every other read here is per-model; an operator also needs "show me
+// every monitored model and which are unhealthy" without knowing names up front.
+//
+// SECURITY: the result is ALWAYS scoped to the caller's team by the auth
+// interceptor (derived from auth claims) — there is deliberately NO team field on
+// this request, because a client-supplied team would be a cross-tenant read.
+message ListMonitorsRequest {
+  // Optional: return only monitors whose latest overall severity is at/above this
+  // (e.g. CRITICAL) — drives the "unhealthy only" filter. UNSPECIFIED = all.
+  DriftSeverity min_severity = 1;
+
+  // Optional: return only monitors in this lifecycle state (e.g. ACTIVE).
+  // MONITOR_STATE_UNSPECIFIED = any state.
+  MonitorState state = 2;
+
+  // Cursor-based pagination. page_size defaults to 20; the server CAPS it at 100
+  // regardless of a larger client request (platform-wide cap, see common.proto).
+  forgepoint.common.v1.PaginationRequest pagination = 3;
+}
+
+// ListMonitorsResponse is a page of fleet entries — each pairs the monitor config
+// with its current health so the UI renders the whole table from ONE call (no
+// N+1 GetModelHealth per row).
+message ListMonitorsResponse {
+  // One entry per monitored model in this page.
+  message Entry {
+    // The monitor's configuration.
+    Monitor monitor = 1;
+
+    // Its current at-a-glance health (overall severity, per-type lights, state).
+    ModelHealth health = 2;
+  }
+
+  // The page of fleet entries.
+  repeated Entry entries = 1;
+
+  // next_page_token + total_count.
+  forgepoint.common.v1.PaginationResponse pagination = 2;
+}
+
+// ============================================================================
+// DeleteMonitor
+// ============================================================================
+
+// DeleteMonitorRequest tears down a model's monitor. WHY this RPC is needed (the
+// design/CLI imply lifecycle management of monitors): when a model is retired you
+// must be able to STOP monitoring it — otherwise the consumer keeps windowing a
+// dead model's (absent) traffic and the fleet view shows zombie rows. This is a
+// soft-delete by default (drift history is retained for audit; see purge flag).
+message DeleteMonitorRequest {
+  // The model whose monitor to delete. Required. Team ownership enforced by auth.
+  string model_name = 1;
+
+  // If true, ALSO purge this monitor's persisted drift reports (a hard delete for
+  // GDPR/right-to-erasure or test cleanup). Default false = soft-delete the config
+  // but KEEP the drift_reports history for audit ("why did it retrain last month?").
+  bool purge_reports = 2;
+
+  // Idempotency key — a retried delete after a network blip must be a safe no-op
+  // (deleting an already-deleted monitor returns success, not NOT_FOUND-on-retry).
+  // The server records the key (short TTL). Empty = treated as unique.
+  string idempotency_key = 3;
+}
+
+// DeleteMonitorResponse is a named-empty ack (Buf forbids google.protobuf.Empty
+// and reusing a domain message). WHY return how many reports were purged: a
+// hard-delete caller wants confirmation of the erasure scope for its own audit.
+message DeleteMonitorResponse {
+  // Number of drift reports purged (0 when purge_reports=false, i.e. soft delete).
+  int32 purged_report_count = 1;
+}
+
+// ============================================================================
+// ResetBaseline
+// ============================================================================
+
+// ResetBaselineRequest manually re-pins a monitor's drift baseline to a specific
+// model version's training-time distribution. WHY a manual path EXISTS even
+// though ModelPromoted auto-resets it: (a) an operator who sees "baseline is 40
+// days old" (Monitor.baseline_captured_at) can refresh it without a promotion;
+// (b) after a known legitimate distribution shift (a new feature pipeline) you
+// re-baseline to stop alerting on expected drift. The closed-loop auto-reset
+// handles the common case; this is the operator escape hatch.
+//
+// SECURITY — the baseline is STILL server-resolved: the caller names a VERSION,
+// not a distribution. The monitor fetches that version's training-time summary
+// from Registry/Experiment-Tracker itself — a client cannot upload a hand-crafted
+// baseline that conveniently matches current traffic to suppress real drift.
+message ResetBaselineRequest {
+  // The model whose baseline to reset. Required. Team ownership enforced by auth.
+  string model_name = 1;
+
+  // The model version whose training-time distribution becomes the new baseline
+  // (e.g. "v8"). Empty = reset to the CURRENT production version (the common
+  // "refresh to latest" case). The server validates the version exists and is
+  // owned by the caller's team before resolving its baseline.
+  string baseline_version = 2;
+
+  // Idempotency key — re-pinning to the same version twice must be a no-op, not a
+  // second baseline-fetch that bumps updated_at. Empty = treated as unique.
+  string idempotency_key = 3;
+}
+
+// ResetBaselineResponse returns the monitor after the re-baseline, so the caller
+// sees the new baseline_version / baseline_captured_at without a follow-up read.
+message ResetBaselineResponse {
+  // The monitor with its refreshed SERVER-authoritative baseline_* fields.
+  Monitor monitor = 1;
 }
 
 // ============================================================================
@@ -652,8 +886,11 @@ message SubmitGroundTruthRequest {
   // The model these labels belong to (scopes the request_id lookups). Required.
   string model_name = 1;
 
-  // The batch of (request_id → actual outcome) labels. May be large; the server
-  // caps batch size and returns INVALID_ARGUMENT above the cap.
+  // The batch of (request_id → actual outcome) labels. CONTRACT CAP: at most
+  // 1000 labels per call; a larger batch is rejected with INVALID_ARGUMENT (a
+  // bound in the contract, not just prose — it protects the server from an
+  // unbounded single request and bounds the transactional write). Callers with
+  // more labels page through multiple calls (each idempotent on its own key).
   repeated GroundTruthLabel labels = 2;
 
   // Idempotency key — re-submitting the same labeling batch after a retry must
@@ -687,11 +924,12 @@ message SubmitGroundTruthResponse {
 // add latency + load. One long-lived gRPC stream replaces a polling storm. This
 // is the same reason Pipeline Orchestrator uses a streaming WatchExecution.
 //
-// WHY a SEPARATE stream from the NATS event bus: NATS fan-out (ModelDriftDetected)
-// is for SERVICE-to-service reactions (Notification, Orchestrator). This gRPC
-// stream is for INTERACTIVE clients (UI, CLI) that hold an authenticated request
-// scope and want a filtered, backpressure-aware feed — without granting them a
-// NATS connection. Two transports, two audiences.
+// WHY a SEPARATE stream from the NATS event bus: NATS fan-out (the canonical
+// events.ModelDriftDetected on fp.models.drift.detected) is for SERVICE-to-service
+// reactions (Notification, Orchestrator). This gRPC stream is for INTERACTIVE
+// clients (UI, CLI) that hold an authenticated request scope and want a filtered,
+// backpressure-aware feed — without granting them a NATS connection. Two
+// transports, two audiences, ONE underlying drift report.
 message StreamDriftEventsRequest {
   // Optional filter: stream only this model's drift events. Empty = all models
   // the caller is authorized to see (authorization is enforced by the auth
@@ -715,74 +953,71 @@ message StreamDriftEventsResponse {
 }
 
 // ============================================================================
-// EVENT PAYLOAD MESSAGES (typed NATS payloads)
+// EVENT CONTRACT  (this service's NATS surface — payloads live in events.proto)
 // ============================================================================
 //
-// WHY typed event payloads live in the proto: the common EventEnvelope.data is
-// a google.protobuf.Any. Defining the concrete payload here gives the Any a
-// real, versioned, lint-checked schema — producers marshal this message into
-// the Any, consumers unmarshal by its type URL. Without it, consumers would
-// parse untyped JSON and break silently on a field change. (Same approach as
-// inference.proto's InferenceCompletedEvent.)
-// ============================================================================
-
-// ============================================================================
-// ModelDriftDetectedEvent  →  subject: fp.models.drift.detected
-// ============================================================================
+// This service does NOT define any event-payload messages. Every NATS payload it
+// produces or consumes is owned by the canonical forgepoint.events.v1 contract
+// (imported above). WHY: events are a PUBLISHED, versioned contract shared by
+// BOTH ends of every pipe — if Model Monitor redefined ModelDriftDetected here,
+// it would diverge from what Notification/Experiment-Tracker/Orchestrator compile
+// against, which is exactly the incoherence the events package was created to
+// fix. The handler maps this service's domain enums to/from the event enums at
+// the publish/consume boundary (a few lines of mechanical conversion).
 //
-// THE LOOP-CLOSER. This is the event the platform was missing — Notification
-// already subscribes to it; here is its producer. Consumers and what each needs:
-//   - Notification Service: alerts a human → needs model_name, version,
-//     drift_type, severity, and a report link.
-//   - Experiment Tracker: records the drift against the model's history →
-//     needs model identity + report_id + scores.
-//   - Pipeline Orchestrator: on CRITICAL + auto_retrain, runs the retrain
-//     pipeline → needs retrain_pipeline_id and the drift context as input.
+// PRODUCES (1):
+//   fp.models.drift.detected → events.ModelDriftDetected   THE LOOP-CLOSER.
+//     Emitted once per drift report (idempotent on window_id; consumers dedupe on
+//     EventEnvelope.id, with report_id as a second business handle). Consumed by
+//     notification (alert), experiment-tracker (record), pipeline-orchestrator
+//     (on CRITICAL + auto_retrain → TriggerExecution of the retrain pipeline).
+//     EventEnvelope.source = "model-monitor" records the real producer even
+//     though the subject lives under fp.models.* (ownership-by-RESOURCE: the
+//     event is about a MODEL). The canonical message is FAT-BUT-FLAT — headline
+//     scalars (model_name/model_version/drift_type/severity) + report_id +
+//     repeated DriftMetric breakdown + the closed-loop control fields
+//     (auto_retrain/retrain_pipeline_id/retrain_context as a Struct) — so the
+//     orchestrator closes the loop with NO callback into this service. It embeds
+//     NO monitor.DriftReport: the report is flattened into the event (decoupling).
 //
-// WHY embed the DriftReport AND scalar headline fields: the report is the full
-// detail; the duplicated headline fields (model_name, drift_type, severity) let
-// a consumer route/filter WITHOUT deserializing the whole report — cheap subject
-// filtering and alert templating. A small, deliberate denormalization.
+//   FIELD-MAPPING (monitor domain → events.ModelDriftDetected), done in the handler:
+//     DriftReport.model_name        → model_name
+//     DriftReport.model_version     → model_version
+//     DriftReport.drift_type        → drift_type   (monitor.DriftType  → events.DriftType)
+//     DriftReport.severity          → severity     (monitor.DriftSeverity → events.DriftSeverity)
+//     DriftReport.id                → report_id
+//     DriftReport.metrics[]         → metrics[]     (monitor.DriftMetric → events.DriftMetric,
+//                                                    incl. monitor.DriftMethod → events.DriftMethod)
+//     DriftReport.window_start/end  → window_start/window_end
+//     DriftReport.sample_count      → sample_count
+//     Monitor.auto_retrain          → auto_retrain
+//     Monitor.retrain_pipeline_id   → retrain_pipeline_id
+//     (computed drift summary)      → retrain_context (Struct; small, PII-free)
+//     DriftReport.created_at        → detected_at
+//   The three mirror enums (DriftType/DriftMethod/DriftSeverity) have IDENTICAL
+//   value numbering on both sides, so the conversion is a cast — but it MUST go
+//   through an explicit switch (not an unchecked numeric cast) so a future
+//   divergence is caught at the boundary, not silently mis-serialized.
 //
-// IDEMPOTENCY: this event is emitted once per drift report (which is itself
-// idempotent on window_id). Consumers dedupe on EventEnvelope.id; the report_id
-// here is a second, business-level idempotency handle.
-message ModelDriftDetectedEvent {
-  // The model and the exact serving version that drifted.
-  string model_name = 1;
-  string model_version = 2;
-
-  // Headline drift type + severity, duplicated from the report for cheap
-  // routing/filtering by consumers (see message note). Severity is always
-  // CRITICAL for an event that fired the loop, but carried explicitly so the
-  // schema also supports WARNING-level informational emissions if enabled.
-  DriftType drift_type = 3;
-  DriftSeverity severity = 4;
-
-  // The full drift report (per-feature breakdown, window bounds, sample count).
-  // Embedded so a reactor like Experiment Tracker records the detail without a
-  // synchronous call back into Model Monitor.
-  DriftReport report = 5;
-
-  // The report's id — a stable handle for deep-linking and business-level dedupe
-  // (redundant with report.id but convenient for consumers that only index this).
-  string report_id = 6;
-
-  // Whether auto-retrain is armed for this model. The Pipeline Orchestrator (or
-  // the monitor's own loop) uses this to decide whether a retrain should fire.
-  bool auto_retrain = 7;
-
-  // The retrain pipeline to run if auto_retrain is true (opaque Orchestrator id).
-  // Carried on the event so the loop can be closed by a reactor without a lookup.
-  string retrain_pipeline_id = 8;
-
-  // Free-form drift context passed as input to the retrain pipeline (e.g.,
-  // {"top_drifted_feature": "income", "psi": 0.41}). google.protobuf.Struct
-  // because the retrain DAG's expected inputs vary per model — a typed message
-  // would couple this event to every pipeline's input schema. Kept SMALL and
-  // PII-free (summaries only, same trust boundary as the inference event).
-  google.protobuf.Struct retrain_context = 9;
-}
+// CONSUMES (3) — these drive the streaming-aggregation loop; none is an RPC:
+//   fp.inference.completed → events.InferenceCompleted   THE PRIMARY INPUT.
+//     Folded into the per-model sliding window: feature_summary → DATA-drift math,
+//     prediction_summary → PREDICTION-drift math, latency → a performance signal.
+//     request_id is the GROUND-TRUTH JOIN KEY — the monitor records the
+//     request_ids it observed so a later SubmitGroundTruth can match delayed
+//     labels back by request_id. version is captured here so a report is tied to
+//     the exact served version (vital under canary splitting).
+//   fp.features.written    → events.FeaturesWritten
+//     Scopes drift checks / invalidates baseline caches for the changed entities.
+//   fp.models.promoted     → events.ModelPromoted
+//     On to_stage == PRODUCTION, RESET the drift baseline to the new prod
+//     version's training distribution (else every new deploy reads as drift vs a
+//     stale baseline). The single-production invariant on this event also tells
+//     the monitor which version to start scoring.
+//   (fp.inference.failed → events.InferenceFailed is an OPTIONAL future input for
+//    an error-RATE degradation signal; not consumed in this phase, noted for the
+//    reader so the contract is complete.)
+// ============================================================================
 
 // ============================================================================
 // MODEL MONITOR SERVICE
@@ -801,24 +1036,48 @@ message ModelDriftDetectedEvent {
 // that loop: configure it, read what it found, watch it live, feed it truth.
 //
 // RPC CATEGORIES:
-//   CONFIG:        ConfigureMonitor  (set thresholds + auto-retrain toggle)
-//   OBSERVABILITY: GetMonitorStatus, GetDriftReport, ListDriftReports, StreamDriftEvents
+//   CONFIG:        ConfigureMonitor, DeleteMonitor, ResetBaseline
+//   OBSERVABILITY: GetModelHealth, GetMonitorStatus, ListMonitors,
+//                  GetDriftReport, ListDriftReports, StreamDriftEvents
 //   FEEDBACK:      SubmitGroundTruth (delayed labels → performance decay)
 //
 // AUTH: every RPC is guarded by the shared auth interceptor (see auth.proto).
 // Drift scores and config are operationally sensitive; reads require monitoring
-// read scope, writes (ConfigureMonitor, SubmitGroundTruth) require write scope.
+// read scope, writes (ConfigureMonitor, DeleteMonitor, ResetBaseline,
+// SubmitGroundTruth) require write scope. EVERY RPC is additionally TEAM-SCOPED
+// by the interceptor from the caller's auth claims — no request carries a team or
+// tenancy field (those would be cross-tenant footguns; see per-request notes).
 // ============================================================================
 service MonitorService {
   // ConfigureMonitor upserts a model's monitor: window shape, per-drift-type
   // thresholds, and the auto-retrain switch. The ONLY config write path.
-  // SERVER-authoritative fields (id, state, baseline_*) are not accepted here.
+  // SERVER-authoritative fields (id, owner_team, state, baseline_*) are not
+  // accepted here (mass-assignment guard).
   rpc ConfigureMonitor(ConfigureMonitorRequest) returns (ConfigureMonitorResponse);
+
+  // DeleteMonitor stops monitoring a model (soft-delete by default; optionally
+  // purges drift history). Idempotent on idempotency_key.
+  rpc DeleteMonitor(DeleteMonitorRequest) returns (DeleteMonitorResponse);
+
+  // ResetBaseline manually re-pins the drift baseline to a model version's
+  // training distribution (operator escape hatch; auto-reset happens on
+  // ModelPromoted). The baseline is server-resolved from the named version.
+  rpc ResetBaseline(ResetBaselineRequest) returns (ResetBaselineResponse);
+
+  // GetModelHealth returns the at-a-glance health verdict for one model (overall
+  // severity + per-type lights + state). The one-line "is this model healthy?"
+  // read for dashboards and `fp monitor <model>`.
+  rpc GetModelHealth(GetModelHealthRequest) returns (GetModelHealthResponse);
 
   // GetMonitorStatus returns the live status for a model: lifecycle state,
   // current-window fill, the latest report, and lifetime drift count. The
-  // cheapest "is this model healthy right now?" read (hits the live Redis window).
+  // operator drill-in view (hits the live Redis window).
   rpc GetMonitorStatus(GetMonitorStatusRequest) returns (GetMonitorStatusResponse);
+
+  // ListMonitors returns the caller team's monitored-model FLEET (config + current
+  // health per row), paginated, with optional severity/state filters. Powers the
+  // Web UI monitoring table and `fp monitor` (no arg). Page size capped at 100.
+  rpc ListMonitors(ListMonitorsRequest) returns (ListMonitorsResponse);
 
   // GetDriftReport fetches a single persisted drift report by id (the handle the
   // ModelDriftDetected event and UI deep-links reference).

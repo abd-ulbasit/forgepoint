@@ -11,8 +11,46 @@
 //   - Tensor primitives: TensorData, DataType (the wire format for ML I/O)
 //   - Domain messages: ModelInfo, TensorSpec, ServingMetrics, ModelState
 //   - RPCs: Predict, StreamPredict (data plane) + LoadModel, UnloadModel,
-//     GetModelStatus, GetModelInfo, GetServingMetrics, HealthCheck (control plane)
-//   - Event payloads: ModelLoadedEvent, PredictionCompletedEvent, ModelUnloadedEvent
+//     GetModelStatus, GetModelInfo, ListLoadedModels, GetServingMetrics,
+//     HealthCheck (control plane)
+//   - NO event-payload messages. Serving is a PURE EVENT CONSUMER (see the
+//     EVENTING block below) — it publishes nothing on the bus.
+//
+// EVENTING ROLE — PURE CONSUMER, ZERO PRODUCED EVENTS (read this):
+//   An earlier draft of this proto defined ModelLoadedEvent,
+//   PredictionCompletedEvent, and ModelUnloadedEvent. ALL THREE ARE DELETED.
+//   The platform's canonical event contract (proto/forgepoint/events/v1/
+//   events.proto) makes serving a pure consumer:
+//     - The ONE inference/metering event is the gateway's
+//       events.InferenceCompleted (fp.inference.completed) — the gateway alone
+//       knows latency, the served version post traffic-split, the billed
+//       principal, and canary status. A serving pod must NOT emit a competing
+//       metering event (it would double-count and disagree on the served
+//       version). So PredictionCompletedEvent is gone (conflict #1).
+//     - The AUTHORITATIVE deploy lifecycle is the orchestrator saga's
+//       events.ModelDeployed / events.ModelUndeployed (fp.pipelines.model.*),
+//       NOT a serving-pod ModelLoaded/ModelUnloaded side note. A pod loading a
+//       model is an IMPLEMENTATION DETAIL of a deploy the saga owns; emitting a
+//       second "loaded" fact would race the saga's authoritative one and create
+//       two sources of truth for "is version X live?" (conflict #2). So
+//       ModelLoadedEvent / ModelUnloadedEvent are gone.
+//   WHAT SERVING CONSUMES (all defined in events.proto, unmarshalled in Go at
+//   the consume boundary — this proto declares none of them, so it does NOT
+//   import events.proto; redeclaring or importing-without-use would violate the
+//   decoupling rule and Buf's import hygiene):
+//     - fp.models.version.ready    (events.ModelVersionReady)  → a version is
+//          now loadable; pre-warm / be ready to LoadModel it.
+//     - fp.pipelines.model.deployed (events.ModelDeployed)     → ensure this
+//          version is LOADED (the controller reconciles the pod to READY).
+//     - fp.pipelines.model.undeployed (events.ModelUndeployed) → UNLOAD the
+//          version to free memory.
+//     - fp.models.promoted         (events.ModelPromoted)      → the prod
+//          pointer moved; (re)load/route to the new prod weights.
+//     - fp.models.archived         (events.ModelArchived)      → tear down the
+//          running instance(s) of the archived model.
+//   These reactions are realized by the LoadModel / UnloadModel control-plane
+//   RPCs below, driven by the per-version-Deployment controller that owns the
+//   subscription. The data-plane Predict path emits nothing.
 //
 // PATTERN — Sidecar + Horizontal Autoscaling (HPA on custom metrics):
 //
@@ -70,8 +108,13 @@
 //        (gateway does: auth, rate-limit, circuit-breaker, traffic-split)
 //                          └──gRPC──► ModelServing.Predict()  [this service]
 //                                        └─ ONNX runtime in-memory inference
-//                          └──publishes──► fp.serving.prediction_completed
-//                                          (billing + monitor consume it)
+//        ◄──PredictResponse── (returns to the gateway; the POD emits NO event)
+//                          └──the GATEWAY publishes──► fp.inference.completed
+//                                          (events.InferenceCompleted —
+//                                           billing + monitor consume it).
+//   The serving pod is intentionally outside the event path: it does math and
+//   returns; the gateway, which owns latency/served-version/principal/canary,
+//   is the single producer of the inference fact. See the EVENTING block above.
 //
 // VERSIONING: Package path includes v1 (Buf/Google convention). Breaking
 // changes require a new forgepoint.serving.v2 package.
@@ -101,6 +144,7 @@ const (
 	ModelServingService_Predict_FullMethodName           = "/forgepoint.serving.v1.ModelServingService/Predict"
 	ModelServingService_StreamPredict_FullMethodName     = "/forgepoint.serving.v1.ModelServingService/StreamPredict"
 	ModelServingService_GetModelInfo_FullMethodName      = "/forgepoint.serving.v1.ModelServingService/GetModelInfo"
+	ModelServingService_ListLoadedModels_FullMethodName  = "/forgepoint.serving.v1.ModelServingService/ListLoadedModels"
 	ModelServingService_LoadModel_FullMethodName         = "/forgepoint.serving.v1.ModelServingService/LoadModel"
 	ModelServingService_UnloadModel_FullMethodName       = "/forgepoint.serving.v1.ModelServingService/UnloadModel"
 	ModelServingService_GetModelStatus_FullMethodName    = "/forgepoint.serving.v1.ModelServingService/GetModelStatus"
@@ -111,6 +155,30 @@ const (
 // ModelServingServiceClient is the client API for ModelServingService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// ============================================================================
+// NO EVENT-PAYLOAD MESSAGES HERE — BY DESIGN
+// ============================================================================
+//
+// A serving pod publishes NOTHING on the NATS bus. The three former event
+// messages (ModelLoadedEvent, PredictionCompletedEvent, ModelUnloadedEvent)
+// were DELETED when the platform adopted the canonical event contract
+// (proto/forgepoint/events/v1/events.proto). See the EVENTING block at the top
+// of this file for the full rationale. In short:
+//   - The single inference/metering event is the gateway's
+//     events.InferenceCompleted (the gateway owns latency/served-version/
+//     principal/canary) — a serving pod must not emit a competing one.
+//   - The authoritative deploy lifecycle is the orchestrator saga's
+//     events.ModelDeployed / events.ModelUndeployed — a serving pod loading or
+//     unloading a model is an implementation detail of that saga, not a second
+//     source of truth.
+//
+// Serving CONSUMES events.{ModelVersionReady, ModelDeployed, ModelUndeployed,
+// ModelPromoted, ModelArchived} (unmarshalled in Go at the consume boundary by
+// the per-version-Deployment controller) and reacts via the LoadModel /
+// UnloadModel control-plane RPCs below. Because this proto declares and
+// references no event type, it does NOT import events.proto — importing without
+// use would violate the decoupling rule and Buf's import hygiene.
 //
 // ============================================================================
 // MODEL SERVING SERVICE
@@ -135,10 +203,15 @@ const (
 // RPC CATEGORIES:
 //
 //	DATA PLANE:    Predict, StreamPredict
-//	INTROSPECTION: GetModelInfo
+//	INTROSPECTION: GetModelInfo, ListLoadedModels
 //	LIFECYCLE:     LoadModel, UnloadModel, GetModelStatus
 //	AUTOSCALING:   GetServingMetrics
 //	PROBES:        HealthCheck
+//
+// NONE of these RPCs publish an event — the data plane returns inline and the
+// control plane mutates pod-local state; the platform's record of what served
+// (events.InferenceCompleted) and what is deployed (events.ModelDeployed/
+// Undeployed) is produced by the gateway and orchestrator respectively.
 //
 // ASCII — where each RPC sits:
 //
@@ -147,7 +220,8 @@ const (
 //	│  GetServingMetrics  ──────►  least-inflight routing         │
 //	└────────────────────────────────────────────────────┘
 //	┌──────────── Operator / Controller ─────────────────┐
-//	│  LoadModel / UnloadModel / GetModelStatus  ────────►        │
+//	│  LoadModel / UnloadModel / GetModelStatus / ListLoadedModels ►│
+//	│  (driven by consumed ModelDeployed/Undeployed/Promoted/...)  │
 //	└────────────────────────────────────────────────────┘
 //	┌──────────────────── Kubelet ───────────────────────┐
 //	│  HealthCheck (readiness=READY, liveness=latency<thr)────────►│
@@ -157,8 +231,10 @@ const (
 type ModelServingServiceClient interface {
 	// Predict runs a single synchronous inference. The hot path; called by the
 	// Inference Gateway after it has authed, rate-limited, and chosen a version.
-	// Side effect: emits fp.serving.prediction_completed (billing + monitor).
-	// Idempotent on idempotency_key to make gateway retries safe (no double-bill).
+	// NO side effect on the bus: the pod returns the result and the GATEWAY
+	// publishes events.InferenceCompleted (billing + monitor consume that single
+	// canonical event). Idempotent on idempotency_key purely to make gateway
+	// retries cheap (result cache, not a billing concern).
 	Predict(ctx context.Context, in *PredictRequest, opts ...grpc.CallOption) (*PredictResponse, error)
 	// StreamPredict is a bidirectional stream for high-throughput batch scoring
 	// or long-lived online feeds. Opt-in (unary Predict is the primary path).
@@ -168,13 +244,22 @@ type ModelServingServiceClient interface {
 	// GetModelInfo returns the served model's identity + I/O schema so clients
 	// can build valid Predict requests. All fields server-authoritative.
 	GetModelInfo(ctx context.Context, in *GetModelInfoRequest, opts ...grpc.CallOption) (*GetModelInfoResponse, error)
+	// ListLoadedModels returns the live status of every model resident on the pod
+	// (0..1 today; forward-compatible with multi-model). Paginated (common.v1;
+	// page_size server-clamped to [1,100]). The reconcile loop uses it to compare
+	// desired (consumed ModelDeployed events) vs actual (resident) models.
+	ListLoadedModels(ctx context.Context, in *ListLoadedModelsRequest, opts ...grpc.CallOption) (*ListLoadedModelsResponse, error)
 	// LoadModel pulls an artifact from object storage and loads it into the ONNX
-	// runtime. Admin/operator-only. Load is async — poll GetModelStatus for READY.
-	// Idempotent: re-loading an already-READY identical (name,version,digest) is
-	// a no-op returning current status.
+	// runtime. Admin/controller-only — typically driven by a consumed
+	// events.ModelDeployed / events.ModelVersionReady. Load is async — poll
+	// GetModelStatus for READY. Idempotent: re-loading an already-READY identical
+	// (name,version,digest) is a no-op returning current status. SSRF-guarded:
+	// artifact_uri is validated against the pod's allow-listed bucket/prefix.
 	LoadModel(ctx context.Context, in *LoadModelRequest, opts ...grpc.CallOption) (*LoadModelResponse, error)
-	// UnloadModel frees the model from memory. Admin/operator-only. After unload
-	// Predict returns FAILED_PRECONDITION; emits fp.serving.model_unloaded.
+	// UnloadModel frees the model from memory. Admin/controller-only — typically
+	// driven by a consumed events.ModelUndeployed / events.ModelArchived. After
+	// unload Predict returns FAILED_PRECONDITION. Publishes NO event (the
+	// authoritative teardown fact is the orchestrator's events.ModelUndeployed).
 	UnloadModel(ctx context.Context, in *UnloadModelRequest, opts ...grpc.CallOption) (*UnloadModelResponse, error)
 	// GetModelStatus returns the live lifecycle state (DOWNLOADING/LOADING/READY/
 	// FAILED/UNLOADED). Used by the operator's reconcile loop and admin tooling.
@@ -223,6 +308,16 @@ func (c *modelServingServiceClient) GetModelInfo(ctx context.Context, in *GetMod
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetModelInfoResponse)
 	err := c.cc.Invoke(ctx, ModelServingService_GetModelInfo_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *modelServingServiceClient) ListLoadedModels(ctx context.Context, in *ListLoadedModelsRequest, opts ...grpc.CallOption) (*ListLoadedModelsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListLoadedModelsResponse)
+	err := c.cc.Invoke(ctx, ModelServingService_ListLoadedModels_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -284,6 +379,30 @@ func (c *modelServingServiceClient) HealthCheck(ctx context.Context, in *HealthC
 // for forward compatibility.
 //
 // ============================================================================
+// NO EVENT-PAYLOAD MESSAGES HERE — BY DESIGN
+// ============================================================================
+//
+// A serving pod publishes NOTHING on the NATS bus. The three former event
+// messages (ModelLoadedEvent, PredictionCompletedEvent, ModelUnloadedEvent)
+// were DELETED when the platform adopted the canonical event contract
+// (proto/forgepoint/events/v1/events.proto). See the EVENTING block at the top
+// of this file for the full rationale. In short:
+//   - The single inference/metering event is the gateway's
+//     events.InferenceCompleted (the gateway owns latency/served-version/
+//     principal/canary) — a serving pod must not emit a competing one.
+//   - The authoritative deploy lifecycle is the orchestrator saga's
+//     events.ModelDeployed / events.ModelUndeployed — a serving pod loading or
+//     unloading a model is an implementation detail of that saga, not a second
+//     source of truth.
+//
+// Serving CONSUMES events.{ModelVersionReady, ModelDeployed, ModelUndeployed,
+// ModelPromoted, ModelArchived} (unmarshalled in Go at the consume boundary by
+// the per-version-Deployment controller) and reacts via the LoadModel /
+// UnloadModel control-plane RPCs below. Because this proto declares and
+// references no event type, it does NOT import events.proto — importing without
+// use would violate the decoupling rule and Buf's import hygiene.
+//
+// ============================================================================
 // MODEL SERVING SERVICE
 // ============================================================================
 //
@@ -306,10 +425,15 @@ func (c *modelServingServiceClient) HealthCheck(ctx context.Context, in *HealthC
 // RPC CATEGORIES:
 //
 //	DATA PLANE:    Predict, StreamPredict
-//	INTROSPECTION: GetModelInfo
+//	INTROSPECTION: GetModelInfo, ListLoadedModels
 //	LIFECYCLE:     LoadModel, UnloadModel, GetModelStatus
 //	AUTOSCALING:   GetServingMetrics
 //	PROBES:        HealthCheck
+//
+// NONE of these RPCs publish an event — the data plane returns inline and the
+// control plane mutates pod-local state; the platform's record of what served
+// (events.InferenceCompleted) and what is deployed (events.ModelDeployed/
+// Undeployed) is produced by the gateway and orchestrator respectively.
 //
 // ASCII — where each RPC sits:
 //
@@ -318,7 +442,8 @@ func (c *modelServingServiceClient) HealthCheck(ctx context.Context, in *HealthC
 //	│  GetServingMetrics  ──────►  least-inflight routing         │
 //	└────────────────────────────────────────────────────┘
 //	┌──────────── Operator / Controller ─────────────────┐
-//	│  LoadModel / UnloadModel / GetModelStatus  ────────►        │
+//	│  LoadModel / UnloadModel / GetModelStatus / ListLoadedModels ►│
+//	│  (driven by consumed ModelDeployed/Undeployed/Promoted/...)  │
 //	└────────────────────────────────────────────────────┘
 //	┌──────────────────── Kubelet ───────────────────────┐
 //	│  HealthCheck (readiness=READY, liveness=latency<thr)────────►│
@@ -328,8 +453,10 @@ func (c *modelServingServiceClient) HealthCheck(ctx context.Context, in *HealthC
 type ModelServingServiceServer interface {
 	// Predict runs a single synchronous inference. The hot path; called by the
 	// Inference Gateway after it has authed, rate-limited, and chosen a version.
-	// Side effect: emits fp.serving.prediction_completed (billing + monitor).
-	// Idempotent on idempotency_key to make gateway retries safe (no double-bill).
+	// NO side effect on the bus: the pod returns the result and the GATEWAY
+	// publishes events.InferenceCompleted (billing + monitor consume that single
+	// canonical event). Idempotent on idempotency_key purely to make gateway
+	// retries cheap (result cache, not a billing concern).
 	Predict(context.Context, *PredictRequest) (*PredictResponse, error)
 	// StreamPredict is a bidirectional stream for high-throughput batch scoring
 	// or long-lived online feeds. Opt-in (unary Predict is the primary path).
@@ -339,13 +466,22 @@ type ModelServingServiceServer interface {
 	// GetModelInfo returns the served model's identity + I/O schema so clients
 	// can build valid Predict requests. All fields server-authoritative.
 	GetModelInfo(context.Context, *GetModelInfoRequest) (*GetModelInfoResponse, error)
+	// ListLoadedModels returns the live status of every model resident on the pod
+	// (0..1 today; forward-compatible with multi-model). Paginated (common.v1;
+	// page_size server-clamped to [1,100]). The reconcile loop uses it to compare
+	// desired (consumed ModelDeployed events) vs actual (resident) models.
+	ListLoadedModels(context.Context, *ListLoadedModelsRequest) (*ListLoadedModelsResponse, error)
 	// LoadModel pulls an artifact from object storage and loads it into the ONNX
-	// runtime. Admin/operator-only. Load is async — poll GetModelStatus for READY.
-	// Idempotent: re-loading an already-READY identical (name,version,digest) is
-	// a no-op returning current status.
+	// runtime. Admin/controller-only — typically driven by a consumed
+	// events.ModelDeployed / events.ModelVersionReady. Load is async — poll
+	// GetModelStatus for READY. Idempotent: re-loading an already-READY identical
+	// (name,version,digest) is a no-op returning current status. SSRF-guarded:
+	// artifact_uri is validated against the pod's allow-listed bucket/prefix.
 	LoadModel(context.Context, *LoadModelRequest) (*LoadModelResponse, error)
-	// UnloadModel frees the model from memory. Admin/operator-only. After unload
-	// Predict returns FAILED_PRECONDITION; emits fp.serving.model_unloaded.
+	// UnloadModel frees the model from memory. Admin/controller-only — typically
+	// driven by a consumed events.ModelUndeployed / events.ModelArchived. After
+	// unload Predict returns FAILED_PRECONDITION. Publishes NO event (the
+	// authoritative teardown fact is the orchestrator's events.ModelUndeployed).
 	UnloadModel(context.Context, *UnloadModelRequest) (*UnloadModelResponse, error)
 	// GetModelStatus returns the live lifecycle state (DOWNLOADING/LOADING/READY/
 	// FAILED/UNLOADED). Used by the operator's reconcile loop and admin tooling.
@@ -375,6 +511,9 @@ func (UnimplementedModelServingServiceServer) StreamPredict(grpc.BidiStreamingSe
 }
 func (UnimplementedModelServingServiceServer) GetModelInfo(context.Context, *GetModelInfoRequest) (*GetModelInfoResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetModelInfo not implemented")
+}
+func (UnimplementedModelServingServiceServer) ListLoadedModels(context.Context, *ListLoadedModelsRequest) (*ListLoadedModelsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListLoadedModels not implemented")
 }
 func (UnimplementedModelServingServiceServer) LoadModel(context.Context, *LoadModelRequest) (*LoadModelResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method LoadModel not implemented")
@@ -451,6 +590,24 @@ func _ModelServingService_GetModelInfo_Handler(srv interface{}, ctx context.Cont
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ModelServingServiceServer).GetModelInfo(ctx, req.(*GetModelInfoRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ModelServingService_ListLoadedModels_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListLoadedModelsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ModelServingServiceServer).ListLoadedModels(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ModelServingService_ListLoadedModels_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ModelServingServiceServer).ListLoadedModels(ctx, req.(*ListLoadedModelsRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -559,6 +716,10 @@ var ModelServingService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetModelInfo",
 			Handler:    _ModelServingService_GetModelInfo_Handler,
+		},
+		{
+			MethodName: "ListLoadedModels",
+			Handler:    _ModelServingService_ListLoadedModels_Handler,
 		},
 		{
 			MethodName: "LoadModel",

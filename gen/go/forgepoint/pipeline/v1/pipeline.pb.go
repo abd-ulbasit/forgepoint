@@ -52,8 +52,54 @@
 // concurrently. The API here is the durable, queryable face of that state.
 //
 // CLOSED LOOP: this service is what makes Forgepoint a closed loop. The Model
-// Monitor calls TriggerExecution on a model's training pipeline when drift is
-// detected (retrain → canary → promote), which closes serve → monitor → retrain.
+// Monitor publishes fp.models.drift.detected (events.ModelDriftDetected); this
+// service CONSUMES it and, on a CRITICAL report with auto_retrain armed, calls
+// its OWN TriggerExecution on the model's retrain pipeline (retrain → canary →
+// promote). That closes serve → monitor → retrain WITHOUT a synchronous callback
+// — the orchestrator reacts to a fat-but-flat event, not a gRPC poke.
+//
+// EVENT CONTRACT (single source of truth): this service's NATS payloads are
+// defined in forgepoint/events/v1/events.proto, NOT here. We deliberately do NOT
+// re-declare event-payload messages in this API proto, and we do NOT even import
+// events.proto into this file (the generated Go event types are imported by the
+// Go publisher/consumer code instead — keeping the API-proto surface uncoupled
+// from the event schema). WHY: an event is a PUBLISHED CONTRACT with its own
+// lifecycle and its own buf-breaking guarantee, decoupled from the RPC types — a
+// consumer (Notification, Experiment Tracker) depends only on the events package,
+// never on this service's API proto. See the long DESIGN block in events.proto
+// for the schema-registry reasoning. The handler maps this proto's domain enums
+// (PipelineType, StepType) to/from the mirrored events enums at the publish
+// boundary (a few lines of mechanical conversion — the price of decoupling).
+//
+//   PRODUCES (subject → events.v1 message):
+//     fp.pipelines.started                  → events.PipelineStarted
+//     fp.pipelines.step.completed           → events.StepCompleted
+//     fp.pipelines.step.failed              → events.StepFailed
+//     fp.pipelines.completed                → events.PipelineCompleted
+//     fp.pipelines.failed                   → events.PipelineFailed
+//     fp.pipelines.compensation.triggered   → events.CompensationTriggered
+//     fp.pipelines.model.deployed           → events.ModelDeployed     (NEW — see below)
+//     fp.pipelines.model.undeployed         → events.ModelUndeployed   (NEW — see below)
+//
+//   CONSUMES:
+//     fp.models.drift.detected              → events.ModelDriftDetected
+//       (on severity == CRITICAL && auto_retrain, TriggerExecution(retrain_pipeline_id))
+//
+// MODEL-DEPLOY LIFECYCLE OWNERSHIP (events.proto conflict #2): the DEPLOY /
+// PROMOTE saga steps — and the compensation that rolls them back — are the
+// AUTHORITATIVE source of "a model version is now (un)deployed". This service
+// therefore OWNS and publishes events.ModelDeployed / events.ModelUndeployed
+// under fp.pipelines.model.* (the deploy is a WORKFLOW outcome, so it lives in
+// the pipelines domain even though it concerns a model — EventEnvelope.source
+// records "pipeline-orchestrator" as the real producer). The Inference Gateway
+// and Model Serving CONSUME these to add/remove routes and (un)load versions; a
+// serving pod must NOT emit a competing ModelLoaded/Unloaded lifecycle event.
+//   SSRF GUARD (interview-critical): events.ModelDeployed.endpoint is the serving
+//   backend address. It is RESOLVED SERVER-SIDE by the DEPLOY executor (from the
+//   model version + the K8s Service it created), NEVER taken from client-supplied
+//   step `config`. Accepting a client URL as the route target would let a caller
+//   point gateway traffic at an arbitrary internal host (SSRF). The executor only
+//   ever emits an endpoint it constructed itself, against the fp-models namespace.
 //
 // VERSIONING: Package path includes v1 following Buf/Google convention.
 // Breaking changes require a new forgepoint.pipeline.v2 package.
@@ -486,7 +532,16 @@ type StepDefinition struct {
 	// hyperparameters, target model_id/version). Struct (not a typed message)
 	// because config shape varies per StepType and per CUSTOM step — typing every
 	// variant would bloat this proto and couple it to executor internals.
-	// SECURITY: the engine treats this as untrusted input; executors validate it.
+	// SECURITY (untrusted input — executors MUST validate, never trust shape):
+	//   - SSRF: config may name a target model_id/version, but it must NOT supply a
+	//     raw serving URL/host/IP for the engine to call. The DEPLOY/CANARY
+	//     executors RESOLVE the serving endpoint server-side (from the model
+	//     version + the K8s Service in fp-models) and only ever talk to that
+	//     allowlisted, internally-constructed address. A client-supplied endpoint
+	//     would be a server-side request forgery vector — rejected at validation.
+	//   - Resource caps: numeric config (e.g. parallel fold count, retry budget) is
+	//     clamped to engine maxima so a config can't request unbounded fan-out.
+	//   - No secrets here: config is echoed in GetExecution responses and step events.
 	Config *structpb.Struct `protobuf:"bytes,6,opt,name=config,proto3" json:"config,omitempty"`
 	// Optional per-step timeout. If the step runs longer, the engine fails it
 	// (which, in a saga, triggers compensation). Zero/unset = use engine default.
@@ -1000,9 +1055,22 @@ type CreatePipelineRequest struct {
 	Type PipelineType `protobuf:"varint,2,opt,name=type,proto3,enum=forgepoint.pipeline.v1.PipelineType" json:"type,omitempty"`
 	// The step graph. The server validates: known StepTypes, depends_on refers to
 	// real step ids, no cycles (DAG), compensation_step_id refers to real steps.
-	Steps         []*StepDefinition `protobuf:"bytes,3,rep,name=steps,proto3" json:"steps,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// BATCH-SIZE CAP (contract, not just prose): the server REJECTS a definition
+	// with more than 256 steps (INVALID_ARGUMENT). A pipeline graph this large is
+	// almost always a mistake, and an unbounded graph is a DoS vector (the engine
+	// persists a checkpoint row per step and topo-sorts the whole set). 256 is far
+	// above any real ML workflow yet bounds the work the server commits to.
+	Steps []*StepDefinition `protobuf:"bytes,3,rep,name=steps,proto3" json:"steps,omitempty"`
+	// Caller-supplied idempotency key (typically a UUID) for the CREATE itself.
+	// WHY mutating-create idempotency: a client retry after a network blip must not
+	// create two pipelines with the same name (which would then fail the
+	// uniqueness check confusingly, or — worse, under a race — both succeed). Same
+	// key → the SAME PipelineDefinition is returned, never a duplicate. Empty = no
+	// dedup (interactive one-off). Mirrors TriggerExecution's idempotency_key and
+	// the Stripe idempotency-key pattern used across the platform.
+	IdempotencyKey string `protobuf:"bytes,4,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *CreatePipelineRequest) Reset() {
@@ -1054,6 +1122,13 @@ func (x *CreatePipelineRequest) GetSteps() []*StepDefinition {
 		return x.Steps
 	}
 	return nil
+}
+
+func (x *CreatePipelineRequest) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
 }
 
 // CreatePipelineResponse wraps the created PipelineDefinition.
@@ -1596,10 +1671,17 @@ func (x *CancelExecutionResponse) GetExecution() *Execution {
 // across every list RPC on the platform (cursor-based; see common.proto for the
 // WHY). SECURITY: the server CAPS page_size (default 20, max 100) regardless of
 // the requested value, to prevent a client from requesting an unbounded page.
+//
+// TENANCY (anti-IDOR): there is deliberately NO team field on this request. The
+// result set is ALWAYS scoped to the caller's team, derived SERVER-SIDE from the
+// auth token claims — never from a client-supplied tenancy field. A client cannot
+// list another team's executions by passing a different team. The pipeline_id /
+// status_filter below only NARROW within that authorized scope.
 type ListExecutionsRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Optional: only runs of this pipeline. Empty = all pipelines (subject to the
-	// caller's team/RBAC scope).
+	// Optional: only runs of this pipeline. Empty = all pipelines the caller's team
+	// owns. A pipeline_id from another team yields an empty page (scope-filtered,
+	// not an error — we don't confirm/deny existence of out-of-scope ids).
 	PipelineId string `protobuf:"bytes,1,opt,name=pipeline_id,json=pipelineId,proto3" json:"pipeline_id,omitempty"`
 	// Optional: only runs in this status (e.g., FAILED for a triage dashboard).
 	// UNSPECIFIED = any status.
@@ -1718,7 +1800,9 @@ func (x *ListExecutionsResponse) GetPagination() *v1.PaginationResponse {
 }
 
 // ListPipelinesRequest returns a paginated list of pipeline TEMPLATES (not
-// runs). Same pagination/cap discipline as ListExecutions.
+// runs). Same pagination/cap discipline as ListExecutions (page_size default 20,
+// capped 100 server-side). TENANCY: like ListExecutions, results are scoped to
+// the caller's team from auth claims — there is no client-supplied team field.
 type ListPipelinesRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Optional: only pipelines of this type (e.g., only TRAINING_DAG).
@@ -1828,34 +1912,34 @@ func (x *ListPipelinesResponse) GetPagination() *v1.PaginationResponse {
 	return nil
 }
 
-// PipelineStartedEvent — emitted when an Execution transitions to RUNNING.
-// Subject: fp.pipelines.started
-type PipelineStartedEvent struct {
-	state        protoimpl.MessageState `protogen:"open.v1"`
-	ExecutionId  string                 `protobuf:"bytes,1,opt,name=execution_id,json=executionId,proto3" json:"execution_id,omitempty"`
-	PipelineId   string                 `protobuf:"bytes,2,opt,name=pipeline_id,json=pipelineId,proto3" json:"pipeline_id,omitempty"`
-	PipelineType PipelineType           `protobuf:"varint,3,opt,name=pipeline_type,json=pipelineType,proto3,enum=forgepoint.pipeline.v1.PipelineType" json:"pipeline_type,omitempty"`
-	// Who/what triggered it (user_id or service identity like "model-monitor").
-	TriggeredBy   string                 `protobuf:"bytes,4,opt,name=triggered_by,json=triggeredBy,proto3" json:"triggered_by,omitempty"`
-	StartedAt     *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=started_at,json=startedAt,proto3" json:"started_at,omitempty"`
+// GetPipelineRequest fetches ONE pipeline TEMPLATE by id.
+// WHY this RPC exists (it was missing): the CLI (`fp pipeline get <id>`), the web
+// UI's pipeline editor, and any client that wants to inspect a template's full
+// step graph before triggering it need a by-id read. ListPipelines is for
+// browsing; this is the point lookup. The server scopes the read to the caller's
+// team/RBAC (a caller cannot fetch another team's pipeline by guessing its id).
+type GetPipelineRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// UUID of the pipeline definition to fetch.
+	PipelineId    string `protobuf:"bytes,1,opt,name=pipeline_id,json=pipelineId,proto3" json:"pipeline_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *PipelineStartedEvent) Reset() {
-	*x = PipelineStartedEvent{}
+func (x *GetPipelineRequest) Reset() {
+	*x = GetPipelineRequest{}
 	mi := &file_forgepoint_pipeline_v1_pipeline_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *PipelineStartedEvent) String() string {
+func (x *GetPipelineRequest) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*PipelineStartedEvent) ProtoMessage() {}
+func (*GetPipelineRequest) ProtoMessage() {}
 
-func (x *PipelineStartedEvent) ProtoReflect() protoreflect.Message {
+func (x *GetPipelineRequest) ProtoReflect() protoreflect.Message {
 	mi := &file_forgepoint_pipeline_v1_pipeline_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -1867,78 +1951,40 @@ func (x *PipelineStartedEvent) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use PipelineStartedEvent.ProtoReflect.Descriptor instead.
-func (*PipelineStartedEvent) Descriptor() ([]byte, []int) {
+// Deprecated: Use GetPipelineRequest.ProtoReflect.Descriptor instead.
+func (*GetPipelineRequest) Descriptor() ([]byte, []int) {
 	return file_forgepoint_pipeline_v1_pipeline_proto_rawDescGZIP(), []int{18}
 }
 
-func (x *PipelineStartedEvent) GetExecutionId() string {
-	if x != nil {
-		return x.ExecutionId
-	}
-	return ""
-}
-
-func (x *PipelineStartedEvent) GetPipelineId() string {
+func (x *GetPipelineRequest) GetPipelineId() string {
 	if x != nil {
 		return x.PipelineId
 	}
 	return ""
 }
 
-func (x *PipelineStartedEvent) GetPipelineType() PipelineType {
-	if x != nil {
-		return x.PipelineType
-	}
-	return PipelineType_PIPELINE_TYPE_UNSPECIFIED
-}
-
-func (x *PipelineStartedEvent) GetTriggeredBy() string {
-	if x != nil {
-		return x.TriggeredBy
-	}
-	return ""
-}
-
-func (x *PipelineStartedEvent) GetStartedAt() *timestamppb.Timestamp {
-	if x != nil {
-		return x.StartedAt
-	}
-	return nil
-}
-
-// StepCompletedEvent — emitted when a single step finishes successfully.
-// Subject: fp.pipelines.step.completed
-// Consumed by Experiment Tracker to record per-step progress/metrics.
-type StepCompletedEvent struct {
-	state       protoimpl.MessageState `protogen:"open.v1"`
-	ExecutionId string                 `protobuf:"bytes,1,opt,name=execution_id,json=executionId,proto3" json:"execution_id,omitempty"`
-	PipelineId  string                 `protobuf:"bytes,2,opt,name=pipeline_id,json=pipelineId,proto3" json:"pipeline_id,omitempty"`
-	// Template step id that completed.
-	StepId   string   `protobuf:"bytes,3,opt,name=step_id,json=stepId,proto3" json:"step_id,omitempty"`
-	StepType StepType `protobuf:"varint,4,opt,name=step_type,json=stepType,proto3,enum=forgepoint.pipeline.v1.StepType" json:"step_type,omitempty"`
-	// Step output (e.g., trained model URI) so downstream consumers don't have to
-	// call back for it. Small, step-specific payload.
-	Output        *structpb.Struct       `protobuf:"bytes,5,opt,name=output,proto3" json:"output,omitempty"`
-	CompletedAt   *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=completed_at,json=completedAt,proto3" json:"completed_at,omitempty"`
+// GetPipelineResponse wraps the PipelineDefinition (incl. its full step graph).
+type GetPipelineResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Pipeline      *PipelineDefinition    `protobuf:"bytes,1,opt,name=pipeline,proto3" json:"pipeline,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *StepCompletedEvent) Reset() {
-	*x = StepCompletedEvent{}
+func (x *GetPipelineResponse) Reset() {
+	*x = GetPipelineResponse{}
 	mi := &file_forgepoint_pipeline_v1_pipeline_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *StepCompletedEvent) String() string {
+func (x *GetPipelineResponse) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*StepCompletedEvent) ProtoMessage() {}
+func (*GetPipelineResponse) ProtoMessage() {}
 
-func (x *StepCompletedEvent) ProtoReflect() protoreflect.Message {
+func (x *GetPipelineResponse) ProtoReflect() protoreflect.Message {
 	mi := &file_forgepoint_pipeline_v1_pipeline_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -1950,84 +1996,67 @@ func (x *StepCompletedEvent) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use StepCompletedEvent.ProtoReflect.Descriptor instead.
-func (*StepCompletedEvent) Descriptor() ([]byte, []int) {
+// Deprecated: Use GetPipelineResponse.ProtoReflect.Descriptor instead.
+func (*GetPipelineResponse) Descriptor() ([]byte, []int) {
 	return file_forgepoint_pipeline_v1_pipeline_proto_rawDescGZIP(), []int{19}
 }
 
-func (x *StepCompletedEvent) GetExecutionId() string {
+func (x *GetPipelineResponse) GetPipeline() *PipelineDefinition {
 	if x != nil {
-		return x.ExecutionId
-	}
-	return ""
-}
-
-func (x *StepCompletedEvent) GetPipelineId() string {
-	if x != nil {
-		return x.PipelineId
-	}
-	return ""
-}
-
-func (x *StepCompletedEvent) GetStepId() string {
-	if x != nil {
-		return x.StepId
-	}
-	return ""
-}
-
-func (x *StepCompletedEvent) GetStepType() StepType {
-	if x != nil {
-		return x.StepType
-	}
-	return StepType_STEP_TYPE_UNSPECIFIED
-}
-
-func (x *StepCompletedEvent) GetOutput() *structpb.Struct {
-	if x != nil {
-		return x.Output
+		return x.Pipeline
 	}
 	return nil
 }
 
-func (x *StepCompletedEvent) GetCompletedAt() *timestamppb.Timestamp {
-	if x != nil {
-		return x.CompletedAt
-	}
-	return nil
-}
-
-// StepFailedEvent — emitted when a step fails (BEFORE compensation runs).
-// Subject: fp.pipelines.step.failed
-type StepFailedEvent struct {
-	state       protoimpl.MessageState `protogen:"open.v1"`
-	ExecutionId string                 `protobuf:"bytes,1,opt,name=execution_id,json=executionId,proto3" json:"execution_id,omitempty"`
-	PipelineId  string                 `protobuf:"bytes,2,opt,name=pipeline_id,json=pipelineId,proto3" json:"pipeline_id,omitempty"`
-	StepId      string                 `protobuf:"bytes,3,opt,name=step_id,json=stepId,proto3" json:"step_id,omitempty"`
-	StepType    StepType               `protobuf:"varint,4,opt,name=step_type,json=stepType,proto3,enum=forgepoint.pipeline.v1.StepType" json:"step_type,omitempty"`
-	// Human-readable failure reason (for alerting/triage; not end-user copy).
-	Error string `protobuf:"bytes,5,opt,name=error,proto3" json:"error,omitempty"`
-	// How many attempts were made before giving up.
-	Attempts      int32                  `protobuf:"varint,6,opt,name=attempts,proto3" json:"attempts,omitempty"`
-	FailedAt      *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=failed_at,json=failedAt,proto3" json:"failed_at,omitempty"`
+// UpdatePipelineRequest edits an existing pipeline TEMPLATE (name and/or steps).
+//
+// WHY this RPC exists (the CLI/UI need to edit a template without recreating it):
+// without Update, the only way to change a pipeline is delete-and-recreate, which
+// changes its id and orphans its execution history. Update keeps the id (and
+// therefore the lineage of past runs) stable.
+//
+// SECURITY — anti-mass-assignment (same discipline as Create): we accept ONLY the
+// user-authorable fields. id selects the target; name/type/steps are the editable
+// payload. We do NOT accept created_by, created_at, or team — those stay
+// server-authoritative and immutable; allowing a client to rewrite created_by
+// would let it forge ownership on an existing record.
+//
+// IMMUTABILITY NOTE: `type` (saga vs DAG) is NOT editable — changing a pipeline's
+// execution model out from under in-flight executions is unsafe, so the server
+// rejects a type change (create a new pipeline instead). It is omitted from this
+// request deliberately.
+//
+// CONCURRENCY: editing a template does NOT affect already-running executions —
+// each Execution captures the step graph it started with (template/instance
+// split). Only future TriggerExecutions see the new definition.
+type UpdatePipelineRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// UUID of the pipeline to update (selects the target; not itself mutable).
+	PipelineId string `protobuf:"bytes,1,opt,name=pipeline_id,json=pipelineId,proto3" json:"pipeline_id,omitempty"`
+	// New human-readable name. Must remain unique within the caller's team.
+	Name string `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
+	// The replacement step graph. Same validation + 256-step cap as CreatePipeline.
+	// This is a FULL REPLACE of the steps (not a partial patch) — simpler to reason
+	// about than field-level merge for a graph, and the whole graph is re-validated.
+	Steps         []*StepDefinition `protobuf:"bytes,3,rep,name=steps,proto3" json:"steps,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *StepFailedEvent) Reset() {
-	*x = StepFailedEvent{}
+func (x *UpdatePipelineRequest) Reset() {
+	*x = UpdatePipelineRequest{}
 	mi := &file_forgepoint_pipeline_v1_pipeline_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *StepFailedEvent) String() string {
+func (x *UpdatePipelineRequest) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*StepFailedEvent) ProtoMessage() {}
+func (*UpdatePipelineRequest) ProtoMessage() {}
 
-func (x *StepFailedEvent) ProtoReflect() protoreflect.Message {
+func (x *UpdatePipelineRequest) ProtoReflect() protoreflect.Message {
 	mi := &file_forgepoint_pipeline_v1_pipeline_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -2039,174 +2068,111 @@ func (x *StepFailedEvent) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use StepFailedEvent.ProtoReflect.Descriptor instead.
-func (*StepFailedEvent) Descriptor() ([]byte, []int) {
+// Deprecated: Use UpdatePipelineRequest.ProtoReflect.Descriptor instead.
+func (*UpdatePipelineRequest) Descriptor() ([]byte, []int) {
 	return file_forgepoint_pipeline_v1_pipeline_proto_rawDescGZIP(), []int{20}
 }
 
-func (x *StepFailedEvent) GetExecutionId() string {
-	if x != nil {
-		return x.ExecutionId
-	}
-	return ""
-}
-
-func (x *StepFailedEvent) GetPipelineId() string {
+func (x *UpdatePipelineRequest) GetPipelineId() string {
 	if x != nil {
 		return x.PipelineId
 	}
 	return ""
 }
 
-func (x *StepFailedEvent) GetStepId() string {
+func (x *UpdatePipelineRequest) GetName() string {
 	if x != nil {
-		return x.StepId
+		return x.Name
 	}
 	return ""
 }
 
-func (x *StepFailedEvent) GetStepType() StepType {
+func (x *UpdatePipelineRequest) GetSteps() []*StepDefinition {
 	if x != nil {
-		return x.StepType
-	}
-	return StepType_STEP_TYPE_UNSPECIFIED
-}
-
-func (x *StepFailedEvent) GetError() string {
-	if x != nil {
-		return x.Error
-	}
-	return ""
-}
-
-func (x *StepFailedEvent) GetAttempts() int32 {
-	if x != nil {
-		return x.Attempts
-	}
-	return 0
-}
-
-func (x *StepFailedEvent) GetFailedAt() *timestamppb.Timestamp {
-	if x != nil {
-		return x.FailedAt
+		return x.Steps
 	}
 	return nil
 }
 
-// CompensationTriggeredEvent — emitted when a saga starts rolling back, i.e. the
-// Execution enters COMPENSATING. Distinct from StepFailed: a step failure is the
-// CAUSE; this event marks the start of the UNDO phase. Useful for operators to
-// see "the saga is now rolling back" as a first-class signal.
-// Subject: fp.pipelines.compensation.triggered
-type CompensationTriggeredEvent struct {
-	state       protoimpl.MessageState `protogen:"open.v1"`
-	ExecutionId string                 `protobuf:"bytes,1,opt,name=execution_id,json=executionId,proto3" json:"execution_id,omitempty"`
-	PipelineId  string                 `protobuf:"bytes,2,opt,name=pipeline_id,json=pipelineId,proto3" json:"pipeline_id,omitempty"`
-	// The step whose failure triggered compensation.
-	FailedStepId string `protobuf:"bytes,3,opt,name=failed_step_id,json=failedStepId,proto3" json:"failed_step_id,omitempty"`
-	// The ordered list of step ids that will be compensated, in the REVERSE order
-	// they completed (the order they will actually be undone). Makes the rollback
-	// plan observable.
-	CompensatingStepIds []string               `protobuf:"bytes,4,rep,name=compensating_step_ids,json=compensatingStepIds,proto3" json:"compensating_step_ids,omitempty"`
-	TriggeredAt         *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=triggered_at,json=triggeredAt,proto3" json:"triggered_at,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
-}
-
-func (x *CompensationTriggeredEvent) Reset() {
-	*x = CompensationTriggeredEvent{}
-	mi := &file_forgepoint_pipeline_v1_pipeline_proto_msgTypes[21]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *CompensationTriggeredEvent) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*CompensationTriggeredEvent) ProtoMessage() {}
-
-func (x *CompensationTriggeredEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_pipeline_v1_pipeline_proto_msgTypes[21]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use CompensationTriggeredEvent.ProtoReflect.Descriptor instead.
-func (*CompensationTriggeredEvent) Descriptor() ([]byte, []int) {
-	return file_forgepoint_pipeline_v1_pipeline_proto_rawDescGZIP(), []int{21}
-}
-
-func (x *CompensationTriggeredEvent) GetExecutionId() string {
-	if x != nil {
-		return x.ExecutionId
-	}
-	return ""
-}
-
-func (x *CompensationTriggeredEvent) GetPipelineId() string {
-	if x != nil {
-		return x.PipelineId
-	}
-	return ""
-}
-
-func (x *CompensationTriggeredEvent) GetFailedStepId() string {
-	if x != nil {
-		return x.FailedStepId
-	}
-	return ""
-}
-
-func (x *CompensationTriggeredEvent) GetCompensatingStepIds() []string {
-	if x != nil {
-		return x.CompensatingStepIds
-	}
-	return nil
-}
-
-func (x *CompensationTriggeredEvent) GetTriggeredAt() *timestamppb.Timestamp {
-	if x != nil {
-		return x.TriggeredAt
-	}
-	return nil
-}
-
-// PipelineCompletedEvent — emitted when an Execution reaches COMPLETED (all
-// steps succeeded). Consumed by Experiment Tracker (and others) to close out a run.
-// Subject: fp.pipelines.completed
-type PipelineCompletedEvent struct {
-	state        protoimpl.MessageState `protogen:"open.v1"`
-	ExecutionId  string                 `protobuf:"bytes,1,opt,name=execution_id,json=executionId,proto3" json:"execution_id,omitempty"`
-	PipelineId   string                 `protobuf:"bytes,2,opt,name=pipeline_id,json=pipelineId,proto3" json:"pipeline_id,omitempty"`
-	PipelineType PipelineType           `protobuf:"varint,3,opt,name=pipeline_type,json=pipelineType,proto3,enum=forgepoint.pipeline.v1.PipelineType" json:"pipeline_type,omitempty"`
-	// Total wall-clock duration of the run (for SLO/latency dashboards).
-	Duration      *durationpb.Duration   `protobuf:"bytes,4,opt,name=duration,proto3" json:"duration,omitempty"`
-	CompletedAt   *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=completed_at,json=completedAt,proto3" json:"completed_at,omitempty"`
+// UpdatePipelineResponse wraps the updated PipelineDefinition.
+type UpdatePipelineResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Pipeline      *PipelineDefinition    `protobuf:"bytes,1,opt,name=pipeline,proto3" json:"pipeline,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *PipelineCompletedEvent) Reset() {
-	*x = PipelineCompletedEvent{}
+func (x *UpdatePipelineResponse) Reset() {
+	*x = UpdatePipelineResponse{}
+	mi := &file_forgepoint_pipeline_v1_pipeline_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdatePipelineResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdatePipelineResponse) ProtoMessage() {}
+
+func (x *UpdatePipelineResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_pipeline_v1_pipeline_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdatePipelineResponse.ProtoReflect.Descriptor instead.
+func (*UpdatePipelineResponse) Descriptor() ([]byte, []int) {
+	return file_forgepoint_pipeline_v1_pipeline_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *UpdatePipelineResponse) GetPipeline() *PipelineDefinition {
+	if x != nil {
+		return x.Pipeline
+	}
+	return nil
+}
+
+// DeletePipelineRequest removes a pipeline TEMPLATE.
+//
+// WHY a dedicated RPC + WHY soft-delete: operators need to retire obsolete
+// templates (the design/CLI call for a Delete). We SOFT-DELETE (archive) rather
+// than hard-delete: past Executions reference this pipeline_id for audit/lineage,
+// and hard-deleting would dangle those foreign keys and erase the history of what
+// ran. An archived template is hidden from ListPipelines and cannot be triggered,
+// but GetExecution on its historical runs still resolves the pipeline name.
+//
+// SAFETY: the server REJECTS deletion while the pipeline has a non-terminal
+// Execution (PENDING/RUNNING/COMPENSATING) — you cannot retire a template whose
+// saga is mid-flight (FAILED_PRECONDITION). Cancel those runs first.
+type DeletePipelineRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// UUID of the pipeline to archive.
+	PipelineId    string `protobuf:"bytes,1,opt,name=pipeline_id,json=pipelineId,proto3" json:"pipeline_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeletePipelineRequest) Reset() {
+	*x = DeletePipelineRequest{}
 	mi := &file_forgepoint_pipeline_v1_pipeline_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *PipelineCompletedEvent) String() string {
+func (x *DeletePipelineRequest) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*PipelineCompletedEvent) ProtoMessage() {}
+func (*DeletePipelineRequest) ProtoMessage() {}
 
-func (x *PipelineCompletedEvent) ProtoReflect() protoreflect.Message {
+func (x *DeletePipelineRequest) ProtoReflect() protoreflect.Message {
 	mi := &file_forgepoint_pipeline_v1_pipeline_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -2218,81 +2184,43 @@ func (x *PipelineCompletedEvent) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use PipelineCompletedEvent.ProtoReflect.Descriptor instead.
-func (*PipelineCompletedEvent) Descriptor() ([]byte, []int) {
+// Deprecated: Use DeletePipelineRequest.ProtoReflect.Descriptor instead.
+func (*DeletePipelineRequest) Descriptor() ([]byte, []int) {
 	return file_forgepoint_pipeline_v1_pipeline_proto_rawDescGZIP(), []int{22}
 }
 
-func (x *PipelineCompletedEvent) GetExecutionId() string {
-	if x != nil {
-		return x.ExecutionId
-	}
-	return ""
-}
-
-func (x *PipelineCompletedEvent) GetPipelineId() string {
+func (x *DeletePipelineRequest) GetPipelineId() string {
 	if x != nil {
 		return x.PipelineId
 	}
 	return ""
 }
 
-func (x *PipelineCompletedEvent) GetPipelineType() PipelineType {
-	if x != nil {
-		return x.PipelineType
-	}
-	return PipelineType_PIPELINE_TYPE_UNSPECIFIED
+// DeletePipelineResponse is an intentionally-empty, dedicated response.
+// WHY a named empty message (not google.protobuf.Empty): Buf STANDARD
+// (RPC_RESPONSE_STANDARD_NAME) requires a <Rpc>Response type, and a named message
+// is forward-compatible — we can add fields later (e.g. archived_at) without a
+// breaking signature change. google.protobuf.Empty can never grow a field.
+type DeletePipelineResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
-func (x *PipelineCompletedEvent) GetDuration() *durationpb.Duration {
-	if x != nil {
-		return x.Duration
-	}
-	return nil
-}
-
-func (x *PipelineCompletedEvent) GetCompletedAt() *timestamppb.Timestamp {
-	if x != nil {
-		return x.CompletedAt
-	}
-	return nil
-}
-
-// PipelineFailedEvent — emitted when an Execution reaches the terminal FAILED
-// state (a step failed AND compensation finished). This is the event the
-// Notification service turns into a page/alert.
-// Subject: fp.pipelines.failed
-type PipelineFailedEvent struct {
-	state        protoimpl.MessageState `protogen:"open.v1"`
-	ExecutionId  string                 `protobuf:"bytes,1,opt,name=execution_id,json=executionId,proto3" json:"execution_id,omitempty"`
-	PipelineId   string                 `protobuf:"bytes,2,opt,name=pipeline_id,json=pipelineId,proto3" json:"pipeline_id,omitempty"`
-	PipelineType PipelineType           `protobuf:"varint,3,opt,name=pipeline_type,json=pipelineType,proto3,enum=forgepoint.pipeline.v1.PipelineType" json:"pipeline_type,omitempty"`
-	// The step whose failure ultimately failed the run.
-	FailedStepId string `protobuf:"bytes,4,opt,name=failed_step_id,json=failedStepId,proto3" json:"failed_step_id,omitempty"`
-	// Failure summary for the alert.
-	Error string `protobuf:"bytes,5,opt,name=error,proto3" json:"error,omitempty"`
-	// True if compensation itself failed (a "stuck saga" — orphaned side effects).
-	// The Notification service should escalate this harder than a clean rollback.
-	CompensationFailed bool                   `protobuf:"varint,6,opt,name=compensation_failed,json=compensationFailed,proto3" json:"compensation_failed,omitempty"`
-	FailedAt           *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=failed_at,json=failedAt,proto3" json:"failed_at,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
-}
-
-func (x *PipelineFailedEvent) Reset() {
-	*x = PipelineFailedEvent{}
+func (x *DeletePipelineResponse) Reset() {
+	*x = DeletePipelineResponse{}
 	mi := &file_forgepoint_pipeline_v1_pipeline_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *PipelineFailedEvent) String() string {
+func (x *DeletePipelineResponse) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*PipelineFailedEvent) ProtoMessage() {}
+func (*DeletePipelineResponse) ProtoMessage() {}
 
-func (x *PipelineFailedEvent) ProtoReflect() protoreflect.Message {
+func (x *DeletePipelineResponse) ProtoReflect() protoreflect.Message {
 	mi := &file_forgepoint_pipeline_v1_pipeline_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -2304,58 +2232,9 @@ func (x *PipelineFailedEvent) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use PipelineFailedEvent.ProtoReflect.Descriptor instead.
-func (*PipelineFailedEvent) Descriptor() ([]byte, []int) {
+// Deprecated: Use DeletePipelineResponse.ProtoReflect.Descriptor instead.
+func (*DeletePipelineResponse) Descriptor() ([]byte, []int) {
 	return file_forgepoint_pipeline_v1_pipeline_proto_rawDescGZIP(), []int{23}
-}
-
-func (x *PipelineFailedEvent) GetExecutionId() string {
-	if x != nil {
-		return x.ExecutionId
-	}
-	return ""
-}
-
-func (x *PipelineFailedEvent) GetPipelineId() string {
-	if x != nil {
-		return x.PipelineId
-	}
-	return ""
-}
-
-func (x *PipelineFailedEvent) GetPipelineType() PipelineType {
-	if x != nil {
-		return x.PipelineType
-	}
-	return PipelineType_PIPELINE_TYPE_UNSPECIFIED
-}
-
-func (x *PipelineFailedEvent) GetFailedStepId() string {
-	if x != nil {
-		return x.FailedStepId
-	}
-	return ""
-}
-
-func (x *PipelineFailedEvent) GetError() string {
-	if x != nil {
-		return x.Error
-	}
-	return ""
-}
-
-func (x *PipelineFailedEvent) GetCompensationFailed() bool {
-	if x != nil {
-		return x.CompensationFailed
-	}
-	return false
-}
-
-func (x *PipelineFailedEvent) GetFailedAt() *timestamppb.Timestamp {
-	if x != nil {
-		return x.FailedAt
-	}
-	return nil
 }
 
 var File_forgepoint_pipeline_v1_pipeline_proto protoreflect.FileDescriptor
@@ -2408,11 +2287,12 @@ const file_forgepoint_pipeline_v1_pipeline_proto_rawDesc = "" +
 	"\fcompleted_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\vcompletedAt\x12-\n" +
 	"\x05input\x18\t \x01(\v2\x17.google.protobuf.StructR\x05input\x12\x14\n" +
 	"\x05error\x18\n" +
-	" \x01(\tR\x05error\"\xa3\x01\n" +
+	" \x01(\tR\x05error\"\xcc\x01\n" +
 	"\x15CreatePipelineRequest\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x128\n" +
 	"\x04type\x18\x02 \x01(\x0e2$.forgepoint.pipeline.v1.PipelineTypeR\x04type\x12<\n" +
-	"\x05steps\x18\x03 \x03(\v2&.forgepoint.pipeline.v1.StepDefinitionR\x05steps\"`\n" +
+	"\x05steps\x18\x03 \x03(\v2&.forgepoint.pipeline.v1.StepDefinitionR\x05steps\x12'\n" +
+	"\x0fidempotency_key\x18\x04 \x01(\tR\x0eidempotencyKey\"`\n" +
 	"\x16CreatePipelineResponse\x12F\n" +
 	"\bpipeline\x18\x01 \x01(\v2*.forgepoint.pipeline.v1.PipelineDefinitionR\bpipeline\"\x92\x01\n" +
 	"\x17TriggerExecutionRequest\x12\x1f\n" +
@@ -2464,55 +2344,23 @@ const file_forgepoint_pipeline_v1_pipeline_proto_rawDesc = "" +
 	"\tpipelines\x18\x01 \x03(\v2*.forgepoint.pipeline.v1.PipelineDefinitionR\tpipelines\x12H\n" +
 	"\n" +
 	"pagination\x18\x02 \x01(\v2(.forgepoint.common.v1.PaginationResponseR\n" +
-	"pagination\"\x83\x02\n" +
-	"\x14PipelineStartedEvent\x12!\n" +
-	"\fexecution_id\x18\x01 \x01(\tR\vexecutionId\x12\x1f\n" +
-	"\vpipeline_id\x18\x02 \x01(\tR\n" +
-	"pipelineId\x12I\n" +
-	"\rpipeline_type\x18\x03 \x01(\x0e2$.forgepoint.pipeline.v1.PipelineTypeR\fpipelineType\x12!\n" +
-	"\ftriggered_by\x18\x04 \x01(\tR\vtriggeredBy\x129\n" +
-	"\n" +
-	"started_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\tstartedAt\"\xa0\x02\n" +
-	"\x12StepCompletedEvent\x12!\n" +
-	"\fexecution_id\x18\x01 \x01(\tR\vexecutionId\x12\x1f\n" +
-	"\vpipeline_id\x18\x02 \x01(\tR\n" +
-	"pipelineId\x12\x17\n" +
-	"\astep_id\x18\x03 \x01(\tR\x06stepId\x12=\n" +
-	"\tstep_type\x18\x04 \x01(\x0e2 .forgepoint.pipeline.v1.StepTypeR\bstepType\x12/\n" +
-	"\x06output\x18\x05 \x01(\v2\x17.google.protobuf.StructR\x06output\x12=\n" +
-	"\fcompleted_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\vcompletedAt\"\x98\x02\n" +
-	"\x0fStepFailedEvent\x12!\n" +
-	"\fexecution_id\x18\x01 \x01(\tR\vexecutionId\x12\x1f\n" +
-	"\vpipeline_id\x18\x02 \x01(\tR\n" +
-	"pipelineId\x12\x17\n" +
-	"\astep_id\x18\x03 \x01(\tR\x06stepId\x12=\n" +
-	"\tstep_type\x18\x04 \x01(\x0e2 .forgepoint.pipeline.v1.StepTypeR\bstepType\x12\x14\n" +
-	"\x05error\x18\x05 \x01(\tR\x05error\x12\x1a\n" +
-	"\battempts\x18\x06 \x01(\x05R\battempts\x127\n" +
-	"\tfailed_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\bfailedAt\"\xf9\x01\n" +
-	"\x1aCompensationTriggeredEvent\x12!\n" +
-	"\fexecution_id\x18\x01 \x01(\tR\vexecutionId\x12\x1f\n" +
-	"\vpipeline_id\x18\x02 \x01(\tR\n" +
-	"pipelineId\x12$\n" +
-	"\x0efailed_step_id\x18\x03 \x01(\tR\ffailedStepId\x122\n" +
-	"\x15compensating_step_ids\x18\x04 \x03(\tR\x13compensatingStepIds\x12=\n" +
-	"\ftriggered_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\vtriggeredAt\"\x9d\x02\n" +
-	"\x16PipelineCompletedEvent\x12!\n" +
-	"\fexecution_id\x18\x01 \x01(\tR\vexecutionId\x12\x1f\n" +
-	"\vpipeline_id\x18\x02 \x01(\tR\n" +
-	"pipelineId\x12I\n" +
-	"\rpipeline_type\x18\x03 \x01(\x0e2$.forgepoint.pipeline.v1.PipelineTypeR\fpipelineType\x125\n" +
-	"\bduration\x18\x04 \x01(\v2\x19.google.protobuf.DurationR\bduration\x12=\n" +
-	"\fcompleted_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\vcompletedAt\"\xca\x02\n" +
-	"\x13PipelineFailedEvent\x12!\n" +
-	"\fexecution_id\x18\x01 \x01(\tR\vexecutionId\x12\x1f\n" +
-	"\vpipeline_id\x18\x02 \x01(\tR\n" +
-	"pipelineId\x12I\n" +
-	"\rpipeline_type\x18\x03 \x01(\x0e2$.forgepoint.pipeline.v1.PipelineTypeR\fpipelineType\x12$\n" +
-	"\x0efailed_step_id\x18\x04 \x01(\tR\ffailedStepId\x12\x14\n" +
-	"\x05error\x18\x05 \x01(\tR\x05error\x12/\n" +
-	"\x13compensation_failed\x18\x06 \x01(\bR\x12compensationFailed\x127\n" +
-	"\tfailed_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\bfailedAt*\x93\x01\n" +
+	"pagination\"5\n" +
+	"\x12GetPipelineRequest\x12\x1f\n" +
+	"\vpipeline_id\x18\x01 \x01(\tR\n" +
+	"pipelineId\"]\n" +
+	"\x13GetPipelineResponse\x12F\n" +
+	"\bpipeline\x18\x01 \x01(\v2*.forgepoint.pipeline.v1.PipelineDefinitionR\bpipeline\"\x8a\x01\n" +
+	"\x15UpdatePipelineRequest\x12\x1f\n" +
+	"\vpipeline_id\x18\x01 \x01(\tR\n" +
+	"pipelineId\x12\x12\n" +
+	"\x04name\x18\x02 \x01(\tR\x04name\x12<\n" +
+	"\x05steps\x18\x03 \x03(\v2&.forgepoint.pipeline.v1.StepDefinitionR\x05steps\"`\n" +
+	"\x16UpdatePipelineResponse\x12F\n" +
+	"\bpipeline\x18\x01 \x01(\v2*.forgepoint.pipeline.v1.PipelineDefinitionR\bpipeline\"8\n" +
+	"\x15DeletePipelineRequest\x12\x1f\n" +
+	"\vpipeline_id\x18\x01 \x01(\tR\n" +
+	"pipelineId\"\x18\n" +
+	"\x16DeletePipelineResponse*\x93\x01\n" +
 	"\fPipelineType\x12\x1d\n" +
 	"\x19PIPELINE_TYPE_UNSPECIFIED\x10\x00\x12!\n" +
 	"\x1dPIPELINE_TYPE_DEPLOYMENT_SAGA\x10\x01\x12\x1e\n" +
@@ -2547,10 +2395,13 @@ const file_forgepoint_pipeline_v1_pipeline_proto_rawDesc = "" +
 	"\x13STEP_STATUS_SKIPPED\x10\x05\x12\x1c\n" +
 	"\x18STEP_STATUS_COMPENSATING\x10\x06\x12\x1b\n" +
 	"\x17STEP_STATUS_COMPENSATED\x10\a\x12#\n" +
-	"\x1fSTEP_STATUS_COMPENSATION_FAILED\x10\b2\xb6\x06\n" +
+	"\x1fSTEP_STATUS_COMPENSATION_FAILED\x10\b2\x80\t\n" +
 	"\x1bPipelineOrchestratorService\x12o\n" +
 	"\x0eCreatePipeline\x12-.forgepoint.pipeline.v1.CreatePipelineRequest\x1a..forgepoint.pipeline.v1.CreatePipelineResponse\x12l\n" +
-	"\rListPipelines\x12,.forgepoint.pipeline.v1.ListPipelinesRequest\x1a-.forgepoint.pipeline.v1.ListPipelinesResponse\x12u\n" +
+	"\rListPipelines\x12,.forgepoint.pipeline.v1.ListPipelinesRequest\x1a-.forgepoint.pipeline.v1.ListPipelinesResponse\x12f\n" +
+	"\vGetPipeline\x12*.forgepoint.pipeline.v1.GetPipelineRequest\x1a+.forgepoint.pipeline.v1.GetPipelineResponse\x12o\n" +
+	"\x0eUpdatePipeline\x12-.forgepoint.pipeline.v1.UpdatePipelineRequest\x1a..forgepoint.pipeline.v1.UpdatePipelineResponse\x12o\n" +
+	"\x0eDeletePipeline\x12-.forgepoint.pipeline.v1.DeletePipelineRequest\x1a..forgepoint.pipeline.v1.DeletePipelineResponse\x12u\n" +
 	"\x10TriggerExecution\x12/.forgepoint.pipeline.v1.TriggerExecutionRequest\x1a0.forgepoint.pipeline.v1.TriggerExecutionResponse\x12i\n" +
 	"\fGetExecution\x12+.forgepoint.pipeline.v1.GetExecutionRequest\x1a,.forgepoint.pipeline.v1.GetExecutionResponse\x12q\n" +
 	"\x0eWatchExecution\x12-.forgepoint.pipeline.v1.WatchExecutionRequest\x1a..forgepoint.pipeline.v1.WatchExecutionResponse0\x01\x12r\n" +
@@ -2572,39 +2423,39 @@ func file_forgepoint_pipeline_v1_pipeline_proto_rawDescGZIP() []byte {
 var file_forgepoint_pipeline_v1_pipeline_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
 var file_forgepoint_pipeline_v1_pipeline_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
 var file_forgepoint_pipeline_v1_pipeline_proto_goTypes = []any{
-	(PipelineType)(0),                  // 0: forgepoint.pipeline.v1.PipelineType
-	(StepType)(0),                      // 1: forgepoint.pipeline.v1.StepType
-	(ExecutionStatus)(0),               // 2: forgepoint.pipeline.v1.ExecutionStatus
-	(StepStatus)(0),                    // 3: forgepoint.pipeline.v1.StepStatus
-	(*StepDefinition)(nil),             // 4: forgepoint.pipeline.v1.StepDefinition
-	(*PipelineDefinition)(nil),         // 5: forgepoint.pipeline.v1.PipelineDefinition
-	(*StepExecution)(nil),              // 6: forgepoint.pipeline.v1.StepExecution
-	(*Execution)(nil),                  // 7: forgepoint.pipeline.v1.Execution
-	(*CreatePipelineRequest)(nil),      // 8: forgepoint.pipeline.v1.CreatePipelineRequest
-	(*CreatePipelineResponse)(nil),     // 9: forgepoint.pipeline.v1.CreatePipelineResponse
-	(*TriggerExecutionRequest)(nil),    // 10: forgepoint.pipeline.v1.TriggerExecutionRequest
-	(*TriggerExecutionResponse)(nil),   // 11: forgepoint.pipeline.v1.TriggerExecutionResponse
-	(*GetExecutionRequest)(nil),        // 12: forgepoint.pipeline.v1.GetExecutionRequest
-	(*GetExecutionResponse)(nil),       // 13: forgepoint.pipeline.v1.GetExecutionResponse
-	(*WatchExecutionRequest)(nil),      // 14: forgepoint.pipeline.v1.WatchExecutionRequest
-	(*WatchExecutionResponse)(nil),     // 15: forgepoint.pipeline.v1.WatchExecutionResponse
-	(*CancelExecutionRequest)(nil),     // 16: forgepoint.pipeline.v1.CancelExecutionRequest
-	(*CancelExecutionResponse)(nil),    // 17: forgepoint.pipeline.v1.CancelExecutionResponse
-	(*ListExecutionsRequest)(nil),      // 18: forgepoint.pipeline.v1.ListExecutionsRequest
-	(*ListExecutionsResponse)(nil),     // 19: forgepoint.pipeline.v1.ListExecutionsResponse
-	(*ListPipelinesRequest)(nil),       // 20: forgepoint.pipeline.v1.ListPipelinesRequest
-	(*ListPipelinesResponse)(nil),      // 21: forgepoint.pipeline.v1.ListPipelinesResponse
-	(*PipelineStartedEvent)(nil),       // 22: forgepoint.pipeline.v1.PipelineStartedEvent
-	(*StepCompletedEvent)(nil),         // 23: forgepoint.pipeline.v1.StepCompletedEvent
-	(*StepFailedEvent)(nil),            // 24: forgepoint.pipeline.v1.StepFailedEvent
-	(*CompensationTriggeredEvent)(nil), // 25: forgepoint.pipeline.v1.CompensationTriggeredEvent
-	(*PipelineCompletedEvent)(nil),     // 26: forgepoint.pipeline.v1.PipelineCompletedEvent
-	(*PipelineFailedEvent)(nil),        // 27: forgepoint.pipeline.v1.PipelineFailedEvent
-	(*structpb.Struct)(nil),            // 28: google.protobuf.Struct
-	(*durationpb.Duration)(nil),        // 29: google.protobuf.Duration
-	(*timestamppb.Timestamp)(nil),      // 30: google.protobuf.Timestamp
-	(*v1.PaginationRequest)(nil),       // 31: forgepoint.common.v1.PaginationRequest
-	(*v1.PaginationResponse)(nil),      // 32: forgepoint.common.v1.PaginationResponse
+	(PipelineType)(0),                // 0: forgepoint.pipeline.v1.PipelineType
+	(StepType)(0),                    // 1: forgepoint.pipeline.v1.StepType
+	(ExecutionStatus)(0),             // 2: forgepoint.pipeline.v1.ExecutionStatus
+	(StepStatus)(0),                  // 3: forgepoint.pipeline.v1.StepStatus
+	(*StepDefinition)(nil),           // 4: forgepoint.pipeline.v1.StepDefinition
+	(*PipelineDefinition)(nil),       // 5: forgepoint.pipeline.v1.PipelineDefinition
+	(*StepExecution)(nil),            // 6: forgepoint.pipeline.v1.StepExecution
+	(*Execution)(nil),                // 7: forgepoint.pipeline.v1.Execution
+	(*CreatePipelineRequest)(nil),    // 8: forgepoint.pipeline.v1.CreatePipelineRequest
+	(*CreatePipelineResponse)(nil),   // 9: forgepoint.pipeline.v1.CreatePipelineResponse
+	(*TriggerExecutionRequest)(nil),  // 10: forgepoint.pipeline.v1.TriggerExecutionRequest
+	(*TriggerExecutionResponse)(nil), // 11: forgepoint.pipeline.v1.TriggerExecutionResponse
+	(*GetExecutionRequest)(nil),      // 12: forgepoint.pipeline.v1.GetExecutionRequest
+	(*GetExecutionResponse)(nil),     // 13: forgepoint.pipeline.v1.GetExecutionResponse
+	(*WatchExecutionRequest)(nil),    // 14: forgepoint.pipeline.v1.WatchExecutionRequest
+	(*WatchExecutionResponse)(nil),   // 15: forgepoint.pipeline.v1.WatchExecutionResponse
+	(*CancelExecutionRequest)(nil),   // 16: forgepoint.pipeline.v1.CancelExecutionRequest
+	(*CancelExecutionResponse)(nil),  // 17: forgepoint.pipeline.v1.CancelExecutionResponse
+	(*ListExecutionsRequest)(nil),    // 18: forgepoint.pipeline.v1.ListExecutionsRequest
+	(*ListExecutionsResponse)(nil),   // 19: forgepoint.pipeline.v1.ListExecutionsResponse
+	(*ListPipelinesRequest)(nil),     // 20: forgepoint.pipeline.v1.ListPipelinesRequest
+	(*ListPipelinesResponse)(nil),    // 21: forgepoint.pipeline.v1.ListPipelinesResponse
+	(*GetPipelineRequest)(nil),       // 22: forgepoint.pipeline.v1.GetPipelineRequest
+	(*GetPipelineResponse)(nil),      // 23: forgepoint.pipeline.v1.GetPipelineResponse
+	(*UpdatePipelineRequest)(nil),    // 24: forgepoint.pipeline.v1.UpdatePipelineRequest
+	(*UpdatePipelineResponse)(nil),   // 25: forgepoint.pipeline.v1.UpdatePipelineResponse
+	(*DeletePipelineRequest)(nil),    // 26: forgepoint.pipeline.v1.DeletePipelineRequest
+	(*DeletePipelineResponse)(nil),   // 27: forgepoint.pipeline.v1.DeletePipelineResponse
+	(*structpb.Struct)(nil),          // 28: google.protobuf.Struct
+	(*durationpb.Duration)(nil),      // 29: google.protobuf.Duration
+	(*timestamppb.Timestamp)(nil),    // 30: google.protobuf.Timestamp
+	(*v1.PaginationRequest)(nil),     // 31: forgepoint.common.v1.PaginationRequest
+	(*v1.PaginationResponse)(nil),    // 32: forgepoint.common.v1.PaginationResponse
 }
 var file_forgepoint_pipeline_v1_pipeline_proto_depIdxs = []int32{
 	1,  // 0: forgepoint.pipeline.v1.StepDefinition.type:type_name -> forgepoint.pipeline.v1.StepType
@@ -2640,38 +2491,34 @@ var file_forgepoint_pipeline_v1_pipeline_proto_depIdxs = []int32{
 	31, // 30: forgepoint.pipeline.v1.ListPipelinesRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
 	5,  // 31: forgepoint.pipeline.v1.ListPipelinesResponse.pipelines:type_name -> forgepoint.pipeline.v1.PipelineDefinition
 	32, // 32: forgepoint.pipeline.v1.ListPipelinesResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
-	0,  // 33: forgepoint.pipeline.v1.PipelineStartedEvent.pipeline_type:type_name -> forgepoint.pipeline.v1.PipelineType
-	30, // 34: forgepoint.pipeline.v1.PipelineStartedEvent.started_at:type_name -> google.protobuf.Timestamp
-	1,  // 35: forgepoint.pipeline.v1.StepCompletedEvent.step_type:type_name -> forgepoint.pipeline.v1.StepType
-	28, // 36: forgepoint.pipeline.v1.StepCompletedEvent.output:type_name -> google.protobuf.Struct
-	30, // 37: forgepoint.pipeline.v1.StepCompletedEvent.completed_at:type_name -> google.protobuf.Timestamp
-	1,  // 38: forgepoint.pipeline.v1.StepFailedEvent.step_type:type_name -> forgepoint.pipeline.v1.StepType
-	30, // 39: forgepoint.pipeline.v1.StepFailedEvent.failed_at:type_name -> google.protobuf.Timestamp
-	30, // 40: forgepoint.pipeline.v1.CompensationTriggeredEvent.triggered_at:type_name -> google.protobuf.Timestamp
-	0,  // 41: forgepoint.pipeline.v1.PipelineCompletedEvent.pipeline_type:type_name -> forgepoint.pipeline.v1.PipelineType
-	29, // 42: forgepoint.pipeline.v1.PipelineCompletedEvent.duration:type_name -> google.protobuf.Duration
-	30, // 43: forgepoint.pipeline.v1.PipelineCompletedEvent.completed_at:type_name -> google.protobuf.Timestamp
-	0,  // 44: forgepoint.pipeline.v1.PipelineFailedEvent.pipeline_type:type_name -> forgepoint.pipeline.v1.PipelineType
-	30, // 45: forgepoint.pipeline.v1.PipelineFailedEvent.failed_at:type_name -> google.protobuf.Timestamp
-	8,  // 46: forgepoint.pipeline.v1.PipelineOrchestratorService.CreatePipeline:input_type -> forgepoint.pipeline.v1.CreatePipelineRequest
-	20, // 47: forgepoint.pipeline.v1.PipelineOrchestratorService.ListPipelines:input_type -> forgepoint.pipeline.v1.ListPipelinesRequest
-	10, // 48: forgepoint.pipeline.v1.PipelineOrchestratorService.TriggerExecution:input_type -> forgepoint.pipeline.v1.TriggerExecutionRequest
-	12, // 49: forgepoint.pipeline.v1.PipelineOrchestratorService.GetExecution:input_type -> forgepoint.pipeline.v1.GetExecutionRequest
-	14, // 50: forgepoint.pipeline.v1.PipelineOrchestratorService.WatchExecution:input_type -> forgepoint.pipeline.v1.WatchExecutionRequest
-	16, // 51: forgepoint.pipeline.v1.PipelineOrchestratorService.CancelExecution:input_type -> forgepoint.pipeline.v1.CancelExecutionRequest
-	18, // 52: forgepoint.pipeline.v1.PipelineOrchestratorService.ListExecutions:input_type -> forgepoint.pipeline.v1.ListExecutionsRequest
-	9,  // 53: forgepoint.pipeline.v1.PipelineOrchestratorService.CreatePipeline:output_type -> forgepoint.pipeline.v1.CreatePipelineResponse
-	21, // 54: forgepoint.pipeline.v1.PipelineOrchestratorService.ListPipelines:output_type -> forgepoint.pipeline.v1.ListPipelinesResponse
-	11, // 55: forgepoint.pipeline.v1.PipelineOrchestratorService.TriggerExecution:output_type -> forgepoint.pipeline.v1.TriggerExecutionResponse
-	13, // 56: forgepoint.pipeline.v1.PipelineOrchestratorService.GetExecution:output_type -> forgepoint.pipeline.v1.GetExecutionResponse
-	15, // 57: forgepoint.pipeline.v1.PipelineOrchestratorService.WatchExecution:output_type -> forgepoint.pipeline.v1.WatchExecutionResponse
-	17, // 58: forgepoint.pipeline.v1.PipelineOrchestratorService.CancelExecution:output_type -> forgepoint.pipeline.v1.CancelExecutionResponse
-	19, // 59: forgepoint.pipeline.v1.PipelineOrchestratorService.ListExecutions:output_type -> forgepoint.pipeline.v1.ListExecutionsResponse
-	53, // [53:60] is the sub-list for method output_type
-	46, // [46:53] is the sub-list for method input_type
-	46, // [46:46] is the sub-list for extension type_name
-	46, // [46:46] is the sub-list for extension extendee
-	0,  // [0:46] is the sub-list for field type_name
+	5,  // 33: forgepoint.pipeline.v1.GetPipelineResponse.pipeline:type_name -> forgepoint.pipeline.v1.PipelineDefinition
+	4,  // 34: forgepoint.pipeline.v1.UpdatePipelineRequest.steps:type_name -> forgepoint.pipeline.v1.StepDefinition
+	5,  // 35: forgepoint.pipeline.v1.UpdatePipelineResponse.pipeline:type_name -> forgepoint.pipeline.v1.PipelineDefinition
+	8,  // 36: forgepoint.pipeline.v1.PipelineOrchestratorService.CreatePipeline:input_type -> forgepoint.pipeline.v1.CreatePipelineRequest
+	20, // 37: forgepoint.pipeline.v1.PipelineOrchestratorService.ListPipelines:input_type -> forgepoint.pipeline.v1.ListPipelinesRequest
+	22, // 38: forgepoint.pipeline.v1.PipelineOrchestratorService.GetPipeline:input_type -> forgepoint.pipeline.v1.GetPipelineRequest
+	24, // 39: forgepoint.pipeline.v1.PipelineOrchestratorService.UpdatePipeline:input_type -> forgepoint.pipeline.v1.UpdatePipelineRequest
+	26, // 40: forgepoint.pipeline.v1.PipelineOrchestratorService.DeletePipeline:input_type -> forgepoint.pipeline.v1.DeletePipelineRequest
+	10, // 41: forgepoint.pipeline.v1.PipelineOrchestratorService.TriggerExecution:input_type -> forgepoint.pipeline.v1.TriggerExecutionRequest
+	12, // 42: forgepoint.pipeline.v1.PipelineOrchestratorService.GetExecution:input_type -> forgepoint.pipeline.v1.GetExecutionRequest
+	14, // 43: forgepoint.pipeline.v1.PipelineOrchestratorService.WatchExecution:input_type -> forgepoint.pipeline.v1.WatchExecutionRequest
+	16, // 44: forgepoint.pipeline.v1.PipelineOrchestratorService.CancelExecution:input_type -> forgepoint.pipeline.v1.CancelExecutionRequest
+	18, // 45: forgepoint.pipeline.v1.PipelineOrchestratorService.ListExecutions:input_type -> forgepoint.pipeline.v1.ListExecutionsRequest
+	9,  // 46: forgepoint.pipeline.v1.PipelineOrchestratorService.CreatePipeline:output_type -> forgepoint.pipeline.v1.CreatePipelineResponse
+	21, // 47: forgepoint.pipeline.v1.PipelineOrchestratorService.ListPipelines:output_type -> forgepoint.pipeline.v1.ListPipelinesResponse
+	23, // 48: forgepoint.pipeline.v1.PipelineOrchestratorService.GetPipeline:output_type -> forgepoint.pipeline.v1.GetPipelineResponse
+	25, // 49: forgepoint.pipeline.v1.PipelineOrchestratorService.UpdatePipeline:output_type -> forgepoint.pipeline.v1.UpdatePipelineResponse
+	27, // 50: forgepoint.pipeline.v1.PipelineOrchestratorService.DeletePipeline:output_type -> forgepoint.pipeline.v1.DeletePipelineResponse
+	11, // 51: forgepoint.pipeline.v1.PipelineOrchestratorService.TriggerExecution:output_type -> forgepoint.pipeline.v1.TriggerExecutionResponse
+	13, // 52: forgepoint.pipeline.v1.PipelineOrchestratorService.GetExecution:output_type -> forgepoint.pipeline.v1.GetExecutionResponse
+	15, // 53: forgepoint.pipeline.v1.PipelineOrchestratorService.WatchExecution:output_type -> forgepoint.pipeline.v1.WatchExecutionResponse
+	17, // 54: forgepoint.pipeline.v1.PipelineOrchestratorService.CancelExecution:output_type -> forgepoint.pipeline.v1.CancelExecutionResponse
+	19, // 55: forgepoint.pipeline.v1.PipelineOrchestratorService.ListExecutions:output_type -> forgepoint.pipeline.v1.ListExecutionsResponse
+	46, // [46:56] is the sub-list for method output_type
+	36, // [36:46] is the sub-list for method input_type
+	36, // [36:36] is the sub-list for extension type_name
+	36, // [36:36] is the sub-list for extension extendee
+	0,  // [0:36] is the sub-list for field type_name
 }
 
 func init() { file_forgepoint_pipeline_v1_pipeline_proto_init() }

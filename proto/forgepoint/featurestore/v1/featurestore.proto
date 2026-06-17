@@ -27,7 +27,12 @@
 //     READ PATH (queries → projections, NEVER hit the raw log on the hot path):
 //       GetOnlineFeatures    ─► Redis hash  feature:{view}:{entity}  (latest)
 //       GetHistoricalFeatures─► Postgres "as-of" projection (point-in-time)
-//       ListFeatureViews     ─► feature_views metadata projection
+//       GetFeatureView       ─► one view's schema (metadata projection)
+//       ListFeatureViews     ─► feature_views metadata projection (fleet/catalog)
+//
+//     ADMIN (event-sourcing lifecycle):
+//       DeleteFeatureView    ─► append FeatureViewDeleted (soft retire; log kept)
+//       RebuildViews         ─► replay the log → regenerate Redis + Postgres views
 //
 //   ASCII — the log is the truth, views are caches built from it:
 //
@@ -92,8 +97,24 @@ package forgepoint.featurestore.v1;
 option go_package = "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/featurestore/v1;featurestorev1";
 
 import "google/protobuf/timestamp.proto";
+// struct.proto IS used: FeatureValues/FeatureVector model a feature row as
+// map<string, google.protobuf.Value>, and FeatureSpec STRUCT features carry a
+// google.protobuf.Struct. (Buf flags unused imports; this one earns its place.)
 import "google/protobuf/struct.proto";
 import "forgepoint/common/v1/common.proto";
+// EVENT CONTRACT — NOTE we deliberately do NOT import forgepoint/events/v1/events.proto
+// here. The Feature Store's async payloads (FeatureViewDefined, FeaturesWritten)
+// are NOT defined here anymore — they live in the platform's single canonical
+// event package, and the handler packs the GENERATED eventsv1.* types into the
+// EventEnvelope. WHY this changed: the per-service protos originally each
+// re-declared their own event messages, and an adversarial review found the
+// platform's async contract had DRIFTED (the feature-write event was published
+// as "FeaturesWritten" but consumed as "FeaturesIngested" — it would never
+// match). The fix is one source of truth: forgepoint.events.v1. Because this API
+// .proto references no events.v1 TYPE, importing it here would be an unused proto
+// import (Buf IMPORT_USED) and a dead compile-time coupling of the API schema to
+// the event schema; the Go code does the import. See the EVENT PAYLOADS section
+// below for the full rationale and the publisher field mapping.
 
 // ============================================================================
 // ENUMS
@@ -266,6 +287,15 @@ message FeatureView {
 
   // When this view's schema was last changed. SERVER-assigned.
   google.protobuf.Timestamp updated_at = 10;
+
+  // SOFT-DELETE marker. Unset (zero) while the view is live; SERVER-set to the
+  // retirement time when DeleteFeatureView appends the terminal
+  // FeatureViewDeleted event. WHY a timestamp, not a bool: it records WHEN the
+  // view was retired (audit) and doubles as the "is deleted" flag (presence =
+  // deleted). The view's history stays queryable via GetHistoricalFeatures for
+  // reproducibility; this only marks it retired from the live catalog/serving.
+  // Never client-supplied (mass-assignment guard).
+  google.protobuf.Timestamp deleted_at = 11;
 }
 
 // ============================================================================
@@ -394,6 +424,37 @@ message DefineFeatureViewResponse {
 }
 
 // ============================================================================
+// GetFeatureView
+// ============================================================================
+
+// GetFeatureViewRequest fetches a SINGLE view's current schema/metadata. WHY
+// this RPC was MISSING and is genuinely needed: every consumer-facing flow —
+// the `fp` CLI's `feature-view describe`, an SDK validating a payload before
+// WriteFeatures, the Web UI's view detail page — needs one view by handle, and
+// ListFeatureViews (page the whole catalog) is the wrong, expensive tool for
+// that. It is a pure read of the feature_views metadata projection.
+//
+// EITHER handle works (a oneof so exactly one is supplied): the immutable id
+// (stable across renames — preferred for machine callers) or the name (the
+// human handle — convenient for the CLI). Team scoping is applied SERVER-side
+// from TokenClaims.team, so a caller cannot read another team's view by
+// guessing an id (authorization, not just existence).
+message GetFeatureViewRequest {
+  oneof handle {
+    // Immutable view UUID (FeatureView.id). Preferred for machine callers.
+    string feature_view_id = 1;
+
+    // View name, resolved within the caller's team. Convenient for humans/CLI.
+    string name = 2;
+  }
+}
+
+message GetFeatureViewResponse {
+  // The requested view with all SERVER-assigned fields populated.
+  FeatureView feature_view = 1;
+}
+
+// ============================================================================
 // ListFeatureViews
 // ============================================================================
 
@@ -407,8 +468,8 @@ message ListFeatureViewsRequest {
   string name_filter = 1;
 
   // Cursor-based pagination. page_size defaults to 20; the server CAPS it at
-  // 100 (oversized requests are clamped, not rejected) to bound response size
-  // and prevent enumeration/DoS.
+  // MAX_PAGE_SIZE=100 (oversized requests are CLAMPED, not rejected) to bound
+  // response size and prevent enumeration/DoS. The cap is the contract.
   forgepoint.common.v1.PaginationRequest pagination = 2;
 }
 
@@ -448,6 +509,9 @@ message WriteFeaturesRequest {
   // The feature rows to append. Each entry's `values` are validated against the
   // view's FeatureSpecs (names + types + dimensions). A type mismatch fails the
   // WHOLE batch (INVALID_ARGUMENT) so partial-corrupt writes can't slip in.
+  // Batch size is CAPPED at MAX_BATCH_SIZE=1000 rows; an over-cap request is
+  // REJECTED with INVALID_ARGUMENT (NOT truncated — silently dropping feature
+  // rows would corrupt counts and history). Split larger pipelines into batches.
   repeated FeatureValues features = 2;
 
   // IDEMPOTENCY KEY: a retried WriteFeatures (lost response) must not append the
@@ -491,7 +555,8 @@ message GetOnlineFeaturesRequest {
 
   // Entity instances to fetch (e.g., ["u_123","u_456"]). Batched to amortize
   // round-trips for models that score many entities at once. Server CAPS the
-  // batch size (documented limit, e.g., 1000) to bound latency/payload.
+  // batch at MAX_BATCH_SIZE=1000 entities; over-cap → INVALID_ARGUMENT (bounds
+  // hot-path latency/payload). The cap is the contract.
   repeated string entity_ids = 2;
 
   // Optional projection: only return these feature names. Empty = all features
@@ -532,8 +597,9 @@ message GetHistoricalFeaturesRequest {
   // Target view (UUID).
   string feature_view_id = 1;
 
-  // Entity instances to retrieve as-of the timestamp. Server CAPS batch size
-  // (documented) to bound the scan.
+  // Entity instances to retrieve as-of the timestamp. Server CAPS the batch at
+  // MAX_BATCH_SIZE=1000 entities; over-cap → INVALID_ARGUMENT, to bound the
+  // point-in-time scan. Larger training pulls page via `pagination` below.
   repeated string entity_ids = 2;
 
   // POINT-IN-TIME cutoff. For each entity, return the values from the latest
@@ -545,7 +611,8 @@ message GetHistoricalFeaturesRequest {
   repeated string feature_names = 4;
 
   // Cursor-based pagination over the entity result set (large training pulls
-  // page through results). page_size capped at 100 server-side.
+  // page through results). page_size defaults to 20, capped at MAX_PAGE_SIZE=100
+  // server-side (clamped).
   forgepoint.common.v1.PaginationRequest pagination = 5;
 }
 
@@ -564,85 +631,188 @@ message GetHistoricalFeaturesResponse {
 }
 
 // ============================================================================
-// EVENT PAYLOADS (published to NATS, carried in common.v1.EventEnvelope.data)
-// ============================================================================
-//
-// WHY typed event payloads: the EventEnvelope's `data` is a google.protobuf.Any.
-// Defining concrete payload messages here lets producers pack a typed value and
-// consumers unpack it with compile-time safety (vs hand-parsing JSON). These
-// messages are the PUBLIC async contract of the Feature Store — they appear in
-// the catalog of events the platform emits.
-//
-// SUBJECT HIERARCHY (matches the design doc fp.features.>):
-//   fp.features.view.defined   → FeatureViewDefined
-//   fp.features.written        → FeaturesWritten
-//
-// WHY these events exist (consumers):
-//   - Experiment Tracker correlates which feature versions fed a training run.
-//   - Model Monitor watches FeaturesWritten to detect feature/data drift and,
-//     in the closed loop, can trigger retraining.
-//   - Notification/audit subscribers log schema changes.
-//
-// PAYLOAD DESIGN — "thin" events with keys + summary, not full row dumps:
-//   FeaturesWritten carries the version range and the affected entity ids, NOT
-//   every feature value. WHY: events are for NOTIFICATION and correlation, not
-//   bulk data transfer; consumers that need the actual values call
-//   GetOnlineFeatures/GetHistoricalFeatures (the read models). This keeps NATS
-//   messages small, avoids duplicating the (large) feature payloads onto the
-//   bus, and prevents the event bus from becoming a second source of truth.
-//   This is the standard "event-carried state transfer vs thin event" tradeoff;
-//   we choose thin events backed by query-able read models.
+// DeleteFeatureView (soft retire — event-sourcing aware)
 // ============================================================================
 
-// FeatureViewDefined is published after a FeatureView is created or its schema
-// evolves (subject: fp.features.view.defined).
-message FeatureViewDefined {
-  // The view's stable id.
+// DeleteFeatureViewRequest retires a FeatureView. WHY this exists (the design
+// /CLI need it) and WHY it is a SOFT delete that APPENDS an event rather than
+// DROP-ing rows:
+//   In an event-sourced system the log is the source of truth and is IMMUTABLE.
+//   "Deleting" therefore means appending a terminal FeatureViewDeleted event
+//   (the design doc's append-only model already lists Created/Updated/Deleted),
+//   which retires the view from the catalog and stops serving it — WITHOUT
+//   erasing history. Past training datasets assembled via GetHistoricalFeatures
+//   must remain reproducible (audit + legal), so the historical events stay; the
+//   online (Redis) projection is torn down. A hard physical purge (GDPR erasure)
+//   is a separate, audited admin operation, deliberately NOT this RPC.
+//
+// SECURITY: only the immutable id is accepted (no owner/team field — team
+// scoping is SERVER-derived from TokenClaims, so a caller cannot delete another
+// team's view). Idempotent: re-deleting an already-deleted view is a no-op that
+// returns the same result, both via the natural terminal state and the explicit
+// idempotency_key (a lost-response retry must not append a second delete event).
+message DeleteFeatureViewRequest {
+  // The view to retire (immutable UUID). Name is intentionally NOT accepted for
+  // a destructive op — the caller must resolve to the stable id first, removing
+  // any rename-race ambiguity about WHICH view is being deleted.
   string feature_view_id = 1;
 
-  // The view name (human-friendly, for routing/filtering by subscribers).
-  string name = 2;
-
-  // The schema version this event represents (1 on create, +1 on each evolve).
-  int64 schema_version = 3;
-
-  // Owning team (for team-scoped consumers/audit). SERVER-assigned, as on the
-  // FeatureView itself.
-  string owner_team = 4;
-
-  // When the definition/evolution happened.
-  google.protobuf.Timestamp occurred_at = 5;
+  // IDEMPOTENCY KEY: appending FeatureViewDeleted is a mutation; a retried
+  // request (response lost in flight) must not append a duplicate terminal
+  // event. UUID v4 per logical attempt. Server dedupes and replays the result.
+  string idempotency_key = 2;
 }
 
-// FeaturesWritten is published after a WriteFeatures append commits
-// (subject: fp.features.written). THIN by design (see note above): it announces
-// "these entities in this view changed up to this version" so consumers can
-// react and, if needed, pull the actual values from the read models.
-message FeaturesWritten {
-  // The view that received the append.
+message DeleteFeatureViewResponse {
+  // The view as of its retirement: schema_version bumped by the delete event and
+  // deleted_at set to the retirement time. Returned so callers can confirm the
+  // terminal state without a follow-up GetFeatureView.
+  FeatureView feature_view = 1;
+}
+
+// ============================================================================
+// RebuildViews (event-sourcing recovery — the headline demonstration)
+// ============================================================================
+
+// RebuildViewsRequest replays the append-only log to REGENERATE the materialized
+// views (Redis online + Postgres offline). This is THE event-sourcing party
+// trick the design doc calls out: "can replay ALL events from scratch to rebuild
+// both views". WHY it must be an explicit RPC, not just an internal job: it is
+// the documented RECOVERY path after a Redis flush, a projection-logic bugfix
+// (replay corrects every entity), or a schema migration of a read model — an
+// operator/CLI needs to invoke it deliberately. The log is never touched; only
+// the caches are rebuilt FROM it (proving the log is the true source of truth).
+//
+// SECURITY: this is an ADMIN operation guarded by a distinct, higher-privilege
+// scope ("features:admin"), NOT the ordinary "features:write" — a full replay is
+// expensive and operationally sensitive, so it must not be reachable with a
+// routine write token. Scope is SERVER-enforced from TokenClaims.
+//
+// LONG-RUNNING / STREAMING CHOICE: a full replay can take minutes over a large
+// log, so this is modeled as a SERVER-STREAMING RPC that emits incremental
+// RebuildViewsResponse progress frames (events replayed so far / total, current
+// view). NOTE the message is named RebuildViewsResponse (not RebuildProgress) to
+// satisfy Buf's RPC_RESPONSE_STANDARD_NAME rule: a unary OR streaming response
+// type must be <RpcName>Response. The frames it carries are still "progress"
+// frames semantically — the name is the contract, the doc explains the role. WHY
+// server-streaming and not a unary "kick off + poll": the operator/CLI wants
+// live progress and a single connection whose closure signals completion, with
+// no polling loop or separate job-status endpoint. (Contrast the data-plane read
+// RPCs, which stay unary because they're bounded and latency-sensitive — the
+// streaming choice here is justified by DURATION, not data volume.)
+message RebuildViewsRequest {
+  // Optional: restrict the rebuild to one view (its UUID). Empty = rebuild ALL
+  // views (full recovery). Scoping to one view makes a targeted bugfix replay
+  // cheap instead of reprocessing the entire platform's feature history.
   string feature_view_id = 1;
 
-  // The view name (convenience for subscribers filtering by name).
-  string feature_view_name = 2;
-
-  // The entity ids whose features changed in this batch. Consumers (e.g., the
-  // Model Monitor) use these to scope drift checks / cache invalidation.
-  // For very large batches this MAY be truncated by the server; written_count
-  // remains the authoritative total.
-  repeated string entity_ids = 3;
-
-  // Total rows appended in this batch (authoritative even if entity_ids above
-  // is truncated for message-size reasons).
-  int32 written_count = 4;
-
-  // Highest event-log version assigned by this append. A consumer can request
-  // features as_of_version >= this to be sure it sees the new data.
-  int64 written_through_version = 5;
-
-  // When the append committed (server time).
-  google.protobuf.Timestamp occurred_at = 6;
+  // Which projection(s) to rebuild. Lets an operator rebuild only the cache that
+  // was lost/corrupted (e.g. ONLINE after a Redis flush) instead of both.
+  RebuildTarget target = 2;
 }
 
+// RebuildTarget selects which materialized projection(s) a rebuild regenerates.
+// Buf STANDARD: _UNSPECIFIED zero value + enum-name prefix on every value.
+enum RebuildTarget {
+  // Unset — server treats as REBUILD_TARGET_ALL (rebuild everything) but the
+  // caller SHOULD set this explicitly; the zero value exists only to satisfy
+  // proto3/Buf, not as a meaningful "no target".
+  REBUILD_TARGET_UNSPECIFIED = 0;
+
+  // Rebuild both the Redis online view and the Postgres offline view.
+  REBUILD_TARGET_ALL = 1;
+
+  // Rebuild only the Redis online (latest-value) projection — e.g. after a flush.
+  REBUILD_TARGET_ONLINE = 2;
+
+  // Rebuild only the Postgres offline (point-in-time) projection.
+  REBUILD_TARGET_OFFLINE = 3;
+}
+
+// RebuildViewsResponse is one streamed frame of a RebuildViews replay (a
+// "progress" frame). The stream emits these periodically; the final frame has
+// done=true and the connection closes cleanly (its closure is the completion
+// signal — no poll needed). Named <RpcName>Response to satisfy Buf's
+// RPC_RESPONSE_STANDARD_NAME rule even though it is a streamed progress frame.
+message RebuildViewsResponse {
+  // Events replayed so far and the total to replay (so the CLI renders a bar).
+  // total_events may be -1 early if counting the log up front is itself costly.
+  int64 events_replayed = 1;
+  int64 total_events = 2;
+
+  // The view currently being rebuilt (empty when rebuilding the whole fleet
+  // and between views). Lets the operator see progress per view.
+  string current_feature_view_id = 3;
+
+  // True on the FINAL frame — the rebuild is complete and the stream will close.
+  bool done = 4;
+}
+
+// ============================================================================
+// EVENT PAYLOADS — NOW CANONICAL (forgepoint.events.v1), NOT redefined here
+// ============================================================================
+//
+// The Feature Store PRODUCES two events. Their payload messages used to live in
+// THIS file; they have been MOVED to the platform's single canonical event
+// package and DELETED here. Producers pack the canonical messages into
+// common.v1.EventEnvelope.data (a google.protobuf.Any); consumers unpack the
+// SAME message by its Any type_url — one contract, both ends of every pipe.
+//
+//   WHAT THE FEATURE STORE PUBLISHES (producer = "feature-store"):
+//     fp.features.view.defined  → forgepoint.events.v1.FeatureViewDefined
+//     fp.features.written       → forgepoint.events.v1.FeaturesWritten
+//
+//   WHO CONSUMES (informational — defined by the consumers, not us):
+//     FeatureViewDefined → experiment-tracker (correlate which feature schema
+//                          versions fed a training run), audit subscribers.
+//     FeaturesWritten    → experiment-tracker (which feature versions fed a
+//                          run), model-monitor (scope drift checks / cache
+//                          invalidation to the changed entities).
+//
+// WHY MOVED (the bug this fixes — conflict #4 in events.proto):
+//   The platform's async nervous system had DRIFTED. The design doc and the
+//   experiment-tracker subscribed to "fp.features.ingested" / "FeaturesIngested",
+//   while this service published "FeaturesWritten" on "fp.features.written".
+//   Same fact, two names — the subscription would NEVER fire. Centralizing the
+//   payloads in forgepoint.events.v1 makes that class of mismatch impossible:
+//   producer and consumer literally import the same generated Go type. (The
+//   experiment-tracker fix repoints its subscription to fp.features.written.)
+//
+//   It also DECOUPLES the event schema from this service's API schema. The old
+//   local messages were fine until you ask: should the Experiment Tracker
+//   compile-depend on featurestore.proto just to read an event? No. The event is
+//   a separately-versioned PUBLISHED CONTRACT (schema-registry thinking); it
+//   imports only well-known types + common, never a service's API proto.
+//
+// THIN-BY-DESIGN (unchanged, and codified in the canonical message):
+//   events.FeaturesWritten carries the affected entity_ids + a count +
+//   written_through_version — NOT the feature VALUES. Events are for
+//   NOTIFICATION/correlation; a consumer that needs the actual values calls
+//   GetOnlineFeatures/GetHistoricalFeatures (the read models below). This keeps
+//   NATS small and stops the bus becoming a second source of truth. (This is the
+//   "thin event + callback" side of the fat-vs-thin tradeoff — chosen here
+//   because feature rows are large and only some consumers want the values.)
+//
+// PUBLISHER FIELD MAPPING (a few lines in the handler at the publish boundary —
+// the price of decoupling, and the only thing the rename touches):
+//   DefineFeatureView success →  events.FeatureViewDefined{
+//       feature_view_id   = view.id
+//       feature_view_name = view.name        // canonical field is feature_view_name
+//       schema_version    = view.schema_version
+//       owner_team        = view.owner_team
+//       defined_at        = view.updated_at  // RENAMED: old local occurred_at → defined_at
+//   }
+//   WriteFeatures success →      events.FeaturesWritten{
+//       feature_view_id          = req.feature_view_id
+//       feature_view_name        = view.name
+//       entity_ids               = affected ids (MAY be truncated; count is authoritative)
+//       written_count            = rows appended
+//       written_through_version  = resp.written_through_version
+//       written_at               = append commit time  // RENAMED: old occurred_at → written_at
+//   }
+// The canonical messages live in proto/forgepoint/events/v1/events.proto under
+// the "FEATURE-STORE EVENTS" section — read there for field-level docs.
+//
 // ============================================================================
 // FEATURE STORE SERVICE
 // ============================================================================
@@ -656,13 +826,25 @@ message FeaturesWritten {
 //   log; read models = Redis online + Postgres offline), not across services.
 //
 // RPC CATEGORIES:
-//   DEFINITION (catalog):  DefineFeatureView, ListFeatureViews
+//   DEFINITION (catalog):  DefineFeatureView, GetFeatureView, ListFeatureViews
 //   WRITE (commands):      WriteFeatures                 → appends events
 //   READ (projections):    GetOnlineFeatures (latest),
 //                          GetHistoricalFeatures (point-in-time)
+//   ADMIN (lifecycle):     DeleteFeatureView (soft retire → FeatureViewDeleted),
+//                          RebuildViews (replay log → regenerate projections)
+//
+// SERVER-ENFORCED LIMITS (in the CONTRACT, not just prose — see each RPC):
+//   * page_size (ListFeatureViews, GetHistoricalFeatures): default 20, hard cap
+//     MAX_PAGE_SIZE = 100 (oversized requests are CLAMPED, not rejected).
+//   * batch size (entity_ids on GetOnline/GetHistorical; features on Write):
+//     hard cap MAX_BATCH_SIZE = 1000 entities/rows; OVER-cap requests are
+//     REJECTED with INVALID_ARGUMENT (a too-large write must fail loudly, not be
+//     silently truncated — truncation would drop feature rows). proto3 has no
+//     native numeric bound, so these caps are documented as named constants and
+//     enforced server-side; the constants are the contract.
 //
 // STREAMING CHOICE (interview-critical):
-//   ALL RPCs are UNARY. Justification:
+//   DATA-PLANE RPCs are UNARY; the long-running ADMIN replay is SERVER-STREAMING.
 //     - WriteFeatures: producers emit in BATCHES (one RPC = one atomic append
 //       with one idempotency key). Client-streaming would blur the idempotency/
 //       atomicity boundary (when is the append "committed"?). Bounded batches +
@@ -672,43 +854,74 @@ message FeaturesWritten {
 //     - GetHistoricalFeatures: bounded, PAGINATED point-in-time pulls. Truly
 //       huge training joins are an offline batch job (export to object storage),
 //       not a synchronous server stream — a deliberate later refinement.
-//   So no RPC here is server- or bidi-streaming, by design, and the reasons are
-//   documented so the choice is defensible.
+//     - RebuildViews: SERVER-STREAMING — a full log replay runs for minutes, so
+//       we stream RebuildViewsResponse frames for live feedback and use stream-close as the
+//       completion signal (no poll loop). Note this is justified by DURATION, not
+//       data volume — the contrast with the unary reads is the interview point.
+//   So the only streaming RPC is the admin replay, deliberately, and every choice
+//   is documented so it is defensible.
 //
 // EVENT-SOURCING RECAP (what an interviewer will probe):
 //   * Source of truth = append-only feature_events log. Views are caches.
 //   * Reads never replay on the hot path; they read projections.
 //   * Reproducibility = GetHistoricalFeatures(as_of) over event_time.
-//   * Recovery = replay the log to rebuild Redis + Postgres views.
+//   * Recovery = RebuildViews replays the log to rebuild Redis + Postgres views.
+//   * Soft delete = DeleteFeatureView appends a terminal event; history is kept.
 //   * Exactly-once EFFECT under retries = idempotency_key on mutating RPCs.
 //   * Eventual consistency online = surfaced via as_of_version in reads.
+//   * Async contract = publishes forgepoint.events.v1 FeatureViewDefined /
+//     FeaturesWritten (canonical, decoupled from this API proto).
 // ============================================================================
 service FeatureStoreService {
   // DefineFeatureView creates a FeatureView or evolves its schema (append a
   // FeatureViewDefined event; bump schema_version). Owner/team/timestamps are
-  // SERVER-assigned. Idempotent via idempotency_key. Requires "features:write".
+  // SERVER-assigned. Idempotent via idempotency_key. On commit, publishes
+  // forgepoint.events.v1.FeatureViewDefined on fp.features.view.defined.
+  // Requires "features:write".
   rpc DefineFeatureView(DefineFeatureViewRequest) returns (DefineFeatureViewResponse);
 
+  // GetFeatureView returns a SINGLE view's current schema/metadata by id or name
+  // (a read of the catalog projection), scoped to the caller's team. Requires
+  // "features:read".
+  rpc GetFeatureView(GetFeatureViewRequest) returns (GetFeatureViewResponse);
+
   // ListFeatureViews returns a paginated catalog of feature views (a projection
-  // over FeatureViewDefined events), scoped to the caller's team. page_size is
-  // capped at 100 server-side. Requires "features:read".
+  // over FeatureViewDefined events), scoped to the caller's team. page_size
+  // defaults to 20 and is CAPPED at MAX_PAGE_SIZE=100 server-side (clamped).
+  // Requires "features:read".
   rpc ListFeatureViews(ListFeatureViewsRequest) returns (ListFeatureViewsResponse);
 
   // WriteFeatures appends a batch of feature rows to the event log (the core
   // event-sourcing write). Values are validated against the view schema; a type
-  // mismatch fails the whole batch. Idempotent via idempotency_key. Emits
-  // FeaturesWritten on commit. Requires "features:write".
+  // mismatch fails the whole batch. Batch size is capped at MAX_BATCH_SIZE=1000
+  // rows (over-cap → INVALID_ARGUMENT). Idempotent via idempotency_key. On
+  // commit, publishes forgepoint.events.v1.FeaturesWritten on fp.features.written.
+  // Requires "features:write".
   rpc WriteFeatures(WriteFeaturesRequest) returns (WriteFeaturesResponse);
 
   // GetOnlineFeatures returns the LATEST feature values for entities from the
-  // low-latency online projection (the inference hot path). Eventually
-  // consistent with writes; response carries as_of_version for staleness
-  // detection. Requires "features:read".
+  // low-latency online projection (the inference hot path). entity_ids batch is
+  // capped at MAX_BATCH_SIZE=1000. Eventually consistent with writes; response
+  // carries as_of_version for staleness detection. Requires "features:read".
   rpc GetOnlineFeatures(GetOnlineFeaturesRequest) returns (GetOnlineFeaturesResponse);
 
   // GetHistoricalFeatures returns POINT-IN-TIME ("as-of") feature values from
   // the offline projection — for each entity, the latest event with
   // event_time <= as_of. Powers reproducible training and prevents label
-  // leakage. Paginated; page_size capped at 100. Requires "features:read".
+  // leakage. entity_ids batch capped at MAX_BATCH_SIZE=1000; result paginated
+  // with page_size capped at MAX_PAGE_SIZE=100. Requires "features:read".
   rpc GetHistoricalFeatures(GetHistoricalFeaturesRequest) returns (GetHistoricalFeaturesResponse);
+
+  // DeleteFeatureView soft-retires a view by appending a terminal
+  // FeatureViewDeleted event (the log/history is preserved for reproducibility;
+  // the online projection is torn down). Idempotent via idempotency_key.
+  // Requires "features:write".
+  rpc DeleteFeatureView(DeleteFeatureViewRequest) returns (DeleteFeatureViewResponse);
+
+  // RebuildViews replays the append-only log to regenerate the materialized
+  // projections (Redis online + Postgres offline) — the event-sourcing recovery
+  // path. SERVER-STREAMING: emits RebuildViewsResponse progress frames until done.
+  // This is an ADMIN op requiring the elevated "features:admin" scope (a full
+  // replay is expensive and sensitive — not reachable with a routine write token).
+  rpc RebuildViews(RebuildViewsRequest) returns (stream RebuildViewsResponse);
 }

@@ -79,12 +79,33 @@
 // SECURITY / MASS-ASSIGNMENT POSTURE (applies to every write RPC below):
 //   Server-authoritative fields are NEVER accepted on write requests. The
 //   caller does not get to set: id, owner_id, team (derived from the caller's
-//   auth claims), stage/status (only PromoteVersion may change stage),
-//   created_at/updated_at/archived_at, or artifact_path/digest (set by the
-//   storage layer on upload). Accepting any of these would let a caller forge
-//   ownership, backdate records, or jump a version straight to production —
-//   classic mass-assignment escalation. We model only the genuinely
+//   auth claims), stage/status (only PromoteVersion may change stage, only
+//   ConfirmVersionUpload may change status), created_at/updated_at/archived_at,
+//   or artifact_path/digest/size_bytes (MEASURED by the storage layer on upload,
+//   never client-asserted — a forged digest defeats content integrity, a forged
+//   size lets a tenant dodge storage billing). Accepting any of these would let a
+//   caller forge ownership, backdate records, or jump a version straight to
+//   production — classic mass-assignment escalation. We model only the genuinely
 //   client-supplied fields on *Request messages and derive the rest server-side.
+//
+// TENANCY SCOPING (authz from claims, not the body):
+//   There is intentionally NO `team` / `owner_id` field on any list/get/write
+//   request. Team scoping and ownership are derived from the caller's validated
+//   TokenClaims server-side, so a caller can neither list another team's models
+//   nor register into another team's namespace. The few filter fields that DO
+//   stay on requests (task_type_filter, framework_filter, tag key/value) only
+//   NARROW within the caller's already-scoped view — they never widen it.
+//
+// PAGINATION / DoS BOUND (a contract invariant, not just per-RPC prose):
+//   Every list RPC takes common.v1.PaginationRequest. page_size DEFAULTS to 20
+//   and is HARD-CAPPED AT 100 server-side — a larger request is silently clamped
+//   to 100, never honored. This is the platform-wide cap documented on
+//   common.v1.PaginationRequest (default 20 / max 100) and it bounds Redis
+//   ZRANGE/SMEMBERS work and response size (a memory/CPU DoS guard). proto3 has no
+//   numeric-bound syntax and protovalidate is intentionally not a dependency here,
+//   so the cap is expressed as this explicit, uniform contract clause and enforced
+//   in the handler; it is NOT advisory. There are no batch-write RPCs in this
+//   service, so no separate batch-size cap is needed.
 //
 // VERSIONING: Package path includes v1 (Buf/Google convention). Breaking
 // changes require a new forgepoint.registry.v2 package; both coexist during
@@ -112,16 +133,19 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	RegistryService_RegisterModel_FullMethodName  = "/forgepoint.registry.v1.RegistryService/RegisterModel"
-	RegistryService_CreateVersion_FullMethodName  = "/forgepoint.registry.v1.RegistryService/CreateVersion"
-	RegistryService_PromoteVersion_FullMethodName = "/forgepoint.registry.v1.RegistryService/PromoteVersion"
-	RegistryService_DeleteModel_FullMethodName    = "/forgepoint.registry.v1.RegistryService/DeleteModel"
-	RegistryService_GetModel_FullMethodName       = "/forgepoint.registry.v1.RegistryService/GetModel"
-	RegistryService_ListModels_FullMethodName     = "/forgepoint.registry.v1.RegistryService/ListModels"
-	RegistryService_SearchByTag_FullMethodName    = "/forgepoint.registry.v1.RegistryService/SearchByTag"
-	RegistryService_GetVersion_FullMethodName     = "/forgepoint.registry.v1.RegistryService/GetVersion"
-	RegistryService_ListVersions_FullMethodName   = "/forgepoint.registry.v1.RegistryService/ListVersions"
-	RegistryService_GetDownloadURL_FullMethodName = "/forgepoint.registry.v1.RegistryService/GetDownloadURL"
+	RegistryService_RegisterModel_FullMethodName        = "/forgepoint.registry.v1.RegistryService/RegisterModel"
+	RegistryService_UpdateModel_FullMethodName          = "/forgepoint.registry.v1.RegistryService/UpdateModel"
+	RegistryService_CreateVersion_FullMethodName        = "/forgepoint.registry.v1.RegistryService/CreateVersion"
+	RegistryService_ConfirmVersionUpload_FullMethodName = "/forgepoint.registry.v1.RegistryService/ConfirmVersionUpload"
+	RegistryService_PromoteVersion_FullMethodName       = "/forgepoint.registry.v1.RegistryService/PromoteVersion"
+	RegistryService_DeleteModel_FullMethodName          = "/forgepoint.registry.v1.RegistryService/DeleteModel"
+	RegistryService_GetModel_FullMethodName             = "/forgepoint.registry.v1.RegistryService/GetModel"
+	RegistryService_ListModels_FullMethodName           = "/forgepoint.registry.v1.RegistryService/ListModels"
+	RegistryService_SearchByTag_FullMethodName          = "/forgepoint.registry.v1.RegistryService/SearchByTag"
+	RegistryService_GetVersion_FullMethodName           = "/forgepoint.registry.v1.RegistryService/GetVersion"
+	RegistryService_ListVersions_FullMethodName         = "/forgepoint.registry.v1.RegistryService/ListVersions"
+	RegistryService_GetUploadURL_FullMethodName         = "/forgepoint.registry.v1.RegistryService/GetUploadURL"
+	RegistryService_GetDownloadURL_FullMethodName       = "/forgepoint.registry.v1.RegistryService/GetDownloadURL"
 )
 
 // RegistryServiceClient is the client API for RegistryService service.
@@ -157,32 +181,50 @@ const (
 //
 // RPC GROUPS:
 //
-//	COMMANDS (Postgres write, then publish NATS event):
-//	  RegisterModel, CreateVersion, PromoteVersion, DeleteModel
+//	COMMANDS (Postgres write, then publish a canonical events.v1 NATS event):
+//	  RegisterModel, UpdateModel, CreateVersion, ConfirmVersionUpload,
+//	  PromoteVersion, DeleteModel
 //	QUERIES (Redis read projection, eventually consistent):
 //	  GetModel, ListModels, SearchByTag, GetVersion, ListVersions
 //	STORAGE (object store, presigned URLs — bytes bypass this service):
-//	  GetDownloadURL  (upload URL is returned inline by CreateVersion)
+//	  GetUploadURL (re-issue), GetDownloadURL  (the FIRST upload URL is returned
+//	  inline by CreateVersion; GetUploadURL re-issues an expired one)
 //
 // ============================================================================
 type RegistryServiceClient interface {
 	// RegisterModel creates a new model (the identity, no versions yet). Writes to
-	// Postgres and publishes ModelRegistered. owner_id/team are taken from the
-	// caller's auth claims, never the request. Idempotent via idempotency_key.
+	// Postgres and publishes events.ModelRegistered (fp.models.registered).
+	// owner_id/team are taken from the caller's auth claims, never the request.
+	// Idempotent via idempotency_key.
 	RegisterModel(ctx context.Context, in *RegisterModelRequest, opts ...grpc.CallOption) (*RegisterModelResponse, error)
+	// UpdateModel mutates the small mutable surface (description and/or tags) of an
+	// existing model, using explicit update_description/replace_tags flags so an
+	// omitted field never silently clears stored data. name/owner/team/timestamps
+	// are NOT mutable here (mass-assignment guard). Publishes NO canonical event —
+	// these edits are not a published platform fact — but refreshes the read model.
+	UpdateModel(ctx context.Context, in *UpdateModelRequest, opts ...grpc.CallOption) (*UpdateModelResponse, error)
 	// CreateVersion cuts a new immutable version of an existing model. Writes the
 	// version row (status=PENDING_UPLOAD, stage=DEV), returns a presigned upload
-	// URL for the artifact, and publishes ModelVersionCreated. The artifact bytes
-	// never flow through this RPC.
+	// URL for the artifact, and publishes events.ModelVersionCreated
+	// (fp.models.version.created). The artifact bytes never flow through this RPC.
 	CreateVersion(ctx context.Context, in *CreateVersionRequest, opts ...grpc.CallOption) (*CreateVersionResponse, error)
+	// ConfirmVersionUpload drives the PENDING_UPLOAD → READY (or FAILED) transition
+	// after the artifact has been PUT directly to object storage. The server
+	// RE-VERIFIES the object (existence + server-measured digest + size — never a
+	// client-asserted value), and on success flips status to READY and publishes
+	// events.ModelVersionReady (fp.models.version.ready) carrying the server-measured
+	// artifact_path/artifact_digest/size_bytes that serving/billing/orchestrator
+	// need. This is the READY edge that was previously unreachable (conflict #3).
+	ConfirmVersionUpload(ctx context.Context, in *ConfirmVersionUploadRequest, opts ...grpc.CallOption) (*ConfirmVersionUploadResponse, error)
 	// PromoteVersion advances a version through the stage state machine
 	// (DEV→STAGING→PRODUCTION→ARCHIVED), enforcing legal transitions and the
 	// single-production invariant in ONE Postgres transaction, then publishes
-	// ModelPromoted. This is what drives serving/gateway/monitor/billing reactions.
+	// events.ModelPromoted (fp.models.promoted). This is what drives
+	// serving/gateway/monitor/billing reactions.
 	PromoteVersion(ctx context.Context, in *PromoteVersionRequest, opts ...grpc.CallOption) (*PromoteVersionResponse, error)
 	// DeleteModel soft-deletes (archives) a model and all its versions, removes it
-	// from active read lists, and publishes ModelArchived. Rows are retained for
-	// lineage/audit — this is not a hard delete.
+	// from active read lists, and publishes events.ModelArchived
+	// (fp.models.archived). Rows are retained for lineage/audit — not a hard delete.
 	DeleteModel(ctx context.Context, in *DeleteModelRequest, opts ...grpc.CallOption) (*DeleteModelResponse, error)
 	// GetModel returns a single model by id or name from the Redis read model.
 	// May briefly miss a just-registered model (projection lag).
@@ -200,6 +242,11 @@ type RegistryServiceClient interface {
 	// ListVersions returns a paginated, newest-first list of a model's versions
 	// from the read model, optionally filtered by stage. 100-item cap.
 	ListVersions(ctx context.Context, in *ListVersionsRequest, opts ...grpc.CallOption) (*ListVersionsResponse, error)
+	// GetUploadURL re-issues a fresh presigned PUT URL for an existing version that
+	// is still PENDING_UPLOAD (e.g. the original URL from CreateVersion expired, or
+	// the client crashed before uploading). Makes the upload step resumable without
+	// minting a duplicate version. Rejected if the version is already READY/FAILED.
+	GetUploadURL(ctx context.Context, in *GetUploadURLRequest, opts ...grpc.CallOption) (*GetUploadURLResponse, error)
 	// GetDownloadURL returns a short-lived presigned URL to fetch a READY
 	// version's artifact directly from MinIO/S3, plus the expected digest for
 	// integrity verification. Read-only and safe to retry.
@@ -224,10 +271,30 @@ func (c *registryServiceClient) RegisterModel(ctx context.Context, in *RegisterM
 	return out, nil
 }
 
+func (c *registryServiceClient) UpdateModel(ctx context.Context, in *UpdateModelRequest, opts ...grpc.CallOption) (*UpdateModelResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpdateModelResponse)
+	err := c.cc.Invoke(ctx, RegistryService_UpdateModel_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *registryServiceClient) CreateVersion(ctx context.Context, in *CreateVersionRequest, opts ...grpc.CallOption) (*CreateVersionResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(CreateVersionResponse)
 	err := c.cc.Invoke(ctx, RegistryService_CreateVersion_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *registryServiceClient) ConfirmVersionUpload(ctx context.Context, in *ConfirmVersionUploadRequest, opts ...grpc.CallOption) (*ConfirmVersionUploadResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ConfirmVersionUploadResponse)
+	err := c.cc.Invoke(ctx, RegistryService_ConfirmVersionUpload_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -304,6 +371,16 @@ func (c *registryServiceClient) ListVersions(ctx context.Context, in *ListVersio
 	return out, nil
 }
 
+func (c *registryServiceClient) GetUploadURL(ctx context.Context, in *GetUploadURLRequest, opts ...grpc.CallOption) (*GetUploadURLResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetUploadURLResponse)
+	err := c.cc.Invoke(ctx, RegistryService_GetUploadURL_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *registryServiceClient) GetDownloadURL(ctx context.Context, in *GetDownloadURLRequest, opts ...grpc.CallOption) (*GetDownloadURLResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetDownloadURLResponse)
@@ -347,32 +424,50 @@ func (c *registryServiceClient) GetDownloadURL(ctx context.Context, in *GetDownl
 //
 // RPC GROUPS:
 //
-//	COMMANDS (Postgres write, then publish NATS event):
-//	  RegisterModel, CreateVersion, PromoteVersion, DeleteModel
+//	COMMANDS (Postgres write, then publish a canonical events.v1 NATS event):
+//	  RegisterModel, UpdateModel, CreateVersion, ConfirmVersionUpload,
+//	  PromoteVersion, DeleteModel
 //	QUERIES (Redis read projection, eventually consistent):
 //	  GetModel, ListModels, SearchByTag, GetVersion, ListVersions
 //	STORAGE (object store, presigned URLs — bytes bypass this service):
-//	  GetDownloadURL  (upload URL is returned inline by CreateVersion)
+//	  GetUploadURL (re-issue), GetDownloadURL  (the FIRST upload URL is returned
+//	  inline by CreateVersion; GetUploadURL re-issues an expired one)
 //
 // ============================================================================
 type RegistryServiceServer interface {
 	// RegisterModel creates a new model (the identity, no versions yet). Writes to
-	// Postgres and publishes ModelRegistered. owner_id/team are taken from the
-	// caller's auth claims, never the request. Idempotent via idempotency_key.
+	// Postgres and publishes events.ModelRegistered (fp.models.registered).
+	// owner_id/team are taken from the caller's auth claims, never the request.
+	// Idempotent via idempotency_key.
 	RegisterModel(context.Context, *RegisterModelRequest) (*RegisterModelResponse, error)
+	// UpdateModel mutates the small mutable surface (description and/or tags) of an
+	// existing model, using explicit update_description/replace_tags flags so an
+	// omitted field never silently clears stored data. name/owner/team/timestamps
+	// are NOT mutable here (mass-assignment guard). Publishes NO canonical event —
+	// these edits are not a published platform fact — but refreshes the read model.
+	UpdateModel(context.Context, *UpdateModelRequest) (*UpdateModelResponse, error)
 	// CreateVersion cuts a new immutable version of an existing model. Writes the
 	// version row (status=PENDING_UPLOAD, stage=DEV), returns a presigned upload
-	// URL for the artifact, and publishes ModelVersionCreated. The artifact bytes
-	// never flow through this RPC.
+	// URL for the artifact, and publishes events.ModelVersionCreated
+	// (fp.models.version.created). The artifact bytes never flow through this RPC.
 	CreateVersion(context.Context, *CreateVersionRequest) (*CreateVersionResponse, error)
+	// ConfirmVersionUpload drives the PENDING_UPLOAD → READY (or FAILED) transition
+	// after the artifact has been PUT directly to object storage. The server
+	// RE-VERIFIES the object (existence + server-measured digest + size — never a
+	// client-asserted value), and on success flips status to READY and publishes
+	// events.ModelVersionReady (fp.models.version.ready) carrying the server-measured
+	// artifact_path/artifact_digest/size_bytes that serving/billing/orchestrator
+	// need. This is the READY edge that was previously unreachable (conflict #3).
+	ConfirmVersionUpload(context.Context, *ConfirmVersionUploadRequest) (*ConfirmVersionUploadResponse, error)
 	// PromoteVersion advances a version through the stage state machine
 	// (DEV→STAGING→PRODUCTION→ARCHIVED), enforcing legal transitions and the
 	// single-production invariant in ONE Postgres transaction, then publishes
-	// ModelPromoted. This is what drives serving/gateway/monitor/billing reactions.
+	// events.ModelPromoted (fp.models.promoted). This is what drives
+	// serving/gateway/monitor/billing reactions.
 	PromoteVersion(context.Context, *PromoteVersionRequest) (*PromoteVersionResponse, error)
 	// DeleteModel soft-deletes (archives) a model and all its versions, removes it
-	// from active read lists, and publishes ModelArchived. Rows are retained for
-	// lineage/audit — this is not a hard delete.
+	// from active read lists, and publishes events.ModelArchived
+	// (fp.models.archived). Rows are retained for lineage/audit — not a hard delete.
 	DeleteModel(context.Context, *DeleteModelRequest) (*DeleteModelResponse, error)
 	// GetModel returns a single model by id or name from the Redis read model.
 	// May briefly miss a just-registered model (projection lag).
@@ -390,6 +485,11 @@ type RegistryServiceServer interface {
 	// ListVersions returns a paginated, newest-first list of a model's versions
 	// from the read model, optionally filtered by stage. 100-item cap.
 	ListVersions(context.Context, *ListVersionsRequest) (*ListVersionsResponse, error)
+	// GetUploadURL re-issues a fresh presigned PUT URL for an existing version that
+	// is still PENDING_UPLOAD (e.g. the original URL from CreateVersion expired, or
+	// the client crashed before uploading). Makes the upload step resumable without
+	// minting a duplicate version. Rejected if the version is already READY/FAILED.
+	GetUploadURL(context.Context, *GetUploadURLRequest) (*GetUploadURLResponse, error)
 	// GetDownloadURL returns a short-lived presigned URL to fetch a READY
 	// version's artifact directly from MinIO/S3, plus the expected digest for
 	// integrity verification. Read-only and safe to retry.
@@ -407,8 +507,14 @@ type UnimplementedRegistryServiceServer struct{}
 func (UnimplementedRegistryServiceServer) RegisterModel(context.Context, *RegisterModelRequest) (*RegisterModelResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RegisterModel not implemented")
 }
+func (UnimplementedRegistryServiceServer) UpdateModel(context.Context, *UpdateModelRequest) (*UpdateModelResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdateModel not implemented")
+}
 func (UnimplementedRegistryServiceServer) CreateVersion(context.Context, *CreateVersionRequest) (*CreateVersionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateVersion not implemented")
+}
+func (UnimplementedRegistryServiceServer) ConfirmVersionUpload(context.Context, *ConfirmVersionUploadRequest) (*ConfirmVersionUploadResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ConfirmVersionUpload not implemented")
 }
 func (UnimplementedRegistryServiceServer) PromoteVersion(context.Context, *PromoteVersionRequest) (*PromoteVersionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PromoteVersion not implemented")
@@ -430,6 +536,9 @@ func (UnimplementedRegistryServiceServer) GetVersion(context.Context, *GetVersio
 }
 func (UnimplementedRegistryServiceServer) ListVersions(context.Context, *ListVersionsRequest) (*ListVersionsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListVersions not implemented")
+}
+func (UnimplementedRegistryServiceServer) GetUploadURL(context.Context, *GetUploadURLRequest) (*GetUploadURLResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetUploadURL not implemented")
 }
 func (UnimplementedRegistryServiceServer) GetDownloadURL(context.Context, *GetDownloadURLRequest) (*GetDownloadURLResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetDownloadURL not implemented")
@@ -473,6 +582,24 @@ func _RegistryService_RegisterModel_Handler(srv interface{}, ctx context.Context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RegistryService_UpdateModel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateModelRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RegistryServiceServer).UpdateModel(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RegistryService_UpdateModel_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RegistryServiceServer).UpdateModel(ctx, req.(*UpdateModelRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _RegistryService_CreateVersion_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(CreateVersionRequest)
 	if err := dec(in); err != nil {
@@ -487,6 +614,24 @@ func _RegistryService_CreateVersion_Handler(srv interface{}, ctx context.Context
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(RegistryServiceServer).CreateVersion(ctx, req.(*CreateVersionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _RegistryService_ConfirmVersionUpload_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ConfirmVersionUploadRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RegistryServiceServer).ConfirmVersionUpload(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RegistryService_ConfirmVersionUpload_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RegistryServiceServer).ConfirmVersionUpload(ctx, req.(*ConfirmVersionUploadRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -617,6 +762,24 @@ func _RegistryService_ListVersions_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _RegistryService_GetUploadURL_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetUploadURLRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(RegistryServiceServer).GetUploadURL(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: RegistryService_GetUploadURL_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(RegistryServiceServer).GetUploadURL(ctx, req.(*GetUploadURLRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _RegistryService_GetDownloadURL_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetDownloadURLRequest)
 	if err := dec(in); err != nil {
@@ -647,8 +810,16 @@ var RegistryService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _RegistryService_RegisterModel_Handler,
 		},
 		{
+			MethodName: "UpdateModel",
+			Handler:    _RegistryService_UpdateModel_Handler,
+		},
+		{
 			MethodName: "CreateVersion",
 			Handler:    _RegistryService_CreateVersion_Handler,
+		},
+		{
+			MethodName: "ConfirmVersionUpload",
+			Handler:    _RegistryService_ConfirmVersionUpload_Handler,
 		},
 		{
 			MethodName: "PromoteVersion",
@@ -677,6 +848,10 @@ var RegistryService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListVersions",
 			Handler:    _RegistryService_ListVersions_Handler,
+		},
+		{
+			MethodName: "GetUploadURL",
+			Handler:    _RegistryService_GetUploadURL_Handler,
 		},
 		{
 			MethodName: "GetDownloadURL",

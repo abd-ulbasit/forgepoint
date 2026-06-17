@@ -38,11 +38,15 @@
 //   request/response, so it does not belong in gRPC. The gRPC API exists ONLY
 //   for the human-facing CONTROL PLANE:
 //     - reading the notifications I've been sent (inbox) — List/Get/MarkRead
+//     - auditing whether my alerts actually went out — ListDeliveryAttempts
 //     - configuring HOW and WHEN I want to be notified — Get/UpdatePreferences
+//     - verifying a configured channel works — TestChannel (owner self-test)
 //   That is the entire RPC surface. We resisted adding "SendNotification" or
-//   "TriggerAlert" RPCs precisely because a producer calling us would VIOLATE
+//   "TriggerAlert" RPCs precisely because a PRODUCER calling us would VIOLATE
 //   choreography — it would make us an orchestrated dependency. Producers emit
-//   events; they never address us directly.
+//   events; they never address us directly. (TestChannel is NOT such an RPC: it
+//   is the OWNER asking us to test THEIR OWN channel, addressing no third party —
+//   see its message doc for why that distinction matters.)
 //
 //   NOTE ON RULES: the implementation plan also mentions CreateRule/ListRules
 //   for the matching engine. In this v1 contract we fold a user's routing
@@ -51,6 +55,8 @@
 //   end user actually wants ("email me on failures, Slack me on drift"). A
 //   richer admin rule-builder can arrive as a v2 addition without breaking this
 //   surface. This tradeoff is called out so it is defensible in an interview.
+//   The plan's third RPC, GetDeliveryLog, IS honored here as ListDeliveryAttempts
+//   (the cross-notification delivery-health/audit query).
 //
 // REAL-WORLD COMPARISON:
 //   - PagerDuty / Opsgenie: event intake → routing rules → notification
@@ -627,7 +633,7 @@ func (x *DeliveryAttempt) GetAttemptedAt() *timestamppb.Timestamp {
 // URL, the Slack URL, the email address). This is the per-channel building block
 // of NotificationPreferences.
 //
-// SECURITY — secrets/PII handling:
+// SECURITY — secrets/PII handling (masking-on-read):
 //
 //	The `target` here holds potentially sensitive routing data (a webhook URL
 //	may embed a token; an email is PII). The platform MAY return it on
@@ -638,10 +644,38 @@ func (x *DeliveryAttempt) GetAttemptedAt() *timestamppb.Timestamp {
 //	on reads while accepting the full value on UpdatePreferences. We document
 //	this rather than hard-code masking so the storage layer owns the policy.
 //
+// SECURITY — SSRF (the headline risk for THIS service, interview-critical):
+//
+//	`target` for WEBHOOK/SLACK is a CLIENT-SUPPLIED URL that the delivery layer
+//	will make an outbound HTTP request to. A naive implementation is a textbook
+//	Server-Side Request Forgery primitive: a user could point a "webhook" at
+//	http://169.254.169.254/ (the cloud metadata endpoint → IAM credential theft),
+//	at http://localhost:port internal admin APIs, at an RFC1918 service inside the
+//	cluster, or at file://. The CONTRACT therefore REQUIRES the server to validate
+//	every webhook/slack target BEFORE storing it (on UpdatePreferences/TestChannel)
+//	AND to re-resolve+re-check at delivery time (TOCTOU — DNS can be rebound
+//	between store and POST). The mandated validation, enforced server-side:
+//	  1. Scheme allowlist: https only (http rejected; no file/gopher/ftp/etc).
+//	  2. Host allowlist for SLACK: must be hooks.slack.com (Slack incoming-webhook
+//	     host) — a Slack channel cannot point anywhere else.
+//	  3. DNS resolution + IP DENYLIST for WEBHOOK: reject if the resolved IP is
+//	     loopback (127/8, ::1), link-local (169.254/16, fe80::/10 — blocks the
+//	     metadata endpoint), private (10/8, 172.16/12, 192.168/16, fc00::/7),
+//	     unspecified/multicast/reserved. Resolve and pin the IP, then connect to
+//	     the PINNED ip (defeats DNS-rebinding TOCTOU).
+//	  4. No credentials in the userinfo component; cap redirects (or disable them)
+//	     so a 302 can't bounce the request to a denied address.
+//	A target that fails validation is REJECTED at write time (INVALID_ARGUMENT
+//	with a field-level ErrorDetail), so a malicious URL never reaches storage.
+//	This is documented in the contract — not left to the implementer's memory —
+//	precisely because it is the one place this service makes attacker-influenced
+//	outbound calls.
+//
 // ============================================================================
 type ChannelPreference struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// Which channel this preference configures.
+	// Which channel this preference configures. Server-validated against the closed
+	// NotificationChannel enum; a value the delivery layer can't service is rejected.
 	Channel NotificationChannel `protobuf:"varint,1,opt,name=channel,proto3,enum=forgepoint.notification.v1.NotificationChannel" json:"channel,omitempty"`
 	// Master on/off for this channel. Disabled channels are skipped entirely
 	// (the corresponding DeliveryAttempt is recorded as SUPPRESSED, not FAILED).
@@ -657,7 +691,8 @@ type ChannelPreference struct {
 	//	EMAIL         → the destination email address.
 	//	IN_APP        → ignored (the inbox target is the user themselves).
 	//
-	// See the SECURITY note above on masking-on-read.
+	// SUBJECT TO THE SSRF VALIDATION + masking-on-read rules in the SECURITY notes
+	// above. Server-validated on every write; never client-trusted at delivery time.
 	Target        string `protobuf:"bytes,4,opt,name=target,proto3" json:"target,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -817,194 +852,6 @@ func (x *NotificationPreferences) GetUpdatedAt() *timestamppb.Timestamp {
 	return nil
 }
 
-// NotificationDeliveredEvent — emitted when a notification is successfully
-// delivered on a fan-out channel. Lets the platform observe delivery health
-// (e.g. Experiment Tracker recording alert volume, dashboards on success rates).
-type NotificationDeliveredEvent struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// The Notification.id that was delivered.
-	NotificationId string `protobuf:"bytes,1,opt,name=notification_id,json=notificationId,proto3" json:"notification_id,omitempty"`
-	// Who it went to.
-	RecipientUserId string `protobuf:"bytes,2,opt,name=recipient_user_id,json=recipientUserId,proto3" json:"recipient_user_id,omitempty"`
-	// Which channel succeeded.
-	Channel NotificationChannel `protobuf:"varint,3,opt,name=channel,proto3,enum=forgepoint.notification.v1.NotificationChannel" json:"channel,omitempty"`
-	// The originating event's type (provenance), e.g. "fp.pipelines.failed".
-	EventType string `protobuf:"bytes,4,opt,name=event_type,json=eventType,proto3" json:"event_type,omitempty"`
-	// When delivery succeeded. Server clock.
-	DeliveredAt   *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=delivered_at,json=deliveredAt,proto3" json:"delivered_at,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *NotificationDeliveredEvent) Reset() {
-	*x = NotificationDeliveredEvent{}
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[4]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *NotificationDeliveredEvent) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*NotificationDeliveredEvent) ProtoMessage() {}
-
-func (x *NotificationDeliveredEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[4]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use NotificationDeliveredEvent.ProtoReflect.Descriptor instead.
-func (*NotificationDeliveredEvent) Descriptor() ([]byte, []int) {
-	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{4}
-}
-
-func (x *NotificationDeliveredEvent) GetNotificationId() string {
-	if x != nil {
-		return x.NotificationId
-	}
-	return ""
-}
-
-func (x *NotificationDeliveredEvent) GetRecipientUserId() string {
-	if x != nil {
-		return x.RecipientUserId
-	}
-	return ""
-}
-
-func (x *NotificationDeliveredEvent) GetChannel() NotificationChannel {
-	if x != nil {
-		return x.Channel
-	}
-	return NotificationChannel_NOTIFICATION_CHANNEL_UNSPECIFIED
-}
-
-func (x *NotificationDeliveredEvent) GetEventType() string {
-	if x != nil {
-		return x.EventType
-	}
-	return ""
-}
-
-func (x *NotificationDeliveredEvent) GetDeliveredAt() *timestamppb.Timestamp {
-	if x != nil {
-		return x.DeliveredAt
-	}
-	return nil
-}
-
-// NotificationFailedEvent — emitted when delivery permanently fails on a channel
-// after exhausting retries (or the circuit breaker is open). WHY publish a
-// failure event: it makes delivery failures observable platform-wide (alerting
-// on "we couldn't reach the user we were trying to alert" is itself important),
-// and it can feed a dead-letter / on-call escalation flow downstream.
-type NotificationFailedEvent struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// The Notification.id whose delivery failed.
-	NotificationId string `protobuf:"bytes,1,opt,name=notification_id,json=notificationId,proto3" json:"notification_id,omitempty"`
-	// Who we were trying to reach.
-	RecipientUserId string `protobuf:"bytes,2,opt,name=recipient_user_id,json=recipientUserId,proto3" json:"recipient_user_id,omitempty"`
-	// Which channel failed.
-	Channel NotificationChannel `protobuf:"varint,3,opt,name=channel,proto3,enum=forgepoint.notification.v1.NotificationChannel" json:"channel,omitempty"`
-	// The originating event's type (provenance).
-	EventType string `protobuf:"bytes,4,opt,name=event_type,json=eventType,proto3" json:"event_type,omitempty"`
-	// Number of attempts made before giving up (the exhausted retry budget).
-	Attempts int32 `protobuf:"varint,5,opt,name=attempts,proto3" json:"attempts,omitempty"`
-	// Last failure detail (e.g. "503 from webhook", "circuit breaker open").
-	ErrorMessage string `protobuf:"bytes,6,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
-	// When we gave up. Server clock.
-	FailedAt      *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=failed_at,json=failedAt,proto3" json:"failed_at,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *NotificationFailedEvent) Reset() {
-	*x = NotificationFailedEvent{}
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[5]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *NotificationFailedEvent) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*NotificationFailedEvent) ProtoMessage() {}
-
-func (x *NotificationFailedEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[5]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use NotificationFailedEvent.ProtoReflect.Descriptor instead.
-func (*NotificationFailedEvent) Descriptor() ([]byte, []int) {
-	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{5}
-}
-
-func (x *NotificationFailedEvent) GetNotificationId() string {
-	if x != nil {
-		return x.NotificationId
-	}
-	return ""
-}
-
-func (x *NotificationFailedEvent) GetRecipientUserId() string {
-	if x != nil {
-		return x.RecipientUserId
-	}
-	return ""
-}
-
-func (x *NotificationFailedEvent) GetChannel() NotificationChannel {
-	if x != nil {
-		return x.Channel
-	}
-	return NotificationChannel_NOTIFICATION_CHANNEL_UNSPECIFIED
-}
-
-func (x *NotificationFailedEvent) GetEventType() string {
-	if x != nil {
-		return x.EventType
-	}
-	return ""
-}
-
-func (x *NotificationFailedEvent) GetAttempts() int32 {
-	if x != nil {
-		return x.Attempts
-	}
-	return 0
-}
-
-func (x *NotificationFailedEvent) GetErrorMessage() string {
-	if x != nil {
-		return x.ErrorMessage
-	}
-	return ""
-}
-
-func (x *NotificationFailedEvent) GetFailedAt() *timestamppb.Timestamp {
-	if x != nil {
-		return x.FailedAt
-	}
-	return nil
-}
-
 // ListNotificationsRequest fetches the authenticated caller's inbox page.
 // WHY there is no `user_id` field: the inbox is ALWAYS scoped to the caller,
 // resolved from TokenClaims by the auth interceptor. Accepting a user_id here
@@ -1032,7 +879,7 @@ type ListNotificationsRequest struct {
 
 func (x *ListNotificationsRequest) Reset() {
 	*x = ListNotificationsRequest{}
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[6]
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1044,7 +891,7 @@ func (x *ListNotificationsRequest) String() string {
 func (*ListNotificationsRequest) ProtoMessage() {}
 
 func (x *ListNotificationsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[6]
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1057,7 +904,7 @@ func (x *ListNotificationsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListNotificationsRequest.ProtoReflect.Descriptor instead.
 func (*ListNotificationsRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{6}
+	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *ListNotificationsRequest) GetUnreadOnly() bool {
@@ -1106,7 +953,7 @@ type ListNotificationsResponse struct {
 
 func (x *ListNotificationsResponse) Reset() {
 	*x = ListNotificationsResponse{}
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[7]
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1118,7 +965,7 @@ func (x *ListNotificationsResponse) String() string {
 func (*ListNotificationsResponse) ProtoMessage() {}
 
 func (x *ListNotificationsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[7]
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1131,7 +978,7 @@ func (x *ListNotificationsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListNotificationsResponse.ProtoReflect.Descriptor instead.
 func (*ListNotificationsResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{7}
+	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *ListNotificationsResponse) GetNotifications() []*Notification {
@@ -1169,7 +1016,7 @@ type GetNotificationRequest struct {
 
 func (x *GetNotificationRequest) Reset() {
 	*x = GetNotificationRequest{}
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[8]
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1181,7 +1028,7 @@ func (x *GetNotificationRequest) String() string {
 func (*GetNotificationRequest) ProtoMessage() {}
 
 func (x *GetNotificationRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[8]
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1194,7 +1041,7 @@ func (x *GetNotificationRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetNotificationRequest.ProtoReflect.Descriptor instead.
 func (*GetNotificationRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{8}
+	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *GetNotificationRequest) GetId() string {
@@ -1223,7 +1070,7 @@ type GetNotificationResponse struct {
 
 func (x *GetNotificationResponse) Reset() {
 	*x = GetNotificationResponse{}
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[9]
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1235,7 +1082,7 @@ func (x *GetNotificationResponse) String() string {
 func (*GetNotificationResponse) ProtoMessage() {}
 
 func (x *GetNotificationResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[9]
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1248,7 +1095,7 @@ func (x *GetNotificationResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetNotificationResponse.ProtoReflect.Descriptor instead.
 func (*GetNotificationResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{9}
+	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *GetNotificationResponse) GetNotification() *Notification {
@@ -1286,7 +1133,7 @@ type MarkReadRequest struct {
 
 func (x *MarkReadRequest) Reset() {
 	*x = MarkReadRequest{}
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[10]
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1298,7 +1145,7 @@ func (x *MarkReadRequest) String() string {
 func (*MarkReadRequest) ProtoMessage() {}
 
 func (x *MarkReadRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[10]
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1311,7 +1158,7 @@ func (x *MarkReadRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MarkReadRequest.ProtoReflect.Descriptor instead.
 func (*MarkReadRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{10}
+	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *MarkReadRequest) GetIds() []string {
@@ -1344,7 +1191,7 @@ type MarkReadResponse struct {
 
 func (x *MarkReadResponse) Reset() {
 	*x = MarkReadResponse{}
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[11]
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1356,7 +1203,7 @@ func (x *MarkReadResponse) String() string {
 func (*MarkReadResponse) ProtoMessage() {}
 
 func (x *MarkReadResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[11]
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1369,7 +1216,7 @@ func (x *MarkReadResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MarkReadResponse.ProtoReflect.Descriptor instead.
 func (*MarkReadResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{11}
+	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *MarkReadResponse) GetMarkedCount() int32 {
@@ -1397,7 +1244,7 @@ type GetPreferencesRequest struct {
 
 func (x *GetPreferencesRequest) Reset() {
 	*x = GetPreferencesRequest{}
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[12]
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1409,7 +1256,7 @@ func (x *GetPreferencesRequest) String() string {
 func (*GetPreferencesRequest) ProtoMessage() {}
 
 func (x *GetPreferencesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[12]
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1422,7 +1269,7 @@ func (x *GetPreferencesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetPreferencesRequest.ProtoReflect.Descriptor instead.
 func (*GetPreferencesRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{12}
+	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{10}
 }
 
 // GetPreferencesResponse wraps the caller's preferences.
@@ -1443,7 +1290,7 @@ type GetPreferencesResponse struct {
 
 func (x *GetPreferencesResponse) Reset() {
 	*x = GetPreferencesResponse{}
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[13]
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1455,7 +1302,7 @@ func (x *GetPreferencesResponse) String() string {
 func (*GetPreferencesResponse) ProtoMessage() {}
 
 func (x *GetPreferencesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[13]
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1468,7 +1315,7 @@ func (x *GetPreferencesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetPreferencesResponse.ProtoReflect.Descriptor instead.
 func (*GetPreferencesResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{13}
+	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *GetPreferencesResponse) GetPreferences() *NotificationPreferences {
@@ -1492,11 +1339,18 @@ type UpdatePreferencesRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The full desired per-channel preference set. Replaces the stored set
 	// wholesale. An omitted channel is treated as "not configured" (i.e. removed),
-	// matching PUT semantics. The server validates targets (e.g. webhook/slack
-	// URLs must be https, email must be well-formed) before persisting.
+	// matching PUT semantics. The server validates EVERY target before persisting:
+	// email must be well-formed; webhook/slack URLs must pass the full SSRF guard
+	// documented on ChannelPreference.target (https-only, Slack-host allowlist,
+	// private/link-local/loopback IP denylist with pinned-IP connect). A target
+	// that fails validation rejects the whole update with INVALID_ARGUMENT + a
+	// field-level ErrorDetail (so a malicious URL never reaches storage), rather
+	// than silently dropping one channel.
 	Channels []*ChannelPreference `protobuf:"bytes,1,rep,name=channels,proto3" json:"channels,omitempty"`
 	// The full desired mute list (event-type patterns). Replaces the stored list.
-	// Empty = mute nothing.
+	// Empty = mute nothing. Server-bounded: at most 100 patterns (a runaway mute
+	// list is both a storage-abuse vector and a sign of misuse — real muting needs
+	// a handful of patterns, not thousands).
 	MutedEventPatterns []string `protobuf:"bytes,2,rep,name=muted_event_patterns,json=mutedEventPatterns,proto3" json:"muted_event_patterns,omitempty"`
 	// Caller-supplied idempotency key (typically a UUID). WHY on a settings write:
 	// a flaky client that retries an UpdatePreferences after a timeout must not
@@ -1511,7 +1365,7 @@ type UpdatePreferencesRequest struct {
 
 func (x *UpdatePreferencesRequest) Reset() {
 	*x = UpdatePreferencesRequest{}
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[14]
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1523,7 +1377,7 @@ func (x *UpdatePreferencesRequest) String() string {
 func (*UpdatePreferencesRequest) ProtoMessage() {}
 
 func (x *UpdatePreferencesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[14]
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1536,7 +1390,7 @@ func (x *UpdatePreferencesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdatePreferencesRequest.ProtoReflect.Descriptor instead.
 func (*UpdatePreferencesRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{14}
+	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *UpdatePreferencesRequest) GetChannels() []*ChannelPreference {
@@ -1573,7 +1427,7 @@ type UpdatePreferencesResponse struct {
 
 func (x *UpdatePreferencesResponse) Reset() {
 	*x = UpdatePreferencesResponse{}
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[15]
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1585,7 +1439,7 @@ func (x *UpdatePreferencesResponse) String() string {
 func (*UpdatePreferencesResponse) ProtoMessage() {}
 
 func (x *UpdatePreferencesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[15]
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1598,7 +1452,7 @@ func (x *UpdatePreferencesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdatePreferencesResponse.ProtoReflect.Descriptor instead.
 func (*UpdatePreferencesResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{15}
+	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *UpdatePreferencesResponse) GetPreferences() *NotificationPreferences {
@@ -1606,6 +1460,321 @@ func (x *UpdatePreferencesResponse) GetPreferences() *NotificationPreferences {
 		return x.Preferences
 	}
 	return nil
+}
+
+// ============================================================================
+// ListDeliveryAttempts (the delivery-log audit view)
+// ============================================================================
+//
+// WHY THIS RPC EXISTS: the design doc + implementation plan (Phase 9) call for a
+// `GetDeliveryLog` surface — the operator/owner view over the `delivery_log`
+// table: "did my alerts actually go out, and which failed?". GetNotification
+// returns the attempts for ONE notification; this is the cross-notification
+// query the plan asks for ("show me all my FAILED webhook deliveries in the last
+// hour"). It is the delivery-health counterpart to the inbox list. Folding it
+// into GetNotification would not answer the fleet question, so it is its own RPC.
+//
+// SECURITY / AUTHORITY: scoped to the AUTHENTICATED caller's own notifications —
+// there is no recipient_user_id field (same anti-IDOR rule as the inbox). The
+// status/channel filters are query predicates over the caller's own rows only.
+type ListDeliveryAttemptsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Optional: restrict to attempts on a single channel (e.g. only WEBHOOK).
+	// UNSPECIFIED = all channels.
+	Channel NotificationChannel `protobuf:"varint,1,opt,name=channel,proto3,enum=forgepoint.notification.v1.NotificationChannel" json:"channel,omitempty"`
+	// Optional: restrict to a single outcome (e.g. only FAILED, to triage broken
+	// endpoints). UNSPECIFIED = all statuses.
+	Status DeliveryStatus `protobuf:"varint,2,opt,name=status,proto3,enum=forgepoint.notification.v1.DeliveryStatus" json:"status,omitempty"`
+	// Optional: restrict to attempts for one of the caller's notifications. Empty =
+	// across all of the caller's notifications. If set, the server verifies the
+	// notification belongs to the caller (NOT_FOUND otherwise — no existence leak).
+	NotificationId string `protobuf:"bytes,3,opt,name=notification_id,json=notificationId,proto3" json:"notification_id,omitempty"`
+	// Cursor-based pagination (shared shape, see common.proto). Server caps
+	// page_size at 100 and defaults it to 20, enforced server-side regardless of
+	// the requested value — a client cannot demand an unbounded page.
+	Pagination    *v1.PaginationRequest `protobuf:"bytes,4,opt,name=pagination,proto3" json:"pagination,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListDeliveryAttemptsRequest) Reset() {
+	*x = ListDeliveryAttemptsRequest{}
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListDeliveryAttemptsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListDeliveryAttemptsRequest) ProtoMessage() {}
+
+func (x *ListDeliveryAttemptsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListDeliveryAttemptsRequest.ProtoReflect.Descriptor instead.
+func (*ListDeliveryAttemptsRequest) Descriptor() ([]byte, []int) {
+	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *ListDeliveryAttemptsRequest) GetChannel() NotificationChannel {
+	if x != nil {
+		return x.Channel
+	}
+	return NotificationChannel_NOTIFICATION_CHANNEL_UNSPECIFIED
+}
+
+func (x *ListDeliveryAttemptsRequest) GetStatus() DeliveryStatus {
+	if x != nil {
+		return x.Status
+	}
+	return DeliveryStatus_DELIVERY_STATUS_UNSPECIFIED
+}
+
+func (x *ListDeliveryAttemptsRequest) GetNotificationId() string {
+	if x != nil {
+		return x.NotificationId
+	}
+	return ""
+}
+
+func (x *ListDeliveryAttemptsRequest) GetPagination() *v1.PaginationRequest {
+	if x != nil {
+		return x.Pagination
+	}
+	return nil
+}
+
+// ListDeliveryAttemptsResponse returns one page of the caller's delivery log,
+// newest attempt first. Each row carries enough to debug delivery health without
+// echoing the target URL or any secret (see DeliveryAttempt's SECURITY note).
+type ListDeliveryAttemptsResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The page of delivery attempts (the delivery_log rows), newest first.
+	Attempts []*DeliveryAttempt `protobuf:"bytes,1,rep,name=attempts,proto3" json:"attempts,omitempty"`
+	// Which notification each attempt belongs to, positionally aligned 1:1 with
+	// `attempts` (attempts[i] is for notification_ids[i]). WHY a parallel slice
+	// rather than embedding the id on DeliveryAttempt: DeliveryAttempt is also
+	// returned by GetNotification where the notification id is already known/implied,
+	// so we keep the id off the attempt message and surface it here where the fleet
+	// view needs it. Lets the UI link each row back to its inbox entry.
+	NotificationIds []string `protobuf:"bytes,2,rep,name=notification_ids,json=notificationIds,proto3" json:"notification_ids,omitempty"`
+	// Pagination metadata: next_page_token + total_count. See common.proto.
+	Pagination    *v1.PaginationResponse `protobuf:"bytes,3,opt,name=pagination,proto3" json:"pagination,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListDeliveryAttemptsResponse) Reset() {
+	*x = ListDeliveryAttemptsResponse{}
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListDeliveryAttemptsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListDeliveryAttemptsResponse) ProtoMessage() {}
+
+func (x *ListDeliveryAttemptsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListDeliveryAttemptsResponse.ProtoReflect.Descriptor instead.
+func (*ListDeliveryAttemptsResponse) Descriptor() ([]byte, []int) {
+	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *ListDeliveryAttemptsResponse) GetAttempts() []*DeliveryAttempt {
+	if x != nil {
+		return x.Attempts
+	}
+	return nil
+}
+
+func (x *ListDeliveryAttemptsResponse) GetNotificationIds() []string {
+	if x != nil {
+		return x.NotificationIds
+	}
+	return nil
+}
+
+func (x *ListDeliveryAttemptsResponse) GetPagination() *v1.PaginationResponse {
+	if x != nil {
+		return x.Pagination
+	}
+	return nil
+}
+
+// ============================================================================
+// TestChannel (owner self-test — does NOT violate choreography)
+// ============================================================================
+//
+// WHY THIS RPC EXISTS: configuring a webhook/Slack URL is error-prone (wrong URL,
+// expired token, firewall). Every real notification product (PagerDuty, GitHub,
+// Grafana) lets you "send a test" to verify a channel works before relying on it.
+//
+// WHY IT DOESN'T BREAK CHOREOGRAPHY: choreography forbids a PRODUCER addressing
+// us to make us notify a THIRD party. This is the opposite: the OWNER asks us to
+// deliver a synthetic test to THEIR OWN configured channel. No platform producer
+// is involved, no other user is targeted, and it drives no business workflow. It
+// is a control-plane self-check, exactly like GetPreferences — so it belongs on
+// the gRPC surface, not the event bus.
+//
+// SECURITY: the test is delivered to the channel CONFIG of the AUTHENTICATED
+// caller (resolved from their stored preferences / TokenClaims) — the request
+// does NOT carry a free-form target, so it cannot be turned into an SSRF probe of
+// arbitrary URLs. The stored target was already SSRF-validated on write, and the
+// delivery path re-validates with a pinned-IP connect (the same guard as a real
+// delivery). The caller can only test channels they own.
+type TestChannelRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Which of the caller's configured channels to send the synthetic test over.
+	// Must correspond to an enabled ChannelPreference the caller owns (else
+	// FAILED_PRECONDITION). IN_APP testing is a no-op success (the inbox is always
+	// reachable). NEVER carries a URL — the destination is the stored, already-
+	// validated target, so this RPC is not an SSRF vector.
+	Channel NotificationChannel `protobuf:"varint,1,opt,name=channel,proto3,enum=forgepoint.notification.v1.NotificationChannel" json:"channel,omitempty"`
+	// Caller-supplied idempotency key (typically a UUID). WHY on a test-send: a
+	// client that retries after a timeout must not double-fire the test (spamming
+	// the user's Slack). Same key → the server returns the first attempt's result
+	// instead of sending again. The Stripe idempotency-key pattern. Optional but
+	// recommended for automated callers / CLI retries.
+	IdempotencyKey string `protobuf:"bytes,2,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *TestChannelRequest) Reset() {
+	*x = TestChannelRequest{}
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TestChannelRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TestChannelRequest) ProtoMessage() {}
+
+func (x *TestChannelRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TestChannelRequest.ProtoReflect.Descriptor instead.
+func (*TestChannelRequest) Descriptor() ([]byte, []int) {
+	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *TestChannelRequest) GetChannel() NotificationChannel {
+	if x != nil {
+		return x.Channel
+	}
+	return NotificationChannel_NOTIFICATION_CHANNEL_UNSPECIFIED
+}
+
+func (x *TestChannelRequest) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
+}
+
+// TestChannelResponse reports the synthetic delivery's outcome so the settings UI
+// can show "✓ delivered" / "✗ 401 from Slack" inline next to the channel.
+type TestChannelResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Outcome of the test delivery (DELIVERED on success; FAILED with detail below
+	// on error; SUPPRESSED if the channel was disabled).
+	Status DeliveryStatus `protobuf:"varint,1,opt,name=status,proto3,enum=forgepoint.notification.v1.DeliveryStatus" json:"status,omitempty"`
+	// For HTTP channels: the response status code observed (0 if none / non-HTTP).
+	ResponseCode int32 `protobuf:"varint,2,opt,name=response_code,json=responseCode,proto3" json:"response_code,omitempty"`
+	// Human-readable failure detail on error (e.g. "401 from Slack",
+	// "connection refused", "target failed SSRF revalidation"). Empty on success.
+	// Mirrors DeliveryAttempt.error_message — for the operator, not end-user copy.
+	ErrorMessage  string `protobuf:"bytes,3,opt,name=error_message,json=errorMessage,proto3" json:"error_message,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TestChannelResponse) Reset() {
+	*x = TestChannelResponse{}
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TestChannelResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TestChannelResponse) ProtoMessage() {}
+
+func (x *TestChannelResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_notification_v1_notification_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TestChannelResponse.ProtoReflect.Descriptor instead.
+func (*TestChannelResponse) Descriptor() ([]byte, []int) {
+	return file_forgepoint_notification_v1_notification_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *TestChannelResponse) GetStatus() DeliveryStatus {
+	if x != nil {
+		return x.Status
+	}
+	return DeliveryStatus_DELIVERY_STATUS_UNSPECIFIED
+}
+
+func (x *TestChannelResponse) GetResponseCode() int32 {
+	if x != nil {
+		return x.ResponseCode
+	}
+	return 0
+}
+
+func (x *TestChannelResponse) GetErrorMessage() string {
+	if x != nil {
+		return x.ErrorMessage
+	}
+	return ""
 }
 
 var File_forgepoint_notification_v1_notification_proto protoreflect.FileDescriptor
@@ -1646,23 +1815,7 @@ const file_forgepoint_notification_v1_notification_proto_rawDesc = "" +
 	"\bchannels\x18\x02 \x03(\v2-.forgepoint.notification.v1.ChannelPreferenceR\bchannels\x120\n" +
 	"\x14muted_event_patterns\x18\x03 \x03(\tR\x12mutedEventPatterns\x129\n" +
 	"\n" +
-	"updated_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\"\x9a\x02\n" +
-	"\x1aNotificationDeliveredEvent\x12'\n" +
-	"\x0fnotification_id\x18\x01 \x01(\tR\x0enotificationId\x12*\n" +
-	"\x11recipient_user_id\x18\x02 \x01(\tR\x0frecipientUserId\x12I\n" +
-	"\achannel\x18\x03 \x01(\x0e2/.forgepoint.notification.v1.NotificationChannelR\achannel\x12\x1d\n" +
-	"\n" +
-	"event_type\x18\x04 \x01(\tR\teventType\x12=\n" +
-	"\fdelivered_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\vdeliveredAt\"\xd2\x02\n" +
-	"\x17NotificationFailedEvent\x12'\n" +
-	"\x0fnotification_id\x18\x01 \x01(\tR\x0enotificationId\x12*\n" +
-	"\x11recipient_user_id\x18\x02 \x01(\tR\x0frecipientUserId\x12I\n" +
-	"\achannel\x18\x03 \x01(\x0e2/.forgepoint.notification.v1.NotificationChannelR\achannel\x12\x1d\n" +
-	"\n" +
-	"event_type\x18\x04 \x01(\tR\teventType\x12\x1a\n" +
-	"\battempts\x18\x05 \x01(\x05R\battempts\x12#\n" +
-	"\rerror_message\x18\x06 \x01(\tR\ferrorMessage\x127\n" +
-	"\tfailed_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\bfailedAt\"\x85\x02\n" +
+	"updated_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\"\x85\x02\n" +
 	"\x18ListNotificationsRequest\x12\x1f\n" +
 	"\vunread_only\x18\x01 \x01(\bR\n" +
 	"unreadOnly\x12S\n" +
@@ -1696,7 +1849,27 @@ const file_forgepoint_notification_v1_notification_proto_rawDesc = "" +
 	"\x14muted_event_patterns\x18\x02 \x03(\tR\x12mutedEventPatterns\x12'\n" +
 	"\x0fidempotency_key\x18\x03 \x01(\tR\x0eidempotencyKey\"r\n" +
 	"\x19UpdatePreferencesResponse\x12U\n" +
-	"\vpreferences\x18\x01 \x01(\v23.forgepoint.notification.v1.NotificationPreferencesR\vpreferences*\xbe\x01\n" +
+	"\vpreferences\x18\x01 \x01(\v23.forgepoint.notification.v1.NotificationPreferencesR\vpreferences\"\x9e\x02\n" +
+	"\x1bListDeliveryAttemptsRequest\x12I\n" +
+	"\achannel\x18\x01 \x01(\x0e2/.forgepoint.notification.v1.NotificationChannelR\achannel\x12B\n" +
+	"\x06status\x18\x02 \x01(\x0e2*.forgepoint.notification.v1.DeliveryStatusR\x06status\x12'\n" +
+	"\x0fnotification_id\x18\x03 \x01(\tR\x0enotificationId\x12G\n" +
+	"\n" +
+	"pagination\x18\x04 \x01(\v2'.forgepoint.common.v1.PaginationRequestR\n" +
+	"pagination\"\xdc\x01\n" +
+	"\x1cListDeliveryAttemptsResponse\x12G\n" +
+	"\battempts\x18\x01 \x03(\v2+.forgepoint.notification.v1.DeliveryAttemptR\battempts\x12)\n" +
+	"\x10notification_ids\x18\x02 \x03(\tR\x0fnotificationIds\x12H\n" +
+	"\n" +
+	"pagination\x18\x03 \x01(\v2(.forgepoint.common.v1.PaginationResponseR\n" +
+	"pagination\"\x88\x01\n" +
+	"\x12TestChannelRequest\x12I\n" +
+	"\achannel\x18\x01 \x01(\x0e2/.forgepoint.notification.v1.NotificationChannelR\achannel\x12'\n" +
+	"\x0fidempotency_key\x18\x02 \x01(\tR\x0eidempotencyKey\"\xa3\x01\n" +
+	"\x13TestChannelResponse\x12B\n" +
+	"\x06status\x18\x01 \x01(\x0e2*.forgepoint.notification.v1.DeliveryStatusR\x06status\x12#\n" +
+	"\rresponse_code\x18\x02 \x01(\x05R\fresponseCode\x12#\n" +
+	"\rerror_message\x18\x03 \x01(\tR\ferrorMessage*\xbe\x01\n" +
 	"\x13NotificationChannel\x12$\n" +
 	" NOTIFICATION_CHANNEL_UNSPECIFIED\x10\x00\x12\x1f\n" +
 	"\x1bNOTIFICATION_CHANNEL_IN_APP\x10\x01\x12 \n" +
@@ -1715,13 +1888,15 @@ const file_forgepoint_notification_v1_notification_proto_rawDesc = "" +
 	"\x18DELIVERY_STATUS_RETRYING\x10\x02\x12\x1d\n" +
 	"\x19DELIVERY_STATUS_DELIVERED\x10\x03\x12\x1a\n" +
 	"\x16DELIVERY_STATUS_FAILED\x10\x04\x12\x1e\n" +
-	"\x1aDELIVERY_STATUS_SUPPRESSED\x10\x052\xf7\x04\n" +
+	"\x1aDELIVERY_STATUS_SUPPRESSED\x10\x052\xf3\x06\n" +
 	"\x13NotificationService\x12\x80\x01\n" +
 	"\x11ListNotifications\x124.forgepoint.notification.v1.ListNotificationsRequest\x1a5.forgepoint.notification.v1.ListNotificationsResponse\x12z\n" +
 	"\x0fGetNotification\x122.forgepoint.notification.v1.GetNotificationRequest\x1a3.forgepoint.notification.v1.GetNotificationResponse\x12e\n" +
-	"\bMarkRead\x12+.forgepoint.notification.v1.MarkReadRequest\x1a,.forgepoint.notification.v1.MarkReadResponse\x12w\n" +
+	"\bMarkRead\x12+.forgepoint.notification.v1.MarkReadRequest\x1a,.forgepoint.notification.v1.MarkReadResponse\x12\x89\x01\n" +
+	"\x14ListDeliveryAttempts\x127.forgepoint.notification.v1.ListDeliveryAttemptsRequest\x1a8.forgepoint.notification.v1.ListDeliveryAttemptsResponse\x12w\n" +
 	"\x0eGetPreferences\x121.forgepoint.notification.v1.GetPreferencesRequest\x1a2.forgepoint.notification.v1.GetPreferencesResponse\x12\x80\x01\n" +
-	"\x11UpdatePreferences\x124.forgepoint.notification.v1.UpdatePreferencesRequest\x1a5.forgepoint.notification.v1.UpdatePreferencesResponseBTZRgithub.com/abd-ulbasit/forgepoint/gen/go/forgepoint/notification/v1;notificationv1b\x06proto3"
+	"\x11UpdatePreferences\x124.forgepoint.notification.v1.UpdatePreferencesRequest\x1a5.forgepoint.notification.v1.UpdatePreferencesResponse\x12n\n" +
+	"\vTestChannel\x12..forgepoint.notification.v1.TestChannelRequest\x1a/.forgepoint.notification.v1.TestChannelResponseBTZRgithub.com/abd-ulbasit/forgepoint/gen/go/forgepoint/notification/v1;notificationv1b\x06proto3"
 
 var (
 	file_forgepoint_notification_v1_notification_proto_rawDescOnce sync.Once
@@ -1736,71 +1911,80 @@ func file_forgepoint_notification_v1_notification_proto_rawDescGZIP() []byte {
 }
 
 var file_forgepoint_notification_v1_notification_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
-var file_forgepoint_notification_v1_notification_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
+var file_forgepoint_notification_v1_notification_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
 var file_forgepoint_notification_v1_notification_proto_goTypes = []any{
-	(NotificationChannel)(0),           // 0: forgepoint.notification.v1.NotificationChannel
-	(NotificationSeverity)(0),          // 1: forgepoint.notification.v1.NotificationSeverity
-	(DeliveryStatus)(0),                // 2: forgepoint.notification.v1.DeliveryStatus
-	(*Notification)(nil),               // 3: forgepoint.notification.v1.Notification
-	(*DeliveryAttempt)(nil),            // 4: forgepoint.notification.v1.DeliveryAttempt
-	(*ChannelPreference)(nil),          // 5: forgepoint.notification.v1.ChannelPreference
-	(*NotificationPreferences)(nil),    // 6: forgepoint.notification.v1.NotificationPreferences
-	(*NotificationDeliveredEvent)(nil), // 7: forgepoint.notification.v1.NotificationDeliveredEvent
-	(*NotificationFailedEvent)(nil),    // 8: forgepoint.notification.v1.NotificationFailedEvent
-	(*ListNotificationsRequest)(nil),   // 9: forgepoint.notification.v1.ListNotificationsRequest
-	(*ListNotificationsResponse)(nil),  // 10: forgepoint.notification.v1.ListNotificationsResponse
-	(*GetNotificationRequest)(nil),     // 11: forgepoint.notification.v1.GetNotificationRequest
-	(*GetNotificationResponse)(nil),    // 12: forgepoint.notification.v1.GetNotificationResponse
-	(*MarkReadRequest)(nil),            // 13: forgepoint.notification.v1.MarkReadRequest
-	(*MarkReadResponse)(nil),           // 14: forgepoint.notification.v1.MarkReadResponse
-	(*GetPreferencesRequest)(nil),      // 15: forgepoint.notification.v1.GetPreferencesRequest
-	(*GetPreferencesResponse)(nil),     // 16: forgepoint.notification.v1.GetPreferencesResponse
-	(*UpdatePreferencesRequest)(nil),   // 17: forgepoint.notification.v1.UpdatePreferencesRequest
-	(*UpdatePreferencesResponse)(nil),  // 18: forgepoint.notification.v1.UpdatePreferencesResponse
-	(*timestamppb.Timestamp)(nil),      // 19: google.protobuf.Timestamp
-	(*v1.PaginationRequest)(nil),       // 20: forgepoint.common.v1.PaginationRequest
-	(*v1.PaginationResponse)(nil),      // 21: forgepoint.common.v1.PaginationResponse
+	(NotificationChannel)(0),             // 0: forgepoint.notification.v1.NotificationChannel
+	(NotificationSeverity)(0),            // 1: forgepoint.notification.v1.NotificationSeverity
+	(DeliveryStatus)(0),                  // 2: forgepoint.notification.v1.DeliveryStatus
+	(*Notification)(nil),                 // 3: forgepoint.notification.v1.Notification
+	(*DeliveryAttempt)(nil),              // 4: forgepoint.notification.v1.DeliveryAttempt
+	(*ChannelPreference)(nil),            // 5: forgepoint.notification.v1.ChannelPreference
+	(*NotificationPreferences)(nil),      // 6: forgepoint.notification.v1.NotificationPreferences
+	(*ListNotificationsRequest)(nil),     // 7: forgepoint.notification.v1.ListNotificationsRequest
+	(*ListNotificationsResponse)(nil),    // 8: forgepoint.notification.v1.ListNotificationsResponse
+	(*GetNotificationRequest)(nil),       // 9: forgepoint.notification.v1.GetNotificationRequest
+	(*GetNotificationResponse)(nil),      // 10: forgepoint.notification.v1.GetNotificationResponse
+	(*MarkReadRequest)(nil),              // 11: forgepoint.notification.v1.MarkReadRequest
+	(*MarkReadResponse)(nil),             // 12: forgepoint.notification.v1.MarkReadResponse
+	(*GetPreferencesRequest)(nil),        // 13: forgepoint.notification.v1.GetPreferencesRequest
+	(*GetPreferencesResponse)(nil),       // 14: forgepoint.notification.v1.GetPreferencesResponse
+	(*UpdatePreferencesRequest)(nil),     // 15: forgepoint.notification.v1.UpdatePreferencesRequest
+	(*UpdatePreferencesResponse)(nil),    // 16: forgepoint.notification.v1.UpdatePreferencesResponse
+	(*ListDeliveryAttemptsRequest)(nil),  // 17: forgepoint.notification.v1.ListDeliveryAttemptsRequest
+	(*ListDeliveryAttemptsResponse)(nil), // 18: forgepoint.notification.v1.ListDeliveryAttemptsResponse
+	(*TestChannelRequest)(nil),           // 19: forgepoint.notification.v1.TestChannelRequest
+	(*TestChannelResponse)(nil),          // 20: forgepoint.notification.v1.TestChannelResponse
+	(*timestamppb.Timestamp)(nil),        // 21: google.protobuf.Timestamp
+	(*v1.PaginationRequest)(nil),         // 22: forgepoint.common.v1.PaginationRequest
+	(*v1.PaginationResponse)(nil),        // 23: forgepoint.common.v1.PaginationResponse
 }
 var file_forgepoint_notification_v1_notification_proto_depIdxs = []int32{
 	1,  // 0: forgepoint.notification.v1.Notification.severity:type_name -> forgepoint.notification.v1.NotificationSeverity
 	0,  // 1: forgepoint.notification.v1.Notification.channels:type_name -> forgepoint.notification.v1.NotificationChannel
-	19, // 2: forgepoint.notification.v1.Notification.created_at:type_name -> google.protobuf.Timestamp
-	19, // 3: forgepoint.notification.v1.Notification.read_at:type_name -> google.protobuf.Timestamp
+	21, // 2: forgepoint.notification.v1.Notification.created_at:type_name -> google.protobuf.Timestamp
+	21, // 3: forgepoint.notification.v1.Notification.read_at:type_name -> google.protobuf.Timestamp
 	0,  // 4: forgepoint.notification.v1.DeliveryAttempt.channel:type_name -> forgepoint.notification.v1.NotificationChannel
 	2,  // 5: forgepoint.notification.v1.DeliveryAttempt.status:type_name -> forgepoint.notification.v1.DeliveryStatus
-	19, // 6: forgepoint.notification.v1.DeliveryAttempt.attempted_at:type_name -> google.protobuf.Timestamp
+	21, // 6: forgepoint.notification.v1.DeliveryAttempt.attempted_at:type_name -> google.protobuf.Timestamp
 	0,  // 7: forgepoint.notification.v1.ChannelPreference.channel:type_name -> forgepoint.notification.v1.NotificationChannel
 	1,  // 8: forgepoint.notification.v1.ChannelPreference.min_severity:type_name -> forgepoint.notification.v1.NotificationSeverity
 	5,  // 9: forgepoint.notification.v1.NotificationPreferences.channels:type_name -> forgepoint.notification.v1.ChannelPreference
-	19, // 10: forgepoint.notification.v1.NotificationPreferences.updated_at:type_name -> google.protobuf.Timestamp
-	0,  // 11: forgepoint.notification.v1.NotificationDeliveredEvent.channel:type_name -> forgepoint.notification.v1.NotificationChannel
-	19, // 12: forgepoint.notification.v1.NotificationDeliveredEvent.delivered_at:type_name -> google.protobuf.Timestamp
-	0,  // 13: forgepoint.notification.v1.NotificationFailedEvent.channel:type_name -> forgepoint.notification.v1.NotificationChannel
-	19, // 14: forgepoint.notification.v1.NotificationFailedEvent.failed_at:type_name -> google.protobuf.Timestamp
-	1,  // 15: forgepoint.notification.v1.ListNotificationsRequest.min_severity:type_name -> forgepoint.notification.v1.NotificationSeverity
-	20, // 16: forgepoint.notification.v1.ListNotificationsRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
-	3,  // 17: forgepoint.notification.v1.ListNotificationsResponse.notifications:type_name -> forgepoint.notification.v1.Notification
-	21, // 18: forgepoint.notification.v1.ListNotificationsResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
-	3,  // 19: forgepoint.notification.v1.GetNotificationResponse.notification:type_name -> forgepoint.notification.v1.Notification
-	4,  // 20: forgepoint.notification.v1.GetNotificationResponse.delivery_attempts:type_name -> forgepoint.notification.v1.DeliveryAttempt
-	6,  // 21: forgepoint.notification.v1.GetPreferencesResponse.preferences:type_name -> forgepoint.notification.v1.NotificationPreferences
-	5,  // 22: forgepoint.notification.v1.UpdatePreferencesRequest.channels:type_name -> forgepoint.notification.v1.ChannelPreference
-	6,  // 23: forgepoint.notification.v1.UpdatePreferencesResponse.preferences:type_name -> forgepoint.notification.v1.NotificationPreferences
-	9,  // 24: forgepoint.notification.v1.NotificationService.ListNotifications:input_type -> forgepoint.notification.v1.ListNotificationsRequest
-	11, // 25: forgepoint.notification.v1.NotificationService.GetNotification:input_type -> forgepoint.notification.v1.GetNotificationRequest
-	13, // 26: forgepoint.notification.v1.NotificationService.MarkRead:input_type -> forgepoint.notification.v1.MarkReadRequest
-	15, // 27: forgepoint.notification.v1.NotificationService.GetPreferences:input_type -> forgepoint.notification.v1.GetPreferencesRequest
-	17, // 28: forgepoint.notification.v1.NotificationService.UpdatePreferences:input_type -> forgepoint.notification.v1.UpdatePreferencesRequest
-	10, // 29: forgepoint.notification.v1.NotificationService.ListNotifications:output_type -> forgepoint.notification.v1.ListNotificationsResponse
-	12, // 30: forgepoint.notification.v1.NotificationService.GetNotification:output_type -> forgepoint.notification.v1.GetNotificationResponse
-	14, // 31: forgepoint.notification.v1.NotificationService.MarkRead:output_type -> forgepoint.notification.v1.MarkReadResponse
-	16, // 32: forgepoint.notification.v1.NotificationService.GetPreferences:output_type -> forgepoint.notification.v1.GetPreferencesResponse
-	18, // 33: forgepoint.notification.v1.NotificationService.UpdatePreferences:output_type -> forgepoint.notification.v1.UpdatePreferencesResponse
-	29, // [29:34] is the sub-list for method output_type
-	24, // [24:29] is the sub-list for method input_type
-	24, // [24:24] is the sub-list for extension type_name
-	24, // [24:24] is the sub-list for extension extendee
-	0,  // [0:24] is the sub-list for field type_name
+	21, // 10: forgepoint.notification.v1.NotificationPreferences.updated_at:type_name -> google.protobuf.Timestamp
+	1,  // 11: forgepoint.notification.v1.ListNotificationsRequest.min_severity:type_name -> forgepoint.notification.v1.NotificationSeverity
+	22, // 12: forgepoint.notification.v1.ListNotificationsRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
+	3,  // 13: forgepoint.notification.v1.ListNotificationsResponse.notifications:type_name -> forgepoint.notification.v1.Notification
+	23, // 14: forgepoint.notification.v1.ListNotificationsResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
+	3,  // 15: forgepoint.notification.v1.GetNotificationResponse.notification:type_name -> forgepoint.notification.v1.Notification
+	4,  // 16: forgepoint.notification.v1.GetNotificationResponse.delivery_attempts:type_name -> forgepoint.notification.v1.DeliveryAttempt
+	6,  // 17: forgepoint.notification.v1.GetPreferencesResponse.preferences:type_name -> forgepoint.notification.v1.NotificationPreferences
+	5,  // 18: forgepoint.notification.v1.UpdatePreferencesRequest.channels:type_name -> forgepoint.notification.v1.ChannelPreference
+	6,  // 19: forgepoint.notification.v1.UpdatePreferencesResponse.preferences:type_name -> forgepoint.notification.v1.NotificationPreferences
+	0,  // 20: forgepoint.notification.v1.ListDeliveryAttemptsRequest.channel:type_name -> forgepoint.notification.v1.NotificationChannel
+	2,  // 21: forgepoint.notification.v1.ListDeliveryAttemptsRequest.status:type_name -> forgepoint.notification.v1.DeliveryStatus
+	22, // 22: forgepoint.notification.v1.ListDeliveryAttemptsRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
+	4,  // 23: forgepoint.notification.v1.ListDeliveryAttemptsResponse.attempts:type_name -> forgepoint.notification.v1.DeliveryAttempt
+	23, // 24: forgepoint.notification.v1.ListDeliveryAttemptsResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
+	0,  // 25: forgepoint.notification.v1.TestChannelRequest.channel:type_name -> forgepoint.notification.v1.NotificationChannel
+	2,  // 26: forgepoint.notification.v1.TestChannelResponse.status:type_name -> forgepoint.notification.v1.DeliveryStatus
+	7,  // 27: forgepoint.notification.v1.NotificationService.ListNotifications:input_type -> forgepoint.notification.v1.ListNotificationsRequest
+	9,  // 28: forgepoint.notification.v1.NotificationService.GetNotification:input_type -> forgepoint.notification.v1.GetNotificationRequest
+	11, // 29: forgepoint.notification.v1.NotificationService.MarkRead:input_type -> forgepoint.notification.v1.MarkReadRequest
+	17, // 30: forgepoint.notification.v1.NotificationService.ListDeliveryAttempts:input_type -> forgepoint.notification.v1.ListDeliveryAttemptsRequest
+	13, // 31: forgepoint.notification.v1.NotificationService.GetPreferences:input_type -> forgepoint.notification.v1.GetPreferencesRequest
+	15, // 32: forgepoint.notification.v1.NotificationService.UpdatePreferences:input_type -> forgepoint.notification.v1.UpdatePreferencesRequest
+	19, // 33: forgepoint.notification.v1.NotificationService.TestChannel:input_type -> forgepoint.notification.v1.TestChannelRequest
+	8,  // 34: forgepoint.notification.v1.NotificationService.ListNotifications:output_type -> forgepoint.notification.v1.ListNotificationsResponse
+	10, // 35: forgepoint.notification.v1.NotificationService.GetNotification:output_type -> forgepoint.notification.v1.GetNotificationResponse
+	12, // 36: forgepoint.notification.v1.NotificationService.MarkRead:output_type -> forgepoint.notification.v1.MarkReadResponse
+	18, // 37: forgepoint.notification.v1.NotificationService.ListDeliveryAttempts:output_type -> forgepoint.notification.v1.ListDeliveryAttemptsResponse
+	14, // 38: forgepoint.notification.v1.NotificationService.GetPreferences:output_type -> forgepoint.notification.v1.GetPreferencesResponse
+	16, // 39: forgepoint.notification.v1.NotificationService.UpdatePreferences:output_type -> forgepoint.notification.v1.UpdatePreferencesResponse
+	20, // 40: forgepoint.notification.v1.NotificationService.TestChannel:output_type -> forgepoint.notification.v1.TestChannelResponse
+	34, // [34:41] is the sub-list for method output_type
+	27, // [27:34] is the sub-list for method input_type
+	27, // [27:27] is the sub-list for extension type_name
+	27, // [27:27] is the sub-list for extension extendee
+	0,  // [0:27] is the sub-list for field type_name
 }
 
 func init() { file_forgepoint_notification_v1_notification_proto_init() }
@@ -1814,7 +1998,7 @@ func file_forgepoint_notification_v1_notification_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_forgepoint_notification_v1_notification_proto_rawDesc), len(file_forgepoint_notification_v1_notification_proto_rawDesc)),
 			NumEnums:      3,
-			NumMessages:   16,
+			NumMessages:   18,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

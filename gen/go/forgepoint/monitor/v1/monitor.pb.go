@@ -11,12 +11,15 @@
 //
 // WHAT'S HERE:
 //   - Domain messages: Monitor (config + baseline), DriftReport, DriftMetric,
-//     MonitorStatus, GroundTruthLabel
-//   - MonitorService RPCs: configure monitors, read drift reports (one +
-//     paginated list), read live status, submit delayed ground truth, and
-//     stream drift events live (server-streaming)
-//   - Event-payload messages: ModelDriftDetectedEvent — the typed payload that
-//     rides inside the common EventEnvelope's Any field on fp.models.drift.detected
+//     MonitorStatus, ModelHealth, GroundTruthLabel
+//   - MonitorService RPCs: configure / list / delete monitors, read model health
+//     and drift reports (one + paginated list), read live status, reset the
+//     baseline, submit delayed ground truth, and stream drift events live
+//     (server-streaming)
+//   - NO event-payload messages: the drift event this service produces
+//     (ModelDriftDetected on fp.models.drift.detected) is defined ONCE in the
+//     canonical forgepoint.events.v1 contract and imported, NOT redefined here.
+//     See the EVENT CONTRACT note near the bottom of this file for the mapping.
 //
 // PATTERN — Streaming Aggregation + Closed-Loop Control:
 //   This is the most "alive" part of the platform. Two ideas combine:
@@ -89,7 +92,6 @@ import (
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	durationpb "google.golang.org/protobuf/types/known/durationpb"
-	structpb "google.golang.org/protobuf/types/known/structpb"
 	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
 	reflect "reflect"
 	sync "sync"
@@ -521,6 +523,14 @@ type Monitor struct {
 	// The model this monitor watches (e.g., "fraud-detector"). Stable name from
 	// the Model Registry; combined with the live serving version at event time.
 	ModelName string `protobuf:"bytes,2,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
+	// SERVER-AUTHORITATIVE. The team that owns this monitor, derived from the
+	// creator's auth claims on ConfigureMonitor — NEVER from a request field.
+	// WHY it is server-set and not in the request: tenancy is an authz fact, and a
+	// client that could name its own team could create/read monitors for another
+	// tenant's models (a cross-tenant data leak). All reads (List/Get/Status) are
+	// additionally scoped to the caller's team by the auth interceptor; this field
+	// only RECORDS the owner for display/audit, it is not the access-control input.
+	OwnerTeam string `protobuf:"bytes,14,opt,name=owner_team,json=ownerTeam,proto3" json:"owner_team,omitempty"`
 	// Window length over which drift is computed. Two ways to bound a sliding
 	// window — by TIME (this field) or by COUNT (window_size below). The monitor
 	// uses whichever is set; if both are set, a window closes when EITHER bound is
@@ -529,10 +539,19 @@ type Monitor struct {
 	WindowDuration *durationpb.Duration `protobuf:"bytes,3,opt,name=window_duration,json=windowDuration,proto3" json:"window_duration,omitempty"`
 	// Max number of inference events per window (count-based bound). See above for
 	// how it interacts with window_duration. 0 = unbounded by count (time only).
+	// BOUNDS (server-validated on write): must be >= 0 and <= 1_000_000. The upper
+	// cap is a MEMORY guard — the live window is held in Redis, so an unbounded or
+	// absurd window_size would let a single monitor pin gigabytes of RAM. Values
+	// above the cap are rejected with INVALID_ARGUMENT (not silently clamped, so
+	// the operator notices). int32 (max ~2.1B) comfortably covers the 1M cap with
+	// no overflow risk in window-fill arithmetic.
 	WindowSize int32 `protobuf:"varint,4,opt,name=window_size,json=windowSize,proto3" json:"window_size,omitempty"`
 	// Minimum samples before the monitor will SCORE a window. Below this the
 	// monitor stays WARMING_UP — comparing a near-empty window to a large baseline
 	// yields noise, so we refuse to emit a verdict until the sample is sound.
+	// BOUNDS (server-validated): 0 <= min_samples <= window_size when window_size>0
+	// (you cannot require more samples than the window can hold, else it never
+	// scores). Rejected with INVALID_ARGUMENT otherwise.
 	MinSamples int32 `protobuf:"varint,5,opt,name=min_samples,json=minSamples,proto3" json:"min_samples,omitempty"`
 	// Per-drift-type thresholds (data / prediction / performance). A monitor may
 	// configure any subset; an unconfigured type is simply not scored.
@@ -606,6 +625,13 @@ func (x *Monitor) GetId() string {
 func (x *Monitor) GetModelName() string {
 	if x != nil {
 		return x.ModelName
+	}
+	return ""
+}
+
+func (x *Monitor) GetOwnerTeam() string {
+	if x != nil {
+		return x.OwnerTeam
 	}
 	return ""
 }
@@ -800,8 +826,10 @@ func (x *DriftMetric) GetSeverity() DriftSeverity {
 // WHY a first-class, persisted report (not just an event): the report is the
 // durable record of a single window's verdict. It backs the paginated history
 // (ListDriftReports), the Web UI time series, and the audit trail ("why did the
-// model retrain at 03:14?"). The ModelDriftDetected event carries a *reference*
-// to this report; the report itself is the source of truth.
+// model retrain at 03:14?"). The canonical events.ModelDriftDetected event
+// carries a *flattened copy* of this report's fields + its report_id (it does NOT
+// embed monitor.DriftReport — events are decoupled from API types); this
+// persisted report is the source of truth a consumer deep-links back to.
 //
 // IDEMPOTENCY — window_id is the natural key: each closed window has a stable
 // id, and a report is persisted idempotently on it (Task 16.3: "idempotent on
@@ -1064,6 +1092,140 @@ func (x *MonitorStatus) GetDriftEventsTotal() int64 {
 }
 
 // ============================================================================
+// ModelHealth
+// ============================================================================
+//
+// WHY a dedicated health rollup distinct from MonitorStatus: the design doc and
+// the `fp monitor <model>` CLI ask a SIMPLER question than MonitorStatus answers
+// — "is this model healthy right now, in one line?". MonitorStatus exposes the
+// raw live machinery (window fill, latest report, lifecycle state) for an
+// operator drilling in; ModelHealth is the AT-A-GLANCE verdict a dashboard tile,
+// a CLI summary, or a Rollouts AnalysisTemplate (Phase 22) consumes. Splitting
+// them keeps GetModelHealth a cheap, cacheable read and lets the health verdict
+// evolve (e.g., fold error-rate from InferenceFailed in later) without bloating
+// the status view.
+//
+// SERVER-AUTHORITATIVE: every field here is computed by the monitor. A client
+// cannot assert its own model "healthy".
+type ModelHealth struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The model this health verdict is for.
+	ModelName string `protobuf:"bytes,1,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
+	// The version currently judged (the live production/served version the monitor
+	// is scoring). Empty if no traffic has been seen yet.
+	ModelVersion string `protobuf:"bytes,2,opt,name=model_version,json=modelVersion,proto3" json:"model_version,omitempty"`
+	// The headline verdict: the MAX severity across all active drift signals
+	// (data / prediction / performance) in the most recent scored window. OK means
+	// healthy; WARNING/CRITICAL surface the worst signal. This is the single value
+	// a dashboard tile colors on. SERVER-computed.
+	OverallSeverity DriftSeverity `protobuf:"varint,3,opt,name=overall_severity,json=overallSeverity,proto3,enum=forgepoint.monitor.v1.DriftSeverity" json:"overall_severity,omitempty"`
+	// The most recent severity per drift type, so a UI can render a 3-light panel
+	// (data / prediction / performance) without fetching every report. Keyed by
+	// the DriftType enum's integer value (proto3 map keys cannot be enums). A type
+	// absent from the map is simply not configured/scored for this model.
+	SeverityByType map[int32]DriftSeverity `protobuf:"bytes,4,rep,name=severity_by_type,json=severityByType,proto3" json:"severity_by_type,omitempty" protobuf_key:"varint,1,opt,name=key" protobuf_val:"varint,2,opt,name=value,enum=forgepoint.monitor.v1.DriftSeverity"`
+	// Live lifecycle state (mirrors Monitor.state) — distinguishes "healthy" from
+	// "not scoring yet" (WARMING_UP), which a bare severity of OK would conflate.
+	State MonitorState `protobuf:"varint,5,opt,name=state,proto3,enum=forgepoint.monitor.v1.MonitorState" json:"state,omitempty"`
+	// The most recent drift report id, a deep-link handle for "see why". Empty
+	// until the first window closes.
+	LatestReportId string `protobuf:"bytes,6,opt,name=latest_report_id,json=latestReportId,proto3" json:"latest_report_id,omitempty"`
+	// When the monitor last consumed an inference event for this model. A stale
+	// value means the model is getting no traffic (its own kind of alert).
+	LastEventAt *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=last_event_at,json=lastEventAt,proto3" json:"last_event_at,omitempty"`
+	// Count of CRITICAL reports in this monitor's lifetime — a cheap trend KPI.
+	DriftEventsTotal int64 `protobuf:"varint,8,opt,name=drift_events_total,json=driftEventsTotal,proto3" json:"drift_events_total,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *ModelHealth) Reset() {
+	*x = ModelHealth{}
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ModelHealth) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ModelHealth) ProtoMessage() {}
+
+func (x *ModelHealth) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ModelHealth.ProtoReflect.Descriptor instead.
+func (*ModelHealth) Descriptor() ([]byte, []int) {
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *ModelHealth) GetModelName() string {
+	if x != nil {
+		return x.ModelName
+	}
+	return ""
+}
+
+func (x *ModelHealth) GetModelVersion() string {
+	if x != nil {
+		return x.ModelVersion
+	}
+	return ""
+}
+
+func (x *ModelHealth) GetOverallSeverity() DriftSeverity {
+	if x != nil {
+		return x.OverallSeverity
+	}
+	return DriftSeverity_DRIFT_SEVERITY_UNSPECIFIED
+}
+
+func (x *ModelHealth) GetSeverityByType() map[int32]DriftSeverity {
+	if x != nil {
+		return x.SeverityByType
+	}
+	return nil
+}
+
+func (x *ModelHealth) GetState() MonitorState {
+	if x != nil {
+		return x.State
+	}
+	return MonitorState_MONITOR_STATE_UNSPECIFIED
+}
+
+func (x *ModelHealth) GetLatestReportId() string {
+	if x != nil {
+		return x.LatestReportId
+	}
+	return ""
+}
+
+func (x *ModelHealth) GetLastEventAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.LastEventAt
+	}
+	return nil
+}
+
+func (x *ModelHealth) GetDriftEventsTotal() int64 {
+	if x != nil {
+		return x.DriftEventsTotal
+	}
+	return 0
+}
+
+// ============================================================================
 // GroundTruthLabel
 // ============================================================================
 //
@@ -1086,6 +1248,10 @@ type GroundTruthLabel struct {
 	RequestId string `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	// The actual observed outcome (e.g., "fraud" / "not_fraud", or a regression
 	// target as a string). Compared against the recorded prediction for that id.
+	// SECURITY/PII: this is a LABEL, not a free-form blob — the server caps its
+	// length (e.g. 256 bytes) and it must not be used to smuggle PII; the monitor
+	// stores only the label↔request_id pairing it needs for rolling accuracy, the
+	// same PII-free trust boundary as the inference event.
 	ActualLabel string `protobuf:"bytes,2,opt,name=actual_label,json=actualLabel,proto3" json:"actual_label,omitempty"`
 	// When the true outcome became known (NOT when the prediction was made). Lets
 	// the monitor measure label latency and weight recent labels for rolling F1.
@@ -1096,7 +1262,7 @@ type GroundTruthLabel struct {
 
 func (x *GroundTruthLabel) Reset() {
 	*x = GroundTruthLabel{}
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[5]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1108,7 +1274,7 @@ func (x *GroundTruthLabel) String() string {
 func (*GroundTruthLabel) ProtoMessage() {}
 
 func (x *GroundTruthLabel) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[5]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1121,7 +1287,7 @@ func (x *GroundTruthLabel) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GroundTruthLabel.ProtoReflect.Descriptor instead.
 func (*GroundTruthLabel) Descriptor() ([]byte, []int) {
-	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{5}
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *GroundTruthLabel) GetRequestId() string {
@@ -1149,19 +1315,28 @@ func (x *GroundTruthLabel) GetObservedAt() *timestamppb.Timestamp {
 // model_name). This is the ONLY write path for monitor config.
 //
 // SECURITY — MASS-ASSIGNMENT GUARD: this request deliberately accepts ONLY the
-// operator-owned fields. It does NOT accept id, state, baseline_version,
-// baseline_captured_at, created_at, or updated_at — all of those are SERVER-
-// authoritative on the Monitor (see Monitor's security note). Accepting them
-// here would let a client point a monitor at a hand-picked baseline or fake its
-// state to force/suppress retrains. We model the writable surface explicitly as
-// scalar fields rather than embedding a Monitor, precisely so unwritable fields
-// cannot even be expressed on the wire.
+// operator-owned fields. It does NOT accept id, owner_team, state,
+// baseline_version, baseline_captured_at, created_at, or updated_at — all of
+// those are SERVER-authoritative on the Monitor (see Monitor's security note).
+//   - owner_team is derived from the caller's AUTH CLAIMS, never a request field
+//     (a client that could name its own team could create a monitor against
+//     another tenant's model — cross-tenant write).
+//   - Accepting id/state/baseline_* would let a client point a monitor at a
+//     hand-picked baseline or fake its state to force/suppress retrains.
+//
+// We model the writable surface explicitly as scalar fields rather than embedding
+// a Monitor, precisely so unwritable fields cannot even be expressed on the wire.
 type ConfigureMonitorRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The model to monitor. Identifies the monitor for upsert (one monitor per
-	// model name). Required.
+	// model name, WITHIN the caller's team). Required. The server additionally
+	// verifies the caller's team owns this model (via Registry) before creating —
+	// model_name here is the WHICH, not the authorization input.
 	ModelName string `protobuf:"bytes,1,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
-	// Window shape (see Monitor.window_duration / window_size / min_samples).
+	// Window shape (see Monitor.window_duration / window_size / min_samples). The
+	// same server-side BOUNDS apply as on the Monitor fields: window_size in
+	// [0, 1_000_000]; 0 <= min_samples <= window_size (when window_size>0);
+	// window_duration must be positive when set. Out-of-range → INVALID_ARGUMENT.
 	WindowDuration *durationpb.Duration `protobuf:"bytes,2,opt,name=window_duration,json=windowDuration,proto3" json:"window_duration,omitempty"`
 	WindowSize     int32                `protobuf:"varint,3,opt,name=window_size,json=windowSize,proto3" json:"window_size,omitempty"`
 	MinSamples     int32                `protobuf:"varint,4,opt,name=min_samples,json=minSamples,proto3" json:"min_samples,omitempty"`
@@ -1189,7 +1364,7 @@ type ConfigureMonitorRequest struct {
 
 func (x *ConfigureMonitorRequest) Reset() {
 	*x = ConfigureMonitorRequest{}
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[6]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1201,7 +1376,7 @@ func (x *ConfigureMonitorRequest) String() string {
 func (*ConfigureMonitorRequest) ProtoMessage() {}
 
 func (x *ConfigureMonitorRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[6]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1214,7 +1389,7 @@ func (x *ConfigureMonitorRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ConfigureMonitorRequest.ProtoReflect.Descriptor instead.
 func (*ConfigureMonitorRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{6}
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *ConfigureMonitorRequest) GetModelName() string {
@@ -1298,7 +1473,7 @@ type ConfigureMonitorResponse struct {
 
 func (x *ConfigureMonitorResponse) Reset() {
 	*x = ConfigureMonitorResponse{}
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[7]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1310,7 +1485,7 @@ func (x *ConfigureMonitorResponse) String() string {
 func (*ConfigureMonitorResponse) ProtoMessage() {}
 
 func (x *ConfigureMonitorResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[7]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1323,7 +1498,7 @@ func (x *ConfigureMonitorResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ConfigureMonitorResponse.ProtoReflect.Descriptor instead.
 func (*ConfigureMonitorResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{7}
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ConfigureMonitorResponse) GetMonitor() *Monitor {
@@ -1351,7 +1526,7 @@ type GetMonitorStatusRequest struct {
 
 func (x *GetMonitorStatusRequest) Reset() {
 	*x = GetMonitorStatusRequest{}
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[8]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1363,7 +1538,7 @@ func (x *GetMonitorStatusRequest) String() string {
 func (*GetMonitorStatusRequest) ProtoMessage() {}
 
 func (x *GetMonitorStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[8]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1376,7 +1551,7 @@ func (x *GetMonitorStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetMonitorStatusRequest.ProtoReflect.Descriptor instead.
 func (*GetMonitorStatusRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{8}
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *GetMonitorStatusRequest) GetModelName() string {
@@ -1397,7 +1572,7 @@ type GetMonitorStatusResponse struct {
 
 func (x *GetMonitorStatusResponse) Reset() {
 	*x = GetMonitorStatusResponse{}
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[9]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1409,7 +1584,7 @@ func (x *GetMonitorStatusResponse) String() string {
 func (*GetMonitorStatusResponse) ProtoMessage() {}
 
 func (x *GetMonitorStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[9]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1422,12 +1597,484 @@ func (x *GetMonitorStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetMonitorStatusResponse.ProtoReflect.Descriptor instead.
 func (*GetMonitorStatusResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{9}
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *GetMonitorStatusResponse) GetStatus() *MonitorStatus {
 	if x != nil {
 		return x.Status
+	}
+	return nil
+}
+
+// GetModelHealthRequest reads the at-a-glance health verdict for one model.
+// WHY a distinct RPC from GetMonitorStatus (design doc lists GetModelHealth
+// explicitly, and `fp monitor <model>` wants a one-line answer): see ModelHealth.
+type GetModelHealthRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The model whose health to read. Required. Authorization (caller's team owns
+	// the model) is enforced by the auth interceptor, not by this field.
+	ModelName     string `protobuf:"bytes,1,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetModelHealthRequest) Reset() {
+	*x = GetModelHealthRequest{}
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[11]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetModelHealthRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetModelHealthRequest) ProtoMessage() {}
+
+func (x *GetModelHealthRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[11]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetModelHealthRequest.ProtoReflect.Descriptor instead.
+func (*GetModelHealthRequest) Descriptor() ([]byte, []int) {
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *GetModelHealthRequest) GetModelName() string {
+	if x != nil {
+		return x.ModelName
+	}
+	return ""
+}
+
+// GetModelHealthResponse wraps the health rollup.
+// WHY wrap: RPC_RESPONSE_STANDARD_NAME + forward compatibility.
+type GetModelHealthResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Health        *ModelHealth           `protobuf:"bytes,1,opt,name=health,proto3" json:"health,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetModelHealthResponse) Reset() {
+	*x = GetModelHealthResponse{}
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetModelHealthResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetModelHealthResponse) ProtoMessage() {}
+
+func (x *GetModelHealthResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetModelHealthResponse.ProtoReflect.Descriptor instead.
+func (*GetModelHealthResponse) Descriptor() ([]byte, []int) {
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *GetModelHealthResponse) GetHealth() *ModelHealth {
+	if x != nil {
+		return x.Health
+	}
+	return nil
+}
+
+// ListMonitorsRequest returns the monitors the caller's team owns — the FLEET
+// view the Web UI's "Monitoring" page and `fp monitor` (no arg) render. WHY this
+// RPC exists: every other read here is per-model; an operator also needs "show me
+// every monitored model and which are unhealthy" without knowing names up front.
+//
+// SECURITY: the result is ALWAYS scoped to the caller's team by the auth
+// interceptor (derived from auth claims) — there is deliberately NO team field on
+// this request, because a client-supplied team would be a cross-tenant read.
+type ListMonitorsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Optional: return only monitors whose latest overall severity is at/above this
+	// (e.g. CRITICAL) — drives the "unhealthy only" filter. UNSPECIFIED = all.
+	MinSeverity DriftSeverity `protobuf:"varint,1,opt,name=min_severity,json=minSeverity,proto3,enum=forgepoint.monitor.v1.DriftSeverity" json:"min_severity,omitempty"`
+	// Optional: return only monitors in this lifecycle state (e.g. ACTIVE).
+	// MONITOR_STATE_UNSPECIFIED = any state.
+	State MonitorState `protobuf:"varint,2,opt,name=state,proto3,enum=forgepoint.monitor.v1.MonitorState" json:"state,omitempty"`
+	// Cursor-based pagination. page_size defaults to 20; the server CAPS it at 100
+	// regardless of a larger client request (platform-wide cap, see common.proto).
+	Pagination    *v1.PaginationRequest `protobuf:"bytes,3,opt,name=pagination,proto3" json:"pagination,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListMonitorsRequest) Reset() {
+	*x = ListMonitorsRequest{}
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListMonitorsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListMonitorsRequest) ProtoMessage() {}
+
+func (x *ListMonitorsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListMonitorsRequest.ProtoReflect.Descriptor instead.
+func (*ListMonitorsRequest) Descriptor() ([]byte, []int) {
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *ListMonitorsRequest) GetMinSeverity() DriftSeverity {
+	if x != nil {
+		return x.MinSeverity
+	}
+	return DriftSeverity_DRIFT_SEVERITY_UNSPECIFIED
+}
+
+func (x *ListMonitorsRequest) GetState() MonitorState {
+	if x != nil {
+		return x.State
+	}
+	return MonitorState_MONITOR_STATE_UNSPECIFIED
+}
+
+func (x *ListMonitorsRequest) GetPagination() *v1.PaginationRequest {
+	if x != nil {
+		return x.Pagination
+	}
+	return nil
+}
+
+// ListMonitorsResponse is a page of fleet entries — each pairs the monitor config
+// with its current health so the UI renders the whole table from ONE call (no
+// N+1 GetModelHealth per row).
+type ListMonitorsResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The page of fleet entries.
+	Entries []*ListMonitorsResponse_Entry `protobuf:"bytes,1,rep,name=entries,proto3" json:"entries,omitempty"`
+	// next_page_token + total_count.
+	Pagination    *v1.PaginationResponse `protobuf:"bytes,2,opt,name=pagination,proto3" json:"pagination,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListMonitorsResponse) Reset() {
+	*x = ListMonitorsResponse{}
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListMonitorsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListMonitorsResponse) ProtoMessage() {}
+
+func (x *ListMonitorsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListMonitorsResponse.ProtoReflect.Descriptor instead.
+func (*ListMonitorsResponse) Descriptor() ([]byte, []int) {
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *ListMonitorsResponse) GetEntries() []*ListMonitorsResponse_Entry {
+	if x != nil {
+		return x.Entries
+	}
+	return nil
+}
+
+func (x *ListMonitorsResponse) GetPagination() *v1.PaginationResponse {
+	if x != nil {
+		return x.Pagination
+	}
+	return nil
+}
+
+// DeleteMonitorRequest tears down a model's monitor. WHY this RPC is needed (the
+// design/CLI imply lifecycle management of monitors): when a model is retired you
+// must be able to STOP monitoring it — otherwise the consumer keeps windowing a
+// dead model's (absent) traffic and the fleet view shows zombie rows. This is a
+// soft-delete by default (drift history is retained for audit; see purge flag).
+type DeleteMonitorRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The model whose monitor to delete. Required. Team ownership enforced by auth.
+	ModelName string `protobuf:"bytes,1,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
+	// If true, ALSO purge this monitor's persisted drift reports (a hard delete for
+	// GDPR/right-to-erasure or test cleanup). Default false = soft-delete the config
+	// but KEEP the drift_reports history for audit ("why did it retrain last month?").
+	PurgeReports bool `protobuf:"varint,2,opt,name=purge_reports,json=purgeReports,proto3" json:"purge_reports,omitempty"`
+	// Idempotency key — a retried delete after a network blip must be a safe no-op
+	// (deleting an already-deleted monitor returns success, not NOT_FOUND-on-retry).
+	// The server records the key (short TTL). Empty = treated as unique.
+	IdempotencyKey string `protobuf:"bytes,3,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *DeleteMonitorRequest) Reset() {
+	*x = DeleteMonitorRequest{}
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteMonitorRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteMonitorRequest) ProtoMessage() {}
+
+func (x *DeleteMonitorRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteMonitorRequest.ProtoReflect.Descriptor instead.
+func (*DeleteMonitorRequest) Descriptor() ([]byte, []int) {
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *DeleteMonitorRequest) GetModelName() string {
+	if x != nil {
+		return x.ModelName
+	}
+	return ""
+}
+
+func (x *DeleteMonitorRequest) GetPurgeReports() bool {
+	if x != nil {
+		return x.PurgeReports
+	}
+	return false
+}
+
+func (x *DeleteMonitorRequest) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
+}
+
+// DeleteMonitorResponse is a named-empty ack (Buf forbids google.protobuf.Empty
+// and reusing a domain message). WHY return how many reports were purged: a
+// hard-delete caller wants confirmation of the erasure scope for its own audit.
+type DeleteMonitorResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Number of drift reports purged (0 when purge_reports=false, i.e. soft delete).
+	PurgedReportCount int32 `protobuf:"varint,1,opt,name=purged_report_count,json=purgedReportCount,proto3" json:"purged_report_count,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *DeleteMonitorResponse) Reset() {
+	*x = DeleteMonitorResponse{}
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteMonitorResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteMonitorResponse) ProtoMessage() {}
+
+func (x *DeleteMonitorResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteMonitorResponse.ProtoReflect.Descriptor instead.
+func (*DeleteMonitorResponse) Descriptor() ([]byte, []int) {
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *DeleteMonitorResponse) GetPurgedReportCount() int32 {
+	if x != nil {
+		return x.PurgedReportCount
+	}
+	return 0
+}
+
+// ResetBaselineRequest manually re-pins a monitor's drift baseline to a specific
+// model version's training-time distribution. WHY a manual path EXISTS even
+// though ModelPromoted auto-resets it: (a) an operator who sees "baseline is 40
+// days old" (Monitor.baseline_captured_at) can refresh it without a promotion;
+// (b) after a known legitimate distribution shift (a new feature pipeline) you
+// re-baseline to stop alerting on expected drift. The closed-loop auto-reset
+// handles the common case; this is the operator escape hatch.
+//
+// SECURITY — the baseline is STILL server-resolved: the caller names a VERSION,
+// not a distribution. The monitor fetches that version's training-time summary
+// from Registry/Experiment-Tracker itself — a client cannot upload a hand-crafted
+// baseline that conveniently matches current traffic to suppress real drift.
+type ResetBaselineRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The model whose baseline to reset. Required. Team ownership enforced by auth.
+	ModelName string `protobuf:"bytes,1,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
+	// The model version whose training-time distribution becomes the new baseline
+	// (e.g. "v8"). Empty = reset to the CURRENT production version (the common
+	// "refresh to latest" case). The server validates the version exists and is
+	// owned by the caller's team before resolving its baseline.
+	BaselineVersion string `protobuf:"bytes,2,opt,name=baseline_version,json=baselineVersion,proto3" json:"baseline_version,omitempty"`
+	// Idempotency key — re-pinning to the same version twice must be a no-op, not a
+	// second baseline-fetch that bumps updated_at. Empty = treated as unique.
+	IdempotencyKey string `protobuf:"bytes,3,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *ResetBaselineRequest) Reset() {
+	*x = ResetBaselineRequest{}
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResetBaselineRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResetBaselineRequest) ProtoMessage() {}
+
+func (x *ResetBaselineRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResetBaselineRequest.ProtoReflect.Descriptor instead.
+func (*ResetBaselineRequest) Descriptor() ([]byte, []int) {
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *ResetBaselineRequest) GetModelName() string {
+	if x != nil {
+		return x.ModelName
+	}
+	return ""
+}
+
+func (x *ResetBaselineRequest) GetBaselineVersion() string {
+	if x != nil {
+		return x.BaselineVersion
+	}
+	return ""
+}
+
+func (x *ResetBaselineRequest) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
+}
+
+// ResetBaselineResponse returns the monitor after the re-baseline, so the caller
+// sees the new baseline_version / baseline_captured_at without a follow-up read.
+type ResetBaselineResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The monitor with its refreshed SERVER-authoritative baseline_* fields.
+	Monitor       *Monitor `protobuf:"bytes,1,opt,name=monitor,proto3" json:"monitor,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ResetBaselineResponse) Reset() {
+	*x = ResetBaselineResponse{}
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ResetBaselineResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ResetBaselineResponse) ProtoMessage() {}
+
+func (x *ResetBaselineResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ResetBaselineResponse.ProtoReflect.Descriptor instead.
+func (*ResetBaselineResponse) Descriptor() ([]byte, []int) {
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *ResetBaselineResponse) GetMonitor() *Monitor {
+	if x != nil {
+		return x.Monitor
 	}
 	return nil
 }
@@ -1445,7 +2092,7 @@ type GetDriftReportRequest struct {
 
 func (x *GetDriftReportRequest) Reset() {
 	*x = GetDriftReportRequest{}
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[10]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1457,7 +2104,7 @@ func (x *GetDriftReportRequest) String() string {
 func (*GetDriftReportRequest) ProtoMessage() {}
 
 func (x *GetDriftReportRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[10]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1470,7 +2117,7 @@ func (x *GetDriftReportRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetDriftReportRequest.ProtoReflect.Descriptor instead.
 func (*GetDriftReportRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{10}
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *GetDriftReportRequest) GetReportId() string {
@@ -1491,7 +2138,7 @@ type GetDriftReportResponse struct {
 
 func (x *GetDriftReportResponse) Reset() {
 	*x = GetDriftReportResponse{}
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[11]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1503,7 +2150,7 @@ func (x *GetDriftReportResponse) String() string {
 func (*GetDriftReportResponse) ProtoMessage() {}
 
 func (x *GetDriftReportResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[11]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1516,7 +2163,7 @@ func (x *GetDriftReportResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetDriftReportResponse.ProtoReflect.Descriptor instead.
 func (*GetDriftReportResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{11}
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *GetDriftReportResponse) GetReport() *DriftReport {
@@ -1552,7 +2199,7 @@ type ListDriftReportsRequest struct {
 
 func (x *ListDriftReportsRequest) Reset() {
 	*x = ListDriftReportsRequest{}
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[12]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1564,7 +2211,7 @@ func (x *ListDriftReportsRequest) String() string {
 func (*ListDriftReportsRequest) ProtoMessage() {}
 
 func (x *ListDriftReportsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[12]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1577,7 +2224,7 @@ func (x *ListDriftReportsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListDriftReportsRequest.ProtoReflect.Descriptor instead.
 func (*ListDriftReportsRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{12}
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *ListDriftReportsRequest) GetModelName() string {
@@ -1627,7 +2274,7 @@ type ListDriftReportsResponse struct {
 
 func (x *ListDriftReportsResponse) Reset() {
 	*x = ListDriftReportsResponse{}
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[13]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1639,7 +2286,7 @@ func (x *ListDriftReportsResponse) String() string {
 func (*ListDriftReportsResponse) ProtoMessage() {}
 
 func (x *ListDriftReportsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[13]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1652,7 +2299,7 @@ func (x *ListDriftReportsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListDriftReportsResponse.ProtoReflect.Descriptor instead.
 func (*ListDriftReportsResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{13}
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *ListDriftReportsResponse) GetReports() []*DriftReport {
@@ -1681,8 +2328,11 @@ type SubmitGroundTruthRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// The model these labels belong to (scopes the request_id lookups). Required.
 	ModelName string `protobuf:"bytes,1,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
-	// The batch of (request_id → actual outcome) labels. May be large; the server
-	// caps batch size and returns INVALID_ARGUMENT above the cap.
+	// The batch of (request_id → actual outcome) labels. CONTRACT CAP: at most
+	// 1000 labels per call; a larger batch is rejected with INVALID_ARGUMENT (a
+	// bound in the contract, not just prose — it protects the server from an
+	// unbounded single request and bounds the transactional write). Callers with
+	// more labels page through multiple calls (each idempotent on its own key).
 	Labels []*GroundTruthLabel `protobuf:"bytes,2,rep,name=labels,proto3" json:"labels,omitempty"`
 	// Idempotency key — re-submitting the same labeling batch after a retry must
 	// not double-count outcomes in the rolling accuracy window. The server records
@@ -1695,7 +2345,7 @@ type SubmitGroundTruthRequest struct {
 
 func (x *SubmitGroundTruthRequest) Reset() {
 	*x = SubmitGroundTruthRequest{}
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[14]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1707,7 +2357,7 @@ func (x *SubmitGroundTruthRequest) String() string {
 func (*SubmitGroundTruthRequest) ProtoMessage() {}
 
 func (x *SubmitGroundTruthRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[14]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1720,7 +2370,7 @@ func (x *SubmitGroundTruthRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubmitGroundTruthRequest.ProtoReflect.Descriptor instead.
 func (*SubmitGroundTruthRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{14}
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *SubmitGroundTruthRequest) GetModelName() string {
@@ -1761,7 +2411,7 @@ type SubmitGroundTruthResponse struct {
 
 func (x *SubmitGroundTruthResponse) Reset() {
 	*x = SubmitGroundTruthResponse{}
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[15]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1773,7 +2423,7 @@ func (x *SubmitGroundTruthResponse) String() string {
 func (*SubmitGroundTruthResponse) ProtoMessage() {}
 
 func (x *SubmitGroundTruthResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[15]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1786,7 +2436,7 @@ func (x *SubmitGroundTruthResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubmitGroundTruthResponse.ProtoReflect.Descriptor instead.
 func (*SubmitGroundTruthResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{15}
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *SubmitGroundTruthResponse) GetAccepted() int32 {
@@ -1810,11 +2460,12 @@ func (x *SubmitGroundTruthResponse) GetUnmatchedRequestIds() []string {
 // add latency + load. One long-lived gRPC stream replaces a polling storm. This
 // is the same reason Pipeline Orchestrator uses a streaming WatchExecution.
 //
-// WHY a SEPARATE stream from the NATS event bus: NATS fan-out (ModelDriftDetected)
-// is for SERVICE-to-service reactions (Notification, Orchestrator). This gRPC
-// stream is for INTERACTIVE clients (UI, CLI) that hold an authenticated request
-// scope and want a filtered, backpressure-aware feed — without granting them a
-// NATS connection. Two transports, two audiences.
+// WHY a SEPARATE stream from the NATS event bus: NATS fan-out (the canonical
+// events.ModelDriftDetected on fp.models.drift.detected) is for SERVICE-to-service
+// reactions (Notification, Orchestrator). This gRPC stream is for INTERACTIVE
+// clients (UI, CLI) that hold an authenticated request scope and want a filtered,
+// backpressure-aware feed — without granting them a NATS connection. Two
+// transports, two audiences, ONE underlying drift report.
 type StreamDriftEventsRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Optional filter: stream only this model's drift events. Empty = all models
@@ -1830,7 +2481,7 @@ type StreamDriftEventsRequest struct {
 
 func (x *StreamDriftEventsRequest) Reset() {
 	*x = StreamDriftEventsRequest{}
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[16]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1842,7 +2493,7 @@ func (x *StreamDriftEventsRequest) String() string {
 func (*StreamDriftEventsRequest) ProtoMessage() {}
 
 func (x *StreamDriftEventsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[16]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1855,7 +2506,7 @@ func (x *StreamDriftEventsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamDriftEventsRequest.ProtoReflect.Descriptor instead.
 func (*StreamDriftEventsRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{16}
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *StreamDriftEventsRequest) GetModelName() string {
@@ -1888,7 +2539,7 @@ type StreamDriftEventsResponse struct {
 
 func (x *StreamDriftEventsResponse) Reset() {
 	*x = StreamDriftEventsResponse{}
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[17]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1900,7 +2551,7 @@ func (x *StreamDriftEventsResponse) String() string {
 func (*StreamDriftEventsResponse) ProtoMessage() {}
 
 func (x *StreamDriftEventsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[17]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1913,7 +2564,7 @@ func (x *StreamDriftEventsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamDriftEventsResponse.ProtoReflect.Descriptor instead.
 func (*StreamDriftEventsResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{17}
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *StreamDriftEventsResponse) GetReport() *DriftReport {
@@ -1923,76 +2574,32 @@ func (x *StreamDriftEventsResponse) GetReport() *DriftReport {
 	return nil
 }
 
-// ============================================================================
-// ModelDriftDetectedEvent  →  subject: fp.models.drift.detected
-// ============================================================================
-//
-// THE LOOP-CLOSER. This is the event the platform was missing — Notification
-// already subscribes to it; here is its producer. Consumers and what each needs:
-//   - Notification Service: alerts a human → needs model_name, version,
-//     drift_type, severity, and a report link.
-//   - Experiment Tracker: records the drift against the model's history →
-//     needs model identity + report_id + scores.
-//   - Pipeline Orchestrator: on CRITICAL + auto_retrain, runs the retrain
-//     pipeline → needs retrain_pipeline_id and the drift context as input.
-//
-// WHY embed the DriftReport AND scalar headline fields: the report is the full
-// detail; the duplicated headline fields (model_name, drift_type, severity) let
-// a consumer route/filter WITHOUT deserializing the whole report — cheap subject
-// filtering and alert templating. A small, deliberate denormalization.
-//
-// IDEMPOTENCY: this event is emitted once per drift report (which is itself
-// idempotent on window_id). Consumers dedupe on EventEnvelope.id; the report_id
-// here is a second, business-level idempotency handle.
-type ModelDriftDetectedEvent struct {
+// One entry per monitored model in this page.
+type ListMonitorsResponse_Entry struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// The model and the exact serving version that drifted.
-	ModelName    string `protobuf:"bytes,1,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
-	ModelVersion string `protobuf:"bytes,2,opt,name=model_version,json=modelVersion,proto3" json:"model_version,omitempty"`
-	// Headline drift type + severity, duplicated from the report for cheap
-	// routing/filtering by consumers (see message note). Severity is always
-	// CRITICAL for an event that fired the loop, but carried explicitly so the
-	// schema also supports WARNING-level informational emissions if enabled.
-	DriftType DriftType     `protobuf:"varint,3,opt,name=drift_type,json=driftType,proto3,enum=forgepoint.monitor.v1.DriftType" json:"drift_type,omitempty"`
-	Severity  DriftSeverity `protobuf:"varint,4,opt,name=severity,proto3,enum=forgepoint.monitor.v1.DriftSeverity" json:"severity,omitempty"`
-	// The full drift report (per-feature breakdown, window bounds, sample count).
-	// Embedded so a reactor like Experiment Tracker records the detail without a
-	// synchronous call back into Model Monitor.
-	Report *DriftReport `protobuf:"bytes,5,opt,name=report,proto3" json:"report,omitempty"`
-	// The report's id — a stable handle for deep-linking and business-level dedupe
-	// (redundant with report.id but convenient for consumers that only index this).
-	ReportId string `protobuf:"bytes,6,opt,name=report_id,json=reportId,proto3" json:"report_id,omitempty"`
-	// Whether auto-retrain is armed for this model. The Pipeline Orchestrator (or
-	// the monitor's own loop) uses this to decide whether a retrain should fire.
-	AutoRetrain bool `protobuf:"varint,7,opt,name=auto_retrain,json=autoRetrain,proto3" json:"auto_retrain,omitempty"`
-	// The retrain pipeline to run if auto_retrain is true (opaque Orchestrator id).
-	// Carried on the event so the loop can be closed by a reactor without a lookup.
-	RetrainPipelineId string `protobuf:"bytes,8,opt,name=retrain_pipeline_id,json=retrainPipelineId,proto3" json:"retrain_pipeline_id,omitempty"`
-	// Free-form drift context passed as input to the retrain pipeline (e.g.,
-	// {"top_drifted_feature": "income", "psi": 0.41}). google.protobuf.Struct
-	// because the retrain DAG's expected inputs vary per model — a typed message
-	// would couple this event to every pipeline's input schema. Kept SMALL and
-	// PII-free (summaries only, same trust boundary as the inference event).
-	RetrainContext *structpb.Struct `protobuf:"bytes,9,opt,name=retrain_context,json=retrainContext,proto3" json:"retrain_context,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// The monitor's configuration.
+	Monitor *Monitor `protobuf:"bytes,1,opt,name=monitor,proto3" json:"monitor,omitempty"`
+	// Its current at-a-glance health (overall severity, per-type lights, state).
+	Health        *ModelHealth `protobuf:"bytes,2,opt,name=health,proto3" json:"health,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
-func (x *ModelDriftDetectedEvent) Reset() {
-	*x = ModelDriftDetectedEvent{}
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[18]
+func (x *ListMonitorsResponse_Entry) Reset() {
+	*x = ListMonitorsResponse_Entry{}
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *ModelDriftDetectedEvent) String() string {
+func (x *ListMonitorsResponse_Entry) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*ModelDriftDetectedEvent) ProtoMessage() {}
+func (*ListMonitorsResponse_Entry) ProtoMessage() {}
 
-func (x *ModelDriftDetectedEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[18]
+func (x *ListMonitorsResponse_Entry) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2003,70 +2610,21 @@ func (x *ModelDriftDetectedEvent) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use ModelDriftDetectedEvent.ProtoReflect.Descriptor instead.
-func (*ModelDriftDetectedEvent) Descriptor() ([]byte, []int) {
-	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{18}
+// Deprecated: Use ListMonitorsResponse_Entry.ProtoReflect.Descriptor instead.
+func (*ListMonitorsResponse_Entry) Descriptor() ([]byte, []int) {
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{14, 0}
 }
 
-func (x *ModelDriftDetectedEvent) GetModelName() string {
+func (x *ListMonitorsResponse_Entry) GetMonitor() *Monitor {
 	if x != nil {
-		return x.ModelName
-	}
-	return ""
-}
-
-func (x *ModelDriftDetectedEvent) GetModelVersion() string {
-	if x != nil {
-		return x.ModelVersion
-	}
-	return ""
-}
-
-func (x *ModelDriftDetectedEvent) GetDriftType() DriftType {
-	if x != nil {
-		return x.DriftType
-	}
-	return DriftType_DRIFT_TYPE_UNSPECIFIED
-}
-
-func (x *ModelDriftDetectedEvent) GetSeverity() DriftSeverity {
-	if x != nil {
-		return x.Severity
-	}
-	return DriftSeverity_DRIFT_SEVERITY_UNSPECIFIED
-}
-
-func (x *ModelDriftDetectedEvent) GetReport() *DriftReport {
-	if x != nil {
-		return x.Report
+		return x.Monitor
 	}
 	return nil
 }
 
-func (x *ModelDriftDetectedEvent) GetReportId() string {
+func (x *ListMonitorsResponse_Entry) GetHealth() *ModelHealth {
 	if x != nil {
-		return x.ReportId
-	}
-	return ""
-}
-
-func (x *ModelDriftDetectedEvent) GetAutoRetrain() bool {
-	if x != nil {
-		return x.AutoRetrain
-	}
-	return false
-}
-
-func (x *ModelDriftDetectedEvent) GetRetrainPipelineId() string {
-	if x != nil {
-		return x.RetrainPipelineId
-	}
-	return ""
-}
-
-func (x *ModelDriftDetectedEvent) GetRetrainContext() *structpb.Struct {
-	if x != nil {
-		return x.RetrainContext
+		return x.Health
 	}
 	return nil
 }
@@ -2075,18 +2633,20 @@ var File_forgepoint_monitor_v1_monitor_proto protoreflect.FileDescriptor
 
 const file_forgepoint_monitor_v1_monitor_proto_rawDesc = "" +
 	"\n" +
-	"#forgepoint/monitor/v1/monitor.proto\x12\x15forgepoint.monitor.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1egoogle/protobuf/duration.proto\x1a\x1cgoogle/protobuf/struct.proto\x1a!forgepoint/common/v1/common.proto\"\xd4\x01\n" +
+	"#forgepoint/monitor/v1/monitor.proto\x12\x15forgepoint.monitor.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1egoogle/protobuf/duration.proto\x1a!forgepoint/common/v1/common.proto\"\xd4\x01\n" +
 	"\x0fThresholdConfig\x12?\n" +
 	"\n" +
 	"drift_type\x18\x01 \x01(\x0e2 .forgepoint.monitor.v1.DriftTypeR\tdriftType\x12:\n" +
 	"\x06method\x18\x02 \x01(\x0e2\".forgepoint.monitor.v1.DriftMethodR\x06method\x12\x1d\n" +
 	"\n" +
 	"warn_score\x18\x03 \x01(\x01R\twarnScore\x12%\n" +
-	"\x0ecritical_score\x18\x04 \x01(\x01R\rcriticalScore\"\x83\x05\n" +
+	"\x0ecritical_score\x18\x04 \x01(\x01R\rcriticalScore\"\xa2\x05\n" +
 	"\aMonitor\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x1d\n" +
 	"\n" +
-	"model_name\x18\x02 \x01(\tR\tmodelName\x12B\n" +
+	"model_name\x18\x02 \x01(\tR\tmodelName\x12\x1d\n" +
+	"\n" +
+	"owner_team\x18\x0e \x01(\tR\townerTeam\x12B\n" +
 	"\x0fwindow_duration\x18\x03 \x01(\v2\x19.google.protobuf.DurationR\x0ewindowDuration\x12\x1f\n" +
 	"\vwindow_size\x18\x04 \x01(\x05R\n" +
 	"windowSize\x12\x1f\n" +
@@ -2137,7 +2697,20 @@ const file_forgepoint_monitor_v1_monitor_proto_rawDesc = "" +
 	"\x16current_window_samples\x18\x03 \x01(\x05R\x14currentWindowSamples\x12G\n" +
 	"\rlatest_report\x18\x04 \x01(\v2\".forgepoint.monitor.v1.DriftReportR\flatestReport\x12>\n" +
 	"\rlast_event_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\vlastEventAt\x12,\n" +
-	"\x12drift_events_total\x18\x06 \x01(\x03R\x10driftEventsTotal\"\x91\x01\n" +
+	"\x12drift_events_total\x18\x06 \x01(\x03R\x10driftEventsTotal\"\xc0\x04\n" +
+	"\vModelHealth\x12\x1d\n" +
+	"\n" +
+	"model_name\x18\x01 \x01(\tR\tmodelName\x12#\n" +
+	"\rmodel_version\x18\x02 \x01(\tR\fmodelVersion\x12O\n" +
+	"\x10overall_severity\x18\x03 \x01(\x0e2$.forgepoint.monitor.v1.DriftSeverityR\x0foverallSeverity\x12`\n" +
+	"\x10severity_by_type\x18\x04 \x03(\v26.forgepoint.monitor.v1.ModelHealth.SeverityByTypeEntryR\x0eseverityByType\x129\n" +
+	"\x05state\x18\x05 \x01(\x0e2#.forgepoint.monitor.v1.MonitorStateR\x05state\x12(\n" +
+	"\x10latest_report_id\x18\x06 \x01(\tR\x0elatestReportId\x12>\n" +
+	"\rlast_event_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\vlastEventAt\x12,\n" +
+	"\x12drift_events_total\x18\b \x01(\x03R\x10driftEventsTotal\x1ag\n" +
+	"\x13SeverityByTypeEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\x05R\x03key\x12:\n" +
+	"\x05value\x18\x02 \x01(\x0e2$.forgepoint.monitor.v1.DriftSeverityR\x05value:\x028\x01\"\x91\x01\n" +
 	"\x10GroundTruthLabel\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12!\n" +
@@ -2166,7 +2739,40 @@ const file_forgepoint_monitor_v1_monitor_proto_rawDesc = "" +
 	"\n" +
 	"model_name\x18\x01 \x01(\tR\tmodelName\"X\n" +
 	"\x18GetMonitorStatusResponse\x12<\n" +
-	"\x06status\x18\x01 \x01(\v2$.forgepoint.monitor.v1.MonitorStatusR\x06status\"4\n" +
+	"\x06status\x18\x01 \x01(\v2$.forgepoint.monitor.v1.MonitorStatusR\x06status\"6\n" +
+	"\x15GetModelHealthRequest\x12\x1d\n" +
+	"\n" +
+	"model_name\x18\x01 \x01(\tR\tmodelName\"T\n" +
+	"\x16GetModelHealthResponse\x12:\n" +
+	"\x06health\x18\x01 \x01(\v2\".forgepoint.monitor.v1.ModelHealthR\x06health\"\xe2\x01\n" +
+	"\x13ListMonitorsRequest\x12G\n" +
+	"\fmin_severity\x18\x01 \x01(\x0e2$.forgepoint.monitor.v1.DriftSeverityR\vminSeverity\x129\n" +
+	"\x05state\x18\x02 \x01(\x0e2#.forgepoint.monitor.v1.MonitorStateR\x05state\x12G\n" +
+	"\n" +
+	"pagination\x18\x03 \x01(\v2'.forgepoint.common.v1.PaginationRequestR\n" +
+	"pagination\"\xac\x02\n" +
+	"\x14ListMonitorsResponse\x12K\n" +
+	"\aentries\x18\x01 \x03(\v21.forgepoint.monitor.v1.ListMonitorsResponse.EntryR\aentries\x12H\n" +
+	"\n" +
+	"pagination\x18\x02 \x01(\v2(.forgepoint.common.v1.PaginationResponseR\n" +
+	"pagination\x1a}\n" +
+	"\x05Entry\x128\n" +
+	"\amonitor\x18\x01 \x01(\v2\x1e.forgepoint.monitor.v1.MonitorR\amonitor\x12:\n" +
+	"\x06health\x18\x02 \x01(\v2\".forgepoint.monitor.v1.ModelHealthR\x06health\"\x83\x01\n" +
+	"\x14DeleteMonitorRequest\x12\x1d\n" +
+	"\n" +
+	"model_name\x18\x01 \x01(\tR\tmodelName\x12#\n" +
+	"\rpurge_reports\x18\x02 \x01(\bR\fpurgeReports\x12'\n" +
+	"\x0fidempotency_key\x18\x03 \x01(\tR\x0eidempotencyKey\"G\n" +
+	"\x15DeleteMonitorResponse\x12.\n" +
+	"\x13purged_report_count\x18\x01 \x01(\x05R\x11purgedReportCount\"\x89\x01\n" +
+	"\x14ResetBaselineRequest\x12\x1d\n" +
+	"\n" +
+	"model_name\x18\x01 \x01(\tR\tmodelName\x12)\n" +
+	"\x10baseline_version\x18\x02 \x01(\tR\x0fbaselineVersion\x12'\n" +
+	"\x0fidempotency_key\x18\x03 \x01(\tR\x0eidempotencyKey\"Q\n" +
+	"\x15ResetBaselineResponse\x128\n" +
+	"\amonitor\x18\x01 \x01(\v2\x1e.forgepoint.monitor.v1.MonitorR\amonitor\"4\n" +
 	"\x15GetDriftReportRequest\x12\x1b\n" +
 	"\treport_id\x18\x01 \x01(\tR\breportId\"T\n" +
 	"\x16GetDriftReportResponse\x12:\n" +
@@ -2198,19 +2804,7 @@ const file_forgepoint_monitor_v1_monitor_proto_rawDesc = "" +
 	"model_name\x18\x01 \x01(\tR\tmodelName\x12G\n" +
 	"\fmin_severity\x18\x02 \x01(\x0e2$.forgepoint.monitor.v1.DriftSeverityR\vminSeverity\"W\n" +
 	"\x19StreamDriftEventsResponse\x12:\n" +
-	"\x06report\x18\x01 \x01(\v2\".forgepoint.monitor.v1.DriftReportR\x06report\"\xce\x03\n" +
-	"\x17ModelDriftDetectedEvent\x12\x1d\n" +
-	"\n" +
-	"model_name\x18\x01 \x01(\tR\tmodelName\x12#\n" +
-	"\rmodel_version\x18\x02 \x01(\tR\fmodelVersion\x12?\n" +
-	"\n" +
-	"drift_type\x18\x03 \x01(\x0e2 .forgepoint.monitor.v1.DriftTypeR\tdriftType\x12@\n" +
-	"\bseverity\x18\x04 \x01(\x0e2$.forgepoint.monitor.v1.DriftSeverityR\bseverity\x12:\n" +
-	"\x06report\x18\x05 \x01(\v2\".forgepoint.monitor.v1.DriftReportR\x06report\x12\x1b\n" +
-	"\treport_id\x18\x06 \x01(\tR\breportId\x12!\n" +
-	"\fauto_retrain\x18\a \x01(\bR\vautoRetrain\x12.\n" +
-	"\x13retrain_pipeline_id\x18\b \x01(\tR\x11retrainPipelineId\x12@\n" +
-	"\x0fretrain_context\x18\t \x01(\v2\x17.google.protobuf.StructR\x0eretrainContext*s\n" +
+	"\x06report\x18\x01 \x01(\v2\".forgepoint.monitor.v1.DriftReportR\x06report*s\n" +
 	"\tDriftType\x12\x1a\n" +
 	"\x16DRIFT_TYPE_UNSPECIFIED\x10\x00\x12\x13\n" +
 	"\x0fDRIFT_TYPE_DATA\x10\x01\x12\x19\n" +
@@ -2231,10 +2825,14 @@ const file_forgepoint_monitor_v1_monitor_proto_rawDesc = "" +
 	"\x1eMONITOR_STATE_PENDING_BASELINE\x10\x01\x12\x1c\n" +
 	"\x18MONITOR_STATE_WARMING_UP\x10\x02\x12\x18\n" +
 	"\x14MONITOR_STATE_ACTIVE\x10\x03\x12\x18\n" +
-	"\x14MONITOR_STATE_PAUSED\x10\x042\xd0\x05\n" +
+	"\x14MONITOR_STATE_PAUSED\x10\x042\x80\t\n" +
 	"\x0eMonitorService\x12s\n" +
-	"\x10ConfigureMonitor\x12..forgepoint.monitor.v1.ConfigureMonitorRequest\x1a/.forgepoint.monitor.v1.ConfigureMonitorResponse\x12s\n" +
-	"\x10GetMonitorStatus\x12..forgepoint.monitor.v1.GetMonitorStatusRequest\x1a/.forgepoint.monitor.v1.GetMonitorStatusResponse\x12m\n" +
+	"\x10ConfigureMonitor\x12..forgepoint.monitor.v1.ConfigureMonitorRequest\x1a/.forgepoint.monitor.v1.ConfigureMonitorResponse\x12j\n" +
+	"\rDeleteMonitor\x12+.forgepoint.monitor.v1.DeleteMonitorRequest\x1a,.forgepoint.monitor.v1.DeleteMonitorResponse\x12j\n" +
+	"\rResetBaseline\x12+.forgepoint.monitor.v1.ResetBaselineRequest\x1a,.forgepoint.monitor.v1.ResetBaselineResponse\x12m\n" +
+	"\x0eGetModelHealth\x12,.forgepoint.monitor.v1.GetModelHealthRequest\x1a-.forgepoint.monitor.v1.GetModelHealthResponse\x12s\n" +
+	"\x10GetMonitorStatus\x12..forgepoint.monitor.v1.GetMonitorStatusRequest\x1a/.forgepoint.monitor.v1.GetMonitorStatusResponse\x12g\n" +
+	"\fListMonitors\x12*.forgepoint.monitor.v1.ListMonitorsRequest\x1a+.forgepoint.monitor.v1.ListMonitorsResponse\x12m\n" +
 	"\x0eGetDriftReport\x12,.forgepoint.monitor.v1.GetDriftReportRequest\x1a-.forgepoint.monitor.v1.GetDriftReportResponse\x12s\n" +
 	"\x10ListDriftReports\x12..forgepoint.monitor.v1.ListDriftReportsRequest\x1a/.forgepoint.monitor.v1.ListDriftReportsResponse\x12v\n" +
 	"\x11SubmitGroundTruth\x12/.forgepoint.monitor.v1.SubmitGroundTruthRequest\x1a0.forgepoint.monitor.v1.SubmitGroundTruthResponse\x12x\n" +
@@ -2253,94 +2851,121 @@ func file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP() []byte {
 }
 
 var file_forgepoint_monitor_v1_monitor_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
-var file_forgepoint_monitor_v1_monitor_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
+var file_forgepoint_monitor_v1_monitor_proto_msgTypes = make([]protoimpl.MessageInfo, 29)
 var file_forgepoint_monitor_v1_monitor_proto_goTypes = []any{
-	(DriftType)(0),                    // 0: forgepoint.monitor.v1.DriftType
-	(DriftMethod)(0),                  // 1: forgepoint.monitor.v1.DriftMethod
-	(DriftSeverity)(0),                // 2: forgepoint.monitor.v1.DriftSeverity
-	(MonitorState)(0),                 // 3: forgepoint.monitor.v1.MonitorState
-	(*ThresholdConfig)(nil),           // 4: forgepoint.monitor.v1.ThresholdConfig
-	(*Monitor)(nil),                   // 5: forgepoint.monitor.v1.Monitor
-	(*DriftMetric)(nil),               // 6: forgepoint.monitor.v1.DriftMetric
-	(*DriftReport)(nil),               // 7: forgepoint.monitor.v1.DriftReport
-	(*MonitorStatus)(nil),             // 8: forgepoint.monitor.v1.MonitorStatus
-	(*GroundTruthLabel)(nil),          // 9: forgepoint.monitor.v1.GroundTruthLabel
-	(*ConfigureMonitorRequest)(nil),   // 10: forgepoint.monitor.v1.ConfigureMonitorRequest
-	(*ConfigureMonitorResponse)(nil),  // 11: forgepoint.monitor.v1.ConfigureMonitorResponse
-	(*GetMonitorStatusRequest)(nil),   // 12: forgepoint.monitor.v1.GetMonitorStatusRequest
-	(*GetMonitorStatusResponse)(nil),  // 13: forgepoint.monitor.v1.GetMonitorStatusResponse
-	(*GetDriftReportRequest)(nil),     // 14: forgepoint.monitor.v1.GetDriftReportRequest
-	(*GetDriftReportResponse)(nil),    // 15: forgepoint.monitor.v1.GetDriftReportResponse
-	(*ListDriftReportsRequest)(nil),   // 16: forgepoint.monitor.v1.ListDriftReportsRequest
-	(*ListDriftReportsResponse)(nil),  // 17: forgepoint.monitor.v1.ListDriftReportsResponse
-	(*SubmitGroundTruthRequest)(nil),  // 18: forgepoint.monitor.v1.SubmitGroundTruthRequest
-	(*SubmitGroundTruthResponse)(nil), // 19: forgepoint.monitor.v1.SubmitGroundTruthResponse
-	(*StreamDriftEventsRequest)(nil),  // 20: forgepoint.monitor.v1.StreamDriftEventsRequest
-	(*StreamDriftEventsResponse)(nil), // 21: forgepoint.monitor.v1.StreamDriftEventsResponse
-	(*ModelDriftDetectedEvent)(nil),   // 22: forgepoint.monitor.v1.ModelDriftDetectedEvent
-	(*durationpb.Duration)(nil),       // 23: google.protobuf.Duration
-	(*timestamppb.Timestamp)(nil),     // 24: google.protobuf.Timestamp
-	(*v1.PaginationRequest)(nil),      // 25: forgepoint.common.v1.PaginationRequest
-	(*v1.PaginationResponse)(nil),     // 26: forgepoint.common.v1.PaginationResponse
-	(*structpb.Struct)(nil),           // 27: google.protobuf.Struct
+	(DriftType)(0),                     // 0: forgepoint.monitor.v1.DriftType
+	(DriftMethod)(0),                   // 1: forgepoint.monitor.v1.DriftMethod
+	(DriftSeverity)(0),                 // 2: forgepoint.monitor.v1.DriftSeverity
+	(MonitorState)(0),                  // 3: forgepoint.monitor.v1.MonitorState
+	(*ThresholdConfig)(nil),            // 4: forgepoint.monitor.v1.ThresholdConfig
+	(*Monitor)(nil),                    // 5: forgepoint.monitor.v1.Monitor
+	(*DriftMetric)(nil),                // 6: forgepoint.monitor.v1.DriftMetric
+	(*DriftReport)(nil),                // 7: forgepoint.monitor.v1.DriftReport
+	(*MonitorStatus)(nil),              // 8: forgepoint.monitor.v1.MonitorStatus
+	(*ModelHealth)(nil),                // 9: forgepoint.monitor.v1.ModelHealth
+	(*GroundTruthLabel)(nil),           // 10: forgepoint.monitor.v1.GroundTruthLabel
+	(*ConfigureMonitorRequest)(nil),    // 11: forgepoint.monitor.v1.ConfigureMonitorRequest
+	(*ConfigureMonitorResponse)(nil),   // 12: forgepoint.monitor.v1.ConfigureMonitorResponse
+	(*GetMonitorStatusRequest)(nil),    // 13: forgepoint.monitor.v1.GetMonitorStatusRequest
+	(*GetMonitorStatusResponse)(nil),   // 14: forgepoint.monitor.v1.GetMonitorStatusResponse
+	(*GetModelHealthRequest)(nil),      // 15: forgepoint.monitor.v1.GetModelHealthRequest
+	(*GetModelHealthResponse)(nil),     // 16: forgepoint.monitor.v1.GetModelHealthResponse
+	(*ListMonitorsRequest)(nil),        // 17: forgepoint.monitor.v1.ListMonitorsRequest
+	(*ListMonitorsResponse)(nil),       // 18: forgepoint.monitor.v1.ListMonitorsResponse
+	(*DeleteMonitorRequest)(nil),       // 19: forgepoint.monitor.v1.DeleteMonitorRequest
+	(*DeleteMonitorResponse)(nil),      // 20: forgepoint.monitor.v1.DeleteMonitorResponse
+	(*ResetBaselineRequest)(nil),       // 21: forgepoint.monitor.v1.ResetBaselineRequest
+	(*ResetBaselineResponse)(nil),      // 22: forgepoint.monitor.v1.ResetBaselineResponse
+	(*GetDriftReportRequest)(nil),      // 23: forgepoint.monitor.v1.GetDriftReportRequest
+	(*GetDriftReportResponse)(nil),     // 24: forgepoint.monitor.v1.GetDriftReportResponse
+	(*ListDriftReportsRequest)(nil),    // 25: forgepoint.monitor.v1.ListDriftReportsRequest
+	(*ListDriftReportsResponse)(nil),   // 26: forgepoint.monitor.v1.ListDriftReportsResponse
+	(*SubmitGroundTruthRequest)(nil),   // 27: forgepoint.monitor.v1.SubmitGroundTruthRequest
+	(*SubmitGroundTruthResponse)(nil),  // 28: forgepoint.monitor.v1.SubmitGroundTruthResponse
+	(*StreamDriftEventsRequest)(nil),   // 29: forgepoint.monitor.v1.StreamDriftEventsRequest
+	(*StreamDriftEventsResponse)(nil),  // 30: forgepoint.monitor.v1.StreamDriftEventsResponse
+	nil,                                // 31: forgepoint.monitor.v1.ModelHealth.SeverityByTypeEntry
+	(*ListMonitorsResponse_Entry)(nil), // 32: forgepoint.monitor.v1.ListMonitorsResponse.Entry
+	(*durationpb.Duration)(nil),        // 33: google.protobuf.Duration
+	(*timestamppb.Timestamp)(nil),      // 34: google.protobuf.Timestamp
+	(*v1.PaginationRequest)(nil),       // 35: forgepoint.common.v1.PaginationRequest
+	(*v1.PaginationResponse)(nil),      // 36: forgepoint.common.v1.PaginationResponse
 }
 var file_forgepoint_monitor_v1_monitor_proto_depIdxs = []int32{
 	0,  // 0: forgepoint.monitor.v1.ThresholdConfig.drift_type:type_name -> forgepoint.monitor.v1.DriftType
 	1,  // 1: forgepoint.monitor.v1.ThresholdConfig.method:type_name -> forgepoint.monitor.v1.DriftMethod
-	23, // 2: forgepoint.monitor.v1.Monitor.window_duration:type_name -> google.protobuf.Duration
+	33, // 2: forgepoint.monitor.v1.Monitor.window_duration:type_name -> google.protobuf.Duration
 	4,  // 3: forgepoint.monitor.v1.Monitor.thresholds:type_name -> forgepoint.monitor.v1.ThresholdConfig
 	3,  // 4: forgepoint.monitor.v1.Monitor.state:type_name -> forgepoint.monitor.v1.MonitorState
-	24, // 5: forgepoint.monitor.v1.Monitor.baseline_captured_at:type_name -> google.protobuf.Timestamp
-	24, // 6: forgepoint.monitor.v1.Monitor.created_at:type_name -> google.protobuf.Timestamp
-	24, // 7: forgepoint.monitor.v1.Monitor.updated_at:type_name -> google.protobuf.Timestamp
+	34, // 5: forgepoint.monitor.v1.Monitor.baseline_captured_at:type_name -> google.protobuf.Timestamp
+	34, // 6: forgepoint.monitor.v1.Monitor.created_at:type_name -> google.protobuf.Timestamp
+	34, // 7: forgepoint.monitor.v1.Monitor.updated_at:type_name -> google.protobuf.Timestamp
 	1,  // 8: forgepoint.monitor.v1.DriftMetric.method:type_name -> forgepoint.monitor.v1.DriftMethod
 	2,  // 9: forgepoint.monitor.v1.DriftMetric.severity:type_name -> forgepoint.monitor.v1.DriftSeverity
 	0,  // 10: forgepoint.monitor.v1.DriftReport.drift_type:type_name -> forgepoint.monitor.v1.DriftType
 	2,  // 11: forgepoint.monitor.v1.DriftReport.severity:type_name -> forgepoint.monitor.v1.DriftSeverity
 	6,  // 12: forgepoint.monitor.v1.DriftReport.metrics:type_name -> forgepoint.monitor.v1.DriftMetric
-	24, // 13: forgepoint.monitor.v1.DriftReport.window_start:type_name -> google.protobuf.Timestamp
-	24, // 14: forgepoint.monitor.v1.DriftReport.window_end:type_name -> google.protobuf.Timestamp
-	24, // 15: forgepoint.monitor.v1.DriftReport.created_at:type_name -> google.protobuf.Timestamp
+	34, // 13: forgepoint.monitor.v1.DriftReport.window_start:type_name -> google.protobuf.Timestamp
+	34, // 14: forgepoint.monitor.v1.DriftReport.window_end:type_name -> google.protobuf.Timestamp
+	34, // 15: forgepoint.monitor.v1.DriftReport.created_at:type_name -> google.protobuf.Timestamp
 	5,  // 16: forgepoint.monitor.v1.MonitorStatus.monitor:type_name -> forgepoint.monitor.v1.Monitor
 	3,  // 17: forgepoint.monitor.v1.MonitorStatus.state:type_name -> forgepoint.monitor.v1.MonitorState
 	7,  // 18: forgepoint.monitor.v1.MonitorStatus.latest_report:type_name -> forgepoint.monitor.v1.DriftReport
-	24, // 19: forgepoint.monitor.v1.MonitorStatus.last_event_at:type_name -> google.protobuf.Timestamp
-	24, // 20: forgepoint.monitor.v1.GroundTruthLabel.observed_at:type_name -> google.protobuf.Timestamp
-	23, // 21: forgepoint.monitor.v1.ConfigureMonitorRequest.window_duration:type_name -> google.protobuf.Duration
-	4,  // 22: forgepoint.monitor.v1.ConfigureMonitorRequest.thresholds:type_name -> forgepoint.monitor.v1.ThresholdConfig
-	5,  // 23: forgepoint.monitor.v1.ConfigureMonitorResponse.monitor:type_name -> forgepoint.monitor.v1.Monitor
-	8,  // 24: forgepoint.monitor.v1.GetMonitorStatusResponse.status:type_name -> forgepoint.monitor.v1.MonitorStatus
-	7,  // 25: forgepoint.monitor.v1.GetDriftReportResponse.report:type_name -> forgepoint.monitor.v1.DriftReport
-	2,  // 26: forgepoint.monitor.v1.ListDriftReportsRequest.min_severity:type_name -> forgepoint.monitor.v1.DriftSeverity
-	24, // 27: forgepoint.monitor.v1.ListDriftReportsRequest.since:type_name -> google.protobuf.Timestamp
-	24, // 28: forgepoint.monitor.v1.ListDriftReportsRequest.until:type_name -> google.protobuf.Timestamp
-	25, // 29: forgepoint.monitor.v1.ListDriftReportsRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
-	7,  // 30: forgepoint.monitor.v1.ListDriftReportsResponse.reports:type_name -> forgepoint.monitor.v1.DriftReport
-	26, // 31: forgepoint.monitor.v1.ListDriftReportsResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
-	9,  // 32: forgepoint.monitor.v1.SubmitGroundTruthRequest.labels:type_name -> forgepoint.monitor.v1.GroundTruthLabel
-	2,  // 33: forgepoint.monitor.v1.StreamDriftEventsRequest.min_severity:type_name -> forgepoint.monitor.v1.DriftSeverity
-	7,  // 34: forgepoint.monitor.v1.StreamDriftEventsResponse.report:type_name -> forgepoint.monitor.v1.DriftReport
-	0,  // 35: forgepoint.monitor.v1.ModelDriftDetectedEvent.drift_type:type_name -> forgepoint.monitor.v1.DriftType
-	2,  // 36: forgepoint.monitor.v1.ModelDriftDetectedEvent.severity:type_name -> forgepoint.monitor.v1.DriftSeverity
-	7,  // 37: forgepoint.monitor.v1.ModelDriftDetectedEvent.report:type_name -> forgepoint.monitor.v1.DriftReport
-	27, // 38: forgepoint.monitor.v1.ModelDriftDetectedEvent.retrain_context:type_name -> google.protobuf.Struct
-	10, // 39: forgepoint.monitor.v1.MonitorService.ConfigureMonitor:input_type -> forgepoint.monitor.v1.ConfigureMonitorRequest
-	12, // 40: forgepoint.monitor.v1.MonitorService.GetMonitorStatus:input_type -> forgepoint.monitor.v1.GetMonitorStatusRequest
-	14, // 41: forgepoint.monitor.v1.MonitorService.GetDriftReport:input_type -> forgepoint.monitor.v1.GetDriftReportRequest
-	16, // 42: forgepoint.monitor.v1.MonitorService.ListDriftReports:input_type -> forgepoint.monitor.v1.ListDriftReportsRequest
-	18, // 43: forgepoint.monitor.v1.MonitorService.SubmitGroundTruth:input_type -> forgepoint.monitor.v1.SubmitGroundTruthRequest
-	20, // 44: forgepoint.monitor.v1.MonitorService.StreamDriftEvents:input_type -> forgepoint.monitor.v1.StreamDriftEventsRequest
-	11, // 45: forgepoint.monitor.v1.MonitorService.ConfigureMonitor:output_type -> forgepoint.monitor.v1.ConfigureMonitorResponse
-	13, // 46: forgepoint.monitor.v1.MonitorService.GetMonitorStatus:output_type -> forgepoint.monitor.v1.GetMonitorStatusResponse
-	15, // 47: forgepoint.monitor.v1.MonitorService.GetDriftReport:output_type -> forgepoint.monitor.v1.GetDriftReportResponse
-	17, // 48: forgepoint.monitor.v1.MonitorService.ListDriftReports:output_type -> forgepoint.monitor.v1.ListDriftReportsResponse
-	19, // 49: forgepoint.monitor.v1.MonitorService.SubmitGroundTruth:output_type -> forgepoint.monitor.v1.SubmitGroundTruthResponse
-	21, // 50: forgepoint.monitor.v1.MonitorService.StreamDriftEvents:output_type -> forgepoint.monitor.v1.StreamDriftEventsResponse
-	45, // [45:51] is the sub-list for method output_type
-	39, // [39:45] is the sub-list for method input_type
-	39, // [39:39] is the sub-list for extension type_name
-	39, // [39:39] is the sub-list for extension extendee
-	0,  // [0:39] is the sub-list for field type_name
+	34, // 19: forgepoint.monitor.v1.MonitorStatus.last_event_at:type_name -> google.protobuf.Timestamp
+	2,  // 20: forgepoint.monitor.v1.ModelHealth.overall_severity:type_name -> forgepoint.monitor.v1.DriftSeverity
+	31, // 21: forgepoint.monitor.v1.ModelHealth.severity_by_type:type_name -> forgepoint.monitor.v1.ModelHealth.SeverityByTypeEntry
+	3,  // 22: forgepoint.monitor.v1.ModelHealth.state:type_name -> forgepoint.monitor.v1.MonitorState
+	34, // 23: forgepoint.monitor.v1.ModelHealth.last_event_at:type_name -> google.protobuf.Timestamp
+	34, // 24: forgepoint.monitor.v1.GroundTruthLabel.observed_at:type_name -> google.protobuf.Timestamp
+	33, // 25: forgepoint.monitor.v1.ConfigureMonitorRequest.window_duration:type_name -> google.protobuf.Duration
+	4,  // 26: forgepoint.monitor.v1.ConfigureMonitorRequest.thresholds:type_name -> forgepoint.monitor.v1.ThresholdConfig
+	5,  // 27: forgepoint.monitor.v1.ConfigureMonitorResponse.monitor:type_name -> forgepoint.monitor.v1.Monitor
+	8,  // 28: forgepoint.monitor.v1.GetMonitorStatusResponse.status:type_name -> forgepoint.monitor.v1.MonitorStatus
+	9,  // 29: forgepoint.monitor.v1.GetModelHealthResponse.health:type_name -> forgepoint.monitor.v1.ModelHealth
+	2,  // 30: forgepoint.monitor.v1.ListMonitorsRequest.min_severity:type_name -> forgepoint.monitor.v1.DriftSeverity
+	3,  // 31: forgepoint.monitor.v1.ListMonitorsRequest.state:type_name -> forgepoint.monitor.v1.MonitorState
+	35, // 32: forgepoint.monitor.v1.ListMonitorsRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
+	32, // 33: forgepoint.monitor.v1.ListMonitorsResponse.entries:type_name -> forgepoint.monitor.v1.ListMonitorsResponse.Entry
+	36, // 34: forgepoint.monitor.v1.ListMonitorsResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
+	5,  // 35: forgepoint.monitor.v1.ResetBaselineResponse.monitor:type_name -> forgepoint.monitor.v1.Monitor
+	7,  // 36: forgepoint.monitor.v1.GetDriftReportResponse.report:type_name -> forgepoint.monitor.v1.DriftReport
+	2,  // 37: forgepoint.monitor.v1.ListDriftReportsRequest.min_severity:type_name -> forgepoint.monitor.v1.DriftSeverity
+	34, // 38: forgepoint.monitor.v1.ListDriftReportsRequest.since:type_name -> google.protobuf.Timestamp
+	34, // 39: forgepoint.monitor.v1.ListDriftReportsRequest.until:type_name -> google.protobuf.Timestamp
+	35, // 40: forgepoint.monitor.v1.ListDriftReportsRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
+	7,  // 41: forgepoint.monitor.v1.ListDriftReportsResponse.reports:type_name -> forgepoint.monitor.v1.DriftReport
+	36, // 42: forgepoint.monitor.v1.ListDriftReportsResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
+	10, // 43: forgepoint.monitor.v1.SubmitGroundTruthRequest.labels:type_name -> forgepoint.monitor.v1.GroundTruthLabel
+	2,  // 44: forgepoint.monitor.v1.StreamDriftEventsRequest.min_severity:type_name -> forgepoint.monitor.v1.DriftSeverity
+	7,  // 45: forgepoint.monitor.v1.StreamDriftEventsResponse.report:type_name -> forgepoint.monitor.v1.DriftReport
+	2,  // 46: forgepoint.monitor.v1.ModelHealth.SeverityByTypeEntry.value:type_name -> forgepoint.monitor.v1.DriftSeverity
+	5,  // 47: forgepoint.monitor.v1.ListMonitorsResponse.Entry.monitor:type_name -> forgepoint.monitor.v1.Monitor
+	9,  // 48: forgepoint.monitor.v1.ListMonitorsResponse.Entry.health:type_name -> forgepoint.monitor.v1.ModelHealth
+	11, // 49: forgepoint.monitor.v1.MonitorService.ConfigureMonitor:input_type -> forgepoint.monitor.v1.ConfigureMonitorRequest
+	19, // 50: forgepoint.monitor.v1.MonitorService.DeleteMonitor:input_type -> forgepoint.monitor.v1.DeleteMonitorRequest
+	21, // 51: forgepoint.monitor.v1.MonitorService.ResetBaseline:input_type -> forgepoint.monitor.v1.ResetBaselineRequest
+	15, // 52: forgepoint.monitor.v1.MonitorService.GetModelHealth:input_type -> forgepoint.monitor.v1.GetModelHealthRequest
+	13, // 53: forgepoint.monitor.v1.MonitorService.GetMonitorStatus:input_type -> forgepoint.monitor.v1.GetMonitorStatusRequest
+	17, // 54: forgepoint.monitor.v1.MonitorService.ListMonitors:input_type -> forgepoint.monitor.v1.ListMonitorsRequest
+	23, // 55: forgepoint.monitor.v1.MonitorService.GetDriftReport:input_type -> forgepoint.monitor.v1.GetDriftReportRequest
+	25, // 56: forgepoint.monitor.v1.MonitorService.ListDriftReports:input_type -> forgepoint.monitor.v1.ListDriftReportsRequest
+	27, // 57: forgepoint.monitor.v1.MonitorService.SubmitGroundTruth:input_type -> forgepoint.monitor.v1.SubmitGroundTruthRequest
+	29, // 58: forgepoint.monitor.v1.MonitorService.StreamDriftEvents:input_type -> forgepoint.monitor.v1.StreamDriftEventsRequest
+	12, // 59: forgepoint.monitor.v1.MonitorService.ConfigureMonitor:output_type -> forgepoint.monitor.v1.ConfigureMonitorResponse
+	20, // 60: forgepoint.monitor.v1.MonitorService.DeleteMonitor:output_type -> forgepoint.monitor.v1.DeleteMonitorResponse
+	22, // 61: forgepoint.monitor.v1.MonitorService.ResetBaseline:output_type -> forgepoint.monitor.v1.ResetBaselineResponse
+	16, // 62: forgepoint.monitor.v1.MonitorService.GetModelHealth:output_type -> forgepoint.monitor.v1.GetModelHealthResponse
+	14, // 63: forgepoint.monitor.v1.MonitorService.GetMonitorStatus:output_type -> forgepoint.monitor.v1.GetMonitorStatusResponse
+	18, // 64: forgepoint.monitor.v1.MonitorService.ListMonitors:output_type -> forgepoint.monitor.v1.ListMonitorsResponse
+	24, // 65: forgepoint.monitor.v1.MonitorService.GetDriftReport:output_type -> forgepoint.monitor.v1.GetDriftReportResponse
+	26, // 66: forgepoint.monitor.v1.MonitorService.ListDriftReports:output_type -> forgepoint.monitor.v1.ListDriftReportsResponse
+	28, // 67: forgepoint.monitor.v1.MonitorService.SubmitGroundTruth:output_type -> forgepoint.monitor.v1.SubmitGroundTruthResponse
+	30, // 68: forgepoint.monitor.v1.MonitorService.StreamDriftEvents:output_type -> forgepoint.monitor.v1.StreamDriftEventsResponse
+	59, // [59:69] is the sub-list for method output_type
+	49, // [49:59] is the sub-list for method input_type
+	49, // [49:49] is the sub-list for extension type_name
+	49, // [49:49] is the sub-list for extension extendee
+	0,  // [0:49] is the sub-list for field type_name
 }
 
 func init() { file_forgepoint_monitor_v1_monitor_proto_init() }
@@ -2354,7 +2979,7 @@ func file_forgepoint_monitor_v1_monitor_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_forgepoint_monitor_v1_monitor_proto_rawDesc), len(file_forgepoint_monitor_v1_monitor_proto_rawDesc)),
 			NumEnums:      4,
-			NumMessages:   19,
+			NumMessages:   29,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

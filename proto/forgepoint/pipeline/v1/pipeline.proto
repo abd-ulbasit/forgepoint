@@ -52,8 +52,54 @@
 // concurrently. The API here is the durable, queryable face of that state.
 //
 // CLOSED LOOP: this service is what makes Forgepoint a closed loop. The Model
-// Monitor calls TriggerExecution on a model's training pipeline when drift is
-// detected (retrain → canary → promote), which closes serve → monitor → retrain.
+// Monitor publishes fp.models.drift.detected (events.ModelDriftDetected); this
+// service CONSUMES it and, on a CRITICAL report with auto_retrain armed, calls
+// its OWN TriggerExecution on the model's retrain pipeline (retrain → canary →
+// promote). That closes serve → monitor → retrain WITHOUT a synchronous callback
+// — the orchestrator reacts to a fat-but-flat event, not a gRPC poke.
+//
+// EVENT CONTRACT (single source of truth): this service's NATS payloads are
+// defined in forgepoint/events/v1/events.proto, NOT here. We deliberately do NOT
+// re-declare event-payload messages in this API proto, and we do NOT even import
+// events.proto into this file (the generated Go event types are imported by the
+// Go publisher/consumer code instead — keeping the API-proto surface uncoupled
+// from the event schema). WHY: an event is a PUBLISHED CONTRACT with its own
+// lifecycle and its own buf-breaking guarantee, decoupled from the RPC types — a
+// consumer (Notification, Experiment Tracker) depends only on the events package,
+// never on this service's API proto. See the long DESIGN block in events.proto
+// for the schema-registry reasoning. The handler maps this proto's domain enums
+// (PipelineType, StepType) to/from the mirrored events enums at the publish
+// boundary (a few lines of mechanical conversion — the price of decoupling).
+//
+//   PRODUCES (subject → events.v1 message):
+//     fp.pipelines.started                  → events.PipelineStarted
+//     fp.pipelines.step.completed           → events.StepCompleted
+//     fp.pipelines.step.failed              → events.StepFailed
+//     fp.pipelines.completed                → events.PipelineCompleted
+//     fp.pipelines.failed                   → events.PipelineFailed
+//     fp.pipelines.compensation.triggered   → events.CompensationTriggered
+//     fp.pipelines.model.deployed           → events.ModelDeployed     (NEW — see below)
+//     fp.pipelines.model.undeployed         → events.ModelUndeployed   (NEW — see below)
+//
+//   CONSUMES:
+//     fp.models.drift.detected              → events.ModelDriftDetected
+//       (on severity == CRITICAL && auto_retrain, TriggerExecution(retrain_pipeline_id))
+//
+// MODEL-DEPLOY LIFECYCLE OWNERSHIP (events.proto conflict #2): the DEPLOY /
+// PROMOTE saga steps — and the compensation that rolls them back — are the
+// AUTHORITATIVE source of "a model version is now (un)deployed". This service
+// therefore OWNS and publishes events.ModelDeployed / events.ModelUndeployed
+// under fp.pipelines.model.* (the deploy is a WORKFLOW outcome, so it lives in
+// the pipelines domain even though it concerns a model — EventEnvelope.source
+// records "pipeline-orchestrator" as the real producer). The Inference Gateway
+// and Model Serving CONSUME these to add/remove routes and (un)load versions; a
+// serving pod must NOT emit a competing ModelLoaded/Unloaded lifecycle event.
+//   SSRF GUARD (interview-critical): events.ModelDeployed.endpoint is the serving
+//   backend address. It is RESOLVED SERVER-SIDE by the DEPLOY executor (from the
+//   model version + the K8s Service it created), NEVER taken from client-supplied
+//   step `config`. Accepting a client URL as the route target would let a caller
+//   point gateway traffic at an arbitrary internal host (SSRF). The executor only
+//   ever emits an endpoint it constructed itself, against the fp-models namespace.
 //
 // VERSIONING: Package path includes v1 following Buf/Google convention.
 // Breaking changes require a new forgepoint.pipeline.v2 package.
@@ -73,6 +119,16 @@ import "google/protobuf/timestamp.proto";
 import "google/protobuf/duration.proto";
 import "google/protobuf/struct.proto";
 import "forgepoint/common/v1/common.proto";
+// NOTE: we deliberately do NOT import forgepoint/events/v1/events.proto here.
+// The canonical event payloads this service publishes/consumes (PipelineStarted,
+// StepCompleted, ModelDeployed, ModelDriftDetected, ...) live in that package,
+// but importing it would make this API proto compile-depend on the event schema —
+// the exact coupling events.proto exists to avoid (an unused proto import would
+// also be dead weight). The GENERATED GO event types are imported by this
+// service's NATS publisher/consumer code (Go-side), which maps this proto's
+// domain enums to/from the events enums at the publish boundary. This .proto
+// stays a pure RPC-contract surface; the event contract is referenced only in
+// the teaching comments below. (struct.proto IS used — config/output/input fields.)
 
 // ============================================================================
 // ENUMS
@@ -283,7 +339,16 @@ message StepDefinition {
   // hyperparameters, target model_id/version). Struct (not a typed message)
   // because config shape varies per StepType and per CUSTOM step — typing every
   // variant would bloat this proto and couple it to executor internals.
-  // SECURITY: the engine treats this as untrusted input; executors validate it.
+  // SECURITY (untrusted input — executors MUST validate, never trust shape):
+  //   - SSRF: config may name a target model_id/version, but it must NOT supply a
+  //     raw serving URL/host/IP for the engine to call. The DEPLOY/CANARY
+  //     executors RESOLVE the serving endpoint server-side (from the model
+  //     version + the K8s Service in fp-models) and only ever talk to that
+  //     allowlisted, internally-constructed address. A client-supplied endpoint
+  //     would be a server-side request forgery vector — rejected at validation.
+  //   - Resource caps: numeric config (e.g. parallel fold count, retry budget) is
+  //     clamped to engine maxima so a config can't request unbounded fan-out.
+  //   - No secrets here: config is echoed in GetExecution responses and step events.
   google.protobuf.Struct config = 6;
 
   // Optional per-step timeout. If the step runs longer, the engine fails it
@@ -460,7 +525,21 @@ message CreatePipelineRequest {
 
   // The step graph. The server validates: known StepTypes, depends_on refers to
   // real step ids, no cycles (DAG), compensation_step_id refers to real steps.
+  // BATCH-SIZE CAP (contract, not just prose): the server REJECTS a definition
+  // with more than 256 steps (INVALID_ARGUMENT). A pipeline graph this large is
+  // almost always a mistake, and an unbounded graph is a DoS vector (the engine
+  // persists a checkpoint row per step and topo-sorts the whole set). 256 is far
+  // above any real ML workflow yet bounds the work the server commits to.
   repeated StepDefinition steps = 3;
+
+  // Caller-supplied idempotency key (typically a UUID) for the CREATE itself.
+  // WHY mutating-create idempotency: a client retry after a network blip must not
+  // create two pipelines with the same name (which would then fail the
+  // uniqueness check confusingly, or — worse, under a race — both succeed). Same
+  // key → the SAME PipelineDefinition is returned, never a duplicate. Empty = no
+  // dedup (interactive one-off). Mirrors TriggerExecution's idempotency_key and
+  // the Stripe idempotency-key pattern used across the platform.
+  string idempotency_key = 4;
 }
 
 // CreatePipelineResponse wraps the created PipelineDefinition.
@@ -621,9 +700,16 @@ message CancelExecutionResponse {
 // across every list RPC on the platform (cursor-based; see common.proto for the
 // WHY). SECURITY: the server CAPS page_size (default 20, max 100) regardless of
 // the requested value, to prevent a client from requesting an unbounded page.
+//
+// TENANCY (anti-IDOR): there is deliberately NO team field on this request. The
+// result set is ALWAYS scoped to the caller's team, derived SERVER-SIDE from the
+// auth token claims — never from a client-supplied tenancy field. A client cannot
+// list another team's executions by passing a different team. The pipeline_id /
+// status_filter below only NARROW within that authorized scope.
 message ListExecutionsRequest {
-  // Optional: only runs of this pipeline. Empty = all pipelines (subject to the
-  // caller's team/RBAC scope).
+  // Optional: only runs of this pipeline. Empty = all pipelines the caller's team
+  // owns. A pipeline_id from another team yields an empty page (scope-filtered,
+  // not an error — we don't confirm/deny existence of out-of-scope ids).
   string pipeline_id = 1;
 
   // Optional: only runs in this status (e.g., FAILED for a triage dashboard).
@@ -649,7 +735,9 @@ message ListExecutionsResponse {
 // ============================================================================
 
 // ListPipelinesRequest returns a paginated list of pipeline TEMPLATES (not
-// runs). Same pagination/cap discipline as ListExecutions.
+// runs). Same pagination/cap discipline as ListExecutions (page_size default 20,
+// capped 100 server-side). TENANCY: like ListExecutions, results are scoped to
+// the caller's team from auth claims — there is no client-supplied team field.
 message ListPipelinesRequest {
   // Optional: only pipelines of this type (e.g., only TRAINING_DAG).
   // UNSPECIFIED = any type.
@@ -668,119 +756,132 @@ message ListPipelinesResponse {
 }
 
 // ============================================================================
-// EVENT PAYLOAD MESSAGES (published to NATS via the common EventEnvelope)
-// ============================================================================
-//
-// WHY THESE EXIST AS TYPED MESSAGES: the platform's EventEnvelope (common.proto)
-// carries its payload as google.protobuf.Any. Defining concrete payload
-// messages here means producers pack a TYPED value into Any (type-safe, schema'd)
-// and consumers unpack a known type — instead of passing around untyped JSON.
-// The envelope stays generic; the payloads are strongly typed per event.
-//
-// SUBJECT MAPPING (NATS subject hierarchy fp.{source}.{event}):
-//   PipelineStartedEvent        → fp.pipelines.started
-//   StepCompletedEvent          → fp.pipelines.step.completed
-//   StepFailedEvent             → fp.pipelines.step.failed
-//   PipelineCompletedEvent      → fp.pipelines.completed
-//   PipelineFailedEvent         → fp.pipelines.failed
-//   CompensationTriggeredEvent  → fp.pipelines.compensation.triggered
-//
-// CONSUMERS (from the design's event-flow map):
-//   - Notification service reacts to PipelineStarted / PipelineFailed (alerting).
-//   - Experiment Tracker ingests StepCompleted / PipelineCompleted (metrics).
-//
-// DESIGN: payloads carry IDS + a snapshot of essential fields, NOT the whole
-// Execution. Events should be small and stable; a consumer that needs full
-// detail can call GetExecution (the "thin event, fat read" pattern — avoids
-// coupling every consumer to the full Execution schema).
+// GetPipeline
 // ============================================================================
 
-// PipelineStartedEvent — emitted when an Execution transitions to RUNNING.
-// Subject: fp.pipelines.started
-message PipelineStartedEvent {
-  string execution_id = 1;
-  string pipeline_id = 2;
-  PipelineType pipeline_type = 3;
-  // Who/what triggered it (user_id or service identity like "model-monitor").
-  string triggered_by = 4;
-  google.protobuf.Timestamp started_at = 5;
+// GetPipelineRequest fetches ONE pipeline TEMPLATE by id.
+// WHY this RPC exists (it was missing): the CLI (`fp pipeline get <id>`), the web
+// UI's pipeline editor, and any client that wants to inspect a template's full
+// step graph before triggering it need a by-id read. ListPipelines is for
+// browsing; this is the point lookup. The server scopes the read to the caller's
+// team/RBAC (a caller cannot fetch another team's pipeline by guessing its id).
+message GetPipelineRequest {
+  // UUID of the pipeline definition to fetch.
+  string pipeline_id = 1;
 }
 
-// StepCompletedEvent — emitted when a single step finishes successfully.
-// Subject: fp.pipelines.step.completed
-// Consumed by Experiment Tracker to record per-step progress/metrics.
-message StepCompletedEvent {
-  string execution_id = 1;
-  string pipeline_id = 2;
-  // Template step id that completed.
-  string step_id = 3;
-  StepType step_type = 4;
-  // Step output (e.g., trained model URI) so downstream consumers don't have to
-  // call back for it. Small, step-specific payload.
-  google.protobuf.Struct output = 5;
-  google.protobuf.Timestamp completed_at = 6;
+// GetPipelineResponse wraps the PipelineDefinition (incl. its full step graph).
+message GetPipelineResponse {
+  PipelineDefinition pipeline = 1;
 }
 
-// StepFailedEvent — emitted when a step fails (BEFORE compensation runs).
-// Subject: fp.pipelines.step.failed
-message StepFailedEvent {
-  string execution_id = 1;
-  string pipeline_id = 2;
-  string step_id = 3;
-  StepType step_type = 4;
-  // Human-readable failure reason (for alerting/triage; not end-user copy).
-  string error = 5;
-  // How many attempts were made before giving up.
-  int32 attempts = 6;
-  google.protobuf.Timestamp failed_at = 7;
+// ============================================================================
+// UpdatePipeline
+// ============================================================================
+
+// UpdatePipelineRequest edits an existing pipeline TEMPLATE (name and/or steps).
+//
+// WHY this RPC exists (the CLI/UI need to edit a template without recreating it):
+// without Update, the only way to change a pipeline is delete-and-recreate, which
+// changes its id and orphans its execution history. Update keeps the id (and
+// therefore the lineage of past runs) stable.
+//
+// SECURITY — anti-mass-assignment (same discipline as Create): we accept ONLY the
+// user-authorable fields. id selects the target; name/type/steps are the editable
+// payload. We do NOT accept created_by, created_at, or team — those stay
+// server-authoritative and immutable; allowing a client to rewrite created_by
+// would let it forge ownership on an existing record.
+//
+// IMMUTABILITY NOTE: `type` (saga vs DAG) is NOT editable — changing a pipeline's
+// execution model out from under in-flight executions is unsafe, so the server
+// rejects a type change (create a new pipeline instead). It is omitted from this
+// request deliberately.
+//
+// CONCURRENCY: editing a template does NOT affect already-running executions —
+// each Execution captures the step graph it started with (template/instance
+// split). Only future TriggerExecutions see the new definition.
+message UpdatePipelineRequest {
+  // UUID of the pipeline to update (selects the target; not itself mutable).
+  string pipeline_id = 1;
+
+  // New human-readable name. Must remain unique within the caller's team.
+  string name = 2;
+
+  // The replacement step graph. Same validation + 256-step cap as CreatePipeline.
+  // This is a FULL REPLACE of the steps (not a partial patch) — simpler to reason
+  // about than field-level merge for a graph, and the whole graph is re-validated.
+  repeated StepDefinition steps = 3;
 }
 
-// CompensationTriggeredEvent — emitted when a saga starts rolling back, i.e. the
-// Execution enters COMPENSATING. Distinct from StepFailed: a step failure is the
-// CAUSE; this event marks the start of the UNDO phase. Useful for operators to
-// see "the saga is now rolling back" as a first-class signal.
-// Subject: fp.pipelines.compensation.triggered
-message CompensationTriggeredEvent {
-  string execution_id = 1;
-  string pipeline_id = 2;
-  // The step whose failure triggered compensation.
-  string failed_step_id = 3;
-  // The ordered list of step ids that will be compensated, in the REVERSE order
-  // they completed (the order they will actually be undone). Makes the rollback
-  // plan observable.
-  repeated string compensating_step_ids = 4;
-  google.protobuf.Timestamp triggered_at = 5;
+// UpdatePipelineResponse wraps the updated PipelineDefinition.
+message UpdatePipelineResponse {
+  PipelineDefinition pipeline = 1;
 }
 
-// PipelineCompletedEvent — emitted when an Execution reaches COMPLETED (all
-// steps succeeded). Consumed by Experiment Tracker (and others) to close out a run.
-// Subject: fp.pipelines.completed
-message PipelineCompletedEvent {
-  string execution_id = 1;
-  string pipeline_id = 2;
-  PipelineType pipeline_type = 3;
-  // Total wall-clock duration of the run (for SLO/latency dashboards).
-  google.protobuf.Duration duration = 4;
-  google.protobuf.Timestamp completed_at = 5;
+// ============================================================================
+// DeletePipeline
+// ============================================================================
+
+// DeletePipelineRequest removes a pipeline TEMPLATE.
+//
+// WHY a dedicated RPC + WHY soft-delete: operators need to retire obsolete
+// templates (the design/CLI call for a Delete). We SOFT-DELETE (archive) rather
+// than hard-delete: past Executions reference this pipeline_id for audit/lineage,
+// and hard-deleting would dangle those foreign keys and erase the history of what
+// ran. An archived template is hidden from ListPipelines and cannot be triggered,
+// but GetExecution on its historical runs still resolves the pipeline name.
+//
+// SAFETY: the server REJECTS deletion while the pipeline has a non-terminal
+// Execution (PENDING/RUNNING/COMPENSATING) — you cannot retire a template whose
+// saga is mid-flight (FAILED_PRECONDITION). Cancel those runs first.
+message DeletePipelineRequest {
+  // UUID of the pipeline to archive.
+  string pipeline_id = 1;
 }
 
-// PipelineFailedEvent — emitted when an Execution reaches the terminal FAILED
-// state (a step failed AND compensation finished). This is the event the
-// Notification service turns into a page/alert.
-// Subject: fp.pipelines.failed
-message PipelineFailedEvent {
-  string execution_id = 1;
-  string pipeline_id = 2;
-  PipelineType pipeline_type = 3;
-  // The step whose failure ultimately failed the run.
-  string failed_step_id = 4;
-  // Failure summary for the alert.
-  string error = 5;
-  // True if compensation itself failed (a "stuck saga" — orphaned side effects).
-  // The Notification service should escalate this harder than a clean rollback.
-  bool compensation_failed = 6;
-  google.protobuf.Timestamp failed_at = 7;
-}
+// DeletePipelineResponse is an intentionally-empty, dedicated response.
+// WHY a named empty message (not google.protobuf.Empty): Buf STANDARD
+// (RPC_RESPONSE_STANDARD_NAME) requires a <Rpc>Response type, and a named message
+// is forward-compatible — we can add fields later (e.g. archived_at) without a
+// breaking signature change. google.protobuf.Empty can never grow a field.
+message DeletePipelineResponse {}
+
+// ============================================================================
+// EVENT PAYLOADS — DEFINED IN forgepoint/events/v1/events.proto, NOT HERE
+// ============================================================================
+//
+// This proto used to declare its own PipelineStartedEvent / StepCompletedEvent /
+// StepFailedEvent / CompensationTriggeredEvent / PipelineCompletedEvent /
+// PipelineFailedEvent messages. They have been DELETED. The platform's single
+// source of truth for every NATS payload is forgepoint/events/v1/events.proto;
+// re-declaring payloads per service was exactly the incoherence that file exists
+// to fix (two services disagreeing on the same event, etc. — see its DESIGN
+// block). This service now publishes/consumes the canonical types instead.
+//
+//   PRODUCES (this service's handler marshals these into common.EventEnvelope.data):
+//     events.PipelineStarted        → fp.pipelines.started
+//     events.StepCompleted          → fp.pipelines.step.completed
+//     events.StepFailed             → fp.pipelines.step.failed
+//     events.CompensationTriggered  → fp.pipelines.compensation.triggered
+//     events.PipelineCompleted      → fp.pipelines.completed
+//     events.PipelineFailed         → fp.pipelines.failed
+//     events.ModelDeployed          → fp.pipelines.model.deployed    (DEPLOY/PROMOTE saga step)
+//     events.ModelUndeployed        → fp.pipelines.model.undeployed  (teardown / rollback compensation)
+//
+//   CONSUMES:
+//     events.ModelDriftDetected     ← fp.models.drift.detected
+//       On severity == DRIFT_SEVERITY_CRITICAL AND auto_retrain == true, the
+//       consumer calls THIS service's TriggerExecution(retrain_pipeline_id,
+//       input = retrain_context) — closing serve → monitor → retrain. The
+//       inbound EventEnvelope.id (and the report_id business handle) dedupe
+//       redeliveries so a drift report never double-triggers a retrain.
+//
+// THIN-EVENT / FAT-READ: the lifecycle events carry IDs + a snapshot of essential
+// fields, NOT the whole Execution. A consumer that wants the full per-step
+// timeline calls GetExecution. The model-deploy events are the exception — they
+// are FAT-BUT-FLAT (endpoint + weight_bps) so the gateway/serving can act with no
+// callback. (See events.proto for the per-event field rationale.)
+// ============================================================================
 
 // ============================================================================
 // PIPELINE ORCHESTRATOR SERVICE
@@ -826,6 +927,19 @@ service PipelineOrchestratorService {
   // ListPipelines returns a paginated list of pipeline templates within the
   // caller's team/RBAC scope, optionally filtered by type.
   rpc ListPipelines(ListPipelinesRequest) returns (ListPipelinesResponse);
+
+  // GetPipeline fetches one pipeline TEMPLATE by id (full step graph), scoped to
+  // the caller's team/RBAC. Point lookup for the CLI/UI before triggering a run.
+  rpc GetPipeline(GetPipelineRequest) returns (GetPipelineResponse);
+
+  // UpdatePipeline edits a template's name/steps in place (id and execution
+  // history preserved). Re-validates the step graph; type is immutable.
+  rpc UpdatePipeline(UpdatePipelineRequest) returns (UpdatePipelineResponse);
+
+  // DeletePipeline soft-deletes (archives) a template so it can no longer be
+  // listed or triggered, while preserving past executions' lineage. Rejected if
+  // a non-terminal execution of the pipeline is still in flight.
+  rpc DeletePipeline(DeletePipelineRequest) returns (DeletePipelineResponse);
 
   // TriggerExecution starts a new run of a pipeline. Supports an idempotency_key
   // so retries don't double-trigger (exactly-once from the caller's view). The

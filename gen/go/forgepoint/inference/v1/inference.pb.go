@@ -13,7 +13,22 @@
 //   - Predict / BatchPredict (unary) + StreamPredict (server-streaming batch)
 //   - Routing & traffic-split admin RPCs (the canary control plane)
 //   - Circuit-breaker observability RPCs
-//   - InferenceCompletedEvent / InferenceFailedEvent — typed NATS payloads
+//   - GetModelInfo (the HTTP GET /v1/models/{model}/info backing RPC)
+//
+// WHAT IS DELIBERATELY NOT HERE (event payloads live in forgepoint.events.v1):
+//   This file used to declare its OWN InferenceCompletedEvent / InferenceFailedEvent
+//   NATS payloads. They are GONE. An adversarial cross-service review found the
+//   event schemas were authored in parallel and DISAGREED — most damningly, this
+//   gateway AND model-serving both claimed the "an inference happened, bill it"
+//   event (inference.InferenceCompletedEvent vs serving.PredictionCompletedEvent),
+//   so Billing could double-meter. The platform now has ONE canonical event
+//   contract: forgepoint/events/v1/events.proto. The gateway publishes
+//   events.InferenceCompleted / events.InferenceFailed from there and DELETES its
+//   local copies. This proto keeps only its RPC request/response/domain types —
+//   the SYNC contract — and depends on the events package for the ASYNC contract.
+//   WHY the split: the event schema is a separately-versioned PUBLISHED contract
+//   (schema-registry thinking) that must not be coupled to any one service's API
+//   types; see the long DESIGN block at the top of events.proto.
 //
 // PATTERN — API GATEWAY + RESILIENCE STACK:
 //   This service composes FOUR classic resilience patterns into one request
@@ -74,11 +89,29 @@
 //        ▼
 //   PredictResponse (outputs + served_version + latency_ms + request_id)
 //
-// EVENTS PUBLISHED (subject hierarchy from the platform design):
-//   fp.inference.completed → InferenceCompletedEvent
-//   fp.inference.failed    → InferenceFailedEvent
-//   Consumed by: Billing (meter usage), Experiment Tracker (record),
-//                Model Monitor (drift windows over features + predictions).
+// EVENTS PRODUCED (canonical — payloads defined in forgepoint.events.v1):
+//   fp.inference.completed → events.InferenceCompleted  (THE single canonical
+//        inference event — the gateway alone knows latency, the version that
+//        ACTUALLY served post-split, the billed principal api_key_id, is_canary,
+//        and token_count. serving emits NO competing event.)
+//   fp.inference.failed    → events.InferenceFailed
+//   Consumed by: Billing (meter requests + tokens, dedupe on request_id),
+//                Experiment Tracker (A/B outcomes per served version),
+//                Model Monitor (drift windows; request_id is the ground-truth
+//                join key for delayed labels).
+//
+// EVENTS CONSUMED (all canonical events.v1 payloads; gateway is a pure reactor
+// on the control plane — the routing table is driven by events, not API writes):
+//   fp.pipelines.model.deployed   → events.ModelDeployed   → ADD a route target
+//        (the deploy SAGA owns this; the gateway uses its server-resolved
+//        endpoint + initial weight_bps — never a client-supplied endpoint).
+//   fp.pipelines.model.undeployed → events.ModelUndeployed → REMOVE a route target
+//   fp.models.promoted            → events.ModelPromoted   → repoint traffic to
+//        the new PRODUCTION version (and tear down the auto-demoted old one).
+//   fp.models.archived            → events.ModelArchived   → DROP the route.
+//   fp.billing.quota.exceeded     → events.QuotaExceeded   → flip the team's
+//        Redis quota cache to "blocked" so subsequent predicts pre-flight-reject
+//        with FAILURE_REASON_QUOTA_EXCEEDED (eventual consistency is fine here).
 //
 // VERSIONING: Package path includes v1 following Buf/Google convention.
 // Breaking changes require a new forgepoint.inference.v2 package.
@@ -94,6 +127,7 @@ package inferencev1
 
 import (
 	v1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/common/v1"
+	v11 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/events/v1"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	durationpb "google.golang.org/protobuf/types/known/durationpb"
@@ -325,98 +359,6 @@ func (CircuitBreakerState) EnumDescriptor() ([]byte, []int) {
 }
 
 // ============================================================================
-// FailureReason
-// ============================================================================
-//
-// WHY enumerate failure causes: each maps to a DIFFERENT operational response,
-// and each names a resilience pattern firing. An interviewer can ask "what
-// happens when the backend is down?" and you point at CIRCUIT_OPEN. Distinct
-// reasons let Monitor/alerts treat a capacity problem (RATE_LIMITED) very
-// differently from a backend health problem (CIRCUIT_OPEN / UPSTREAM_ERROR).
-// ============================================================================
-type FailureReason int32
-
-const (
-	// Required zero value.
-	FailureReason_FAILURE_REASON_UNSPECIFIED FailureReason = 0
-	// No route for the requested model (not deployed / undeployed). → NOT_FOUND.
-	FailureReason_FAILURE_REASON_NO_ROUTE FailureReason = 1
-	// Rate limiter rejected the call (token bucket empty). → RESOURCE_EXHAUSTED
-	// (HTTP 429 + Retry-After at the edge). A CAPACITY/quota signal.
-	FailureReason_FAILURE_REASON_RATE_LIMITED FailureReason = 2
-	// Bulkhead full: per-model concurrency limit reached. → RESOURCE_EXHAUSTED.
-	// Distinct from RATE_LIMITED: this is concurrency isolation, not rate.
-	FailureReason_FAILURE_REASON_BULKHEAD_FULL FailureReason = 3
-	// Circuit breaker OPEN for the chosen backend: failed fast without calling
-	// it. → UNAVAILABLE. A backend-HEALTH signal.
-	FailureReason_FAILURE_REASON_CIRCUIT_OPEN FailureReason = 4
-	// The backend (model-serving) returned an error or was unreachable after
-	// retries. → UNAVAILABLE / INTERNAL depending on the upstream status.
-	FailureReason_FAILURE_REASON_UPSTREAM_ERROR FailureReason = 5
-	// The backend exceeded the gateway's deadline. → DEADLINE_EXCEEDED.
-	FailureReason_FAILURE_REASON_TIMEOUT FailureReason = 6
-	// The request was malformed (bad tensor shape/dtype, unknown input name).
-	// → INVALID_ARGUMENT. A CLIENT error, not a backend problem.
-	FailureReason_FAILURE_REASON_INVALID_INPUT FailureReason = 7
-	// The tenant's billing quota is exhausted (CheckQuota denied). →
-	// RESOURCE_EXHAUSTED. Driven by Billing's QuotaExceeded eventual state.
-	FailureReason_FAILURE_REASON_QUOTA_EXCEEDED FailureReason = 8
-)
-
-// Enum value maps for FailureReason.
-var (
-	FailureReason_name = map[int32]string{
-		0: "FAILURE_REASON_UNSPECIFIED",
-		1: "FAILURE_REASON_NO_ROUTE",
-		2: "FAILURE_REASON_RATE_LIMITED",
-		3: "FAILURE_REASON_BULKHEAD_FULL",
-		4: "FAILURE_REASON_CIRCUIT_OPEN",
-		5: "FAILURE_REASON_UPSTREAM_ERROR",
-		6: "FAILURE_REASON_TIMEOUT",
-		7: "FAILURE_REASON_INVALID_INPUT",
-		8: "FAILURE_REASON_QUOTA_EXCEEDED",
-	}
-	FailureReason_value = map[string]int32{
-		"FAILURE_REASON_UNSPECIFIED":    0,
-		"FAILURE_REASON_NO_ROUTE":       1,
-		"FAILURE_REASON_RATE_LIMITED":   2,
-		"FAILURE_REASON_BULKHEAD_FULL":  3,
-		"FAILURE_REASON_CIRCUIT_OPEN":   4,
-		"FAILURE_REASON_UPSTREAM_ERROR": 5,
-		"FAILURE_REASON_TIMEOUT":        6,
-		"FAILURE_REASON_INVALID_INPUT":  7,
-		"FAILURE_REASON_QUOTA_EXCEEDED": 8,
-	}
-)
-
-func (x FailureReason) Enum() *FailureReason {
-	p := new(FailureReason)
-	*p = x
-	return p
-}
-
-func (x FailureReason) String() string {
-	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
-}
-
-func (FailureReason) Descriptor() protoreflect.EnumDescriptor {
-	return file_forgepoint_inference_v1_inference_proto_enumTypes[3].Descriptor()
-}
-
-func (FailureReason) Type() protoreflect.EnumType {
-	return &file_forgepoint_inference_v1_inference_proto_enumTypes[3]
-}
-
-func (x FailureReason) Number() protoreflect.EnumNumber {
-	return protoreflect.EnumNumber(x)
-}
-
-// Deprecated: Use FailureReason.Descriptor instead.
-func (FailureReason) EnumDescriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{3}
-}
-
-// ============================================================================
 // TensorData
 // ============================================================================
 //
@@ -507,173 +449,6 @@ func (x *TensorData) GetData() []byte {
 }
 
 // ============================================================================
-// PredictionSummary
-// ============================================================================
-//
-// WHY a SEPARATE summary type (not the full tensors) on events: the
-// InferenceCompleted event is consumed by Billing, Experiment Tracker, and
-// Model Monitor — none of them need (or should receive) the raw output
-// tensors of every prediction. Shipping full tensors on every event would
-// flood NATS and leak potentially sensitive payloads to three services.
-// Instead we ship a COMPACT, PRIVACY-CONSCIOUS summary: enough for drift
-// detection and metering, not the raw user data.
-//
-// SECURITY/PII: this is the payload that leaves the gateway over the event
-// bus. It deliberately carries statistics and the top label, NOT the full
-// feature vector or full output tensor. Model Monitor gets distributional
-// summaries (means/mins/maxes) sufficient for PSI/KS drift math without the
-// raw rows. If a model needs full-fidelity monitoring, that is an explicit,
-// separately-authorized data path — never the default event.
-// ============================================================================
-type PredictionSummary struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// For classifiers: the predicted class label / argmax index as a string.
-	// For regressors: a string-formatted scalar. Empty if not applicable.
-	TopLabel string `protobuf:"bytes,1,opt,name=top_label,json=topLabel,proto3" json:"top_label,omitempty"`
-	// Confidence / probability of top_label for classifiers (0.0–1.0).
-	// Zero for regression or when the model emits no probabilities.
-	TopScore float64 `protobuf:"fixed64,2,opt,name=top_score,json=topScore,proto3" json:"top_score,omitempty"`
-	// Per-output simple statistics (e.g., {"score_mean": 0.31, "score_max": 0.9}).
-	// Compact, model-agnostic numeric summary for monitoring/drift — NOT the
-	// raw output tensor. Keep this small; it rides on every event.
-	OutputStats map[string]float64 `protobuf:"bytes,3,rep,name=output_stats,json=outputStats,proto3" json:"output_stats,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"fixed64,2,opt,name=value"`
-	// Number of elements in the model's output (e.g., number of classes).
-	// Lets monitor track output-shape changes across versions cheaply.
-	OutputCardinality int32 `protobuf:"varint,4,opt,name=output_cardinality,json=outputCardinality,proto3" json:"output_cardinality,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
-}
-
-func (x *PredictionSummary) Reset() {
-	*x = PredictionSummary{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[1]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *PredictionSummary) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*PredictionSummary) ProtoMessage() {}
-
-func (x *PredictionSummary) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[1]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use PredictionSummary.ProtoReflect.Descriptor instead.
-func (*PredictionSummary) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{1}
-}
-
-func (x *PredictionSummary) GetTopLabel() string {
-	if x != nil {
-		return x.TopLabel
-	}
-	return ""
-}
-
-func (x *PredictionSummary) GetTopScore() float64 {
-	if x != nil {
-		return x.TopScore
-	}
-	return 0
-}
-
-func (x *PredictionSummary) GetOutputStats() map[string]float64 {
-	if x != nil {
-		return x.OutputStats
-	}
-	return nil
-}
-
-func (x *PredictionSummary) GetOutputCardinality() int32 {
-	if x != nil {
-		return x.OutputCardinality
-	}
-	return 0
-}
-
-// ============================================================================
-// FeatureSummary
-// ============================================================================
-//
-// WHY: Model Monitor computes DATA drift (have the inputs shifted vs the
-// training baseline?). It needs a description of the request's features, but —
-// same reasoning as PredictionSummary — not the raw feature bytes on every
-// event. This carries per-feature scalar summaries the monitor can fold into
-// its sliding-window PSI/KS computations.
-//
-// SECURITY/PII: summaries only. A feature like "user_age" rides as a numeric
-// value or a bucketed stat, never as a join-key back to a person. The gateway
-// is the trust boundary that decides what feature signal is safe to emit.
-// ============================================================================
-type FeatureSummary struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// Per-feature numeric value or summary statistic keyed by feature name,
-	// e.g., {"sepal_length": 5.1, "sepal_width": 3.5}. For high-dimensional
-	// inputs the gateway may emit only a sampled/aggregated subset.
-	FeatureValues map[string]float64 `protobuf:"bytes,1,rep,name=feature_values,json=featureValues,proto3" json:"feature_values,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"fixed64,2,opt,name=value"`
-	// Total number of input features in the request (dimensionality). Lets the
-	// monitor detect schema/shape drift independent of the sampled values above.
-	FeatureCount  int32 `protobuf:"varint,2,opt,name=feature_count,json=featureCount,proto3" json:"feature_count,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *FeatureSummary) Reset() {
-	*x = FeatureSummary{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[2]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *FeatureSummary) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*FeatureSummary) ProtoMessage() {}
-
-func (x *FeatureSummary) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[2]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use FeatureSummary.ProtoReflect.Descriptor instead.
-func (*FeatureSummary) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{2}
-}
-
-func (x *FeatureSummary) GetFeatureValues() map[string]float64 {
-	if x != nil {
-		return x.FeatureValues
-	}
-	return nil
-}
-
-func (x *FeatureSummary) GetFeatureCount() int32 {
-	if x != nil {
-		return x.FeatureCount
-	}
-	return 0
-}
-
-// ============================================================================
 // RouteTarget
 // ============================================================================
 //
@@ -709,7 +484,7 @@ type RouteTarget struct {
 
 func (x *RouteTarget) Reset() {
 	*x = RouteTarget{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[3]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -721,7 +496,7 @@ func (x *RouteTarget) String() string {
 func (*RouteTarget) ProtoMessage() {}
 
 func (x *RouteTarget) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[3]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -734,7 +509,7 @@ func (x *RouteTarget) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RouteTarget.ProtoReflect.Descriptor instead.
 func (*RouteTarget) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{3}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *RouteTarget) GetVersion() string {
@@ -799,7 +574,7 @@ type Route struct {
 
 func (x *Route) Reset() {
 	*x = Route{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[4]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -811,7 +586,7 @@ func (x *Route) String() string {
 func (*Route) ProtoMessage() {}
 
 func (x *Route) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[4]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -824,7 +599,7 @@ func (x *Route) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Route.ProtoReflect.Descriptor instead.
 func (*Route) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{4}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *Route) GetModelName() string {
@@ -896,7 +671,7 @@ type CircuitState struct {
 
 func (x *CircuitState) Reset() {
 	*x = CircuitState{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[5]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -908,7 +683,7 @@ func (x *CircuitState) String() string {
 func (*CircuitState) ProtoMessage() {}
 
 func (x *CircuitState) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[5]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -921,7 +696,7 @@ func (x *CircuitState) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CircuitState.ProtoReflect.Descriptor instead.
 func (*CircuitState) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{5}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *CircuitState) GetModelName() string {
@@ -996,7 +771,7 @@ type PredictRequest struct {
 
 func (x *PredictRequest) Reset() {
 	*x = PredictRequest{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[6]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1008,7 +783,7 @@ func (x *PredictRequest) String() string {
 func (*PredictRequest) ProtoMessage() {}
 
 func (x *PredictRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[6]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1021,7 +796,7 @@ func (x *PredictRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PredictRequest.ProtoReflect.Descriptor instead.
 func (*PredictRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{6}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *PredictRequest) GetModelName() string {
@@ -1083,7 +858,7 @@ type PredictResponse struct {
 
 func (x *PredictResponse) Reset() {
 	*x = PredictResponse{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[7]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1095,7 +870,7 @@ func (x *PredictResponse) String() string {
 func (*PredictResponse) ProtoMessage() {}
 
 func (x *PredictResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[7]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1108,7 +883,7 @@ func (x *PredictResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PredictResponse.ProtoReflect.Descriptor instead.
 func (*PredictResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{7}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *PredictResponse) GetOutputs() map[string]*TensorData {
@@ -1153,8 +928,10 @@ type BatchPredictRequest struct {
 	// for the SAME model, not a mix).
 	ModelName string `protobuf:"bytes,1,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
 	// The batch items. Each is one independent prediction's named inputs.
-	// The gateway caps batch size server-side (default 256; see service docs)
-	// and returns INVALID_ARGUMENT above the cap to bound memory/latency.
+	// HARD CAP: the gateway rejects more than 256 items server-side with
+	// INVALID_ARGUMENT, to bound memory/latency of a single unary call (this is a
+	// MAX, not a tunable default — it is part of the contract, not a hint). For
+	// larger jobs use StreamPredict (cap 10000) so results stream incrementally.
 	Items []*BatchPredictItem `protobuf:"bytes,2,rep,name=items,proto3" json:"items,omitempty"`
 	// OPTIONAL privileged version override applied to the WHOLE batch (debug /
 	// canary probing). Empty = weighted split, decided once per item.
@@ -1167,7 +944,7 @@ type BatchPredictRequest struct {
 
 func (x *BatchPredictRequest) Reset() {
 	*x = BatchPredictRequest{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[8]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1179,7 +956,7 @@ func (x *BatchPredictRequest) String() string {
 func (*BatchPredictRequest) ProtoMessage() {}
 
 func (x *BatchPredictRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[8]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1192,7 +969,7 @@ func (x *BatchPredictRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BatchPredictRequest.ProtoReflect.Descriptor instead.
 func (*BatchPredictRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{8}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *BatchPredictRequest) GetModelName() string {
@@ -1240,7 +1017,7 @@ type BatchPredictItem struct {
 
 func (x *BatchPredictItem) Reset() {
 	*x = BatchPredictItem{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[9]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1252,7 +1029,7 @@ func (x *BatchPredictItem) String() string {
 func (*BatchPredictItem) ProtoMessage() {}
 
 func (x *BatchPredictItem) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[9]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1265,7 +1042,7 @@ func (x *BatchPredictItem) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BatchPredictItem.ProtoReflect.Descriptor instead.
 func (*BatchPredictItem) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{9}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *BatchPredictItem) GetItemId() string {
@@ -1301,7 +1078,7 @@ type BatchPredictResponse struct {
 
 func (x *BatchPredictResponse) Reset() {
 	*x = BatchPredictResponse{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[10]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1313,7 +1090,7 @@ func (x *BatchPredictResponse) String() string {
 func (*BatchPredictResponse) ProtoMessage() {}
 
 func (x *BatchPredictResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[10]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1326,7 +1103,7 @@ func (x *BatchPredictResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BatchPredictResponse.ProtoReflect.Descriptor instead.
 func (*BatchPredictResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{10}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *BatchPredictResponse) GetResults() []*BatchPredictResult {
@@ -1357,14 +1134,26 @@ type BatchPredictResult struct {
 	// Per-item error if this prediction failed. Nil/unset on success. Reuses
 	// the common structured error type so clients handle it uniformly with
 	// single-predict errors. PARTIAL-SUCCESS marker for this item.
-	Error         *v1.ErrorDetail `protobuf:"bytes,4,opt,name=error,proto3" json:"error,omitempty"`
+	Error *v1.ErrorDetail `protobuf:"bytes,4,opt,name=error,proto3" json:"error,omitempty"`
+	// The gateway's resilience classification for THIS item's failure (which
+	// pattern fired). INFERENCE_FAILURE_REASON_UNSPECIFIED on success. WHY surface
+	// it on a batch item and not on unary Predict: a unary failure rides a gRPC
+	// status code (RESOURCE_EXHAUSTED, UNAVAILABLE, ...) that already carries the
+	// class; a batch is PARTIAL-SUCCESS over a single OK envelope, so each item
+	// must carry its own machine-readable cause here for a bulk-scoring client to
+	// decide per-item retry policy (retry a TIMEOUT, never an INVALID_INPUT).
+	// WHY the events enum (not a private mirror): this is the SAME failure
+	// taxonomy the gateway publishes on events.InferenceFailed, so reusing
+	// events.InferenceFailureReason makes the sync result and the async event
+	// speak one vocabulary with no divergent-copy / mapping risk.
+	FailureReason v11.InferenceFailureReason `protobuf:"varint,5,opt,name=failure_reason,json=failureReason,proto3,enum=forgepoint.events.v1.InferenceFailureReason" json:"failure_reason,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *BatchPredictResult) Reset() {
 	*x = BatchPredictResult{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[11]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1376,7 +1165,7 @@ func (x *BatchPredictResult) String() string {
 func (*BatchPredictResult) ProtoMessage() {}
 
 func (x *BatchPredictResult) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[11]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1389,7 +1178,7 @@ func (x *BatchPredictResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BatchPredictResult.ProtoReflect.Descriptor instead.
 func (*BatchPredictResult) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{11}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *BatchPredictResult) GetItemId() string {
@@ -1420,6 +1209,13 @@ func (x *BatchPredictResult) GetError() *v1.ErrorDetail {
 	return nil
 }
 
+func (x *BatchPredictResult) GetFailureReason() v11.InferenceFailureReason {
+	if x != nil {
+		return x.FailureReason
+	}
+	return v11.InferenceFailureReason(0)
+}
+
 // StreamPredictRequest is a single request that yields a STREAM of results.
 //
 // WHY SERVER-STREAMING (1 request → N responses) and not bidi here: the
@@ -1441,8 +1237,13 @@ type StreamPredictRequest struct {
 	// The public model name. Required.
 	ModelName string `protobuf:"bytes,1,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
 	// All batch items to score. The gateway streams a StreamPredictResponse per
-	// item as each completes. No fixed cap (that's the point of streaming) but
-	// the bulkhead still bounds in-flight concurrency to the backend.
+	// item as each completes. WHY there is STILL a cap even though responses
+	// stream: the REQUEST is unary — the whole `items` list must be received and
+	// held before the first result streams back, so an unbounded list is a memory
+	// DoS on the request side. The gateway caps this at 10000 items server-side
+	// (10x the unary BatchPredict cap; see service docs) and rejects above it with
+	// INVALID_ARGUMENT. The bulkhead independently bounds in-flight concurrency to
+	// the backend. For truly unbounded feeds, submit multiple stream calls.
 	Items []*BatchPredictItem `protobuf:"bytes,2,rep,name=items,proto3" json:"items,omitempty"`
 	// OPTIONAL privileged version override for the whole stream.
 	VersionOverride string `protobuf:"bytes,3,opt,name=version_override,json=versionOverride,proto3" json:"version_override,omitempty"`
@@ -1454,7 +1255,7 @@ type StreamPredictRequest struct {
 
 func (x *StreamPredictRequest) Reset() {
 	*x = StreamPredictRequest{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[12]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1466,7 +1267,7 @@ func (x *StreamPredictRequest) String() string {
 func (*StreamPredictRequest) ProtoMessage() {}
 
 func (x *StreamPredictRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[12]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1479,7 +1280,7 @@ func (x *StreamPredictRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamPredictRequest.ProtoReflect.Descriptor instead.
 func (*StreamPredictRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{12}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *StreamPredictRequest) GetModelName() string {
@@ -1531,7 +1332,7 @@ type StreamPredictResponse struct {
 
 func (x *StreamPredictResponse) Reset() {
 	*x = StreamPredictResponse{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[13]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1543,7 +1344,7 @@ func (x *StreamPredictResponse) String() string {
 func (*StreamPredictResponse) ProtoMessage() {}
 
 func (x *StreamPredictResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[13]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1556,7 +1357,7 @@ func (x *StreamPredictResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamPredictResponse.ProtoReflect.Descriptor instead.
 func (*StreamPredictResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{13}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *StreamPredictResponse) GetResult() *BatchPredictResult {
@@ -1584,7 +1385,7 @@ type GetRouteRequest struct {
 
 func (x *GetRouteRequest) Reset() {
 	*x = GetRouteRequest{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[14]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1596,7 +1397,7 @@ func (x *GetRouteRequest) String() string {
 func (*GetRouteRequest) ProtoMessage() {}
 
 func (x *GetRouteRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[14]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1609,7 +1410,7 @@ func (x *GetRouteRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRouteRequest.ProtoReflect.Descriptor instead.
 func (*GetRouteRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{14}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *GetRouteRequest) GetModelName() string {
@@ -1632,7 +1433,7 @@ type GetRouteResponse struct {
 
 func (x *GetRouteResponse) Reset() {
 	*x = GetRouteResponse{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[15]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1644,7 +1445,7 @@ func (x *GetRouteResponse) String() string {
 func (*GetRouteResponse) ProtoMessage() {}
 
 func (x *GetRouteResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[15]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1657,7 +1458,7 @@ func (x *GetRouteResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRouteResponse.ProtoReflect.Descriptor instead.
 func (*GetRouteResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{15}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *GetRouteResponse) GetRoute() *Route {
@@ -1681,7 +1482,7 @@ type ListRoutesRequest struct {
 
 func (x *ListRoutesRequest) Reset() {
 	*x = ListRoutesRequest{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[16]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1693,7 +1494,7 @@ func (x *ListRoutesRequest) String() string {
 func (*ListRoutesRequest) ProtoMessage() {}
 
 func (x *ListRoutesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[16]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1706,7 +1507,7 @@ func (x *ListRoutesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRoutesRequest.ProtoReflect.Descriptor instead.
 func (*ListRoutesRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{16}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *ListRoutesRequest) GetPagination() *v1.PaginationRequest {
@@ -1728,7 +1529,7 @@ type ListRoutesResponse struct {
 
 func (x *ListRoutesResponse) Reset() {
 	*x = ListRoutesResponse{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[17]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1740,7 +1541,7 @@ func (x *ListRoutesResponse) String() string {
 func (*ListRoutesResponse) ProtoMessage() {}
 
 func (x *ListRoutesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[17]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1753,7 +1554,7 @@ func (x *ListRoutesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListRoutesResponse.ProtoReflect.Descriptor instead.
 func (*ListRoutesResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{17}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *ListRoutesResponse) GetRoutes() []*Route {
@@ -1798,7 +1599,7 @@ type UpsertRouteRequest struct {
 
 func (x *UpsertRouteRequest) Reset() {
 	*x = UpsertRouteRequest{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[18]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1810,7 +1611,7 @@ func (x *UpsertRouteRequest) String() string {
 func (*UpsertRouteRequest) ProtoMessage() {}
 
 func (x *UpsertRouteRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[18]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1823,7 +1624,7 @@ func (x *UpsertRouteRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpsertRouteRequest.ProtoReflect.Descriptor instead.
 func (*UpsertRouteRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{18}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *UpsertRouteRequest) GetModelName() string {
@@ -1859,7 +1660,7 @@ type UpsertRouteResponse struct {
 
 func (x *UpsertRouteResponse) Reset() {
 	*x = UpsertRouteResponse{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[19]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1871,7 +1672,7 @@ func (x *UpsertRouteResponse) String() string {
 func (*UpsertRouteResponse) ProtoMessage() {}
 
 func (x *UpsertRouteResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[19]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1884,7 +1685,7 @@ func (x *UpsertRouteResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpsertRouteResponse.ProtoReflect.Descriptor instead.
 func (*UpsertRouteResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{19}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *UpsertRouteResponse) GetRoute() *Route {
@@ -1918,7 +1719,7 @@ type SetTrafficSplitRequest struct {
 
 func (x *SetTrafficSplitRequest) Reset() {
 	*x = SetTrafficSplitRequest{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[20]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1930,7 +1731,7 @@ func (x *SetTrafficSplitRequest) String() string {
 func (*SetTrafficSplitRequest) ProtoMessage() {}
 
 func (x *SetTrafficSplitRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[20]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1943,7 +1744,7 @@ func (x *SetTrafficSplitRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetTrafficSplitRequest.ProtoReflect.Descriptor instead.
 func (*SetTrafficSplitRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{20}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *SetTrafficSplitRequest) GetModelName() string {
@@ -1984,7 +1785,7 @@ type TrafficWeight struct {
 
 func (x *TrafficWeight) Reset() {
 	*x = TrafficWeight{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[21]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1996,7 +1797,7 @@ func (x *TrafficWeight) String() string {
 func (*TrafficWeight) ProtoMessage() {}
 
 func (x *TrafficWeight) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[21]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2009,7 +1810,7 @@ func (x *TrafficWeight) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TrafficWeight.ProtoReflect.Descriptor instead.
 func (*TrafficWeight) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{21}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *TrafficWeight) GetVersion() string {
@@ -2037,7 +1838,7 @@ type SetTrafficSplitResponse struct {
 
 func (x *SetTrafficSplitResponse) Reset() {
 	*x = SetTrafficSplitResponse{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[22]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2049,7 +1850,7 @@ func (x *SetTrafficSplitResponse) String() string {
 func (*SetTrafficSplitResponse) ProtoMessage() {}
 
 func (x *SetTrafficSplitResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[22]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2062,7 +1863,7 @@ func (x *SetTrafficSplitResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetTrafficSplitResponse.ProtoReflect.Descriptor instead.
 func (*SetTrafficSplitResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{22}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *SetTrafficSplitResponse) GetRoute() *Route {
@@ -2087,7 +1888,7 @@ type DeleteRouteRequest struct {
 
 func (x *DeleteRouteRequest) Reset() {
 	*x = DeleteRouteRequest{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[23]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2099,7 +1900,7 @@ func (x *DeleteRouteRequest) String() string {
 func (*DeleteRouteRequest) ProtoMessage() {}
 
 func (x *DeleteRouteRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[23]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2112,7 +1913,7 @@ func (x *DeleteRouteRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteRouteRequest.ProtoReflect.Descriptor instead.
 func (*DeleteRouteRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{23}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *DeleteRouteRequest) GetModelName() string {
@@ -2141,7 +1942,7 @@ type DeleteRouteResponse struct {
 
 func (x *DeleteRouteResponse) Reset() {
 	*x = DeleteRouteResponse{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[24]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2153,7 +1954,7 @@ func (x *DeleteRouteResponse) String() string {
 func (*DeleteRouteResponse) ProtoMessage() {}
 
 func (x *DeleteRouteResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[24]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2166,7 +1967,7 @@ func (x *DeleteRouteResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteRouteResponse.ProtoReflect.Descriptor instead.
 func (*DeleteRouteResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{24}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{22}
 }
 
 // GetCircuitStateRequest inspects one backend's breaker. WHY model+version:
@@ -2183,7 +1984,7 @@ type GetCircuitStateRequest struct {
 
 func (x *GetCircuitStateRequest) Reset() {
 	*x = GetCircuitStateRequest{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[25]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2195,7 +1996,7 @@ func (x *GetCircuitStateRequest) String() string {
 func (*GetCircuitStateRequest) ProtoMessage() {}
 
 func (x *GetCircuitStateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[25]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2208,7 +2009,7 @@ func (x *GetCircuitStateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetCircuitStateRequest.ProtoReflect.Descriptor instead.
 func (*GetCircuitStateRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{25}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *GetCircuitStateRequest) GetModelName() string {
@@ -2235,7 +2036,7 @@ type GetCircuitStateResponse struct {
 
 func (x *GetCircuitStateResponse) Reset() {
 	*x = GetCircuitStateResponse{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[26]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2247,7 +2048,7 @@ func (x *GetCircuitStateResponse) String() string {
 func (*GetCircuitStateResponse) ProtoMessage() {}
 
 func (x *GetCircuitStateResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[26]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2260,7 +2061,7 @@ func (x *GetCircuitStateResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetCircuitStateResponse.ProtoReflect.Descriptor instead.
 func (*GetCircuitStateResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{26}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *GetCircuitStateResponse) GetCircuitState() *CircuitState {
@@ -2284,7 +2085,7 @@ type ListCircuitStatesRequest struct {
 
 func (x *ListCircuitStatesRequest) Reset() {
 	*x = ListCircuitStatesRequest{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[27]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2296,7 +2097,7 @@ func (x *ListCircuitStatesRequest) String() string {
 func (*ListCircuitStatesRequest) ProtoMessage() {}
 
 func (x *ListCircuitStatesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[27]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2309,7 +2110,7 @@ func (x *ListCircuitStatesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListCircuitStatesRequest.ProtoReflect.Descriptor instead.
 func (*ListCircuitStatesRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{27}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *ListCircuitStatesRequest) GetModelNameFilter() string {
@@ -2338,7 +2139,7 @@ type ListCircuitStatesResponse struct {
 
 func (x *ListCircuitStatesResponse) Reset() {
 	*x = ListCircuitStatesResponse{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[28]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2350,7 +2151,7 @@ func (x *ListCircuitStatesResponse) String() string {
 func (*ListCircuitStatesResponse) ProtoMessage() {}
 
 func (x *ListCircuitStatesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[28]
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2363,7 +2164,7 @@ func (x *ListCircuitStatesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListCircuitStatesResponse.ProtoReflect.Descriptor instead.
 func (*ListCircuitStatesResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{28}
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *ListCircuitStatesResponse) GetCircuitStates() []*CircuitState {
@@ -2381,75 +2182,44 @@ func (x *ListCircuitStatesResponse) GetPagination() *v1.PaginationResponse {
 }
 
 // ============================================================================
-// InferenceCompletedEvent  →  subject: fp.inference.completed
+// TensorSpec
 // ============================================================================
 //
-// CONSUMERS & WHY EACH FIELD EXISTS:
-//   - Billing: meters usage → needs api_key_id, model_id, version, timestamp.
-//   - Experiment Tracker: records A/B outcomes → served_version, summaries.
-//   - Model Monitor: drift windows → feature_summary (data drift),
-//     prediction_summary (prediction drift), latency (performance decay).
-//
-// SECURITY/PII (critical — this leaves the gateway over the bus):
-//
-//	We ship IDs and SUMMARIES, never raw input/output tensors and never an
-//	end-user identity. api_key_id (not the raw key), model_id, version are
-//	safe references. The summaries are statistical (see PredictionSummary /
-//	FeatureSummary docs). This keeps three downstream services from each
-//	becoming a copy of every prediction's raw data.
-//
-// IDEMPOTENCY: the envelope's `id` (UUID) dedupes redeliveries; request_id
-// here lets a consumer additionally tie the event to the original predict call
-// and dedupe at the business level (e.g., Billing won't double-count a
-// request_id it already metered).
-type InferenceCompletedEvent struct {
+// WHY a SPEC (no bytes) distinct from TensorData (carries bytes): GetModelInfo
+// publishes the SHAPE of the contract — "input 'features' is FLOAT32 [1,4]" —
+// so a client (or the HTTP edge) can validate a request locally before sending
+// it. A -1 in a dimension means "dynamic" (e.g., a variable batch axis), the
+// usual convention in ONNX/Triton model signatures.
+// ============================================================================
+type TensorSpec struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// The gateway-assigned request ID (matches PredictResponse.request_id).
-	// Business-level idempotency key for consumers (Billing dedupes on it).
-	RequestId string `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	// The model that served the request (registry model identifier).
-	ModelId string `protobuf:"bytes,2,opt,name=model_id,json=modelId,proto3" json:"model_id,omitempty"`
-	// The public model name (human-readable; convenience for dashboards).
-	ModelName string `protobuf:"bytes,3,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
-	// The version that actually served (post traffic-split). KEY for A/B
-	// analysis and per-version metering/monitoring.
-	Version string `protobuf:"bytes,4,opt,name=version,proto3" json:"version,omitempty"`
-	// The API key that made the call (ID, never the raw secret). Billing meters
-	// against this; it maps to a team/rate-plan. SERVER-stamped from the
-	// authenticated request — not client-supplied in the event.
-	ApiKeyId string `protobuf:"bytes,5,opt,name=api_key_id,json=apiKeyId,proto3" json:"api_key_id,omitempty"`
-	// Observed backend latency. WHY both a Duration AND latency_ms below:
-	// latency is the precise typed value; latency_ms is a denormalized integer
-	// convenience so simple consumers/dashboards don't have to convert.
-	Latency *durationpb.Duration `protobuf:"bytes,6,opt,name=latency,proto3" json:"latency,omitempty"`
-	// Latency in whole milliseconds — denormalized convenience for metering and
-	// Grafana panels (derived from `latency`).
-	LatencyMs int64 `protobuf:"varint,7,opt,name=latency_ms,json=latencyMs,proto3" json:"latency_ms,omitempty"`
-	// Compact prediction summary for monitoring/A-B (NOT raw outputs).
-	PredictionSummary *PredictionSummary `protobuf:"bytes,8,opt,name=prediction_summary,json=predictionSummary,proto3" json:"prediction_summary,omitempty"`
-	// Compact input feature summary for data-drift detection (NOT raw inputs).
-	FeatureSummary *FeatureSummary `protobuf:"bytes,9,opt,name=feature_summary,json=featureSummary,proto3" json:"feature_summary,omitempty"`
-	// When the inference completed (gateway clock). SERVER-authoritative.
-	Timestamp     *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	// The tensor's name in the model signature (e.g., "features"). The key a
+	// client uses in PredictRequest.inputs / reads from PredictResponse.outputs.
+	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	// Element type the model expects/produces for this tensor.
+	Dtype DataType `protobuf:"varint,2,opt,name=dtype,proto3,enum=forgepoint.inference.v1.DataType" json:"dtype,omitempty"`
+	// Declared dimensions, outermost first; -1 marks a dynamic axis (e.g., a
+	// variable batch size). Empty = scalar.
+	Shape         []int64 `protobuf:"varint,3,rep,packed,name=shape,proto3" json:"shape,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *InferenceCompletedEvent) Reset() {
-	*x = InferenceCompletedEvent{}
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[29]
+func (x *TensorSpec) Reset() {
+	*x = TensorSpec{}
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *InferenceCompletedEvent) String() string {
+func (x *TensorSpec) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*InferenceCompletedEvent) ProtoMessage() {}
+func (*TensorSpec) ProtoMessage() {}
 
-func (x *InferenceCompletedEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[29]
+func (x *TensorSpec) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2460,132 +2230,176 @@ func (x *InferenceCompletedEvent) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use InferenceCompletedEvent.ProtoReflect.Descriptor instead.
-func (*InferenceCompletedEvent) Descriptor() ([]byte, []int) {
-	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{29}
+// Deprecated: Use TensorSpec.ProtoReflect.Descriptor instead.
+func (*TensorSpec) Descriptor() ([]byte, []int) {
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{27}
 }
 
-func (x *InferenceCompletedEvent) GetRequestId() string {
+func (x *TensorSpec) GetName() string {
 	if x != nil {
-		return x.RequestId
+		return x.Name
 	}
 	return ""
 }
 
-func (x *InferenceCompletedEvent) GetModelId() string {
+func (x *TensorSpec) GetDtype() DataType {
 	if x != nil {
-		return x.ModelId
+		return x.Dtype
 	}
-	return ""
+	return DataType_DATA_TYPE_UNSPECIFIED
 }
 
-func (x *InferenceCompletedEvent) GetModelName() string {
+func (x *TensorSpec) GetShape() []int64 {
 	if x != nil {
-		return x.ModelName
+		return x.Shape
 	}
-	return ""
+	return nil
 }
 
-func (x *InferenceCompletedEvent) GetVersion() string {
+// ============================================================================
+// VersionInfo
+// ============================================================================
+//
+// A caller-safe projection of one routable version: its label and current
+// traffic share. Deliberately OMITS the backend endpoint and breaker internals
+// (those are operator-only, exposed via GetRoute/GetCircuitState) — a public
+// caller has no business seeing the serving pod's address.
+// ============================================================================
+type VersionInfo struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The version label (e.g., "v3"). What shows up as served_version.
+	Version string `protobuf:"bytes,1,opt,name=version,proto3" json:"version,omitempty"`
+	// This version's current traffic share in basis points (0–10000). Lets a UI
+	// show "v3 is taking 10% canary traffic" without operator scope.
+	WeightBps int32 `protobuf:"varint,2,opt,name=weight_bps,json=weightBps,proto3" json:"weight_bps,omitempty"`
+	// True if this version is the current stable (non-canary) target. Lets a
+	// caller/UI distinguish the canary from the stable variant.
+	IsStable      bool `protobuf:"varint,3,opt,name=is_stable,json=isStable,proto3" json:"is_stable,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VersionInfo) Reset() {
+	*x = VersionInfo{}
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[28]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VersionInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VersionInfo) ProtoMessage() {}
+
+func (x *VersionInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[28]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VersionInfo.ProtoReflect.Descriptor instead.
+func (*VersionInfo) Descriptor() ([]byte, []int) {
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{28}
+}
+
+func (x *VersionInfo) GetVersion() string {
 	if x != nil {
 		return x.Version
 	}
 	return ""
 }
 
-func (x *InferenceCompletedEvent) GetApiKeyId() string {
+func (x *VersionInfo) GetWeightBps() int32 {
 	if x != nil {
-		return x.ApiKeyId
-	}
-	return ""
-}
-
-func (x *InferenceCompletedEvent) GetLatency() *durationpb.Duration {
-	if x != nil {
-		return x.Latency
-	}
-	return nil
-}
-
-func (x *InferenceCompletedEvent) GetLatencyMs() int64 {
-	if x != nil {
-		return x.LatencyMs
+		return x.WeightBps
 	}
 	return 0
 }
 
-func (x *InferenceCompletedEvent) GetPredictionSummary() *PredictionSummary {
+func (x *VersionInfo) GetIsStable() bool {
 	if x != nil {
-		return x.PredictionSummary
+		return x.IsStable
 	}
-	return nil
+	return false
 }
 
-func (x *InferenceCompletedEvent) GetFeatureSummary() *FeatureSummary {
-	if x != nil {
-		return x.FeatureSummary
-	}
-	return nil
-}
-
-func (x *InferenceCompletedEvent) GetTimestamp() *timestamppb.Timestamp {
-	if x != nil {
-		return x.Timestamp
-	}
-	return nil
-}
-
-// ============================================================================
-// InferenceFailedEvent  →  subject: fp.inference.failed
-// ============================================================================
-//
-// WHY a separate failure event: failures are first-class signal. The Model
-// Monitor watches error RATES (a spiking failure rate is its own kind of
-// "drift"/degradation), and operators alert on it. Emitting a typed failure
-// event (rather than just logging) lets those consumers react via the same
-// event bus they already subscribe to.
-//
-// WHY no payload summaries here: on failure there may be no prediction to
-// summarize, and we avoid echoing the (possibly malformed) input. We carry the
-// classification of the failure instead.
-type InferenceFailedEvent struct {
+// GetModelInfoRequest asks for one model's public contract.
+type GetModelInfoRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// The gateway-assigned request ID (idempotency + correlation).
-	RequestId string `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	// The model name the client targeted.
-	ModelName string `protobuf:"bytes,2,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
-	// The version the gateway attempted (if routing got that far; may be empty
-	// if the failure was before version selection, e.g., NOT_FOUND).
-	Version string `protobuf:"bytes,3,opt,name=version,proto3" json:"version,omitempty"`
-	// The API key that made the call (ID only). Lets Billing decide policy on
-	// failed calls (typically NOT metered) and lets per-tenant error rates be
-	// computed. SERVER-stamped.
-	ApiKeyId string `protobuf:"bytes,4,opt,name=api_key_id,json=apiKeyId,proto3" json:"api_key_id,omitempty"`
-	// Why it failed — the resilience-pattern outcome. Drives monitor/alerts.
-	Reason FailureReason `protobuf:"varint,5,opt,name=reason,proto3,enum=forgepoint.inference.v1.FailureReason" json:"reason,omitempty"`
-	// Human-readable detail for logs/debugging (e.g., the upstream gRPC status
-	// message). Not for end-user display.
-	Message string `protobuf:"bytes,6,opt,name=message,proto3" json:"message,omitempty"`
-	// When the failure occurred. SERVER-authoritative.
-	Timestamp     *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	// The public model name to describe. Required. (No version/api_key/team here:
+	// the version set is what the gateway routes; the principal is from the token.)
+	ModelName     string `protobuf:"bytes,1,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *InferenceFailedEvent) Reset() {
-	*x = InferenceFailedEvent{}
+func (x *GetModelInfoRequest) Reset() {
+	*x = GetModelInfoRequest{}
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[29]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetModelInfoRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetModelInfoRequest) ProtoMessage() {}
+
+func (x *GetModelInfoRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[29]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetModelInfoRequest.ProtoReflect.Descriptor instead.
+func (*GetModelInfoRequest) Descriptor() ([]byte, []int) {
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{29}
+}
+
+func (x *GetModelInfoRequest) GetModelName() string {
+	if x != nil {
+		return x.ModelName
+	}
+	return ""
+}
+
+// GetModelInfoResponse is the caller-facing description of a model.
+type GetModelInfoResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The model contract (schema + routable versions + serving status).
+	ModelInfo     *ModelInfo `protobuf:"bytes,1,opt,name=model_info,json=modelInfo,proto3" json:"model_info,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetModelInfoResponse) Reset() {
+	*x = GetModelInfoResponse{}
 	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *InferenceFailedEvent) String() string {
+func (x *GetModelInfoResponse) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*InferenceFailedEvent) ProtoMessage() {}
+func (*GetModelInfoResponse) ProtoMessage() {}
 
-func (x *InferenceFailedEvent) ProtoReflect() protoreflect.Message {
+func (x *GetModelInfoResponse) ProtoReflect() protoreflect.Message {
 	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
@@ -2597,56 +2411,119 @@ func (x *InferenceFailedEvent) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use InferenceFailedEvent.ProtoReflect.Descriptor instead.
-func (*InferenceFailedEvent) Descriptor() ([]byte, []int) {
+// Deprecated: Use GetModelInfoResponse.ProtoReflect.Descriptor instead.
+func (*GetModelInfoResponse) Descriptor() ([]byte, []int) {
 	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{30}
 }
 
-func (x *InferenceFailedEvent) GetRequestId() string {
+func (x *GetModelInfoResponse) GetModelInfo() *ModelInfo {
 	if x != nil {
-		return x.RequestId
+		return x.ModelInfo
 	}
-	return ""
+	return nil
 }
 
-func (x *InferenceFailedEvent) GetModelName() string {
+// ============================================================================
+// ModelInfo
+// ============================================================================
+//
+// The CALLER VIEW of a model: enough to build a valid request and understand
+// what will answer it, and NOTHING server-internal. Contrast with Route (the
+// operator view) which carries endpoints/status. Populated by the gateway from
+// the routing table it built off ModelDeployed/ModelPromoted events plus the
+// input/output schema it learned from the serving backend's signature.
+// ============================================================================
+type ModelInfo struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The public model name clients call.
+	ModelName string `protobuf:"bytes,1,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"`
+	// Whether the model is currently routable (has at least one ACTIVE target).
+	// False = predicts will fail FAILURE_REASON_NO_ROUTE. Lets a UI grey it out.
+	IsServing bool `protobuf:"varint,2,opt,name=is_serving,json=isServing,proto3" json:"is_serving,omitempty"`
+	// The model's input tensor signature (names/dtypes/shapes) for client-side
+	// request validation at the edge.
+	Inputs []*TensorSpec `protobuf:"bytes,3,rep,name=inputs,proto3" json:"inputs,omitempty"`
+	// The model's output tensor signature, so a client knows what keys/shapes to
+	// expect back in PredictResponse.outputs.
+	Outputs []*TensorSpec `protobuf:"bytes,4,rep,name=outputs,proto3" json:"outputs,omitempty"`
+	// The currently routable versions and their traffic weights (caller-safe
+	// projection — no endpoints). Mirrors the live split a Predict would use.
+	Versions []*VersionInfo `protobuf:"bytes,5,rep,name=versions,proto3" json:"versions,omitempty"`
+	// When the routing entry backing this info last changed (deploy/promote event
+	// or admin write). SERVER-authoritative; lets a client reason about staleness.
+	UpdatedAt     *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ModelInfo) Reset() {
+	*x = ModelInfo{}
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[31]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ModelInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ModelInfo) ProtoMessage() {}
+
+func (x *ModelInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_inference_v1_inference_proto_msgTypes[31]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ModelInfo.ProtoReflect.Descriptor instead.
+func (*ModelInfo) Descriptor() ([]byte, []int) {
+	return file_forgepoint_inference_v1_inference_proto_rawDescGZIP(), []int{31}
+}
+
+func (x *ModelInfo) GetModelName() string {
 	if x != nil {
 		return x.ModelName
 	}
 	return ""
 }
 
-func (x *InferenceFailedEvent) GetVersion() string {
+func (x *ModelInfo) GetIsServing() bool {
 	if x != nil {
-		return x.Version
+		return x.IsServing
 	}
-	return ""
+	return false
 }
 
-func (x *InferenceFailedEvent) GetApiKeyId() string {
+func (x *ModelInfo) GetInputs() []*TensorSpec {
 	if x != nil {
-		return x.ApiKeyId
+		return x.Inputs
 	}
-	return ""
+	return nil
 }
 
-func (x *InferenceFailedEvent) GetReason() FailureReason {
+func (x *ModelInfo) GetOutputs() []*TensorSpec {
 	if x != nil {
-		return x.Reason
+		return x.Outputs
 	}
-	return FailureReason_FAILURE_REASON_UNSPECIFIED
+	return nil
 }
 
-func (x *InferenceFailedEvent) GetMessage() string {
+func (x *ModelInfo) GetVersions() []*VersionInfo {
 	if x != nil {
-		return x.Message
+		return x.Versions
 	}
-	return ""
+	return nil
 }
 
-func (x *InferenceFailedEvent) GetTimestamp() *timestamppb.Timestamp {
+func (x *ModelInfo) GetUpdatedAt() *timestamppb.Timestamp {
 	if x != nil {
-		return x.Timestamp
+		return x.UpdatedAt
 	}
 	return nil
 }
@@ -2655,26 +2532,12 @@ var File_forgepoint_inference_v1_inference_proto protoreflect.FileDescriptor
 
 const file_forgepoint_inference_v1_inference_proto_rawDesc = "" +
 	"\n" +
-	"'forgepoint/inference/v1/inference.proto\x12\x17forgepoint.inference.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1egoogle/protobuf/duration.proto\x1a!forgepoint/common/v1/common.proto\"o\n" +
+	"'forgepoint/inference/v1/inference.proto\x12\x17forgepoint.inference.v1\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x1egoogle/protobuf/duration.proto\x1a!forgepoint/common/v1/common.proto\x1a!forgepoint/events/v1/events.proto\"o\n" +
 	"\n" +
 	"TensorData\x12\x14\n" +
 	"\x05shape\x18\x01 \x03(\x03R\x05shape\x127\n" +
 	"\x05dtype\x18\x02 \x01(\x0e2!.forgepoint.inference.v1.DataTypeR\x05dtype\x12\x12\n" +
-	"\x04data\x18\x03 \x01(\fR\x04data\"\x9c\x02\n" +
-	"\x11PredictionSummary\x12\x1b\n" +
-	"\ttop_label\x18\x01 \x01(\tR\btopLabel\x12\x1b\n" +
-	"\ttop_score\x18\x02 \x01(\x01R\btopScore\x12^\n" +
-	"\foutput_stats\x18\x03 \x03(\v2;.forgepoint.inference.v1.PredictionSummary.OutputStatsEntryR\voutputStats\x12-\n" +
-	"\x12output_cardinality\x18\x04 \x01(\x05R\x11outputCardinality\x1a>\n" +
-	"\x10OutputStatsEntry\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\x01R\x05value:\x028\x01\"\xda\x01\n" +
-	"\x0eFeatureSummary\x12a\n" +
-	"\x0efeature_values\x18\x01 \x03(\v2:.forgepoint.inference.v1.FeatureSummary.FeatureValuesEntryR\rfeatureValues\x12#\n" +
-	"\rfeature_count\x18\x02 \x01(\x05R\ffeatureCount\x1a@\n" +
-	"\x12FeatureValuesEntry\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\x01R\x05value:\x028\x01\"\xa1\x01\n" +
+	"\x04data\x18\x03 \x01(\fR\x04data\"\xa1\x01\n" +
 	"\vRouteTarget\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\tR\aversion\x12\x1a\n" +
 	"\bendpoint\x18\x02 \x01(\tR\bendpoint\x12\x1d\n" +
@@ -2727,12 +2590,13 @@ const file_forgepoint_inference_v1_inference_proto_rawDesc = "" +
 	"\x14BatchPredictResponse\x12E\n" +
 	"\aresults\x18\x01 \x03(\v2+.forgepoint.inference.v1.BatchPredictResultR\aresults\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x02 \x01(\tR\trequestId\"\xc2\x02\n" +
+	"request_id\x18\x02 \x01(\tR\trequestId\"\x97\x03\n" +
 	"\x12BatchPredictResult\x12\x17\n" +
 	"\aitem_id\x18\x01 \x01(\tR\x06itemId\x12R\n" +
 	"\aoutputs\x18\x02 \x03(\v28.forgepoint.inference.v1.BatchPredictResult.OutputsEntryR\aoutputs\x12%\n" +
 	"\x0eserved_version\x18\x03 \x01(\tR\rservedVersion\x127\n" +
-	"\x05error\x18\x04 \x01(\v2!.forgepoint.common.v1.ErrorDetailR\x05error\x1a_\n" +
+	"\x05error\x18\x04 \x01(\v2!.forgepoint.common.v1.ErrorDetailR\x05error\x12S\n" +
+	"\x0efailure_reason\x18\x05 \x01(\x0e2,.forgepoint.events.v1.InferenceFailureReasonR\rfailureReason\x1a_\n" +
 	"\fOutputsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x129\n" +
 	"\x05value\x18\x02 \x01(\v2#.forgepoint.inference.v1.TensorDataR\x05value:\x028\x01\"\xca\x01\n" +
@@ -2798,34 +2662,33 @@ const file_forgepoint_inference_v1_inference_proto_rawDesc = "" +
 	"\x0ecircuit_states\x18\x01 \x03(\v2%.forgepoint.inference.v1.CircuitStateR\rcircuitStates\x12H\n" +
 	"\n" +
 	"pagination\x18\x02 \x01(\v2(.forgepoint.common.v1.PaginationResponseR\n" +
-	"pagination\"\xe5\x03\n" +
-	"\x17InferenceCompletedEvent\x12\x1d\n" +
+	"pagination\"o\n" +
 	"\n" +
-	"request_id\x18\x01 \x01(\tR\trequestId\x12\x19\n" +
-	"\bmodel_id\x18\x02 \x01(\tR\amodelId\x12\x1d\n" +
+	"TensorSpec\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x127\n" +
+	"\x05dtype\x18\x02 \x01(\x0e2!.forgepoint.inference.v1.DataTypeR\x05dtype\x12\x14\n" +
+	"\x05shape\x18\x03 \x03(\x03R\x05shape\"c\n" +
+	"\vVersionInfo\x12\x18\n" +
+	"\aversion\x18\x01 \x01(\tR\aversion\x12\x1d\n" +
 	"\n" +
-	"model_name\x18\x03 \x01(\tR\tmodelName\x12\x18\n" +
-	"\aversion\x18\x04 \x01(\tR\aversion\x12\x1c\n" +
+	"weight_bps\x18\x02 \x01(\x05R\tweightBps\x12\x1b\n" +
+	"\tis_stable\x18\x03 \x01(\bR\bisStable\"4\n" +
+	"\x13GetModelInfoRequest\x12\x1d\n" +
 	"\n" +
-	"api_key_id\x18\x05 \x01(\tR\bapiKeyId\x123\n" +
-	"\alatency\x18\x06 \x01(\v2\x19.google.protobuf.DurationR\alatency\x12\x1d\n" +
+	"model_name\x18\x01 \x01(\tR\tmodelName\"Y\n" +
+	"\x14GetModelInfoResponse\x12A\n" +
 	"\n" +
-	"latency_ms\x18\a \x01(\x03R\tlatencyMs\x12Y\n" +
-	"\x12prediction_summary\x18\b \x01(\v2*.forgepoint.inference.v1.PredictionSummaryR\x11predictionSummary\x12P\n" +
-	"\x0ffeature_summary\x18\t \x01(\v2'.forgepoint.inference.v1.FeatureSummaryR\x0efeatureSummary\x128\n" +
-	"\ttimestamp\x18\n" +
-	" \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\"\xa0\x02\n" +
-	"\x14InferenceFailedEvent\x12\x1d\n" +
+	"model_info\x18\x01 \x01(\v2\".forgepoint.inference.v1.ModelInfoR\tmodelInfo\"\xc2\x02\n" +
+	"\tModelInfo\x12\x1d\n" +
 	"\n" +
-	"request_id\x18\x01 \x01(\tR\trequestId\x12\x1d\n" +
+	"model_name\x18\x01 \x01(\tR\tmodelName\x12\x1d\n" +
 	"\n" +
-	"model_name\x18\x02 \x01(\tR\tmodelName\x12\x18\n" +
-	"\aversion\x18\x03 \x01(\tR\aversion\x12\x1c\n" +
+	"is_serving\x18\x02 \x01(\bR\tisServing\x12;\n" +
+	"\x06inputs\x18\x03 \x03(\v2#.forgepoint.inference.v1.TensorSpecR\x06inputs\x12=\n" +
+	"\aoutputs\x18\x04 \x03(\v2#.forgepoint.inference.v1.TensorSpecR\aoutputs\x12@\n" +
+	"\bversions\x18\x05 \x03(\v2$.forgepoint.inference.v1.VersionInfoR\bversions\x129\n" +
 	"\n" +
-	"api_key_id\x18\x04 \x01(\tR\bapiKeyId\x12>\n" +
-	"\x06reason\x18\x05 \x01(\x0e2&.forgepoint.inference.v1.FailureReasonR\x06reason\x12\x18\n" +
-	"\amessage\x18\x06 \x01(\tR\amessage\x128\n" +
-	"\ttimestamp\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp*\xa7\x01\n" +
+	"updated_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt*\xa7\x01\n" +
 	"\bDataType\x12\x19\n" +
 	"\x15DATA_TYPE_UNSPECIFIED\x10\x00\x12\x15\n" +
 	"\x11DATA_TYPE_FLOAT32\x10\x01\x12\x15\n" +
@@ -2843,21 +2706,12 @@ const file_forgepoint_inference_v1_inference_proto_rawDesc = "" +
 	"!CIRCUIT_BREAKER_STATE_UNSPECIFIED\x10\x00\x12 \n" +
 	"\x1cCIRCUIT_BREAKER_STATE_CLOSED\x10\x01\x12\x1e\n" +
 	"\x1aCIRCUIT_BREAKER_STATE_OPEN\x10\x02\x12#\n" +
-	"\x1fCIRCUIT_BREAKER_STATE_HALF_OPEN\x10\x03*\xb4\x02\n" +
-	"\rFailureReason\x12\x1e\n" +
-	"\x1aFAILURE_REASON_UNSPECIFIED\x10\x00\x12\x1b\n" +
-	"\x17FAILURE_REASON_NO_ROUTE\x10\x01\x12\x1f\n" +
-	"\x1bFAILURE_REASON_RATE_LIMITED\x10\x02\x12 \n" +
-	"\x1cFAILURE_REASON_BULKHEAD_FULL\x10\x03\x12\x1f\n" +
-	"\x1bFAILURE_REASON_CIRCUIT_OPEN\x10\x04\x12!\n" +
-	"\x1dFAILURE_REASON_UPSTREAM_ERROR\x10\x05\x12\x1a\n" +
-	"\x16FAILURE_REASON_TIMEOUT\x10\x06\x12 \n" +
-	"\x1cFAILURE_REASON_INVALID_INPUT\x10\a\x12!\n" +
-	"\x1dFAILURE_REASON_QUOTA_EXCEEDED\x10\b2\xda\b\n" +
+	"\x1fCIRCUIT_BREAKER_STATE_HALF_OPEN\x10\x032\xc7\t\n" +
 	"\x17InferenceGatewayService\x12\\\n" +
 	"\aPredict\x12'.forgepoint.inference.v1.PredictRequest\x1a(.forgepoint.inference.v1.PredictResponse\x12k\n" +
 	"\fBatchPredict\x12,.forgepoint.inference.v1.BatchPredictRequest\x1a-.forgepoint.inference.v1.BatchPredictResponse\x12p\n" +
-	"\rStreamPredict\x12-.forgepoint.inference.v1.StreamPredictRequest\x1a..forgepoint.inference.v1.StreamPredictResponse0\x01\x12_\n" +
+	"\rStreamPredict\x12-.forgepoint.inference.v1.StreamPredictRequest\x1a..forgepoint.inference.v1.StreamPredictResponse0\x01\x12k\n" +
+	"\fGetModelInfo\x12,.forgepoint.inference.v1.GetModelInfoRequest\x1a-.forgepoint.inference.v1.GetModelInfoResponse\x12_\n" +
 	"\bGetRoute\x12(.forgepoint.inference.v1.GetRouteRequest\x1a).forgepoint.inference.v1.GetRouteResponse\x12e\n" +
 	"\n" +
 	"ListRoutes\x12*.forgepoint.inference.v1.ListRoutesRequest\x1a+.forgepoint.inference.v1.ListRoutesResponse\x12h\n" +
@@ -2879,122 +2733,122 @@ func file_forgepoint_inference_v1_inference_proto_rawDescGZIP() []byte {
 	return file_forgepoint_inference_v1_inference_proto_rawDescData
 }
 
-var file_forgepoint_inference_v1_inference_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
-var file_forgepoint_inference_v1_inference_proto_msgTypes = make([]protoimpl.MessageInfo, 37)
+var file_forgepoint_inference_v1_inference_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
+var file_forgepoint_inference_v1_inference_proto_msgTypes = make([]protoimpl.MessageInfo, 36)
 var file_forgepoint_inference_v1_inference_proto_goTypes = []any{
 	(DataType)(0),                     // 0: forgepoint.inference.v1.DataType
 	(TargetStatus)(0),                 // 1: forgepoint.inference.v1.TargetStatus
 	(CircuitBreakerState)(0),          // 2: forgepoint.inference.v1.CircuitBreakerState
-	(FailureReason)(0),                // 3: forgepoint.inference.v1.FailureReason
-	(*TensorData)(nil),                // 4: forgepoint.inference.v1.TensorData
-	(*PredictionSummary)(nil),         // 5: forgepoint.inference.v1.PredictionSummary
-	(*FeatureSummary)(nil),            // 6: forgepoint.inference.v1.FeatureSummary
-	(*RouteTarget)(nil),               // 7: forgepoint.inference.v1.RouteTarget
-	(*Route)(nil),                     // 8: forgepoint.inference.v1.Route
-	(*CircuitState)(nil),              // 9: forgepoint.inference.v1.CircuitState
-	(*PredictRequest)(nil),            // 10: forgepoint.inference.v1.PredictRequest
-	(*PredictResponse)(nil),           // 11: forgepoint.inference.v1.PredictResponse
-	(*BatchPredictRequest)(nil),       // 12: forgepoint.inference.v1.BatchPredictRequest
-	(*BatchPredictItem)(nil),          // 13: forgepoint.inference.v1.BatchPredictItem
-	(*BatchPredictResponse)(nil),      // 14: forgepoint.inference.v1.BatchPredictResponse
-	(*BatchPredictResult)(nil),        // 15: forgepoint.inference.v1.BatchPredictResult
-	(*StreamPredictRequest)(nil),      // 16: forgepoint.inference.v1.StreamPredictRequest
-	(*StreamPredictResponse)(nil),     // 17: forgepoint.inference.v1.StreamPredictResponse
-	(*GetRouteRequest)(nil),           // 18: forgepoint.inference.v1.GetRouteRequest
-	(*GetRouteResponse)(nil),          // 19: forgepoint.inference.v1.GetRouteResponse
-	(*ListRoutesRequest)(nil),         // 20: forgepoint.inference.v1.ListRoutesRequest
-	(*ListRoutesResponse)(nil),        // 21: forgepoint.inference.v1.ListRoutesResponse
-	(*UpsertRouteRequest)(nil),        // 22: forgepoint.inference.v1.UpsertRouteRequest
-	(*UpsertRouteResponse)(nil),       // 23: forgepoint.inference.v1.UpsertRouteResponse
-	(*SetTrafficSplitRequest)(nil),    // 24: forgepoint.inference.v1.SetTrafficSplitRequest
-	(*TrafficWeight)(nil),             // 25: forgepoint.inference.v1.TrafficWeight
-	(*SetTrafficSplitResponse)(nil),   // 26: forgepoint.inference.v1.SetTrafficSplitResponse
-	(*DeleteRouteRequest)(nil),        // 27: forgepoint.inference.v1.DeleteRouteRequest
-	(*DeleteRouteResponse)(nil),       // 28: forgepoint.inference.v1.DeleteRouteResponse
-	(*GetCircuitStateRequest)(nil),    // 29: forgepoint.inference.v1.GetCircuitStateRequest
-	(*GetCircuitStateResponse)(nil),   // 30: forgepoint.inference.v1.GetCircuitStateResponse
-	(*ListCircuitStatesRequest)(nil),  // 31: forgepoint.inference.v1.ListCircuitStatesRequest
-	(*ListCircuitStatesResponse)(nil), // 32: forgepoint.inference.v1.ListCircuitStatesResponse
-	(*InferenceCompletedEvent)(nil),   // 33: forgepoint.inference.v1.InferenceCompletedEvent
-	(*InferenceFailedEvent)(nil),      // 34: forgepoint.inference.v1.InferenceFailedEvent
-	nil,                               // 35: forgepoint.inference.v1.PredictionSummary.OutputStatsEntry
-	nil,                               // 36: forgepoint.inference.v1.FeatureSummary.FeatureValuesEntry
-	nil,                               // 37: forgepoint.inference.v1.PredictRequest.InputsEntry
-	nil,                               // 38: forgepoint.inference.v1.PredictResponse.OutputsEntry
-	nil,                               // 39: forgepoint.inference.v1.BatchPredictItem.InputsEntry
-	nil,                               // 40: forgepoint.inference.v1.BatchPredictResult.OutputsEntry
-	(*timestamppb.Timestamp)(nil),     // 41: google.protobuf.Timestamp
-	(*durationpb.Duration)(nil),       // 42: google.protobuf.Duration
-	(*v1.ErrorDetail)(nil),            // 43: forgepoint.common.v1.ErrorDetail
-	(*v1.PaginationRequest)(nil),      // 44: forgepoint.common.v1.PaginationRequest
-	(*v1.PaginationResponse)(nil),     // 45: forgepoint.common.v1.PaginationResponse
+	(*TensorData)(nil),                // 3: forgepoint.inference.v1.TensorData
+	(*RouteTarget)(nil),               // 4: forgepoint.inference.v1.RouteTarget
+	(*Route)(nil),                     // 5: forgepoint.inference.v1.Route
+	(*CircuitState)(nil),              // 6: forgepoint.inference.v1.CircuitState
+	(*PredictRequest)(nil),            // 7: forgepoint.inference.v1.PredictRequest
+	(*PredictResponse)(nil),           // 8: forgepoint.inference.v1.PredictResponse
+	(*BatchPredictRequest)(nil),       // 9: forgepoint.inference.v1.BatchPredictRequest
+	(*BatchPredictItem)(nil),          // 10: forgepoint.inference.v1.BatchPredictItem
+	(*BatchPredictResponse)(nil),      // 11: forgepoint.inference.v1.BatchPredictResponse
+	(*BatchPredictResult)(nil),        // 12: forgepoint.inference.v1.BatchPredictResult
+	(*StreamPredictRequest)(nil),      // 13: forgepoint.inference.v1.StreamPredictRequest
+	(*StreamPredictResponse)(nil),     // 14: forgepoint.inference.v1.StreamPredictResponse
+	(*GetRouteRequest)(nil),           // 15: forgepoint.inference.v1.GetRouteRequest
+	(*GetRouteResponse)(nil),          // 16: forgepoint.inference.v1.GetRouteResponse
+	(*ListRoutesRequest)(nil),         // 17: forgepoint.inference.v1.ListRoutesRequest
+	(*ListRoutesResponse)(nil),        // 18: forgepoint.inference.v1.ListRoutesResponse
+	(*UpsertRouteRequest)(nil),        // 19: forgepoint.inference.v1.UpsertRouteRequest
+	(*UpsertRouteResponse)(nil),       // 20: forgepoint.inference.v1.UpsertRouteResponse
+	(*SetTrafficSplitRequest)(nil),    // 21: forgepoint.inference.v1.SetTrafficSplitRequest
+	(*TrafficWeight)(nil),             // 22: forgepoint.inference.v1.TrafficWeight
+	(*SetTrafficSplitResponse)(nil),   // 23: forgepoint.inference.v1.SetTrafficSplitResponse
+	(*DeleteRouteRequest)(nil),        // 24: forgepoint.inference.v1.DeleteRouteRequest
+	(*DeleteRouteResponse)(nil),       // 25: forgepoint.inference.v1.DeleteRouteResponse
+	(*GetCircuitStateRequest)(nil),    // 26: forgepoint.inference.v1.GetCircuitStateRequest
+	(*GetCircuitStateResponse)(nil),   // 27: forgepoint.inference.v1.GetCircuitStateResponse
+	(*ListCircuitStatesRequest)(nil),  // 28: forgepoint.inference.v1.ListCircuitStatesRequest
+	(*ListCircuitStatesResponse)(nil), // 29: forgepoint.inference.v1.ListCircuitStatesResponse
+	(*TensorSpec)(nil),                // 30: forgepoint.inference.v1.TensorSpec
+	(*VersionInfo)(nil),               // 31: forgepoint.inference.v1.VersionInfo
+	(*GetModelInfoRequest)(nil),       // 32: forgepoint.inference.v1.GetModelInfoRequest
+	(*GetModelInfoResponse)(nil),      // 33: forgepoint.inference.v1.GetModelInfoResponse
+	(*ModelInfo)(nil),                 // 34: forgepoint.inference.v1.ModelInfo
+	nil,                               // 35: forgepoint.inference.v1.PredictRequest.InputsEntry
+	nil,                               // 36: forgepoint.inference.v1.PredictResponse.OutputsEntry
+	nil,                               // 37: forgepoint.inference.v1.BatchPredictItem.InputsEntry
+	nil,                               // 38: forgepoint.inference.v1.BatchPredictResult.OutputsEntry
+	(*timestamppb.Timestamp)(nil),     // 39: google.protobuf.Timestamp
+	(*durationpb.Duration)(nil),       // 40: google.protobuf.Duration
+	(*v1.ErrorDetail)(nil),            // 41: forgepoint.common.v1.ErrorDetail
+	(v11.InferenceFailureReason)(0),   // 42: forgepoint.events.v1.InferenceFailureReason
+	(*v1.PaginationRequest)(nil),      // 43: forgepoint.common.v1.PaginationRequest
+	(*v1.PaginationResponse)(nil),     // 44: forgepoint.common.v1.PaginationResponse
 }
 var file_forgepoint_inference_v1_inference_proto_depIdxs = []int32{
 	0,  // 0: forgepoint.inference.v1.TensorData.dtype:type_name -> forgepoint.inference.v1.DataType
-	35, // 1: forgepoint.inference.v1.PredictionSummary.output_stats:type_name -> forgepoint.inference.v1.PredictionSummary.OutputStatsEntry
-	36, // 2: forgepoint.inference.v1.FeatureSummary.feature_values:type_name -> forgepoint.inference.v1.FeatureSummary.FeatureValuesEntry
-	1,  // 3: forgepoint.inference.v1.RouteTarget.status:type_name -> forgepoint.inference.v1.TargetStatus
-	7,  // 4: forgepoint.inference.v1.Route.targets:type_name -> forgepoint.inference.v1.RouteTarget
-	41, // 5: forgepoint.inference.v1.Route.updated_at:type_name -> google.protobuf.Timestamp
-	2,  // 6: forgepoint.inference.v1.CircuitState.state:type_name -> forgepoint.inference.v1.CircuitBreakerState
-	41, // 7: forgepoint.inference.v1.CircuitState.last_transition_at:type_name -> google.protobuf.Timestamp
-	37, // 8: forgepoint.inference.v1.PredictRequest.inputs:type_name -> forgepoint.inference.v1.PredictRequest.InputsEntry
-	38, // 9: forgepoint.inference.v1.PredictResponse.outputs:type_name -> forgepoint.inference.v1.PredictResponse.OutputsEntry
-	42, // 10: forgepoint.inference.v1.PredictResponse.latency:type_name -> google.protobuf.Duration
-	13, // 11: forgepoint.inference.v1.BatchPredictRequest.items:type_name -> forgepoint.inference.v1.BatchPredictItem
-	39, // 12: forgepoint.inference.v1.BatchPredictItem.inputs:type_name -> forgepoint.inference.v1.BatchPredictItem.InputsEntry
-	15, // 13: forgepoint.inference.v1.BatchPredictResponse.results:type_name -> forgepoint.inference.v1.BatchPredictResult
-	40, // 14: forgepoint.inference.v1.BatchPredictResult.outputs:type_name -> forgepoint.inference.v1.BatchPredictResult.OutputsEntry
-	43, // 15: forgepoint.inference.v1.BatchPredictResult.error:type_name -> forgepoint.common.v1.ErrorDetail
-	13, // 16: forgepoint.inference.v1.StreamPredictRequest.items:type_name -> forgepoint.inference.v1.BatchPredictItem
-	15, // 17: forgepoint.inference.v1.StreamPredictResponse.result:type_name -> forgepoint.inference.v1.BatchPredictResult
-	8,  // 18: forgepoint.inference.v1.GetRouteResponse.route:type_name -> forgepoint.inference.v1.Route
-	44, // 19: forgepoint.inference.v1.ListRoutesRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
-	8,  // 20: forgepoint.inference.v1.ListRoutesResponse.routes:type_name -> forgepoint.inference.v1.Route
-	45, // 21: forgepoint.inference.v1.ListRoutesResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
-	7,  // 22: forgepoint.inference.v1.UpsertRouteRequest.targets:type_name -> forgepoint.inference.v1.RouteTarget
-	8,  // 23: forgepoint.inference.v1.UpsertRouteResponse.route:type_name -> forgepoint.inference.v1.Route
-	25, // 24: forgepoint.inference.v1.SetTrafficSplitRequest.weights:type_name -> forgepoint.inference.v1.TrafficWeight
-	8,  // 25: forgepoint.inference.v1.SetTrafficSplitResponse.route:type_name -> forgepoint.inference.v1.Route
-	9,  // 26: forgepoint.inference.v1.GetCircuitStateResponse.circuit_state:type_name -> forgepoint.inference.v1.CircuitState
-	44, // 27: forgepoint.inference.v1.ListCircuitStatesRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
-	9,  // 28: forgepoint.inference.v1.ListCircuitStatesResponse.circuit_states:type_name -> forgepoint.inference.v1.CircuitState
-	45, // 29: forgepoint.inference.v1.ListCircuitStatesResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
-	42, // 30: forgepoint.inference.v1.InferenceCompletedEvent.latency:type_name -> google.protobuf.Duration
-	5,  // 31: forgepoint.inference.v1.InferenceCompletedEvent.prediction_summary:type_name -> forgepoint.inference.v1.PredictionSummary
-	6,  // 32: forgepoint.inference.v1.InferenceCompletedEvent.feature_summary:type_name -> forgepoint.inference.v1.FeatureSummary
-	41, // 33: forgepoint.inference.v1.InferenceCompletedEvent.timestamp:type_name -> google.protobuf.Timestamp
-	3,  // 34: forgepoint.inference.v1.InferenceFailedEvent.reason:type_name -> forgepoint.inference.v1.FailureReason
-	41, // 35: forgepoint.inference.v1.InferenceFailedEvent.timestamp:type_name -> google.protobuf.Timestamp
-	4,  // 36: forgepoint.inference.v1.PredictRequest.InputsEntry.value:type_name -> forgepoint.inference.v1.TensorData
-	4,  // 37: forgepoint.inference.v1.PredictResponse.OutputsEntry.value:type_name -> forgepoint.inference.v1.TensorData
-	4,  // 38: forgepoint.inference.v1.BatchPredictItem.InputsEntry.value:type_name -> forgepoint.inference.v1.TensorData
-	4,  // 39: forgepoint.inference.v1.BatchPredictResult.OutputsEntry.value:type_name -> forgepoint.inference.v1.TensorData
-	10, // 40: forgepoint.inference.v1.InferenceGatewayService.Predict:input_type -> forgepoint.inference.v1.PredictRequest
-	12, // 41: forgepoint.inference.v1.InferenceGatewayService.BatchPredict:input_type -> forgepoint.inference.v1.BatchPredictRequest
-	16, // 42: forgepoint.inference.v1.InferenceGatewayService.StreamPredict:input_type -> forgepoint.inference.v1.StreamPredictRequest
-	18, // 43: forgepoint.inference.v1.InferenceGatewayService.GetRoute:input_type -> forgepoint.inference.v1.GetRouteRequest
-	20, // 44: forgepoint.inference.v1.InferenceGatewayService.ListRoutes:input_type -> forgepoint.inference.v1.ListRoutesRequest
-	22, // 45: forgepoint.inference.v1.InferenceGatewayService.UpsertRoute:input_type -> forgepoint.inference.v1.UpsertRouteRequest
-	24, // 46: forgepoint.inference.v1.InferenceGatewayService.SetTrafficSplit:input_type -> forgepoint.inference.v1.SetTrafficSplitRequest
-	27, // 47: forgepoint.inference.v1.InferenceGatewayService.DeleteRoute:input_type -> forgepoint.inference.v1.DeleteRouteRequest
-	29, // 48: forgepoint.inference.v1.InferenceGatewayService.GetCircuitState:input_type -> forgepoint.inference.v1.GetCircuitStateRequest
-	31, // 49: forgepoint.inference.v1.InferenceGatewayService.ListCircuitStates:input_type -> forgepoint.inference.v1.ListCircuitStatesRequest
-	11, // 50: forgepoint.inference.v1.InferenceGatewayService.Predict:output_type -> forgepoint.inference.v1.PredictResponse
-	14, // 51: forgepoint.inference.v1.InferenceGatewayService.BatchPredict:output_type -> forgepoint.inference.v1.BatchPredictResponse
-	17, // 52: forgepoint.inference.v1.InferenceGatewayService.StreamPredict:output_type -> forgepoint.inference.v1.StreamPredictResponse
-	19, // 53: forgepoint.inference.v1.InferenceGatewayService.GetRoute:output_type -> forgepoint.inference.v1.GetRouteResponse
-	21, // 54: forgepoint.inference.v1.InferenceGatewayService.ListRoutes:output_type -> forgepoint.inference.v1.ListRoutesResponse
-	23, // 55: forgepoint.inference.v1.InferenceGatewayService.UpsertRoute:output_type -> forgepoint.inference.v1.UpsertRouteResponse
-	26, // 56: forgepoint.inference.v1.InferenceGatewayService.SetTrafficSplit:output_type -> forgepoint.inference.v1.SetTrafficSplitResponse
-	28, // 57: forgepoint.inference.v1.InferenceGatewayService.DeleteRoute:output_type -> forgepoint.inference.v1.DeleteRouteResponse
-	30, // 58: forgepoint.inference.v1.InferenceGatewayService.GetCircuitState:output_type -> forgepoint.inference.v1.GetCircuitStateResponse
-	32, // 59: forgepoint.inference.v1.InferenceGatewayService.ListCircuitStates:output_type -> forgepoint.inference.v1.ListCircuitStatesResponse
-	50, // [50:60] is the sub-list for method output_type
-	40, // [40:50] is the sub-list for method input_type
-	40, // [40:40] is the sub-list for extension type_name
-	40, // [40:40] is the sub-list for extension extendee
-	0,  // [0:40] is the sub-list for field type_name
+	1,  // 1: forgepoint.inference.v1.RouteTarget.status:type_name -> forgepoint.inference.v1.TargetStatus
+	4,  // 2: forgepoint.inference.v1.Route.targets:type_name -> forgepoint.inference.v1.RouteTarget
+	39, // 3: forgepoint.inference.v1.Route.updated_at:type_name -> google.protobuf.Timestamp
+	2,  // 4: forgepoint.inference.v1.CircuitState.state:type_name -> forgepoint.inference.v1.CircuitBreakerState
+	39, // 5: forgepoint.inference.v1.CircuitState.last_transition_at:type_name -> google.protobuf.Timestamp
+	35, // 6: forgepoint.inference.v1.PredictRequest.inputs:type_name -> forgepoint.inference.v1.PredictRequest.InputsEntry
+	36, // 7: forgepoint.inference.v1.PredictResponse.outputs:type_name -> forgepoint.inference.v1.PredictResponse.OutputsEntry
+	40, // 8: forgepoint.inference.v1.PredictResponse.latency:type_name -> google.protobuf.Duration
+	10, // 9: forgepoint.inference.v1.BatchPredictRequest.items:type_name -> forgepoint.inference.v1.BatchPredictItem
+	37, // 10: forgepoint.inference.v1.BatchPredictItem.inputs:type_name -> forgepoint.inference.v1.BatchPredictItem.InputsEntry
+	12, // 11: forgepoint.inference.v1.BatchPredictResponse.results:type_name -> forgepoint.inference.v1.BatchPredictResult
+	38, // 12: forgepoint.inference.v1.BatchPredictResult.outputs:type_name -> forgepoint.inference.v1.BatchPredictResult.OutputsEntry
+	41, // 13: forgepoint.inference.v1.BatchPredictResult.error:type_name -> forgepoint.common.v1.ErrorDetail
+	42, // 14: forgepoint.inference.v1.BatchPredictResult.failure_reason:type_name -> forgepoint.events.v1.InferenceFailureReason
+	10, // 15: forgepoint.inference.v1.StreamPredictRequest.items:type_name -> forgepoint.inference.v1.BatchPredictItem
+	12, // 16: forgepoint.inference.v1.StreamPredictResponse.result:type_name -> forgepoint.inference.v1.BatchPredictResult
+	5,  // 17: forgepoint.inference.v1.GetRouteResponse.route:type_name -> forgepoint.inference.v1.Route
+	43, // 18: forgepoint.inference.v1.ListRoutesRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
+	5,  // 19: forgepoint.inference.v1.ListRoutesResponse.routes:type_name -> forgepoint.inference.v1.Route
+	44, // 20: forgepoint.inference.v1.ListRoutesResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
+	4,  // 21: forgepoint.inference.v1.UpsertRouteRequest.targets:type_name -> forgepoint.inference.v1.RouteTarget
+	5,  // 22: forgepoint.inference.v1.UpsertRouteResponse.route:type_name -> forgepoint.inference.v1.Route
+	22, // 23: forgepoint.inference.v1.SetTrafficSplitRequest.weights:type_name -> forgepoint.inference.v1.TrafficWeight
+	5,  // 24: forgepoint.inference.v1.SetTrafficSplitResponse.route:type_name -> forgepoint.inference.v1.Route
+	6,  // 25: forgepoint.inference.v1.GetCircuitStateResponse.circuit_state:type_name -> forgepoint.inference.v1.CircuitState
+	43, // 26: forgepoint.inference.v1.ListCircuitStatesRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
+	6,  // 27: forgepoint.inference.v1.ListCircuitStatesResponse.circuit_states:type_name -> forgepoint.inference.v1.CircuitState
+	44, // 28: forgepoint.inference.v1.ListCircuitStatesResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
+	0,  // 29: forgepoint.inference.v1.TensorSpec.dtype:type_name -> forgepoint.inference.v1.DataType
+	34, // 30: forgepoint.inference.v1.GetModelInfoResponse.model_info:type_name -> forgepoint.inference.v1.ModelInfo
+	30, // 31: forgepoint.inference.v1.ModelInfo.inputs:type_name -> forgepoint.inference.v1.TensorSpec
+	30, // 32: forgepoint.inference.v1.ModelInfo.outputs:type_name -> forgepoint.inference.v1.TensorSpec
+	31, // 33: forgepoint.inference.v1.ModelInfo.versions:type_name -> forgepoint.inference.v1.VersionInfo
+	39, // 34: forgepoint.inference.v1.ModelInfo.updated_at:type_name -> google.protobuf.Timestamp
+	3,  // 35: forgepoint.inference.v1.PredictRequest.InputsEntry.value:type_name -> forgepoint.inference.v1.TensorData
+	3,  // 36: forgepoint.inference.v1.PredictResponse.OutputsEntry.value:type_name -> forgepoint.inference.v1.TensorData
+	3,  // 37: forgepoint.inference.v1.BatchPredictItem.InputsEntry.value:type_name -> forgepoint.inference.v1.TensorData
+	3,  // 38: forgepoint.inference.v1.BatchPredictResult.OutputsEntry.value:type_name -> forgepoint.inference.v1.TensorData
+	7,  // 39: forgepoint.inference.v1.InferenceGatewayService.Predict:input_type -> forgepoint.inference.v1.PredictRequest
+	9,  // 40: forgepoint.inference.v1.InferenceGatewayService.BatchPredict:input_type -> forgepoint.inference.v1.BatchPredictRequest
+	13, // 41: forgepoint.inference.v1.InferenceGatewayService.StreamPredict:input_type -> forgepoint.inference.v1.StreamPredictRequest
+	32, // 42: forgepoint.inference.v1.InferenceGatewayService.GetModelInfo:input_type -> forgepoint.inference.v1.GetModelInfoRequest
+	15, // 43: forgepoint.inference.v1.InferenceGatewayService.GetRoute:input_type -> forgepoint.inference.v1.GetRouteRequest
+	17, // 44: forgepoint.inference.v1.InferenceGatewayService.ListRoutes:input_type -> forgepoint.inference.v1.ListRoutesRequest
+	19, // 45: forgepoint.inference.v1.InferenceGatewayService.UpsertRoute:input_type -> forgepoint.inference.v1.UpsertRouteRequest
+	21, // 46: forgepoint.inference.v1.InferenceGatewayService.SetTrafficSplit:input_type -> forgepoint.inference.v1.SetTrafficSplitRequest
+	24, // 47: forgepoint.inference.v1.InferenceGatewayService.DeleteRoute:input_type -> forgepoint.inference.v1.DeleteRouteRequest
+	26, // 48: forgepoint.inference.v1.InferenceGatewayService.GetCircuitState:input_type -> forgepoint.inference.v1.GetCircuitStateRequest
+	28, // 49: forgepoint.inference.v1.InferenceGatewayService.ListCircuitStates:input_type -> forgepoint.inference.v1.ListCircuitStatesRequest
+	8,  // 50: forgepoint.inference.v1.InferenceGatewayService.Predict:output_type -> forgepoint.inference.v1.PredictResponse
+	11, // 51: forgepoint.inference.v1.InferenceGatewayService.BatchPredict:output_type -> forgepoint.inference.v1.BatchPredictResponse
+	14, // 52: forgepoint.inference.v1.InferenceGatewayService.StreamPredict:output_type -> forgepoint.inference.v1.StreamPredictResponse
+	33, // 53: forgepoint.inference.v1.InferenceGatewayService.GetModelInfo:output_type -> forgepoint.inference.v1.GetModelInfoResponse
+	16, // 54: forgepoint.inference.v1.InferenceGatewayService.GetRoute:output_type -> forgepoint.inference.v1.GetRouteResponse
+	18, // 55: forgepoint.inference.v1.InferenceGatewayService.ListRoutes:output_type -> forgepoint.inference.v1.ListRoutesResponse
+	20, // 56: forgepoint.inference.v1.InferenceGatewayService.UpsertRoute:output_type -> forgepoint.inference.v1.UpsertRouteResponse
+	23, // 57: forgepoint.inference.v1.InferenceGatewayService.SetTrafficSplit:output_type -> forgepoint.inference.v1.SetTrafficSplitResponse
+	25, // 58: forgepoint.inference.v1.InferenceGatewayService.DeleteRoute:output_type -> forgepoint.inference.v1.DeleteRouteResponse
+	27, // 59: forgepoint.inference.v1.InferenceGatewayService.GetCircuitState:output_type -> forgepoint.inference.v1.GetCircuitStateResponse
+	29, // 60: forgepoint.inference.v1.InferenceGatewayService.ListCircuitStates:output_type -> forgepoint.inference.v1.ListCircuitStatesResponse
+	50, // [50:61] is the sub-list for method output_type
+	39, // [39:50] is the sub-list for method input_type
+	39, // [39:39] is the sub-list for extension type_name
+	39, // [39:39] is the sub-list for extension extendee
+	0,  // [0:39] is the sub-list for field type_name
 }
 
 func init() { file_forgepoint_inference_v1_inference_proto_init() }
@@ -3007,8 +2861,8 @@ func file_forgepoint_inference_v1_inference_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_forgepoint_inference_v1_inference_proto_rawDesc), len(file_forgepoint_inference_v1_inference_proto_rawDesc)),
-			NumEnums:      4,
-			NumMessages:   37,
+			NumEnums:      3,
+			NumMessages:   36,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -11,11 +11,25 @@
 // WHAT'S HERE:
 //   - Domain messages: Money, RatePlan, UsageRecord, UsageSummary, Invoice,
 //     InvoiceLineItem
-//   - BillingService RPCs: RecordUsage (meter), GetUsage (aggregate, paged),
-//     GetInvoice, ListInvoices (paged)
-//   - Event payload messages: UsageRecorded, InvoiceGenerated, QuotaExceeded —
-//     the typed payloads carried in common.v1.EventEnvelope.data and published
-//     via the OUTBOX poller (see pattern note below)
+//   - BillingService RPCs:
+//       METERING:   RecordUsage (outbox-protected write)
+//       PRICING:    CreateRatePlan (admin), GetRatePlan
+//       QUOTA:      CheckQuota (gateway pre-flight)
+//       REPORTING:  GetUsage (aggregate, paged), GetInvoice, ListInvoices (paged)
+//
+// EVENT PAYLOADS LIVE IN forgepoint.events.v1 (NOT here):
+//   This service formerly defined its OWN UsageRecorded/InvoiceGenerated/
+//   QuotaExceeded payload messages inline. An adversarial cross-service review
+//   found per-service ad-hoc event messages drifting from their consumers, so the
+//   platform now has ONE canonical event contract — forgepoint.events.v1 — that
+//   both producers and consumers depend on. Those three inline messages have been
+//   DELETED from this file; billing publishes the canonical events.UsageRecorded /
+//   events.InvoiceGenerated / events.QuotaExceeded instead (see import block and
+//   the EVENT CONTRACT section near the service definition). The canonical money-
+//   bearing events (UsageRecorded, InvoiceGenerated) FLATTEN Money into
+//   cost_micros/total_micros + currency_code — no embedded billing.Money / .Invoice
+//   — precisely so a consumer (Experiment Tracker, Notification) need not compile-
+//   depend on this billing API proto just to read an event.
 //
 // PATTERN — Outbox (Transactional Outbox / reliable event publishing):
 //   The hard problem this service exists to demonstrate is the DUAL-WRITE
@@ -46,10 +60,12 @@
 //       outbox protects DB→NATS; the idempotency key protects NATS→DB. Both ends
 //       of the pipe must be idempotent for the whole thing to be exactly-once
 //       *in effect*.
-//     - The event payload messages live in THIS proto (not raw JSON) so the
-//       outbox `payload` column is a typed, versioned, buf-breaking-checked
-//       contract — the same "typed payload in a generic envelope" discipline as
-//       the registry service.
+//     - The event payloads are the canonical forgepoint.events.v1 messages
+//       (not raw JSON), so the outbox `payload` column is a typed, versioned,
+//       buf-breaking-checked contract — the same "typed payload in a generic
+//       envelope" discipline as the registry service. The poller marshals an
+//       eventsv1.* message into common.v1.EventEnvelope.data (an Any) and
+//       publishes it to the subject below.
 //
 //   REAL-WORLD COMPARISON:
 //     - This is exactly how Stripe, Shopify, and most ledger systems publish
@@ -60,13 +76,36 @@
 //       can die in the gap between commit and publish; the outbox moves the
 //       publish intent INTO the committed transaction so a crash loses nothing.
 //
-// METERING SOURCE — consumes InferenceCompleted:
-//   The primary feeder is the async event `fp.inference.completed` emitted by
-//   the Inference Gateway. The billing consumer turns each into a RecordUsage
-//   (internally) so the same metering path serves both the event consumer and
-//   any direct gRPC caller (e.g. a backfill tool). RecordUsage is therefore
-//   exposed on the gRPC surface even though, in steady state, most traffic
-//   arrives via NATS.
+// METERING SOURCES — the two events billing CONSUMES (canonical eventsv1):
+//   1. fp.inference.completed (events.InferenceCompleted) — the PRIMARY feeder,
+//      emitted by the Inference Gateway (the single canonical inference event; a
+//      serving pod must NOT emit a competing one). Each completed inference yields
+//      usage on TWO meters: METER_TYPE_INFERENCE_REQUEST (one per call) and, when
+//      token_count > 0, METER_TYPE_INFERENCE_TOKENS. The event carries token_count
+//      and api_key_id, so billing meters both axes off ONE event and resolves the
+//      billed team from api_key_id (NEVER from a client field).
+//      EXACTLY-ONCE-IN-EFFECT (inbound half): NATS is at-least-once, so the
+//      consumer DEDUPES on events.InferenceCompleted.request_id — a request_id it
+//      already metered is skipped. request_id flows into the UsageRecord as
+//      source_request_id (and into RecordUsageRequest.idempotency_key for the
+//      direct-call path). This is the NATS→DB half of exactly-once; the outbox is
+//      the DB→NATS half.
+//   2. fp.models.version.ready (events.ModelVersionReady) — emitted by the
+//      Registry when an artifact upload is verified. Billing meters
+//      METER_TYPE_STORAGE_BYTES from the event's server-measured size_bytes, so
+//      storage cost rides the same outbox pipeline as inference cost.
+//   The billing consumer turns each consumed event into a RecordUsage (internally)
+//   so the same metering path serves both the event consumers AND any direct gRPC
+//   caller (e.g. a backfill tool). RecordUsage is therefore exposed on the gRPC
+//   surface even though, in steady state, most traffic arrives via NATS.
+//
+// ENUM MAPPING — billing.MeterType <-> events.MeterType:
+//   The event bus carries a MIRROR enum (events.v1.MeterType) with byte-identical
+//   values (UNSPECIFIED=0, INFERENCE_REQUEST=1, INFERENCE_TOKENS=2,
+//   COMPUTE_SECONDS=3, STORAGE_BYTES=4). The handler maps billing.MeterType <->
+//   events.MeterType at the publish/consume boundary — a few lines of mechanical
+//   conversion that keep the API enum free to evolve independently of the wire
+//   contract (the "event schema decoupled from API schema" discipline).
 //
 // SECURITY / TRUST BOUNDARY (this is a billing service — get this right):
 //   EVERY money-bearing or attribution field is SERVER-AUTHORITATIVE. Clients
@@ -76,6 +115,24 @@
 //   discount, a cost, an invoice total, a quota, a status, a timestamp, or
 //   whose account to bill. Accepting any of those would be a mass-assignment
 //   vulnerability with a direct financial blast radius. See per-field notes.
+//
+// INTEGER OVERFLOW — a money service MUST guard its arithmetic:
+//   All money is int64 micro-units and all quantities are int64. The metering
+//   math (cost = quantity * unit_price_micros) and the invoice rollup
+//   (total = Σ line_item.amount) are MULTIPLICATIONS and SUMS over int64 that can
+//   silently WRAP on overflow — and a wrapped total is a real, signed money bug
+//   (a huge bill becomes a negative credit). The wire types stay int64 (protobuf
+//   has no int128, and int64 micro-units comfortably covers any sane bill: 2^63
+//   micro-USD ≈ 9.2 trillion USD), but the SERVER MUST:
+//     (a) bound each input `quantity` to a sane per-record maximum (see the
+//         MAX_QUANTITY_PER_RECORD note on RecordUsageRequest.quantity) and reject
+//         out-of-range values with InvalidArgument — never truncate;
+//     (b) perform every multiply/sum with CHECKED arithmetic (math/bits or an
+//         explicit overflow test) and fail the operation rather than wrap;
+//     (c) reject negative `quantity` (only server-issued credits may be negative,
+//         and those never come from a client).
+//   This guard is a server-side INVARIANT the proto documents but cannot itself
+//   enforce; the integration tests assert the rejection at the boundary.
 //
 // VERSIONING: Package path includes v1 per Buf/Google convention. Breaking
 // changes require a new forgepoint.billing.v2 package.
@@ -93,6 +150,21 @@ option go_package = "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/billing
 
 import "google/protobuf/timestamp.proto";
 import "forgepoint/common/v1/common.proto";
+// NOTE — we deliberately do NOT import forgepoint/events/v1/events.proto here.
+// forgepoint.events.v1 is the SINGLE SOURCE OF TRUTH for every NATS event payload
+// on the platform (see proto/forgepoint/events/v1/events.proto). This service
+// formerly defined its OWN UsageRecorded/InvoiceGenerated/QuotaExceeded payloads
+// here; an adversarial cross-service review found such ad-hoc messages drifting
+// from their consumers, so they have been DELETED and billing depends on the
+// canonical eventsv1 types instead. But that dependency is satisfied in GENERATED
+// GO (the outbox poller marshals an eventsv1.* message into
+// common.v1.EventEnvelope.data at publish time, and the handler maps
+// billing.MeterType <-> events.MeterType at the boundary) — this API .proto
+// references no events.v1 TYPE, so importing it here would be an unused proto
+// import (Buf IMPORT_USED) and a dead compile-time coupling of the API schema to
+// the event schema, the exact coupling events.proto exists to avoid. The
+// SUBJECT/MESSAGE names in the comments below are the documented contract; the
+// wire types live in events.proto and are pulled in by the Go code, not here.
 
 // ============================================================================
 // ENUMS
@@ -114,6 +186,12 @@ import "forgepoint/common/v1/common.proto";
 //   fee. Modeling them as distinct meter types lets one InferenceCompleted
 //   produce multiple priced line items, which is how OpenAI/Anthropic-style
 //   token billing actually works.
+//
+// MIRRORED ON THE BUS: events.v1.MeterType has byte-identical values. This is
+//   the SERVICE/API enum; the handler maps billing.MeterType <-> events.MeterType
+//   at the publish/consume boundary so the event schema can evolve independently
+//   of this API enum (the events.proto decoupling discipline). Keep the two in
+//   lockstep when adding a meter.
 // ============================================================================
 enum MeterType {
   // Required zero value. Unknown/unset meter — the server rejects RecordUsage
@@ -219,12 +297,15 @@ message Money {
 //   after the fact via GetUsage/GetInvoice. This is the structural guarantee
 //   that "the client cannot set its own price".
 //
-// NOTE: RatePlan management RPCs (CreateRatePlan, etc.) are intentionally NOT in
-// this file's M2 surface — the platform design lists CreateRatePlan as a later
-// admin concern. The message is defined now because GetUsage/Invoice responses
-// reference the plan that was applied, and because it documents the pricing
-// model the metering math depends on. Adding the admin RPCs later is additive
-// (buf-breaking-safe).
+// RATE-PLAN MANAGEMENT RPCs: CreateRatePlan (admin) and GetRatePlan are part of
+//   this surface — the platform design (Phase 8.1) lists CreateRatePlan, and the
+//   metering math is undefined without a plan to resolve. CreateRatePlan is
+//   ADMIN-ONLY (it sets prices for real money) and id/created_at are server-set
+//   (mass-assignment guard). GetRatePlan lets a client/BFF read the pricing it
+//   will be billed under. Mutating an existing plan's prices in place is
+//   deliberately NOT offered: prices are immutable once a usage record has pinned
+//   them (reproducible billing), so "changing" a plan means creating a new one —
+//   adding a versioned UpdateRatePlan later is additive (buf-breaking-safe).
 // ============================================================================
 message RatePlan {
   // UUID v4. Stable identifier referenced by usage records and invoices.
@@ -457,7 +538,12 @@ message RecordUsageRequest {
   MeterType meter_type = 1;
 
   // How many units (requests, tokens, compute-seconds, bytes). Server validates
-  // non-negative and within sane per-record bounds.
+  // NON-NEGATIVE (a client may never submit a negative quantity; only server-
+  // issued credits are negative) and within a sane per-record cap:
+  //   MAX_QUANTITY_PER_RECORD (server constant, e.g. 1_000_000_000) — chosen so
+  //   quantity * the largest unit price still cannot overflow int64 micro-units,
+  //   so the cost multiply is provably safe. Out-of-range → InvalidArgument
+  //   (rejected, never truncated). See the INTEGER OVERFLOW note in the header.
   int64 quantity = 2;
 
   // What produced the usage (for attribution / per-model reports). Optional but
@@ -512,8 +598,10 @@ message GetUsageRequest {
   string team = 1;
 
   // Inclusive start / exclusive end of the reporting window. Empty start =
-  // current billing period start; empty end = now. Server caps the maximum
-  // span to bound query cost.
+  // current billing period start; empty end = now. The server CAPS the maximum
+  // span to MAX_USAGE_WINDOW (server constant, e.g. 366 days) to bound query
+  // cost; a wider request is rejected with InvalidArgument rather than silently
+  // truncated, so a caller can't accidentally scan the whole ledger.
   google.protobuf.Timestamp period_start = 2;
   google.protobuf.Timestamp period_end = 3;
 
@@ -521,7 +609,8 @@ message GetUsageRequest {
   MeterType meter_type_filter = 4;
 
   // Cursor-based pagination over sub-period buckets. page_size defaults to 20,
-  // capped at 100 server-side (see common.proto). See PaginationRequest.
+  // capped at MAX_PAGE_SIZE = 100 server-side (see common.proto). A request above
+  // the cap is clamped to 100, never honored as-is. See PaginationRequest.
   forgepoint.common.v1.PaginationRequest pagination = 5;
 }
 
@@ -572,8 +661,9 @@ message ListInvoicesRequest {
   // UNSPECIFIED = all statuses.
   InvoiceStatus status_filter = 2;
 
-  // Cursor-based pagination. page_size defaults to 20, capped at 100
-  // server-side. See common.proto PaginationRequest for the WHY on cursors.
+  // Cursor-based pagination. page_size defaults to 20, capped at MAX_PAGE_SIZE =
+  // 100 server-side (clamped, not honored as-is). See common.proto
+  // PaginationRequest for the WHY on cursors.
   forgepoint.common.v1.PaginationRequest pagination = 3;
 }
 
@@ -587,76 +677,160 @@ message ListInvoicesResponse {
 }
 
 // ============================================================================
-// EVENT PAYLOAD MESSAGES (published via the OUTBOX, carried in EventEnvelope.data)
+// CreateRatePlan  (ADMIN — sets real prices)
 // ============================================================================
 //
-// WHY typed event payloads (not raw JSON):
-//   These messages are what the outbox poller packs into
-//   common.v1.EventEnvelope.data (a google.protobuf.Any) before publishing to
-//   NATS. Defining them as protos gives consumers (Notification, the Inference
-//   Gateway's quota cache, Experiment Tracker) a typed, versioned,
-//   buf-breaking-checked contract — and gives the outbox `payload` column a
-//   stable schema. The Any's type_url tells the consumer which message to
-//   unmarshal. Same discipline as the registry service's event payloads.
+// CreateRatePlanRequest defines a NEW priced plan. This is an ADMIN-ONLY write:
+// it sets the unit prices, free allowances, and quota caps the metering math
+// will apply to real money, so the server enforces an admin role before
+// accepting it. It is also the second-most security-sensitive write here, so the
+// same mass-assignment discipline as RecordUsage applies.
 //
-// WHY events are SELF-CONTAINED:
-//   A consumer must act WITHOUT calling back into billing (that would defeat the
-//   async decoupling and risk reading not-yet-committed state). So each payload
-//   carries the fields its consumers need — the billed team, the meter, the
-//   computed cost — rather than just an id to look up.
+// SERVER-AUTHORITATIVE (absent from this request by design):
+//   id          → server-assigned UUID (a client may not choose/overwrite a
+//                 plan id — that's how you'd hijack an existing plan).
+//   created_at  → server-stamped.
+// The client supplies only the pricing DEFINITION (name + the three maps).
 //
-// SUBJECT MAPPING (from the platform design's NATS hierarchy):
-//   UsageRecorded    → fp.billing.usage.recorded
-//   InvoiceGenerated → fp.billing.invoice.generated
-//   QuotaExceeded    → fp.billing.quota.exceeded
-// ============================================================================
+// PRICE VALIDATION (server-side invariant): every unit_prices entry must use the
+// SAME currency_code (no mixed-currency plan) and a NON-NEGATIVE amount; every
+// map key must be a valid MeterType name. Invalid → InvalidArgument.
+message CreateRatePlanRequest {
+  // Human-readable plan name ("free-tier","standard","enterprise"). Unique per
+  // deployment is a server-enforced constraint, not a wire concern.
+  string name = 1;
 
-// UsageRecorded — emitted after a UsageRecord commits (via the outbox).
-// CONSUMERS: Experiment Tracker (attribute cost to a run/model), and any
-// real-time usage dashboard. Carries the full priced record so consumers need
-// no callback.
-message UsageRecorded {
-  // The committed, priced ledger record. Self-contained: includes team, meter,
-  // quantity, and server-computed cost.
-  UsageRecord record = 1;
+  // Per-meter unit prices. Key = MeterType name; value = price per ONE unit.
+  // All values MUST share one currency_code (server-validated).
+  map<string, Money> unit_prices = 2;
+
+  // Included free allowance per billing period, keyed by MeterType name.
+  // Empty = no free tier.
+  map<string, int64> included_quantities = 3;
+
+  // Hard monthly quota cap per MeterType name. Crossing it fires the
+  // events.QuotaExceeded outbox event. 0 / absent = no hard cap for that meter.
+  map<string, int64> quota_limits = 4;
+
+  // Idempotency key (UUID/stable string). A retry with the same key returns the
+  // ORIGINAL plan instead of creating a duplicate — admin tooling retries too.
+  string idempotency_key = 5;
 }
 
-// QuotaExceeded — emitted when recorded usage pushes a team OVER its rate plan's
-// quota for a meter. Written to the outbox in the SAME transaction as the usage
-// update (the canonical outbox example from the implementation plan), so the
-// alert is as durable as the usage that triggered it.
-// CONSUMERS: Notification (alert the team), Inference Gateway (flip the team's
-// quota cache to "blocked" so subsequent inferences are rejected/throttled).
-message QuotaExceeded {
-  // The team that exceeded quota.
+// CreateRatePlanResponse returns the server-built plan (id + created_at set).
+message CreateRatePlanResponse {
+  // The committed plan, with its server-assigned id and created_at.
+  RatePlan rate_plan = 1;
+
+  // True if the idempotency key already existed and `rate_plan` is the
+  // pre-existing one rather than a newly created plan.
+  bool deduplicated = 2;
+}
+
+// ============================================================================
+// GetRatePlan  (read pricing)
+// ============================================================================
+
+// GetRatePlanRequest fetches a single rate plan by id. WHY expose this: a BFF /
+// the `fp` CLI needs to SHOW a team the pricing it will be billed under, and a
+// usage report references the plan that was applied. Read-only; a non-admin may
+// read the plan currently assigned to its own team (server-enforced), not an
+// arbitrary plan id.
+message GetRatePlanRequest {
+  // The rate plan UUID (RatePlan.id).
+  string rate_plan_id = 1;
+}
+
+// GetRatePlanResponse wraps the plan (forward-compat per RPC_RESPONSE_STANDARD).
+message GetRatePlanResponse {
+  // The requested rate plan with its unit prices, allowances, and quota caps.
+  RatePlan rate_plan = 1;
+}
+
+// ============================================================================
+// CheckQuota  (gateway pre-flight)
+// ============================================================================
+//
+// CheckQuotaRequest asks "how much of its quota does this team have left on this
+// meter?". WHY this RPC exists (design Task 8.4): the Inference Gateway calls it
+// BEFORE forwarding a request, to reject/throttle a team that is over quota. The
+// gateway CACHES the answer in Redis (eventual consistency with the DB is
+// acceptable for a pre-flight) and the events.QuotaExceeded outbox event flips
+// that cache to "blocked" between calls — CheckQuota is the cache-fill / cold
+// path, the event is the invalidation.
+//
+// AUTHORIZATION/TENANCY: `team` is the team to check. For a non-admin caller the
+// server OVERRIDES it with the caller's own team derived from auth claims — the
+// field exists so the gateway (a trusted internal caller) and admins can scope
+// the check; it is NOT a way to probe another tenant's quota. Same rule as
+// GetUsage's team filter.
+message CheckQuotaRequest {
+  // Team to check. Server overrides with the caller's own team for non-admins.
   string team = 1;
 
-  // The rate plan whose quota was hit.
-  string rate_plan_id = 2;
+  // Which meter's quota to check. Must be a known, non-UNSPECIFIED meter.
+  MeterType meter_type = 2;
+}
 
-  // Which meter's quota was exceeded.
+// CheckQuotaResponse reports the team's standing on the requested meter. All
+// fields are SERVER-computed from the team's current plan + period usage.
+message CheckQuotaResponse {
+  // The team checked + the plan whose quota applies (echoed for the cache key).
+  string team = 1;
+  string rate_plan_id = 2;
   MeterType meter_type = 3;
 
-  // The plan's quota cap for that meter (the limit that was crossed).
+  // The plan's hard cap for this meter (0 = unlimited / no cap configured).
   int64 quota_limit = 4;
 
-  // The team's current usage of that meter (>= quota_limit), so the consumer
-  // can show "1,012 / 1,000" without a callback.
+  // The team's usage of this meter SO FAR in the current billing period.
   int64 current_usage = 5;
 
-  // When the threshold was crossed (event time).
-  google.protobuf.Timestamp occurred_at = 6;
+  // remaining = max(0, quota_limit - current_usage); 0 when over or at the cap.
+  // Server-computed so the gateway needn't re-derive it.
+  int64 remaining = 6;
+
+  // True if current_usage >= quota_limit (i.e. the team is OVER quota and the
+  // gateway should reject/throttle). False when quota_limit == 0 (no cap).
+  bool exceeded = 7;
 }
 
-// InvoiceGenerated — emitted when a billing period closes and an invoice
-// transitions DRAFT → FINALIZED (totals locked). Published via the outbox.
-// CONSUMERS: Notification (email/Slack the finalized invoice), and any external
-// payment/accounting integration.
-message InvoiceGenerated {
-  // The finalized invoice, including line items and the server-computed total.
-  // Self-contained so the consumer can render/send it without a callback.
-  Invoice invoice = 1;
-}
+// ============================================================================
+// EVENT CONTRACT — billing PRODUCES three events, defined in forgepoint.events.v1
+// ============================================================================
+//
+// NO event-payload messages are declared here. Billing's three events live in
+// the canonical forgepoint.events.v1 package (the platform's single source of
+// truth); the outbox poller marshals one of those messages into
+// common.v1.EventEnvelope.data (an Any) and publishes it. This file used to
+// declare its own UsageRecorded/QuotaExceeded/InvoiceGenerated — DELETED, because
+// per-service ad-hoc event messages drifted from their consumers (see import
+// block). The canonical contract is referenced (not redefined) here:
+//
+//   SUBJECT                        PAYLOAD (forgepoint.events.v1)   CONSUMERS
+//   ─────────────────────────────  ──────────────────────────────  ────────────────────────────
+//   fp.billing.usage.recorded      events.UsageRecorded            experiment-tracker, dashboards
+//   fp.billing.quota.exceeded      events.QuotaExceeded            notification, inference-gateway
+//   fp.billing.invoice.generated   events.InvoiceGenerated         notification
+//
+// SUBJECT NOTE (conflict #6): the design doc's fp.billing.> hierarchy listed
+//   quota.exceeded and invoice.generated explicitly; usage.recorded was implied
+//   by the outbox example. fp.billing.usage.recorded is the NEW sanctioned
+//   subject under the existing fp.billing.> tree (added to the design-doc NATS
+//   hierarchy as part of this alignment).
+//
+// MONEY IS FLATTENED IN THE EVENTS (decoupling, not an oversight): the canonical
+//   events.UsageRecorded carries cost_micros + currency_code (NOT a billing.Money
+//   and NOT the whole UsageRecord); events.InvoiceGenerated carries total_micros +
+//   currency_code (NOT a billing.Invoice). WHY: a consumer (Experiment Tracker,
+//   Notification) must NOT have to compile-depend on this billing API proto just to
+//   read an event. The handler maps billing.Money/UsageRecord/Invoice -> the flat
+//   event scalars at publish time, and billing.MeterType -> events.MeterType.
+//
+// ALL THREE GO THROUGH THE OUTBOX: each event row is written in the SAME Postgres
+//   transaction as the business write it describes (the usage/quota update or the
+//   invoice finalize), then the poller publishes at-least-once. Consumers are
+//   idempotent on EventEnvelope.id, so at-least-once is safe.
 
 // ============================================================================
 // BILLING SERVICE
@@ -671,41 +845,47 @@ message InvoiceGenerated {
 //
 // RPC CATEGORIES:
 //   METERING (write): RecordUsage — the outbox-protected write path. In steady
-//     state this is driven by the InferenceCompleted NATS consumer; exposed on
-//     gRPC for backfills and direct metering.
+//     state this is driven by the events.InferenceCompleted NATS consumer (and
+//     events.ModelVersionReady for storage); exposed on gRPC for backfills and
+//     direct metering.
+//   PRICING (admin/read): CreateRatePlan (admin write — sets real prices),
+//     GetRatePlan (read the pricing a team is billed under).
+//   QUOTA (read): CheckQuota — the gateway's pre-flight; cheap "how much is left"
+//     answer the gateway caches in Redis (the QuotaExceeded event invalidates it).
 //   REPORTING (read): GetUsage (aggregated, paged), GetInvoice, ListInvoices
 //     (paged) — read-only views over the ledger.
 //
 // WHY ALL UNARY (no streaming):
-//   - RecordUsage is a single fact-in / record-out — request/reply.
+//   - RecordUsage / CreateRatePlan / CheckQuota are single fact-in / record-out —
+//     request/reply.
 //   - GetUsage/ListInvoices return BOUNDED, PAGINATED pages; pagination (not a
 //     server stream) is the right tool because it gives clients resumability,
 //     cacheable page tokens, and a natural total_count — the same choice the
 //     registry's list RPCs made. A server stream would suit an UNBOUNDED live
 //     feed (e.g. tail usage in real time); that real-time need is served by the
-//     async UsageRecorded NATS event instead, keeping the gRPC surface simple.
+//     async events.UsageRecorded NATS event instead, keeping the gRPC surface
+//     simple.
 //
-// WHERE CheckQuota / CreateRatePlan WENT (scope note, not a TODO):
-//   The platform design also lists CheckQuota (gateway pre-flight) and
-//   CreateRatePlan (admin). They are deliberately OUT of this proto's scope per
-//   the task brief (RecordUsage / GetUsage / GetInvoice / ListInvoices). Quota
-//   enforcement is realized here via the QuotaExceeded outbox event that flips
-//   the gateway's Redis quota cache (eventual consistency is acceptable for the
-//   gateway pre-flight). Adding CheckQuota/CreateRatePlan later is purely
-//   additive and buf-breaking-safe.
+// QUOTA ENFORCEMENT — two complementary mechanisms:
+//   CheckQuota is the PULL/pre-flight (gateway asks before forwarding; cache-fill
+//   cold path). The events.QuotaExceeded outbox event is the PUSH/invalidation
+//   (the moment a team crosses the cap, the event flips the gateway's Redis cache
+//   to "blocked"). Eventual consistency between DB and the gateway cache is
+//   acceptable for a pre-flight — the worst case is a handful of over-quota calls
+//   slip through before the cache flips, which the next RecordUsage still meters.
 //
 // ASCII DIAGRAM — the outbox metering pipeline (interview-critical):
 //
 //   Inference Gateway ──fp.inference.completed──► Billing NATS consumer
-//                                                      │ (idempotency_key dedupe)
+//                                                      │ (dedupe on request_id)
 //                                                      ▼
-//                                         ┌─ BEGIN tx ──────────────────────┐
-//                                         │  INSERT usage_record (priced)   │
-//                                         │  UPDATE quota counter           │
-//                                         │  INSERT outbox(UsageRecorded)   │
-//                                         │  if over quota:                 │
-//                                         │     INSERT outbox(QuotaExceeded)│
-//                                         └─ COMMIT ────────────────────────┘
+//                                         ┌─ BEGIN tx ───────────────────────────┐
+//                                         │  INSERT usage_record (priced)        │
+//                                         │  UPDATE quota counter                │
+//                                         │  INSERT outbox(events.UsageRecorded) │
+//                                         │  if over quota:                      │
+//                                         │     INSERT outbox(events.QuotaExceeded)│
+//                                         └─ COMMIT ─────────────────────────────┘
 //                                                      │
 //                            outbox poller (separate goroutine, at-least-once)
 //                                                      ▼
@@ -717,9 +897,24 @@ service BillingService {
   // RecordUsage meters one billable action and writes it to the ledger via the
   // outbox. The cost is COMPUTED server-side from the team's rate plan — the
   // request carries only meter facts, never a price (see RecordUsageRequest).
-  // Idempotent via idempotency_key, so a redelivered InferenceCompleted or a
-  // client retry never double-bills. This is the outbox pattern's write half.
+  // Idempotent via idempotency_key, so a redelivered events.InferenceCompleted or
+  // a client retry never double-bills. This is the outbox pattern's write half.
   rpc RecordUsage(RecordUsageRequest) returns (RecordUsageResponse);
+
+  // CreateRatePlan defines a new priced plan (unit prices, free allowances, quota
+  // caps). ADMIN-ONLY — it sets real money. id/created_at are server-assigned
+  // (mass-assignment guard); idempotent via idempotency_key.
+  rpc CreateRatePlan(CreateRatePlanRequest) returns (CreateRatePlanResponse);
+
+  // GetRatePlan returns a single rate plan's pricing so a BFF/CLI can show a team
+  // what it will be billed. Non-admins may read only their own team's plan.
+  // Read-only.
+  rpc GetRatePlan(GetRatePlanRequest) returns (GetRatePlanResponse);
+
+  // CheckQuota is the gateway's pre-flight: returns remaining quota + an
+  // `exceeded` flag for a team/meter so the gateway can reject/throttle before
+  // forwarding. Server-computed; non-admins scoped to their own team. Read-only.
+  rpc CheckQuota(CheckQuotaRequest) returns (CheckQuotaResponse);
 
   // GetUsage returns aggregated, paginated usage summaries (per-meter rollups +
   // grand total) for a team over a time window. Non-admins are scoped to their

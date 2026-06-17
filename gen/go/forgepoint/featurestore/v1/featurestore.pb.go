@@ -27,7 +27,12 @@
 //     READ PATH (queries → projections, NEVER hit the raw log on the hot path):
 //       GetOnlineFeatures    ─► Redis hash  feature:{view}:{entity}  (latest)
 //       GetHistoricalFeatures─► Postgres "as-of" projection (point-in-time)
-//       ListFeatureViews     ─► feature_views metadata projection
+//       GetFeatureView       ─► one view's schema (metadata projection)
+//       ListFeatureViews     ─► feature_views metadata projection (fleet/catalog)
+//
+//     ADMIN (event-sourcing lifecycle):
+//       DeleteFeatureView    ─► append FeatureViewDeleted (soft retire; log kept)
+//       RebuildViews         ─► replay the log → regenerate Redis + Postgres views
 //
 //   ASCII — the log is the truth, views are caches built from it:
 //
@@ -196,6 +201,66 @@ func (x FeatureValueType) Number() protoreflect.EnumNumber {
 // Deprecated: Use FeatureValueType.Descriptor instead.
 func (FeatureValueType) EnumDescriptor() ([]byte, []int) {
 	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{0}
+}
+
+// RebuildTarget selects which materialized projection(s) a rebuild regenerates.
+// Buf STANDARD: _UNSPECIFIED zero value + enum-name prefix on every value.
+type RebuildTarget int32
+
+const (
+	// Unset — server treats as REBUILD_TARGET_ALL (rebuild everything) but the
+	// caller SHOULD set this explicitly; the zero value exists only to satisfy
+	// proto3/Buf, not as a meaningful "no target".
+	RebuildTarget_REBUILD_TARGET_UNSPECIFIED RebuildTarget = 0
+	// Rebuild both the Redis online view and the Postgres offline view.
+	RebuildTarget_REBUILD_TARGET_ALL RebuildTarget = 1
+	// Rebuild only the Redis online (latest-value) projection — e.g. after a flush.
+	RebuildTarget_REBUILD_TARGET_ONLINE RebuildTarget = 2
+	// Rebuild only the Postgres offline (point-in-time) projection.
+	RebuildTarget_REBUILD_TARGET_OFFLINE RebuildTarget = 3
+)
+
+// Enum value maps for RebuildTarget.
+var (
+	RebuildTarget_name = map[int32]string{
+		0: "REBUILD_TARGET_UNSPECIFIED",
+		1: "REBUILD_TARGET_ALL",
+		2: "REBUILD_TARGET_ONLINE",
+		3: "REBUILD_TARGET_OFFLINE",
+	}
+	RebuildTarget_value = map[string]int32{
+		"REBUILD_TARGET_UNSPECIFIED": 0,
+		"REBUILD_TARGET_ALL":         1,
+		"REBUILD_TARGET_ONLINE":      2,
+		"REBUILD_TARGET_OFFLINE":     3,
+	}
+)
+
+func (x RebuildTarget) Enum() *RebuildTarget {
+	p := new(RebuildTarget)
+	*p = x
+	return p
+}
+
+func (x RebuildTarget) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (RebuildTarget) Descriptor() protoreflect.EnumDescriptor {
+	return file_forgepoint_featurestore_v1_featurestore_proto_enumTypes[1].Descriptor()
+}
+
+func (RebuildTarget) Type() protoreflect.EnumType {
+	return &file_forgepoint_featurestore_v1_featurestore_proto_enumTypes[1]
+}
+
+func (x RebuildTarget) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use RebuildTarget.Descriptor instead.
+func (RebuildTarget) EnumDescriptor() ([]byte, []int) {
+	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{1}
 }
 
 // ============================================================================
@@ -419,7 +484,15 @@ type FeatureView struct {
 	// When this view was first defined. SERVER-assigned. Immutable.
 	CreatedAt *timestamppb.Timestamp `protobuf:"bytes,9,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
 	// When this view's schema was last changed. SERVER-assigned.
-	UpdatedAt     *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	UpdatedAt *timestamppb.Timestamp `protobuf:"bytes,10,opt,name=updated_at,json=updatedAt,proto3" json:"updated_at,omitempty"`
+	// SOFT-DELETE marker. Unset (zero) while the view is live; SERVER-set to the
+	// retirement time when DeleteFeatureView appends the terminal
+	// FeatureViewDeleted event. WHY a timestamp, not a bool: it records WHEN the
+	// view was retired (audit) and doubles as the "is deleted" flag (presence =
+	// deleted). The view's history stays queryable via GetHistoricalFeatures for
+	// reproducibility; this only marks it retired from the live catalog/serving.
+	// Never client-supplied (mass-assignment guard).
+	DeletedAt     *timestamppb.Timestamp `protobuf:"bytes,11,opt,name=deleted_at,json=deletedAt,proto3" json:"deleted_at,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -520,6 +593,13 @@ func (x *FeatureView) GetCreatedAt() *timestamppb.Timestamp {
 func (x *FeatureView) GetUpdatedAt() *timestamppb.Timestamp {
 	if x != nil {
 		return x.UpdatedAt
+	}
+	return nil
+}
+
+func (x *FeatureView) GetDeletedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.DeletedAt
 	}
 	return nil
 }
@@ -862,6 +942,147 @@ func (x *DefineFeatureViewResponse) GetFeatureView() *FeatureView {
 	return nil
 }
 
+// GetFeatureViewRequest fetches a SINGLE view's current schema/metadata. WHY
+// this RPC was MISSING and is genuinely needed: every consumer-facing flow —
+// the `fp` CLI's `feature-view describe`, an SDK validating a payload before
+// WriteFeatures, the Web UI's view detail page — needs one view by handle, and
+// ListFeatureViews (page the whole catalog) is the wrong, expensive tool for
+// that. It is a pure read of the feature_views metadata projection.
+//
+// EITHER handle works (a oneof so exactly one is supplied): the immutable id
+// (stable across renames — preferred for machine callers) or the name (the
+// human handle — convenient for the CLI). Team scoping is applied SERVER-side
+// from TokenClaims.team, so a caller cannot read another team's view by
+// guessing an id (authorization, not just existence).
+type GetFeatureViewRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Handle:
+	//
+	//	*GetFeatureViewRequest_FeatureViewId
+	//	*GetFeatureViewRequest_Name
+	Handle        isGetFeatureViewRequest_Handle `protobuf_oneof:"handle"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetFeatureViewRequest) Reset() {
+	*x = GetFeatureViewRequest{}
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetFeatureViewRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetFeatureViewRequest) ProtoMessage() {}
+
+func (x *GetFeatureViewRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetFeatureViewRequest.ProtoReflect.Descriptor instead.
+func (*GetFeatureViewRequest) Descriptor() ([]byte, []int) {
+	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *GetFeatureViewRequest) GetHandle() isGetFeatureViewRequest_Handle {
+	if x != nil {
+		return x.Handle
+	}
+	return nil
+}
+
+func (x *GetFeatureViewRequest) GetFeatureViewId() string {
+	if x != nil {
+		if x, ok := x.Handle.(*GetFeatureViewRequest_FeatureViewId); ok {
+			return x.FeatureViewId
+		}
+	}
+	return ""
+}
+
+func (x *GetFeatureViewRequest) GetName() string {
+	if x != nil {
+		if x, ok := x.Handle.(*GetFeatureViewRequest_Name); ok {
+			return x.Name
+		}
+	}
+	return ""
+}
+
+type isGetFeatureViewRequest_Handle interface {
+	isGetFeatureViewRequest_Handle()
+}
+
+type GetFeatureViewRequest_FeatureViewId struct {
+	// Immutable view UUID (FeatureView.id). Preferred for machine callers.
+	FeatureViewId string `protobuf:"bytes,1,opt,name=feature_view_id,json=featureViewId,proto3,oneof"`
+}
+
+type GetFeatureViewRequest_Name struct {
+	// View name, resolved within the caller's team. Convenient for humans/CLI.
+	Name string `protobuf:"bytes,2,opt,name=name,proto3,oneof"`
+}
+
+func (*GetFeatureViewRequest_FeatureViewId) isGetFeatureViewRequest_Handle() {}
+
+func (*GetFeatureViewRequest_Name) isGetFeatureViewRequest_Handle() {}
+
+type GetFeatureViewResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The requested view with all SERVER-assigned fields populated.
+	FeatureView   *FeatureView `protobuf:"bytes,1,opt,name=feature_view,json=featureView,proto3" json:"feature_view,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetFeatureViewResponse) Reset() {
+	*x = GetFeatureViewResponse{}
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[8]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetFeatureViewResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetFeatureViewResponse) ProtoMessage() {}
+
+func (x *GetFeatureViewResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[8]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetFeatureViewResponse.ProtoReflect.Descriptor instead.
+func (*GetFeatureViewResponse) Descriptor() ([]byte, []int) {
+	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{8}
+}
+
+func (x *GetFeatureViewResponse) GetFeatureView() *FeatureView {
+	if x != nil {
+		return x.FeatureView
+	}
+	return nil
+}
+
 // ListFeatureViewsRequest pages the FeatureView catalog (a read projection over
 // FeatureViewDefined events). Reuses common.v1.PaginationRequest for a uniform
 // cursor-based shape across the platform (see common.proto for the WHY).
@@ -872,8 +1093,8 @@ type ListFeatureViewsRequest struct {
 	// client field) so a caller cannot enumerate another team's catalog.
 	NameFilter string `protobuf:"bytes,1,opt,name=name_filter,json=nameFilter,proto3" json:"name_filter,omitempty"`
 	// Cursor-based pagination. page_size defaults to 20; the server CAPS it at
-	// 100 (oversized requests are clamped, not rejected) to bound response size
-	// and prevent enumeration/DoS.
+	// MAX_PAGE_SIZE=100 (oversized requests are CLAMPED, not rejected) to bound
+	// response size and prevent enumeration/DoS. The cap is the contract.
 	Pagination    *v1.PaginationRequest `protobuf:"bytes,2,opt,name=pagination,proto3" json:"pagination,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -881,7 +1102,7 @@ type ListFeatureViewsRequest struct {
 
 func (x *ListFeatureViewsRequest) Reset() {
 	*x = ListFeatureViewsRequest{}
-	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[7]
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -893,7 +1114,7 @@ func (x *ListFeatureViewsRequest) String() string {
 func (*ListFeatureViewsRequest) ProtoMessage() {}
 
 func (x *ListFeatureViewsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[7]
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -906,7 +1127,7 @@ func (x *ListFeatureViewsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListFeatureViewsRequest.ProtoReflect.Descriptor instead.
 func (*ListFeatureViewsRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{7}
+	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *ListFeatureViewsRequest) GetNameFilter() string {
@@ -936,7 +1157,7 @@ type ListFeatureViewsResponse struct {
 
 func (x *ListFeatureViewsResponse) Reset() {
 	*x = ListFeatureViewsResponse{}
-	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[8]
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -948,7 +1169,7 @@ func (x *ListFeatureViewsResponse) String() string {
 func (*ListFeatureViewsResponse) ProtoMessage() {}
 
 func (x *ListFeatureViewsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[8]
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -961,7 +1182,7 @@ func (x *ListFeatureViewsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListFeatureViewsResponse.ProtoReflect.Descriptor instead.
 func (*ListFeatureViewsResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{8}
+	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *ListFeatureViewsResponse) GetFeatureViews() []*FeatureView {
@@ -1001,6 +1222,9 @@ type WriteFeaturesRequest struct {
 	// The feature rows to append. Each entry's `values` are validated against the
 	// view's FeatureSpecs (names + types + dimensions). A type mismatch fails the
 	// WHOLE batch (INVALID_ARGUMENT) so partial-corrupt writes can't slip in.
+	// Batch size is CAPPED at MAX_BATCH_SIZE=1000 rows; an over-cap request is
+	// REJECTED with INVALID_ARGUMENT (NOT truncated — silently dropping feature
+	// rows would corrupt counts and history). Split larger pipelines into batches.
 	Features []*FeatureValues `protobuf:"bytes,2,rep,name=features,proto3" json:"features,omitempty"`
 	// IDEMPOTENCY KEY: a retried WriteFeatures (lost response) must not append the
 	// same rows twice — duplicate feature events would corrupt counts and
@@ -1015,7 +1239,7 @@ type WriteFeaturesRequest struct {
 
 func (x *WriteFeaturesRequest) Reset() {
 	*x = WriteFeaturesRequest{}
-	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[9]
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1027,7 +1251,7 @@ func (x *WriteFeaturesRequest) String() string {
 func (*WriteFeaturesRequest) ProtoMessage() {}
 
 func (x *WriteFeaturesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[9]
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1040,7 +1264,7 @@ func (x *WriteFeaturesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteFeaturesRequest.ProtoReflect.Descriptor instead.
 func (*WriteFeaturesRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{9}
+	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *WriteFeaturesRequest) GetFeatureViewId() string {
@@ -1081,7 +1305,7 @@ type WriteFeaturesResponse struct {
 
 func (x *WriteFeaturesResponse) Reset() {
 	*x = WriteFeaturesResponse{}
-	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[10]
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1093,7 +1317,7 @@ func (x *WriteFeaturesResponse) String() string {
 func (*WriteFeaturesResponse) ProtoMessage() {}
 
 func (x *WriteFeaturesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[10]
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1106,7 +1330,7 @@ func (x *WriteFeaturesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteFeaturesResponse.ProtoReflect.Descriptor instead.
 func (*WriteFeaturesResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{10}
+	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *WriteFeaturesResponse) GetWrittenCount() int32 {
@@ -1138,7 +1362,8 @@ type GetOnlineFeaturesRequest struct {
 	FeatureViewId string `protobuf:"bytes,1,opt,name=feature_view_id,json=featureViewId,proto3" json:"feature_view_id,omitempty"`
 	// Entity instances to fetch (e.g., ["u_123","u_456"]). Batched to amortize
 	// round-trips for models that score many entities at once. Server CAPS the
-	// batch size (documented limit, e.g., 1000) to bound latency/payload.
+	// batch at MAX_BATCH_SIZE=1000 entities; over-cap → INVALID_ARGUMENT (bounds
+	// hot-path latency/payload). The cap is the contract.
 	EntityIds []string `protobuf:"bytes,2,rep,name=entity_ids,json=entityIds,proto3" json:"entity_ids,omitempty"`
 	// Optional projection: only return these feature names. Empty = all features
 	// in the view. Lets a model fetch just the columns it needs (smaller payload,
@@ -1150,7 +1375,7 @@ type GetOnlineFeaturesRequest struct {
 
 func (x *GetOnlineFeaturesRequest) Reset() {
 	*x = GetOnlineFeaturesRequest{}
-	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[11]
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1162,7 +1387,7 @@ func (x *GetOnlineFeaturesRequest) String() string {
 func (*GetOnlineFeaturesRequest) ProtoMessage() {}
 
 func (x *GetOnlineFeaturesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[11]
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1175,7 +1400,7 @@ func (x *GetOnlineFeaturesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetOnlineFeaturesRequest.ProtoReflect.Descriptor instead.
 func (*GetOnlineFeaturesRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{11}
+	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *GetOnlineFeaturesRequest) GetFeatureViewId() string {
@@ -1214,7 +1439,7 @@ type GetOnlineFeaturesResponse struct {
 
 func (x *GetOnlineFeaturesResponse) Reset() {
 	*x = GetOnlineFeaturesResponse{}
-	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[12]
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1226,7 +1451,7 @@ func (x *GetOnlineFeaturesResponse) String() string {
 func (*GetOnlineFeaturesResponse) ProtoMessage() {}
 
 func (x *GetOnlineFeaturesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[12]
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1239,7 +1464,7 @@ func (x *GetOnlineFeaturesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetOnlineFeaturesResponse.ProtoReflect.Descriptor instead.
 func (*GetOnlineFeaturesResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{12}
+	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *GetOnlineFeaturesResponse) GetVectors() []*FeatureVector {
@@ -1273,8 +1498,9 @@ type GetHistoricalFeaturesRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Target view (UUID).
 	FeatureViewId string `protobuf:"bytes,1,opt,name=feature_view_id,json=featureViewId,proto3" json:"feature_view_id,omitempty"`
-	// Entity instances to retrieve as-of the timestamp. Server CAPS batch size
-	// (documented) to bound the scan.
+	// Entity instances to retrieve as-of the timestamp. Server CAPS the batch at
+	// MAX_BATCH_SIZE=1000 entities; over-cap → INVALID_ARGUMENT, to bound the
+	// point-in-time scan. Larger training pulls page via `pagination` below.
 	EntityIds []string `protobuf:"bytes,2,rep,name=entity_ids,json=entityIds,proto3" json:"entity_ids,omitempty"`
 	// POINT-IN-TIME cutoff. For each entity, return the values from the latest
 	// event with event_time <= as_of. REQUIRED — a missing as_of would make the
@@ -1283,7 +1509,8 @@ type GetHistoricalFeaturesRequest struct {
 	// Optional feature-name projection. Empty = all features in the view.
 	FeatureNames []string `protobuf:"bytes,4,rep,name=feature_names,json=featureNames,proto3" json:"feature_names,omitempty"`
 	// Cursor-based pagination over the entity result set (large training pulls
-	// page through results). page_size capped at 100 server-side.
+	// page through results). page_size defaults to 20, capped at MAX_PAGE_SIZE=100
+	// server-side (clamped).
 	Pagination    *v1.PaginationRequest `protobuf:"bytes,5,opt,name=pagination,proto3" json:"pagination,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1291,7 +1518,7 @@ type GetHistoricalFeaturesRequest struct {
 
 func (x *GetHistoricalFeaturesRequest) Reset() {
 	*x = GetHistoricalFeaturesRequest{}
-	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[13]
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1303,7 +1530,7 @@ func (x *GetHistoricalFeaturesRequest) String() string {
 func (*GetHistoricalFeaturesRequest) ProtoMessage() {}
 
 func (x *GetHistoricalFeaturesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[13]
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1316,7 +1543,7 @@ func (x *GetHistoricalFeaturesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetHistoricalFeaturesRequest.ProtoReflect.Descriptor instead.
 func (*GetHistoricalFeaturesRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{13}
+	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *GetHistoricalFeaturesRequest) GetFeatureViewId() string {
@@ -1371,7 +1598,7 @@ type GetHistoricalFeaturesResponse struct {
 
 func (x *GetHistoricalFeaturesResponse) Reset() {
 	*x = GetHistoricalFeaturesResponse{}
-	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[14]
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1383,7 +1610,7 @@ func (x *GetHistoricalFeaturesResponse) String() string {
 func (*GetHistoricalFeaturesResponse) ProtoMessage() {}
 
 func (x *GetHistoricalFeaturesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[14]
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1396,7 +1623,7 @@ func (x *GetHistoricalFeaturesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetHistoricalFeaturesResponse.ProtoReflect.Descriptor instead.
 func (*GetHistoricalFeaturesResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{14}
+	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *GetHistoricalFeaturesResponse) GetVectors() []*FeatureVector {
@@ -1420,40 +1647,53 @@ func (x *GetHistoricalFeaturesResponse) GetPagination() *v1.PaginationResponse {
 	return nil
 }
 
-// FeatureViewDefined is published after a FeatureView is created or its schema
-// evolves (subject: fp.features.view.defined).
-type FeatureViewDefined struct {
+// DeleteFeatureViewRequest retires a FeatureView. WHY this exists (the design
+// /CLI need it) and WHY it is a SOFT delete that APPENDS an event rather than
+// DROP-ing rows:
+//
+//	In an event-sourced system the log is the source of truth and is IMMUTABLE.
+//	"Deleting" therefore means appending a terminal FeatureViewDeleted event
+//	(the design doc's append-only model already lists Created/Updated/Deleted),
+//	which retires the view from the catalog and stops serving it — WITHOUT
+//	erasing history. Past training datasets assembled via GetHistoricalFeatures
+//	must remain reproducible (audit + legal), so the historical events stay; the
+//	online (Redis) projection is torn down. A hard physical purge (GDPR erasure)
+//	is a separate, audited admin operation, deliberately NOT this RPC.
+//
+// SECURITY: only the immutable id is accepted (no owner/team field — team
+// scoping is SERVER-derived from TokenClaims, so a caller cannot delete another
+// team's view). Idempotent: re-deleting an already-deleted view is a no-op that
+// returns the same result, both via the natural terminal state and the explicit
+// idempotency_key (a lost-response retry must not append a second delete event).
+type DeleteFeatureViewRequest struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// The view's stable id.
+	// The view to retire (immutable UUID). Name is intentionally NOT accepted for
+	// a destructive op — the caller must resolve to the stable id first, removing
+	// any rename-race ambiguity about WHICH view is being deleted.
 	FeatureViewId string `protobuf:"bytes,1,opt,name=feature_view_id,json=featureViewId,proto3" json:"feature_view_id,omitempty"`
-	// The view name (human-friendly, for routing/filtering by subscribers).
-	Name string `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
-	// The schema version this event represents (1 on create, +1 on each evolve).
-	SchemaVersion int64 `protobuf:"varint,3,opt,name=schema_version,json=schemaVersion,proto3" json:"schema_version,omitempty"`
-	// Owning team (for team-scoped consumers/audit). SERVER-assigned, as on the
-	// FeatureView itself.
-	OwnerTeam string `protobuf:"bytes,4,opt,name=owner_team,json=ownerTeam,proto3" json:"owner_team,omitempty"`
-	// When the definition/evolution happened.
-	OccurredAt    *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=occurred_at,json=occurredAt,proto3" json:"occurred_at,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// IDEMPOTENCY KEY: appending FeatureViewDeleted is a mutation; a retried
+	// request (response lost in flight) must not append a duplicate terminal
+	// event. UUID v4 per logical attempt. Server dedupes and replays the result.
+	IdempotencyKey string `protobuf:"bytes,2,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
-func (x *FeatureViewDefined) Reset() {
-	*x = FeatureViewDefined{}
-	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[15]
+func (x *DeleteFeatureViewRequest) Reset() {
+	*x = DeleteFeatureViewRequest{}
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *FeatureViewDefined) String() string {
+func (x *DeleteFeatureViewRequest) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*FeatureViewDefined) ProtoMessage() {}
+func (*DeleteFeatureViewRequest) ProtoMessage() {}
 
-func (x *FeatureViewDefined) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[15]
+func (x *DeleteFeatureViewRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1464,88 +1704,50 @@ func (x *FeatureViewDefined) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use FeatureViewDefined.ProtoReflect.Descriptor instead.
-func (*FeatureViewDefined) Descriptor() ([]byte, []int) {
-	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{15}
+// Deprecated: Use DeleteFeatureViewRequest.ProtoReflect.Descriptor instead.
+func (*DeleteFeatureViewRequest) Descriptor() ([]byte, []int) {
+	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{17}
 }
 
-func (x *FeatureViewDefined) GetFeatureViewId() string {
+func (x *DeleteFeatureViewRequest) GetFeatureViewId() string {
 	if x != nil {
 		return x.FeatureViewId
 	}
 	return ""
 }
 
-func (x *FeatureViewDefined) GetName() string {
+func (x *DeleteFeatureViewRequest) GetIdempotencyKey() string {
 	if x != nil {
-		return x.Name
+		return x.IdempotencyKey
 	}
 	return ""
 }
 
-func (x *FeatureViewDefined) GetSchemaVersion() int64 {
-	if x != nil {
-		return x.SchemaVersion
-	}
-	return 0
-}
-
-func (x *FeatureViewDefined) GetOwnerTeam() string {
-	if x != nil {
-		return x.OwnerTeam
-	}
-	return ""
-}
-
-func (x *FeatureViewDefined) GetOccurredAt() *timestamppb.Timestamp {
-	if x != nil {
-		return x.OccurredAt
-	}
-	return nil
-}
-
-// FeaturesWritten is published after a WriteFeatures append commits
-// (subject: fp.features.written). THIN by design (see note above): it announces
-// "these entities in this view changed up to this version" so consumers can
-// react and, if needed, pull the actual values from the read models.
-type FeaturesWritten struct {
+type DeleteFeatureViewResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// The view that received the append.
-	FeatureViewId string `protobuf:"bytes,1,opt,name=feature_view_id,json=featureViewId,proto3" json:"feature_view_id,omitempty"`
-	// The view name (convenience for subscribers filtering by name).
-	FeatureViewName string `protobuf:"bytes,2,opt,name=feature_view_name,json=featureViewName,proto3" json:"feature_view_name,omitempty"`
-	// The entity ids whose features changed in this batch. Consumers (e.g., the
-	// Model Monitor) use these to scope drift checks / cache invalidation.
-	// For very large batches this MAY be truncated by the server; written_count
-	// remains the authoritative total.
-	EntityIds []string `protobuf:"bytes,3,rep,name=entity_ids,json=entityIds,proto3" json:"entity_ids,omitempty"`
-	// Total rows appended in this batch (authoritative even if entity_ids above
-	// is truncated for message-size reasons).
-	WrittenCount int32 `protobuf:"varint,4,opt,name=written_count,json=writtenCount,proto3" json:"written_count,omitempty"`
-	// Highest event-log version assigned by this append. A consumer can request
-	// features as_of_version >= this to be sure it sees the new data.
-	WrittenThroughVersion int64 `protobuf:"varint,5,opt,name=written_through_version,json=writtenThroughVersion,proto3" json:"written_through_version,omitempty"`
-	// When the append committed (server time).
-	OccurredAt    *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=occurred_at,json=occurredAt,proto3" json:"occurred_at,omitempty"`
+	// The view as of its retirement: schema_version bumped by the delete event and
+	// deleted_at set to the retirement time. Returned so callers can confirm the
+	// terminal state without a follow-up GetFeatureView.
+	FeatureView   *FeatureView `protobuf:"bytes,1,opt,name=feature_view,json=featureView,proto3" json:"feature_view,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
-func (x *FeaturesWritten) Reset() {
-	*x = FeaturesWritten{}
-	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[16]
+func (x *DeleteFeatureViewResponse) Reset() {
+	*x = DeleteFeatureViewResponse{}
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
 
-func (x *FeaturesWritten) String() string {
+func (x *DeleteFeatureViewResponse) String() string {
 	return protoimpl.X.MessageStringOf(x)
 }
 
-func (*FeaturesWritten) ProtoMessage() {}
+func (*DeleteFeatureViewResponse) ProtoMessage() {}
 
-func (x *FeaturesWritten) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[16]
+func (x *DeleteFeatureViewResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1556,51 +1758,177 @@ func (x *FeaturesWritten) ProtoReflect() protoreflect.Message {
 	return mi.MessageOf(x)
 }
 
-// Deprecated: Use FeaturesWritten.ProtoReflect.Descriptor instead.
-func (*FeaturesWritten) Descriptor() ([]byte, []int) {
-	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{16}
+// Deprecated: Use DeleteFeatureViewResponse.ProtoReflect.Descriptor instead.
+func (*DeleteFeatureViewResponse) Descriptor() ([]byte, []int) {
+	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{18}
 }
 
-func (x *FeaturesWritten) GetFeatureViewId() string {
+func (x *DeleteFeatureViewResponse) GetFeatureView() *FeatureView {
+	if x != nil {
+		return x.FeatureView
+	}
+	return nil
+}
+
+// RebuildViewsRequest replays the append-only log to REGENERATE the materialized
+// views (Redis online + Postgres offline). This is THE event-sourcing party
+// trick the design doc calls out: "can replay ALL events from scratch to rebuild
+// both views". WHY it must be an explicit RPC, not just an internal job: it is
+// the documented RECOVERY path after a Redis flush, a projection-logic bugfix
+// (replay corrects every entity), or a schema migration of a read model — an
+// operator/CLI needs to invoke it deliberately. The log is never touched; only
+// the caches are rebuilt FROM it (proving the log is the true source of truth).
+//
+// SECURITY: this is an ADMIN operation guarded by a distinct, higher-privilege
+// scope ("features:admin"), NOT the ordinary "features:write" — a full replay is
+// expensive and operationally sensitive, so it must not be reachable with a
+// routine write token. Scope is SERVER-enforced from TokenClaims.
+//
+// LONG-RUNNING / STREAMING CHOICE: a full replay can take minutes over a large
+// log, so this is modeled as a SERVER-STREAMING RPC that emits incremental
+// RebuildViewsResponse progress frames (events replayed so far / total, current
+// view). NOTE the message is named RebuildViewsResponse (not RebuildProgress) to
+// satisfy Buf's RPC_RESPONSE_STANDARD_NAME rule: a unary OR streaming response
+// type must be <RpcName>Response. The frames it carries are still "progress"
+// frames semantically — the name is the contract, the doc explains the role. WHY
+// server-streaming and not a unary "kick off + poll": the operator/CLI wants
+// live progress and a single connection whose closure signals completion, with
+// no polling loop or separate job-status endpoint. (Contrast the data-plane read
+// RPCs, which stay unary because they're bounded and latency-sensitive — the
+// streaming choice here is justified by DURATION, not data volume.)
+type RebuildViewsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Optional: restrict the rebuild to one view (its UUID). Empty = rebuild ALL
+	// views (full recovery). Scoping to one view makes a targeted bugfix replay
+	// cheap instead of reprocessing the entire platform's feature history.
+	FeatureViewId string `protobuf:"bytes,1,opt,name=feature_view_id,json=featureViewId,proto3" json:"feature_view_id,omitempty"`
+	// Which projection(s) to rebuild. Lets an operator rebuild only the cache that
+	// was lost/corrupted (e.g. ONLINE after a Redis flush) instead of both.
+	Target        RebuildTarget `protobuf:"varint,2,opt,name=target,proto3,enum=forgepoint.featurestore.v1.RebuildTarget" json:"target,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RebuildViewsRequest) Reset() {
+	*x = RebuildViewsRequest{}
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RebuildViewsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RebuildViewsRequest) ProtoMessage() {}
+
+func (x *RebuildViewsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RebuildViewsRequest.ProtoReflect.Descriptor instead.
+func (*RebuildViewsRequest) Descriptor() ([]byte, []int) {
+	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *RebuildViewsRequest) GetFeatureViewId() string {
 	if x != nil {
 		return x.FeatureViewId
 	}
 	return ""
 }
 
-func (x *FeaturesWritten) GetFeatureViewName() string {
+func (x *RebuildViewsRequest) GetTarget() RebuildTarget {
 	if x != nil {
-		return x.FeatureViewName
+		return x.Target
+	}
+	return RebuildTarget_REBUILD_TARGET_UNSPECIFIED
+}
+
+// RebuildViewsResponse is one streamed frame of a RebuildViews replay (a
+// "progress" frame). The stream emits these periodically; the final frame has
+// done=true and the connection closes cleanly (its closure is the completion
+// signal — no poll needed). Named <RpcName>Response to satisfy Buf's
+// RPC_RESPONSE_STANDARD_NAME rule even though it is a streamed progress frame.
+type RebuildViewsResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Events replayed so far and the total to replay (so the CLI renders a bar).
+	// total_events may be -1 early if counting the log up front is itself costly.
+	EventsReplayed int64 `protobuf:"varint,1,opt,name=events_replayed,json=eventsReplayed,proto3" json:"events_replayed,omitempty"`
+	TotalEvents    int64 `protobuf:"varint,2,opt,name=total_events,json=totalEvents,proto3" json:"total_events,omitempty"`
+	// The view currently being rebuilt (empty when rebuilding the whole fleet
+	// and between views). Lets the operator see progress per view.
+	CurrentFeatureViewId string `protobuf:"bytes,3,opt,name=current_feature_view_id,json=currentFeatureViewId,proto3" json:"current_feature_view_id,omitempty"`
+	// True on the FINAL frame — the rebuild is complete and the stream will close.
+	Done          bool `protobuf:"varint,4,opt,name=done,proto3" json:"done,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RebuildViewsResponse) Reset() {
+	*x = RebuildViewsResponse{}
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RebuildViewsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RebuildViewsResponse) ProtoMessage() {}
+
+func (x *RebuildViewsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RebuildViewsResponse.ProtoReflect.Descriptor instead.
+func (*RebuildViewsResponse) Descriptor() ([]byte, []int) {
+	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *RebuildViewsResponse) GetEventsReplayed() int64 {
+	if x != nil {
+		return x.EventsReplayed
+	}
+	return 0
+}
+
+func (x *RebuildViewsResponse) GetTotalEvents() int64 {
+	if x != nil {
+		return x.TotalEvents
+	}
+	return 0
+}
+
+func (x *RebuildViewsResponse) GetCurrentFeatureViewId() string {
+	if x != nil {
+		return x.CurrentFeatureViewId
 	}
 	return ""
 }
 
-func (x *FeaturesWritten) GetEntityIds() []string {
+func (x *RebuildViewsResponse) GetDone() bool {
 	if x != nil {
-		return x.EntityIds
+		return x.Done
 	}
-	return nil
-}
-
-func (x *FeaturesWritten) GetWrittenCount() int32 {
-	if x != nil {
-		return x.WrittenCount
-	}
-	return 0
-}
-
-func (x *FeaturesWritten) GetWrittenThroughVersion() int64 {
-	if x != nil {
-		return x.WrittenThroughVersion
-	}
-	return 0
-}
-
-func (x *FeaturesWritten) GetOccurredAt() *timestamppb.Timestamp {
-	if x != nil {
-		return x.OccurredAt
-	}
-	return nil
+	return false
 }
 
 var File_forgepoint_featurestore_v1_featurestore_proto protoreflect.FileDescriptor
@@ -1617,7 +1945,7 @@ const file_forgepoint_featurestore_v1_featurestore_proto_rawDesc = "" +
 	"\n" +
 	"value_type\x18\x02 \x01(\x0e2,.forgepoint.featurestore.v1.FeatureValueTypeR\tvalueType\x12 \n" +
 	"\vdescription\x18\x03 \x01(\tR\vdescription\x12\x1c\n" +
-	"\tdimension\x18\x04 \x01(\x05R\tdimension\"\xb4\x03\n" +
+	"\tdimension\x18\x04 \x01(\x05R\tdimension\"\xef\x03\n" +
 	"\vFeatureView\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12 \n" +
@@ -1632,7 +1960,9 @@ const file_forgepoint_featurestore_v1_featurestore_proto_rawDesc = "" +
 	"created_at\x18\t \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\x129\n" +
 	"\n" +
 	"updated_at\x18\n" +
-	" \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\"\x89\x02\n" +
+	" \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\x129\n" +
+	"\n" +
+	"deleted_at\x18\v \x01(\v2\x1a.google.protobuf.TimestampR\tdeletedAt\"\x89\x02\n" +
 	"\rFeatureValues\x12\x1b\n" +
 	"\tentity_id\x18\x01 \x01(\tR\bentityId\x12M\n" +
 	"\x06values\x18\x02 \x03(\v25.forgepoint.featurestore.v1.FeatureValues.ValuesEntryR\x06values\x129\n" +
@@ -1658,6 +1988,12 @@ const file_forgepoint_featurestore_v1_featurestore_proto_rawDesc = "" +
 	"\bfeatures\x18\x04 \x03(\v2'.forgepoint.featurestore.v1.FeatureSpecR\bfeatures\x12'\n" +
 	"\x0fidempotency_key\x18\x05 \x01(\tR\x0eidempotencyKey\"g\n" +
 	"\x19DefineFeatureViewResponse\x12J\n" +
+	"\ffeature_view\x18\x01 \x01(\v2'.forgepoint.featurestore.v1.FeatureViewR\vfeatureView\"a\n" +
+	"\x15GetFeatureViewRequest\x12(\n" +
+	"\x0ffeature_view_id\x18\x01 \x01(\tH\x00R\rfeatureViewId\x12\x14\n" +
+	"\x04name\x18\x02 \x01(\tH\x00R\x04nameB\b\n" +
+	"\x06handle\"d\n" +
+	"\x16GetFeatureViewResponse\x12J\n" +
 	"\ffeature_view\x18\x01 \x01(\v2'.forgepoint.featurestore.v1.FeatureViewR\vfeatureView\"\x83\x01\n" +
 	"\x17ListFeatureViewsRequest\x12\x1f\n" +
 	"\vname_filter\x18\x01 \x01(\tR\n" +
@@ -1699,24 +2035,20 @@ const file_forgepoint_featurestore_v1_featurestore_proto_rawDesc = "" +
 	"\x12missing_entity_ids\x18\x02 \x03(\tR\x10missingEntityIds\x12H\n" +
 	"\n" +
 	"pagination\x18\x03 \x01(\v2(.forgepoint.common.v1.PaginationResponseR\n" +
-	"pagination\"\xd3\x01\n" +
-	"\x12FeatureViewDefined\x12&\n" +
-	"\x0ffeature_view_id\x18\x01 \x01(\tR\rfeatureViewId\x12\x12\n" +
-	"\x04name\x18\x02 \x01(\tR\x04name\x12%\n" +
-	"\x0eschema_version\x18\x03 \x01(\x03R\rschemaVersion\x12\x1d\n" +
-	"\n" +
-	"owner_team\x18\x04 \x01(\tR\townerTeam\x12;\n" +
-	"\voccurred_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
-	"occurredAt\"\x9e\x02\n" +
-	"\x0fFeaturesWritten\x12&\n" +
-	"\x0ffeature_view_id\x18\x01 \x01(\tR\rfeatureViewId\x12*\n" +
-	"\x11feature_view_name\x18\x02 \x01(\tR\x0ffeatureViewName\x12\x1d\n" +
-	"\n" +
-	"entity_ids\x18\x03 \x03(\tR\tentityIds\x12#\n" +
-	"\rwritten_count\x18\x04 \x01(\x05R\fwrittenCount\x126\n" +
-	"\x17written_through_version\x18\x05 \x01(\x03R\x15writtenThroughVersion\x12;\n" +
-	"\voccurred_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\n" +
-	"occurredAt*\x94\x02\n" +
+	"pagination\"k\n" +
+	"\x18DeleteFeatureViewRequest\x12&\n" +
+	"\x0ffeature_view_id\x18\x01 \x01(\tR\rfeatureViewId\x12'\n" +
+	"\x0fidempotency_key\x18\x02 \x01(\tR\x0eidempotencyKey\"g\n" +
+	"\x19DeleteFeatureViewResponse\x12J\n" +
+	"\ffeature_view\x18\x01 \x01(\v2'.forgepoint.featurestore.v1.FeatureViewR\vfeatureView\"\x80\x01\n" +
+	"\x13RebuildViewsRequest\x12&\n" +
+	"\x0ffeature_view_id\x18\x01 \x01(\tR\rfeatureViewId\x12A\n" +
+	"\x06target\x18\x02 \x01(\x0e2).forgepoint.featurestore.v1.RebuildTargetR\x06target\"\xad\x01\n" +
+	"\x14RebuildViewsResponse\x12'\n" +
+	"\x0fevents_replayed\x18\x01 \x01(\x03R\x0eeventsReplayed\x12!\n" +
+	"\ftotal_events\x18\x02 \x01(\x03R\vtotalEvents\x125\n" +
+	"\x17current_feature_view_id\x18\x03 \x01(\tR\x14currentFeatureViewId\x12\x12\n" +
+	"\x04done\x18\x04 \x01(\bR\x04done*\x94\x02\n" +
 	"\x10FeatureValueType\x12\"\n" +
 	"\x1eFEATURE_VALUE_TYPE_UNSPECIFIED\x10\x00\x12\x1c\n" +
 	"\x18FEATURE_VALUE_TYPE_INT64\x10\x01\x12\x1d\n" +
@@ -1725,13 +2057,21 @@ const file_forgepoint_featurestore_v1_featurestore_proto_rawDesc = "" +
 	"\x17FEATURE_VALUE_TYPE_BOOL\x10\x04\x12 \n" +
 	"\x1cFEATURE_VALUE_TYPE_TIMESTAMP\x10\x05\x12\"\n" +
 	"\x1eFEATURE_VALUE_TYPE_DOUBLE_LIST\x10\x06\x12\x1d\n" +
-	"\x19FEATURE_VALUE_TYPE_STRUCT\x10\a2\x9f\x05\n" +
+	"\x19FEATURE_VALUE_TYPE_STRUCT\x10\a*~\n" +
+	"\rRebuildTarget\x12\x1e\n" +
+	"\x1aREBUILD_TARGET_UNSPECIFIED\x10\x00\x12\x16\n" +
+	"\x12REBUILD_TARGET_ALL\x10\x01\x12\x19\n" +
+	"\x15REBUILD_TARGET_ONLINE\x10\x02\x12\x1a\n" +
+	"\x16REBUILD_TARGET_OFFLINE\x10\x032\x90\b\n" +
 	"\x13FeatureStoreService\x12\x80\x01\n" +
-	"\x11DefineFeatureView\x124.forgepoint.featurestore.v1.DefineFeatureViewRequest\x1a5.forgepoint.featurestore.v1.DefineFeatureViewResponse\x12}\n" +
+	"\x11DefineFeatureView\x124.forgepoint.featurestore.v1.DefineFeatureViewRequest\x1a5.forgepoint.featurestore.v1.DefineFeatureViewResponse\x12w\n" +
+	"\x0eGetFeatureView\x121.forgepoint.featurestore.v1.GetFeatureViewRequest\x1a2.forgepoint.featurestore.v1.GetFeatureViewResponse\x12}\n" +
 	"\x10ListFeatureViews\x123.forgepoint.featurestore.v1.ListFeatureViewsRequest\x1a4.forgepoint.featurestore.v1.ListFeatureViewsResponse\x12t\n" +
 	"\rWriteFeatures\x120.forgepoint.featurestore.v1.WriteFeaturesRequest\x1a1.forgepoint.featurestore.v1.WriteFeaturesResponse\x12\x80\x01\n" +
 	"\x11GetOnlineFeatures\x124.forgepoint.featurestore.v1.GetOnlineFeaturesRequest\x1a5.forgepoint.featurestore.v1.GetOnlineFeaturesResponse\x12\x8c\x01\n" +
-	"\x15GetHistoricalFeatures\x128.forgepoint.featurestore.v1.GetHistoricalFeaturesRequest\x1a9.forgepoint.featurestore.v1.GetHistoricalFeaturesResponseBTZRgithub.com/abd-ulbasit/forgepoint/gen/go/forgepoint/featurestore/v1;featurestorev1b\x06proto3"
+	"\x15GetHistoricalFeatures\x128.forgepoint.featurestore.v1.GetHistoricalFeaturesRequest\x1a9.forgepoint.featurestore.v1.GetHistoricalFeaturesResponse\x12\x80\x01\n" +
+	"\x11DeleteFeatureView\x124.forgepoint.featurestore.v1.DeleteFeatureViewRequest\x1a5.forgepoint.featurestore.v1.DeleteFeatureViewResponse\x12s\n" +
+	"\fRebuildViews\x12/.forgepoint.featurestore.v1.RebuildViewsRequest\x1a0.forgepoint.featurestore.v1.RebuildViewsResponse0\x01BTZRgithub.com/abd-ulbasit/forgepoint/gen/go/forgepoint/featurestore/v1;featurestorev1b\x06proto3"
 
 var (
 	file_forgepoint_featurestore_v1_featurestore_proto_rawDescOnce sync.Once
@@ -1745,75 +2085,88 @@ func file_forgepoint_featurestore_v1_featurestore_proto_rawDescGZIP() []byte {
 	return file_forgepoint_featurestore_v1_featurestore_proto_rawDescData
 }
 
-var file_forgepoint_featurestore_v1_featurestore_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_forgepoint_featurestore_v1_featurestore_proto_msgTypes = make([]protoimpl.MessageInfo, 19)
+var file_forgepoint_featurestore_v1_featurestore_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_forgepoint_featurestore_v1_featurestore_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
 var file_forgepoint_featurestore_v1_featurestore_proto_goTypes = []any{
 	(FeatureValueType)(0),                 // 0: forgepoint.featurestore.v1.FeatureValueType
-	(*Entity)(nil),                        // 1: forgepoint.featurestore.v1.Entity
-	(*FeatureSpec)(nil),                   // 2: forgepoint.featurestore.v1.FeatureSpec
-	(*FeatureView)(nil),                   // 3: forgepoint.featurestore.v1.FeatureView
-	(*FeatureValues)(nil),                 // 4: forgepoint.featurestore.v1.FeatureValues
-	(*FeatureVector)(nil),                 // 5: forgepoint.featurestore.v1.FeatureVector
-	(*DefineFeatureViewRequest)(nil),      // 6: forgepoint.featurestore.v1.DefineFeatureViewRequest
-	(*DefineFeatureViewResponse)(nil),     // 7: forgepoint.featurestore.v1.DefineFeatureViewResponse
-	(*ListFeatureViewsRequest)(nil),       // 8: forgepoint.featurestore.v1.ListFeatureViewsRequest
-	(*ListFeatureViewsResponse)(nil),      // 9: forgepoint.featurestore.v1.ListFeatureViewsResponse
-	(*WriteFeaturesRequest)(nil),          // 10: forgepoint.featurestore.v1.WriteFeaturesRequest
-	(*WriteFeaturesResponse)(nil),         // 11: forgepoint.featurestore.v1.WriteFeaturesResponse
-	(*GetOnlineFeaturesRequest)(nil),      // 12: forgepoint.featurestore.v1.GetOnlineFeaturesRequest
-	(*GetOnlineFeaturesResponse)(nil),     // 13: forgepoint.featurestore.v1.GetOnlineFeaturesResponse
-	(*GetHistoricalFeaturesRequest)(nil),  // 14: forgepoint.featurestore.v1.GetHistoricalFeaturesRequest
-	(*GetHistoricalFeaturesResponse)(nil), // 15: forgepoint.featurestore.v1.GetHistoricalFeaturesResponse
-	(*FeatureViewDefined)(nil),            // 16: forgepoint.featurestore.v1.FeatureViewDefined
-	(*FeaturesWritten)(nil),               // 17: forgepoint.featurestore.v1.FeaturesWritten
-	nil,                                   // 18: forgepoint.featurestore.v1.FeatureValues.ValuesEntry
-	nil,                                   // 19: forgepoint.featurestore.v1.FeatureVector.ValuesEntry
-	(*timestamppb.Timestamp)(nil),         // 20: google.protobuf.Timestamp
-	(*v1.PaginationRequest)(nil),          // 21: forgepoint.common.v1.PaginationRequest
-	(*v1.PaginationResponse)(nil),         // 22: forgepoint.common.v1.PaginationResponse
-	(*structpb.Value)(nil),                // 23: google.protobuf.Value
+	(RebuildTarget)(0),                    // 1: forgepoint.featurestore.v1.RebuildTarget
+	(*Entity)(nil),                        // 2: forgepoint.featurestore.v1.Entity
+	(*FeatureSpec)(nil),                   // 3: forgepoint.featurestore.v1.FeatureSpec
+	(*FeatureView)(nil),                   // 4: forgepoint.featurestore.v1.FeatureView
+	(*FeatureValues)(nil),                 // 5: forgepoint.featurestore.v1.FeatureValues
+	(*FeatureVector)(nil),                 // 6: forgepoint.featurestore.v1.FeatureVector
+	(*DefineFeatureViewRequest)(nil),      // 7: forgepoint.featurestore.v1.DefineFeatureViewRequest
+	(*DefineFeatureViewResponse)(nil),     // 8: forgepoint.featurestore.v1.DefineFeatureViewResponse
+	(*GetFeatureViewRequest)(nil),         // 9: forgepoint.featurestore.v1.GetFeatureViewRequest
+	(*GetFeatureViewResponse)(nil),        // 10: forgepoint.featurestore.v1.GetFeatureViewResponse
+	(*ListFeatureViewsRequest)(nil),       // 11: forgepoint.featurestore.v1.ListFeatureViewsRequest
+	(*ListFeatureViewsResponse)(nil),      // 12: forgepoint.featurestore.v1.ListFeatureViewsResponse
+	(*WriteFeaturesRequest)(nil),          // 13: forgepoint.featurestore.v1.WriteFeaturesRequest
+	(*WriteFeaturesResponse)(nil),         // 14: forgepoint.featurestore.v1.WriteFeaturesResponse
+	(*GetOnlineFeaturesRequest)(nil),      // 15: forgepoint.featurestore.v1.GetOnlineFeaturesRequest
+	(*GetOnlineFeaturesResponse)(nil),     // 16: forgepoint.featurestore.v1.GetOnlineFeaturesResponse
+	(*GetHistoricalFeaturesRequest)(nil),  // 17: forgepoint.featurestore.v1.GetHistoricalFeaturesRequest
+	(*GetHistoricalFeaturesResponse)(nil), // 18: forgepoint.featurestore.v1.GetHistoricalFeaturesResponse
+	(*DeleteFeatureViewRequest)(nil),      // 19: forgepoint.featurestore.v1.DeleteFeatureViewRequest
+	(*DeleteFeatureViewResponse)(nil),     // 20: forgepoint.featurestore.v1.DeleteFeatureViewResponse
+	(*RebuildViewsRequest)(nil),           // 21: forgepoint.featurestore.v1.RebuildViewsRequest
+	(*RebuildViewsResponse)(nil),          // 22: forgepoint.featurestore.v1.RebuildViewsResponse
+	nil,                                   // 23: forgepoint.featurestore.v1.FeatureValues.ValuesEntry
+	nil,                                   // 24: forgepoint.featurestore.v1.FeatureVector.ValuesEntry
+	(*timestamppb.Timestamp)(nil),         // 25: google.protobuf.Timestamp
+	(*v1.PaginationRequest)(nil),          // 26: forgepoint.common.v1.PaginationRequest
+	(*v1.PaginationResponse)(nil),         // 27: forgepoint.common.v1.PaginationResponse
+	(*structpb.Value)(nil),                // 28: google.protobuf.Value
 }
 var file_forgepoint_featurestore_v1_featurestore_proto_depIdxs = []int32{
 	0,  // 0: forgepoint.featurestore.v1.FeatureSpec.value_type:type_name -> forgepoint.featurestore.v1.FeatureValueType
-	1,  // 1: forgepoint.featurestore.v1.FeatureView.entity:type_name -> forgepoint.featurestore.v1.Entity
-	2,  // 2: forgepoint.featurestore.v1.FeatureView.features:type_name -> forgepoint.featurestore.v1.FeatureSpec
-	20, // 3: forgepoint.featurestore.v1.FeatureView.created_at:type_name -> google.protobuf.Timestamp
-	20, // 4: forgepoint.featurestore.v1.FeatureView.updated_at:type_name -> google.protobuf.Timestamp
-	18, // 5: forgepoint.featurestore.v1.FeatureValues.values:type_name -> forgepoint.featurestore.v1.FeatureValues.ValuesEntry
-	20, // 6: forgepoint.featurestore.v1.FeatureValues.event_time:type_name -> google.protobuf.Timestamp
-	19, // 7: forgepoint.featurestore.v1.FeatureVector.values:type_name -> forgepoint.featurestore.v1.FeatureVector.ValuesEntry
-	20, // 8: forgepoint.featurestore.v1.FeatureVector.event_time:type_name -> google.protobuf.Timestamp
-	1,  // 9: forgepoint.featurestore.v1.DefineFeatureViewRequest.entity:type_name -> forgepoint.featurestore.v1.Entity
-	2,  // 10: forgepoint.featurestore.v1.DefineFeatureViewRequest.features:type_name -> forgepoint.featurestore.v1.FeatureSpec
-	3,  // 11: forgepoint.featurestore.v1.DefineFeatureViewResponse.feature_view:type_name -> forgepoint.featurestore.v1.FeatureView
-	21, // 12: forgepoint.featurestore.v1.ListFeatureViewsRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
-	3,  // 13: forgepoint.featurestore.v1.ListFeatureViewsResponse.feature_views:type_name -> forgepoint.featurestore.v1.FeatureView
-	22, // 14: forgepoint.featurestore.v1.ListFeatureViewsResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
-	4,  // 15: forgepoint.featurestore.v1.WriteFeaturesRequest.features:type_name -> forgepoint.featurestore.v1.FeatureValues
-	5,  // 16: forgepoint.featurestore.v1.GetOnlineFeaturesResponse.vectors:type_name -> forgepoint.featurestore.v1.FeatureVector
-	20, // 17: forgepoint.featurestore.v1.GetHistoricalFeaturesRequest.as_of:type_name -> google.protobuf.Timestamp
-	21, // 18: forgepoint.featurestore.v1.GetHistoricalFeaturesRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
-	5,  // 19: forgepoint.featurestore.v1.GetHistoricalFeaturesResponse.vectors:type_name -> forgepoint.featurestore.v1.FeatureVector
-	22, // 20: forgepoint.featurestore.v1.GetHistoricalFeaturesResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
-	20, // 21: forgepoint.featurestore.v1.FeatureViewDefined.occurred_at:type_name -> google.protobuf.Timestamp
-	20, // 22: forgepoint.featurestore.v1.FeaturesWritten.occurred_at:type_name -> google.protobuf.Timestamp
-	23, // 23: forgepoint.featurestore.v1.FeatureValues.ValuesEntry.value:type_name -> google.protobuf.Value
-	23, // 24: forgepoint.featurestore.v1.FeatureVector.ValuesEntry.value:type_name -> google.protobuf.Value
-	6,  // 25: forgepoint.featurestore.v1.FeatureStoreService.DefineFeatureView:input_type -> forgepoint.featurestore.v1.DefineFeatureViewRequest
-	8,  // 26: forgepoint.featurestore.v1.FeatureStoreService.ListFeatureViews:input_type -> forgepoint.featurestore.v1.ListFeatureViewsRequest
-	10, // 27: forgepoint.featurestore.v1.FeatureStoreService.WriteFeatures:input_type -> forgepoint.featurestore.v1.WriteFeaturesRequest
-	12, // 28: forgepoint.featurestore.v1.FeatureStoreService.GetOnlineFeatures:input_type -> forgepoint.featurestore.v1.GetOnlineFeaturesRequest
-	14, // 29: forgepoint.featurestore.v1.FeatureStoreService.GetHistoricalFeatures:input_type -> forgepoint.featurestore.v1.GetHistoricalFeaturesRequest
-	7,  // 30: forgepoint.featurestore.v1.FeatureStoreService.DefineFeatureView:output_type -> forgepoint.featurestore.v1.DefineFeatureViewResponse
-	9,  // 31: forgepoint.featurestore.v1.FeatureStoreService.ListFeatureViews:output_type -> forgepoint.featurestore.v1.ListFeatureViewsResponse
-	11, // 32: forgepoint.featurestore.v1.FeatureStoreService.WriteFeatures:output_type -> forgepoint.featurestore.v1.WriteFeaturesResponse
-	13, // 33: forgepoint.featurestore.v1.FeatureStoreService.GetOnlineFeatures:output_type -> forgepoint.featurestore.v1.GetOnlineFeaturesResponse
-	15, // 34: forgepoint.featurestore.v1.FeatureStoreService.GetHistoricalFeatures:output_type -> forgepoint.featurestore.v1.GetHistoricalFeaturesResponse
-	30, // [30:35] is the sub-list for method output_type
-	25, // [25:30] is the sub-list for method input_type
-	25, // [25:25] is the sub-list for extension type_name
-	25, // [25:25] is the sub-list for extension extendee
-	0,  // [0:25] is the sub-list for field type_name
+	2,  // 1: forgepoint.featurestore.v1.FeatureView.entity:type_name -> forgepoint.featurestore.v1.Entity
+	3,  // 2: forgepoint.featurestore.v1.FeatureView.features:type_name -> forgepoint.featurestore.v1.FeatureSpec
+	25, // 3: forgepoint.featurestore.v1.FeatureView.created_at:type_name -> google.protobuf.Timestamp
+	25, // 4: forgepoint.featurestore.v1.FeatureView.updated_at:type_name -> google.protobuf.Timestamp
+	25, // 5: forgepoint.featurestore.v1.FeatureView.deleted_at:type_name -> google.protobuf.Timestamp
+	23, // 6: forgepoint.featurestore.v1.FeatureValues.values:type_name -> forgepoint.featurestore.v1.FeatureValues.ValuesEntry
+	25, // 7: forgepoint.featurestore.v1.FeatureValues.event_time:type_name -> google.protobuf.Timestamp
+	24, // 8: forgepoint.featurestore.v1.FeatureVector.values:type_name -> forgepoint.featurestore.v1.FeatureVector.ValuesEntry
+	25, // 9: forgepoint.featurestore.v1.FeatureVector.event_time:type_name -> google.protobuf.Timestamp
+	2,  // 10: forgepoint.featurestore.v1.DefineFeatureViewRequest.entity:type_name -> forgepoint.featurestore.v1.Entity
+	3,  // 11: forgepoint.featurestore.v1.DefineFeatureViewRequest.features:type_name -> forgepoint.featurestore.v1.FeatureSpec
+	4,  // 12: forgepoint.featurestore.v1.DefineFeatureViewResponse.feature_view:type_name -> forgepoint.featurestore.v1.FeatureView
+	4,  // 13: forgepoint.featurestore.v1.GetFeatureViewResponse.feature_view:type_name -> forgepoint.featurestore.v1.FeatureView
+	26, // 14: forgepoint.featurestore.v1.ListFeatureViewsRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
+	4,  // 15: forgepoint.featurestore.v1.ListFeatureViewsResponse.feature_views:type_name -> forgepoint.featurestore.v1.FeatureView
+	27, // 16: forgepoint.featurestore.v1.ListFeatureViewsResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
+	5,  // 17: forgepoint.featurestore.v1.WriteFeaturesRequest.features:type_name -> forgepoint.featurestore.v1.FeatureValues
+	6,  // 18: forgepoint.featurestore.v1.GetOnlineFeaturesResponse.vectors:type_name -> forgepoint.featurestore.v1.FeatureVector
+	25, // 19: forgepoint.featurestore.v1.GetHistoricalFeaturesRequest.as_of:type_name -> google.protobuf.Timestamp
+	26, // 20: forgepoint.featurestore.v1.GetHistoricalFeaturesRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
+	6,  // 21: forgepoint.featurestore.v1.GetHistoricalFeaturesResponse.vectors:type_name -> forgepoint.featurestore.v1.FeatureVector
+	27, // 22: forgepoint.featurestore.v1.GetHistoricalFeaturesResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
+	4,  // 23: forgepoint.featurestore.v1.DeleteFeatureViewResponse.feature_view:type_name -> forgepoint.featurestore.v1.FeatureView
+	1,  // 24: forgepoint.featurestore.v1.RebuildViewsRequest.target:type_name -> forgepoint.featurestore.v1.RebuildTarget
+	28, // 25: forgepoint.featurestore.v1.FeatureValues.ValuesEntry.value:type_name -> google.protobuf.Value
+	28, // 26: forgepoint.featurestore.v1.FeatureVector.ValuesEntry.value:type_name -> google.protobuf.Value
+	7,  // 27: forgepoint.featurestore.v1.FeatureStoreService.DefineFeatureView:input_type -> forgepoint.featurestore.v1.DefineFeatureViewRequest
+	9,  // 28: forgepoint.featurestore.v1.FeatureStoreService.GetFeatureView:input_type -> forgepoint.featurestore.v1.GetFeatureViewRequest
+	11, // 29: forgepoint.featurestore.v1.FeatureStoreService.ListFeatureViews:input_type -> forgepoint.featurestore.v1.ListFeatureViewsRequest
+	13, // 30: forgepoint.featurestore.v1.FeatureStoreService.WriteFeatures:input_type -> forgepoint.featurestore.v1.WriteFeaturesRequest
+	15, // 31: forgepoint.featurestore.v1.FeatureStoreService.GetOnlineFeatures:input_type -> forgepoint.featurestore.v1.GetOnlineFeaturesRequest
+	17, // 32: forgepoint.featurestore.v1.FeatureStoreService.GetHistoricalFeatures:input_type -> forgepoint.featurestore.v1.GetHistoricalFeaturesRequest
+	19, // 33: forgepoint.featurestore.v1.FeatureStoreService.DeleteFeatureView:input_type -> forgepoint.featurestore.v1.DeleteFeatureViewRequest
+	21, // 34: forgepoint.featurestore.v1.FeatureStoreService.RebuildViews:input_type -> forgepoint.featurestore.v1.RebuildViewsRequest
+	8,  // 35: forgepoint.featurestore.v1.FeatureStoreService.DefineFeatureView:output_type -> forgepoint.featurestore.v1.DefineFeatureViewResponse
+	10, // 36: forgepoint.featurestore.v1.FeatureStoreService.GetFeatureView:output_type -> forgepoint.featurestore.v1.GetFeatureViewResponse
+	12, // 37: forgepoint.featurestore.v1.FeatureStoreService.ListFeatureViews:output_type -> forgepoint.featurestore.v1.ListFeatureViewsResponse
+	14, // 38: forgepoint.featurestore.v1.FeatureStoreService.WriteFeatures:output_type -> forgepoint.featurestore.v1.WriteFeaturesResponse
+	16, // 39: forgepoint.featurestore.v1.FeatureStoreService.GetOnlineFeatures:output_type -> forgepoint.featurestore.v1.GetOnlineFeaturesResponse
+	18, // 40: forgepoint.featurestore.v1.FeatureStoreService.GetHistoricalFeatures:output_type -> forgepoint.featurestore.v1.GetHistoricalFeaturesResponse
+	20, // 41: forgepoint.featurestore.v1.FeatureStoreService.DeleteFeatureView:output_type -> forgepoint.featurestore.v1.DeleteFeatureViewResponse
+	22, // 42: forgepoint.featurestore.v1.FeatureStoreService.RebuildViews:output_type -> forgepoint.featurestore.v1.RebuildViewsResponse
+	35, // [35:43] is the sub-list for method output_type
+	27, // [27:35] is the sub-list for method input_type
+	27, // [27:27] is the sub-list for extension type_name
+	27, // [27:27] is the sub-list for extension extendee
+	0,  // [0:27] is the sub-list for field type_name
 }
 
 func init() { file_forgepoint_featurestore_v1_featurestore_proto_init() }
@@ -1821,13 +2174,17 @@ func file_forgepoint_featurestore_v1_featurestore_proto_init() {
 	if File_forgepoint_featurestore_v1_featurestore_proto != nil {
 		return
 	}
+	file_forgepoint_featurestore_v1_featurestore_proto_msgTypes[7].OneofWrappers = []any{
+		(*GetFeatureViewRequest_FeatureViewId)(nil),
+		(*GetFeatureViewRequest_Name)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_forgepoint_featurestore_v1_featurestore_proto_rawDesc), len(file_forgepoint_featurestore_v1_featurestore_proto_rawDesc)),
-			NumEnums:      1,
-			NumMessages:   19,
+			NumEnums:      2,
+			NumMessages:   23,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

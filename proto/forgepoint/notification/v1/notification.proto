@@ -38,11 +38,15 @@
 //   request/response, so it does not belong in gRPC. The gRPC API exists ONLY
 //   for the human-facing CONTROL PLANE:
 //     - reading the notifications I've been sent (inbox) — List/Get/MarkRead
+//     - auditing whether my alerts actually went out — ListDeliveryAttempts
 //     - configuring HOW and WHEN I want to be notified — Get/UpdatePreferences
+//     - verifying a configured channel works — TestChannel (owner self-test)
 //   That is the entire RPC surface. We resisted adding "SendNotification" or
-//   "TriggerAlert" RPCs precisely because a producer calling us would VIOLATE
+//   "TriggerAlert" RPCs precisely because a PRODUCER calling us would VIOLATE
 //   choreography — it would make us an orchestrated dependency. Producers emit
-//   events; they never address us directly.
+//   events; they never address us directly. (TestChannel is NOT such an RPC: it
+//   is the OWNER asking us to test THEIR OWN channel, addressing no third party —
+//   see its message doc for why that distinction matters.)
 //
 //   NOTE ON RULES: the implementation plan also mentions CreateRule/ListRules
 //   for the matching engine. In this v1 contract we fold a user's routing
@@ -51,6 +55,8 @@
 //   end user actually wants ("email me on failures, Slack me on drift"). A
 //   richer admin rule-builder can arrive as a v2 addition without breaking this
 //   surface. This tradeoff is called out so it is defensible in an interview.
+//   The plan's third RPC, GetDeliveryLog, IS honored here as ListDeliveryAttempts
+//   (the cross-notification delivery-health/audit query).
 //
 // REAL-WORLD COMPARISON:
 //   - PagerDuty / Opsgenie: event intake → routing rules → notification
@@ -79,6 +85,23 @@ option go_package = "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/notific
 
 import "google/protobuf/timestamp.proto";
 import "forgepoint/common/v1/common.proto";
+// EVENT CONTRACT (single source of truth) — forgepoint/events/v1/events.proto.
+// NOTE — we deliberately do NOT import that file here. This service is the
+// PRODUCER of two delivery-health events, and those payloads now live in the
+// canonical contract, NOT inline here (they used to be defined as
+// NotificationDeliveredEvent / NotificationFailedEvent in THIS file — deleted):
+//     fp.notifications.delivered → forgepoint.events.v1.NotificationDelivered
+//     fp.notifications.failed    → forgepoint.events.v1.NotificationFailed
+// The handler marshals one of those GENERATED eventsv1 messages into a
+// common.v1.EventEnvelope.data (a google.protobuf.Any) and publishes it; the only
+// consumer is the Experiment Tracker / dashboards (delivery success-rate health)
+// and an on-call escalation flow. Because this API .proto references no events.v1
+// TYPE, importing events.proto here would be an UNUSED proto import — Buf STANDARD
+// DOES enforce IMPORT_USED — and a dead compile-time coupling of the API schema to
+// the event schema; the Go publisher imports forgepoint/events/v1, this file does
+// not. NOTE: there are deliberately NO consumer-side payload types here either
+// (see the CHOREOGRAPHY note in the EVENTS section) — inbound events are handled
+// OPAQUELY by EventEnvelope.type; that opacity is the point.
 
 // ============================================================================
 // ENUMS
@@ -316,7 +339,7 @@ message DeliveryAttempt {
 // URL, the Slack URL, the email address). This is the per-channel building block
 // of NotificationPreferences.
 //
-// SECURITY — secrets/PII handling:
+// SECURITY — secrets/PII handling (masking-on-read):
 //   The `target` here holds potentially sensitive routing data (a webhook URL
 //   may embed a token; an email is PII). The platform MAY return it on
 //   GetPreferences for the OWNING user (so they can see/edit their own settings)
@@ -325,9 +348,36 @@ message DeliveryAttempt {
 //   the server is free to return a masked target (e.g. "https://hooks.slack…/***")
 //   on reads while accepting the full value on UpdatePreferences. We document
 //   this rather than hard-code masking so the storage layer owns the policy.
+//
+// SECURITY — SSRF (the headline risk for THIS service, interview-critical):
+//   `target` for WEBHOOK/SLACK is a CLIENT-SUPPLIED URL that the delivery layer
+//   will make an outbound HTTP request to. A naive implementation is a textbook
+//   Server-Side Request Forgery primitive: a user could point a "webhook" at
+//   http://169.254.169.254/ (the cloud metadata endpoint → IAM credential theft),
+//   at http://localhost:port internal admin APIs, at an RFC1918 service inside the
+//   cluster, or at file://. The CONTRACT therefore REQUIRES the server to validate
+//   every webhook/slack target BEFORE storing it (on UpdatePreferences/TestChannel)
+//   AND to re-resolve+re-check at delivery time (TOCTOU — DNS can be rebound
+//   between store and POST). The mandated validation, enforced server-side:
+//     1. Scheme allowlist: https only (http rejected; no file/gopher/ftp/etc).
+//     2. Host allowlist for SLACK: must be hooks.slack.com (Slack incoming-webhook
+//        host) — a Slack channel cannot point anywhere else.
+//     3. DNS resolution + IP DENYLIST for WEBHOOK: reject if the resolved IP is
+//        loopback (127/8, ::1), link-local (169.254/16, fe80::/10 — blocks the
+//        metadata endpoint), private (10/8, 172.16/12, 192.168/16, fc00::/7),
+//        unspecified/multicast/reserved. Resolve and pin the IP, then connect to
+//        the PINNED ip (defeats DNS-rebinding TOCTOU).
+//     4. No credentials in the userinfo component; cap redirects (or disable them)
+//        so a 302 can't bounce the request to a denied address.
+//   A target that fails validation is REJECTED at write time (INVALID_ARGUMENT
+//   with a field-level ErrorDetail), so a malicious URL never reaches storage.
+//   This is documented in the contract — not left to the implementer's memory —
+//   precisely because it is the one place this service makes attacker-influenced
+//   outbound calls.
 // ============================================================================
 message ChannelPreference {
-  // Which channel this preference configures.
+  // Which channel this preference configures. Server-validated against the closed
+  // NotificationChannel enum; a value the delivery layer can't service is rejected.
   NotificationChannel channel = 1;
 
   // Master on/off for this channel. Disabled channels are skipped entirely
@@ -344,7 +394,8 @@ message ChannelPreference {
   //   WEBHOOK/SLACK → the HTTPS URL to POST to.
   //   EMAIL         → the destination email address.
   //   IN_APP        → ignored (the inbox target is the user themselves).
-  // See the SECURITY note above on masking-on-read.
+  // SUBJECT TO THE SSRF VALIDATION + masking-on-read rules in the SECURITY notes
+  // above. Server-validated on every write; never client-trusted at delivery time.
   string target = 4;
 }
 
@@ -387,79 +438,49 @@ message NotificationPreferences {
 }
 
 // ============================================================================
-// EVENT PAYLOAD MESSAGES (published to NATS via the common EventEnvelope)
+// EVENT PAYLOADS — NOW CANONICAL (forgepoint.events.v1), NOT redefined here
 // ============================================================================
 //
-// WHY THESE EXIST AS TYPED MESSAGES: the platform's EventEnvelope (common.proto)
-// carries the payload as a google.protobuf.Any. Defining concrete payload
-// messages here lets producers/consumers pack & unpack a TYPED value into that
-// Any (with a stable type_url) instead of slinging untyped JSON. Schema + wire
-// safety, with the Any keeping the envelope decoupled from any single service.
+// WHY THESE MOVED OUT OF THIS FILE (the alignment fix):
+//   The platform's EventEnvelope (common.proto) carries its payload as a
+//   google.protobuf.Any. Each service originally defined its OWN event-payload
+//   messages inline — and an adversarial review found those ad-hoc definitions
+//   drifted from each other (two services defined competing "an inference
+//   happened" events, the deploy-lifecycle events were undefined, a feature-write
+//   event had two different names on producer vs consumer). The fix is ONE source
+//   of truth: forgepoint.events.v1 (see proto/forgepoint/events/v1/events.proto).
+//   This service therefore DELETED its inline NotificationDeliveredEvent and
+//   NotificationFailedEvent and now publishes the canonical messages instead:
 //
-// SUBJECT MAPPING (this service is the PRODUCER of these):
-//   NotificationDeliveredEvent → fp.notifications.delivered
-//   NotificationFailedEvent    → fp.notifications.failed
+//     fp.notifications.delivered → forgepoint.events.v1.NotificationDelivered
+//     fp.notifications.failed    → forgepoint.events.v1.NotificationFailed
 //
-// NOTE — this service CONSUMES events but does not need typed messages for what
-// it consumes. By design (choreography) it treats inbound events opaquely: it
-// pattern-matches on EventEnvelope.type and forwards EventEnvelope.data as the
-// notification payload WITHOUT decoding it. So there are no consumer-side payload
-// messages here — defining them would couple us to producers' schemas and defeat
-// the "zero knowledge of what events mean" principle. The two messages below are
-// only the events WE emit (so observability/Experiment Tracker can react to
-// delivery health), keeping us a good event-driven citizen even as a leaf.
+//   The handler marshals one of those eventsv1 messages into the EventEnvelope's
+//   Any at publish time. The fields are unchanged in spirit (notification_id,
+//   recipient_user_id, channel, event_type, outcome, timestamp) — they simply
+//   live in the shared contract now, so a consumer (Experiment Tracker delivery
+//   health, on-call escalation) depends only on eventsv1 + common, never on this
+//   service's API proto. ENUM MAPPING: notification.v1.NotificationChannel maps
+//   1:1 to events.v1.NotificationChannel (byte-identical values:
+//   UNSPECIFIED=0, IN_APP=1, WEBHOOK=2, SLACK=3, EMAIL=4); the handler converts at
+//   the publish boundary — the few mechanical lines that are the price of keeping
+//   the event schema decoupled from the API schema.
 //
-// KEEP EVENTS SMALL & STABLE: include identifiers and outcome, not the full
-// rendered body. Consumers that want detail can correlate by notification_id.
+// CHOREOGRAPHY — WHY THERE ARE NO CONSUMER-SIDE PAYLOAD TYPES:
+//   This service CONSUMES the entire firehose (fp.> on NATS JetStream) but treats
+//   every inbound event OPAQUELY: it pattern-matches on EventEnvelope.type and
+//   forwards EventEnvelope.data as the notification payload WITHOUT decoding it.
+//   So there are deliberately NO consumer-side payload messages anywhere — not
+//   inline, not imported. Defining/decoding them would couple us to producers'
+//   schemas and destroy the "zero knowledge of what events mean" property that
+//   makes adding a new event type a zero-code-change operation here. That opacity
+//   is the entire payoff of choreography (interview-critical: it's WHY a new
+//   producer needs no change in this service — a user just writes a rule pattern).
+//
+// KEEP EVENTS SMALL & STABLE: the emitted delivery events carry identifiers +
+// outcome, not the full rendered body. Consumers that want detail correlate by
+// notification_id back into this service's read model.
 // ============================================================================
-
-// NotificationDeliveredEvent — emitted when a notification is successfully
-// delivered on a fan-out channel. Lets the platform observe delivery health
-// (e.g. Experiment Tracker recording alert volume, dashboards on success rates).
-message NotificationDeliveredEvent {
-  // The Notification.id that was delivered.
-  string notification_id = 1;
-
-  // Who it went to.
-  string recipient_user_id = 2;
-
-  // Which channel succeeded.
-  NotificationChannel channel = 3;
-
-  // The originating event's type (provenance), e.g. "fp.pipelines.failed".
-  string event_type = 4;
-
-  // When delivery succeeded. Server clock.
-  google.protobuf.Timestamp delivered_at = 5;
-}
-
-// NotificationFailedEvent — emitted when delivery permanently fails on a channel
-// after exhausting retries (or the circuit breaker is open). WHY publish a
-// failure event: it makes delivery failures observable platform-wide (alerting
-// on "we couldn't reach the user we were trying to alert" is itself important),
-// and it can feed a dead-letter / on-call escalation flow downstream.
-message NotificationFailedEvent {
-  // The Notification.id whose delivery failed.
-  string notification_id = 1;
-
-  // Who we were trying to reach.
-  string recipient_user_id = 2;
-
-  // Which channel failed.
-  NotificationChannel channel = 3;
-
-  // The originating event's type (provenance).
-  string event_type = 4;
-
-  // Number of attempts made before giving up (the exhausted retry budget).
-  int32 attempts = 5;
-
-  // Last failure detail (e.g. "503 from webhook", "circuit breaker open").
-  string error_message = 6;
-
-  // When we gave up. Server clock.
-  google.protobuf.Timestamp failed_at = 7;
-}
 
 // ============================================================================
 // REQUEST / RESPONSE MESSAGES
@@ -609,12 +630,19 @@ message GetPreferencesResponse {
 message UpdatePreferencesRequest {
   // The full desired per-channel preference set. Replaces the stored set
   // wholesale. An omitted channel is treated as "not configured" (i.e. removed),
-  // matching PUT semantics. The server validates targets (e.g. webhook/slack
-  // URLs must be https, email must be well-formed) before persisting.
+  // matching PUT semantics. The server validates EVERY target before persisting:
+  // email must be well-formed; webhook/slack URLs must pass the full SSRF guard
+  // documented on ChannelPreference.target (https-only, Slack-host allowlist,
+  // private/link-local/loopback IP denylist with pinned-IP connect). A target
+  // that fails validation rejects the whole update with INVALID_ARGUMENT + a
+  // field-level ErrorDetail (so a malicious URL never reaches storage), rather
+  // than silently dropping one channel.
   repeated ChannelPreference channels = 1;
 
   // The full desired mute list (event-type patterns). Replaces the stored list.
-  // Empty = mute nothing.
+  // Empty = mute nothing. Server-bounded: at most 100 patterns (a runaway mute
+  // list is both a storage-abuse vector and a sign of misuse — real muting needs
+  // a handful of patterns, not thousands).
   repeated string muted_event_patterns = 2;
 
   // Caller-supplied idempotency key (typically a UUID). WHY on a settings write:
@@ -635,6 +663,113 @@ message UpdatePreferencesResponse {
 }
 
 // ============================================================================
+// ListDeliveryAttempts (the delivery-log audit view)
+// ============================================================================
+//
+// WHY THIS RPC EXISTS: the design doc + implementation plan (Phase 9) call for a
+// `GetDeliveryLog` surface — the operator/owner view over the `delivery_log`
+// table: "did my alerts actually go out, and which failed?". GetNotification
+// returns the attempts for ONE notification; this is the cross-notification
+// query the plan asks for ("show me all my FAILED webhook deliveries in the last
+// hour"). It is the delivery-health counterpart to the inbox list. Folding it
+// into GetNotification would not answer the fleet question, so it is its own RPC.
+//
+// SECURITY / AUTHORITY: scoped to the AUTHENTICATED caller's own notifications —
+// there is no recipient_user_id field (same anti-IDOR rule as the inbox). The
+// status/channel filters are query predicates over the caller's own rows only.
+message ListDeliveryAttemptsRequest {
+  // Optional: restrict to attempts on a single channel (e.g. only WEBHOOK).
+  // UNSPECIFIED = all channels.
+  NotificationChannel channel = 1;
+
+  // Optional: restrict to a single outcome (e.g. only FAILED, to triage broken
+  // endpoints). UNSPECIFIED = all statuses.
+  DeliveryStatus status = 2;
+
+  // Optional: restrict to attempts for one of the caller's notifications. Empty =
+  // across all of the caller's notifications. If set, the server verifies the
+  // notification belongs to the caller (NOT_FOUND otherwise — no existence leak).
+  string notification_id = 3;
+
+  // Cursor-based pagination (shared shape, see common.proto). Server caps
+  // page_size at 100 and defaults it to 20, enforced server-side regardless of
+  // the requested value — a client cannot demand an unbounded page.
+  forgepoint.common.v1.PaginationRequest pagination = 4;
+}
+
+// ListDeliveryAttemptsResponse returns one page of the caller's delivery log,
+// newest attempt first. Each row carries enough to debug delivery health without
+// echoing the target URL or any secret (see DeliveryAttempt's SECURITY note).
+message ListDeliveryAttemptsResponse {
+  // The page of delivery attempts (the delivery_log rows), newest first.
+  repeated DeliveryAttempt attempts = 1;
+
+  // Which notification each attempt belongs to, positionally aligned 1:1 with
+  // `attempts` (attempts[i] is for notification_ids[i]). WHY a parallel slice
+  // rather than embedding the id on DeliveryAttempt: DeliveryAttempt is also
+  // returned by GetNotification where the notification id is already known/implied,
+  // so we keep the id off the attempt message and surface it here where the fleet
+  // view needs it. Lets the UI link each row back to its inbox entry.
+  repeated string notification_ids = 2;
+
+  // Pagination metadata: next_page_token + total_count. See common.proto.
+  forgepoint.common.v1.PaginationResponse pagination = 3;
+}
+
+// ============================================================================
+// TestChannel (owner self-test — does NOT violate choreography)
+// ============================================================================
+//
+// WHY THIS RPC EXISTS: configuring a webhook/Slack URL is error-prone (wrong URL,
+// expired token, firewall). Every real notification product (PagerDuty, GitHub,
+// Grafana) lets you "send a test" to verify a channel works before relying on it.
+//
+// WHY IT DOESN'T BREAK CHOREOGRAPHY: choreography forbids a PRODUCER addressing
+// us to make us notify a THIRD party. This is the opposite: the OWNER asks us to
+// deliver a synthetic test to THEIR OWN configured channel. No platform producer
+// is involved, no other user is targeted, and it drives no business workflow. It
+// is a control-plane self-check, exactly like GetPreferences — so it belongs on
+// the gRPC surface, not the event bus.
+//
+// SECURITY: the test is delivered to the channel CONFIG of the AUTHENTICATED
+// caller (resolved from their stored preferences / TokenClaims) — the request
+// does NOT carry a free-form target, so it cannot be turned into an SSRF probe of
+// arbitrary URLs. The stored target was already SSRF-validated on write, and the
+// delivery path re-validates with a pinned-IP connect (the same guard as a real
+// delivery). The caller can only test channels they own.
+message TestChannelRequest {
+  // Which of the caller's configured channels to send the synthetic test over.
+  // Must correspond to an enabled ChannelPreference the caller owns (else
+  // FAILED_PRECONDITION). IN_APP testing is a no-op success (the inbox is always
+  // reachable). NEVER carries a URL — the destination is the stored, already-
+  // validated target, so this RPC is not an SSRF vector.
+  NotificationChannel channel = 1;
+
+  // Caller-supplied idempotency key (typically a UUID). WHY on a test-send: a
+  // client that retries after a timeout must not double-fire the test (spamming
+  // the user's Slack). Same key → the server returns the first attempt's result
+  // instead of sending again. The Stripe idempotency-key pattern. Optional but
+  // recommended for automated callers / CLI retries.
+  string idempotency_key = 2;
+}
+
+// TestChannelResponse reports the synthetic delivery's outcome so the settings UI
+// can show "✓ delivered" / "✗ 401 from Slack" inline next to the channel.
+message TestChannelResponse {
+  // Outcome of the test delivery (DELIVERED on success; FAILED with detail below
+  // on error; SUPPRESSED if the channel was disabled).
+  DeliveryStatus status = 1;
+
+  // For HTTP channels: the response status code observed (0 if none / non-HTTP).
+  int32 response_code = 2;
+
+  // Human-readable failure detail on error (e.g. "401 from Slack",
+  // "connection refused", "target failed SSRF revalidation"). Empty on success.
+  // Mirrors DeliveryAttempt.error_message — for the operator, not end-user copy.
+  string error_message = 3;
+}
+
+// ============================================================================
 // NOTIFICATION SERVICE
 // ============================================================================
 //
@@ -645,8 +780,10 @@ message UpdatePreferencesResponse {
 // "send"/"trigger" RPC: a producer calling us would break choreography.
 //
 // RPC CATEGORIES:
-//   INBOX (read model): ListNotifications, GetNotification, MarkRead
-//   PREFERENCES (config): GetPreferences, UpdatePreferences
+//   INBOX (read model):   ListNotifications, GetNotification, MarkRead
+//   DELIVERY LOG (audit): ListDeliveryAttempts
+//   PREFERENCES (config): GetPreferences, UpdatePreferences, TestChannel
+//   (TestChannel is a control-plane self-check, not a "send" RPC — see its doc.)
 //
 // WHY NO STREAMING RPC HERE (a deliberate choice, interview-relevant):
 //   A live "watch my inbox" stream is tempting, but the natural realtime path
@@ -687,6 +824,12 @@ service NotificationService {
   // skipped rather than failing the batch.
   rpc MarkRead(MarkReadRequest) returns (MarkReadResponse);
 
+  // ListDeliveryAttempts returns a paginated page of the caller's delivery log
+  // (the GetDeliveryLog surface the plan calls for) — the cross-notification view
+  // for "did my alerts go out, which failed?", with optional channel/status/
+  // notification filters. Scoped to the caller; secrets/targets are never echoed.
+  rpc ListDeliveryAttempts(ListDeliveryAttemptsRequest) returns (ListDeliveryAttemptsResponse);
+
   // GetPreferences returns the caller's notification preferences (per-channel
   // settings + mute patterns), falling back to sensible defaults if the user has
   // never configured any. Always the caller's own preferences.
@@ -695,6 +838,15 @@ service NotificationService {
   // UpdatePreferences replaces the caller's preferences wholesale (PUT
   // semantics) and returns the stored result. Accepts an optional idempotency
   // key so retries are safe. The target user is always the caller — the request
-  // body cannot reassign ownership.
+  // body cannot reassign ownership. Every webhook/slack target is SSRF-validated
+  // server-side before persisting (see ChannelPreference.target).
   rpc UpdatePreferences(UpdatePreferencesRequest) returns (UpdatePreferencesResponse);
+
+  // TestChannel sends a synthetic test notification to one of the CALLER'S OWN
+  // configured channels so the settings UI can confirm it works. This is a
+  // control-plane self-check (the owner testing their own delivery config), NOT a
+  // producer-facing "send" RPC — it carries no target URL and addresses no other
+  // user, so it neither violates choreography nor opens an SSRF vector. Accepts an
+  // idempotency key so a retry doesn't double-fire the test.
+  rpc TestChannel(TestChannelRequest) returns (TestChannelResponse);
 }

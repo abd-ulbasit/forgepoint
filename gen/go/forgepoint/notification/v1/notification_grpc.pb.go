@@ -38,11 +38,15 @@
 //   request/response, so it does not belong in gRPC. The gRPC API exists ONLY
 //   for the human-facing CONTROL PLANE:
 //     - reading the notifications I've been sent (inbox) — List/Get/MarkRead
+//     - auditing whether my alerts actually went out — ListDeliveryAttempts
 //     - configuring HOW and WHEN I want to be notified — Get/UpdatePreferences
+//     - verifying a configured channel works — TestChannel (owner self-test)
 //   That is the entire RPC surface. We resisted adding "SendNotification" or
-//   "TriggerAlert" RPCs precisely because a producer calling us would VIOLATE
+//   "TriggerAlert" RPCs precisely because a PRODUCER calling us would VIOLATE
 //   choreography — it would make us an orchestrated dependency. Producers emit
-//   events; they never address us directly.
+//   events; they never address us directly. (TestChannel is NOT such an RPC: it
+//   is the OWNER asking us to test THEIR OWN channel, addressing no third party —
+//   see its message doc for why that distinction matters.)
 //
 //   NOTE ON RULES: the implementation plan also mentions CreateRule/ListRules
 //   for the matching engine. In this v1 contract we fold a user's routing
@@ -51,6 +55,8 @@
 //   end user actually wants ("email me on failures, Slack me on drift"). A
 //   richer admin rule-builder can arrive as a v2 addition without breaking this
 //   surface. This tradeoff is called out so it is defensible in an interview.
+//   The plan's third RPC, GetDeliveryLog, IS honored here as ListDeliveryAttempts
+//   (the cross-notification delivery-health/audit query).
 //
 // REAL-WORLD COMPARISON:
 //   - PagerDuty / Opsgenie: event intake → routing rules → notification
@@ -88,11 +94,13 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	NotificationService_ListNotifications_FullMethodName = "/forgepoint.notification.v1.NotificationService/ListNotifications"
-	NotificationService_GetNotification_FullMethodName   = "/forgepoint.notification.v1.NotificationService/GetNotification"
-	NotificationService_MarkRead_FullMethodName          = "/forgepoint.notification.v1.NotificationService/MarkRead"
-	NotificationService_GetPreferences_FullMethodName    = "/forgepoint.notification.v1.NotificationService/GetPreferences"
-	NotificationService_UpdatePreferences_FullMethodName = "/forgepoint.notification.v1.NotificationService/UpdatePreferences"
+	NotificationService_ListNotifications_FullMethodName    = "/forgepoint.notification.v1.NotificationService/ListNotifications"
+	NotificationService_GetNotification_FullMethodName      = "/forgepoint.notification.v1.NotificationService/GetNotification"
+	NotificationService_MarkRead_FullMethodName             = "/forgepoint.notification.v1.NotificationService/MarkRead"
+	NotificationService_ListDeliveryAttempts_FullMethodName = "/forgepoint.notification.v1.NotificationService/ListDeliveryAttempts"
+	NotificationService_GetPreferences_FullMethodName       = "/forgepoint.notification.v1.NotificationService/GetPreferences"
+	NotificationService_UpdatePreferences_FullMethodName    = "/forgepoint.notification.v1.NotificationService/UpdatePreferences"
+	NotificationService_TestChannel_FullMethodName          = "/forgepoint.notification.v1.NotificationService/TestChannel"
 )
 
 // NotificationServiceClient is the client API for NotificationService service.
@@ -111,8 +119,10 @@ const (
 //
 // RPC CATEGORIES:
 //
-//	INBOX (read model): ListNotifications, GetNotification, MarkRead
-//	PREFERENCES (config): GetPreferences, UpdatePreferences
+//	INBOX (read model):   ListNotifications, GetNotification, MarkRead
+//	DELIVERY LOG (audit): ListDeliveryAttempts
+//	PREFERENCES (config): GetPreferences, UpdatePreferences, TestChannel
+//	(TestChannel is a control-plane self-check, not a "send" RPC — see its doc.)
 //
 // WHY NO STREAMING RPC HERE (a deliberate choice, interview-relevant):
 //
@@ -152,6 +162,11 @@ type NotificationServiceClient interface {
 	// is a no-op), so no idempotency key is required. Foreign/unknown ids are
 	// skipped rather than failing the batch.
 	MarkRead(ctx context.Context, in *MarkReadRequest, opts ...grpc.CallOption) (*MarkReadResponse, error)
+	// ListDeliveryAttempts returns a paginated page of the caller's delivery log
+	// (the GetDeliveryLog surface the plan calls for) — the cross-notification view
+	// for "did my alerts go out, which failed?", with optional channel/status/
+	// notification filters. Scoped to the caller; secrets/targets are never echoed.
+	ListDeliveryAttempts(ctx context.Context, in *ListDeliveryAttemptsRequest, opts ...grpc.CallOption) (*ListDeliveryAttemptsResponse, error)
 	// GetPreferences returns the caller's notification preferences (per-channel
 	// settings + mute patterns), falling back to sensible defaults if the user has
 	// never configured any. Always the caller's own preferences.
@@ -159,8 +174,16 @@ type NotificationServiceClient interface {
 	// UpdatePreferences replaces the caller's preferences wholesale (PUT
 	// semantics) and returns the stored result. Accepts an optional idempotency
 	// key so retries are safe. The target user is always the caller — the request
-	// body cannot reassign ownership.
+	// body cannot reassign ownership. Every webhook/slack target is SSRF-validated
+	// server-side before persisting (see ChannelPreference.target).
 	UpdatePreferences(ctx context.Context, in *UpdatePreferencesRequest, opts ...grpc.CallOption) (*UpdatePreferencesResponse, error)
+	// TestChannel sends a synthetic test notification to one of the CALLER'S OWN
+	// configured channels so the settings UI can confirm it works. This is a
+	// control-plane self-check (the owner testing their own delivery config), NOT a
+	// producer-facing "send" RPC — it carries no target URL and addresses no other
+	// user, so it neither violates choreography nor opens an SSRF vector. Accepts an
+	// idempotency key so a retry doesn't double-fire the test.
+	TestChannel(ctx context.Context, in *TestChannelRequest, opts ...grpc.CallOption) (*TestChannelResponse, error)
 }
 
 type notificationServiceClient struct {
@@ -201,6 +224,16 @@ func (c *notificationServiceClient) MarkRead(ctx context.Context, in *MarkReadRe
 	return out, nil
 }
 
+func (c *notificationServiceClient) ListDeliveryAttempts(ctx context.Context, in *ListDeliveryAttemptsRequest, opts ...grpc.CallOption) (*ListDeliveryAttemptsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListDeliveryAttemptsResponse)
+	err := c.cc.Invoke(ctx, NotificationService_ListDeliveryAttempts_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *notificationServiceClient) GetPreferences(ctx context.Context, in *GetPreferencesRequest, opts ...grpc.CallOption) (*GetPreferencesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetPreferencesResponse)
@@ -215,6 +248,16 @@ func (c *notificationServiceClient) UpdatePreferences(ctx context.Context, in *U
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(UpdatePreferencesResponse)
 	err := c.cc.Invoke(ctx, NotificationService_UpdatePreferences_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *notificationServiceClient) TestChannel(ctx context.Context, in *TestChannelRequest, opts ...grpc.CallOption) (*TestChannelResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TestChannelResponse)
+	err := c.cc.Invoke(ctx, NotificationService_TestChannel_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -237,8 +280,10 @@ func (c *notificationServiceClient) UpdatePreferences(ctx context.Context, in *U
 //
 // RPC CATEGORIES:
 //
-//	INBOX (read model): ListNotifications, GetNotification, MarkRead
-//	PREFERENCES (config): GetPreferences, UpdatePreferences
+//	INBOX (read model):   ListNotifications, GetNotification, MarkRead
+//	DELIVERY LOG (audit): ListDeliveryAttempts
+//	PREFERENCES (config): GetPreferences, UpdatePreferences, TestChannel
+//	(TestChannel is a control-plane self-check, not a "send" RPC — see its doc.)
 //
 // WHY NO STREAMING RPC HERE (a deliberate choice, interview-relevant):
 //
@@ -278,6 +323,11 @@ type NotificationServiceServer interface {
 	// is a no-op), so no idempotency key is required. Foreign/unknown ids are
 	// skipped rather than failing the batch.
 	MarkRead(context.Context, *MarkReadRequest) (*MarkReadResponse, error)
+	// ListDeliveryAttempts returns a paginated page of the caller's delivery log
+	// (the GetDeliveryLog surface the plan calls for) — the cross-notification view
+	// for "did my alerts go out, which failed?", with optional channel/status/
+	// notification filters. Scoped to the caller; secrets/targets are never echoed.
+	ListDeliveryAttempts(context.Context, *ListDeliveryAttemptsRequest) (*ListDeliveryAttemptsResponse, error)
 	// GetPreferences returns the caller's notification preferences (per-channel
 	// settings + mute patterns), falling back to sensible defaults if the user has
 	// never configured any. Always the caller's own preferences.
@@ -285,8 +335,16 @@ type NotificationServiceServer interface {
 	// UpdatePreferences replaces the caller's preferences wholesale (PUT
 	// semantics) and returns the stored result. Accepts an optional idempotency
 	// key so retries are safe. The target user is always the caller — the request
-	// body cannot reassign ownership.
+	// body cannot reassign ownership. Every webhook/slack target is SSRF-validated
+	// server-side before persisting (see ChannelPreference.target).
 	UpdatePreferences(context.Context, *UpdatePreferencesRequest) (*UpdatePreferencesResponse, error)
+	// TestChannel sends a synthetic test notification to one of the CALLER'S OWN
+	// configured channels so the settings UI can confirm it works. This is a
+	// control-plane self-check (the owner testing their own delivery config), NOT a
+	// producer-facing "send" RPC — it carries no target URL and addresses no other
+	// user, so it neither violates choreography nor opens an SSRF vector. Accepts an
+	// idempotency key so a retry doesn't double-fire the test.
+	TestChannel(context.Context, *TestChannelRequest) (*TestChannelResponse, error)
 	mustEmbedUnimplementedNotificationServiceServer()
 }
 
@@ -306,11 +364,17 @@ func (UnimplementedNotificationServiceServer) GetNotification(context.Context, *
 func (UnimplementedNotificationServiceServer) MarkRead(context.Context, *MarkReadRequest) (*MarkReadResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method MarkRead not implemented")
 }
+func (UnimplementedNotificationServiceServer) ListDeliveryAttempts(context.Context, *ListDeliveryAttemptsRequest) (*ListDeliveryAttemptsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListDeliveryAttempts not implemented")
+}
 func (UnimplementedNotificationServiceServer) GetPreferences(context.Context, *GetPreferencesRequest) (*GetPreferencesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetPreferences not implemented")
 }
 func (UnimplementedNotificationServiceServer) UpdatePreferences(context.Context, *UpdatePreferencesRequest) (*UpdatePreferencesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method UpdatePreferences not implemented")
+}
+func (UnimplementedNotificationServiceServer) TestChannel(context.Context, *TestChannelRequest) (*TestChannelResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method TestChannel not implemented")
 }
 func (UnimplementedNotificationServiceServer) mustEmbedUnimplementedNotificationServiceServer() {}
 func (UnimplementedNotificationServiceServer) testEmbeddedByValue()                             {}
@@ -387,6 +451,24 @@ func _NotificationService_MarkRead_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
+func _NotificationService_ListDeliveryAttempts_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListDeliveryAttemptsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NotificationServiceServer).ListDeliveryAttempts(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NotificationService_ListDeliveryAttempts_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NotificationServiceServer).ListDeliveryAttempts(ctx, req.(*ListDeliveryAttemptsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _NotificationService_GetPreferences_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetPreferencesRequest)
 	if err := dec(in); err != nil {
@@ -423,6 +505,24 @@ func _NotificationService_UpdatePreferences_Handler(srv interface{}, ctx context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _NotificationService_TestChannel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TestChannelRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NotificationServiceServer).TestChannel(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NotificationService_TestChannel_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NotificationServiceServer).TestChannel(ctx, req.(*TestChannelRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // NotificationService_ServiceDesc is the grpc.ServiceDesc for NotificationService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -443,12 +543,20 @@ var NotificationService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _NotificationService_MarkRead_Handler,
 		},
 		{
+			MethodName: "ListDeliveryAttempts",
+			Handler:    _NotificationService_ListDeliveryAttempts_Handler,
+		},
+		{
 			MethodName: "GetPreferences",
 			Handler:    _NotificationService_GetPreferences_Handler,
 		},
 		{
 			MethodName: "UpdatePreferences",
 			Handler:    _NotificationService_UpdatePreferences_Handler,
+		},
+		{
+			MethodName: "TestChannel",
+			Handler:    _NotificationService_TestChannel_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
