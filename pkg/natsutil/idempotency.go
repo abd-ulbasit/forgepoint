@@ -2,6 +2,7 @@ package natsutil
 
 import (
 	"context"
+	"os"
 	"sync"
 )
 
@@ -41,15 +42,37 @@ type ProcessedStore interface {
 }
 
 // MemoryProcessedStore is an in-memory ProcessedStore for TESTS and local dev
-// only. It does not survive restarts and grows unbounded, so it must not be
-// used in production — back the interface with Postgres/Redis there.
+// only. It must NOT be used in production because:
+//   - It does not survive process restarts (events are re-processed after restart)
+//   - The internal map is unbounded — long-running services accumulate event IDs
+//     indefinitely, causing OOM in high-throughput scenarios
+//   - It is not shared across replicas — a consumer group of 3 replicas each has
+//     a separate store, so a message redelivered to a different replica is processed
+//     twice even though another replica already handled it
+//
+// In production use a durable, shared backend: a Redis SET with TTL (for
+// short dedup windows), or a Postgres processed_events table (for full history
+// and transactional safety — see the exactly-once caveat comment above).
 type MemoryProcessedStore struct {
 	mu   sync.Mutex
 	seen map[string]struct{}
 }
 
 // NewMemoryProcessedStore creates an empty in-memory store.
+//
+// PRODUCTION GUARD: panics immediately if FP_ENV=production. MemoryProcessedStore
+// must not be used in production (unbounded map → OOM; no cross-replica sharing;
+// no crash-survival). Use a Redis/Postgres-backed ProcessedStore instead.
+//
+// Local dev: leave FP_ENV unset or set to "development".
+// Tests: leave FP_ENV unset (or use t.Setenv("FP_ENV", "test")).
 func NewMemoryProcessedStore() *MemoryProcessedStore {
+	// Fail loud and fast: if someone wires this in production (e.g. via a
+	// misconfigured dependency injection), we'd rather panic at startup (visible,
+	// auditable) than silently cause data-correctness bugs at scale.
+	if os.Getenv("FP_ENV") == "production" {
+		panic("MemoryProcessedStore is for tests/dev only; use a Redis/Postgres-backed ProcessedStore in production")
+	}
 	return &MemoryProcessedStore{seen: make(map[string]struct{})}
 }
 

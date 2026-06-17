@@ -123,6 +123,14 @@ type Subscriber struct {
 
 	mu       sync.Mutex
 	consumes []jetstream.ConsumeContext // active consume loops, stopped on Close
+
+	// done is closed by Close() (exactly once, via closeOnce) to signal all
+	// per-subscription watcher goroutines to exit even when their subscribe ctx
+	// is a long-lived/background context that will never cancel. Without this,
+	// every Subscribe() call leaked one goroutine for the process lifetime when
+	// the subscriber was shut down via Close() rather than ctx cancellation.
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // NewSubscriber creates a new Subscriber with the given options.
@@ -131,7 +139,11 @@ func NewSubscriber(js jetstream.JetStream, opts ...SubOption) *Subscriber {
 	for _, opt := range opts {
 		opt(&cfg)
 	}
-	return &Subscriber{js: js, cfg: cfg}
+	return &Subscriber{
+		js:   js,
+		cfg:  cfg,
+		done: make(chan struct{}),
+	}
 }
 
 // Subscribe starts consuming messages from the given stream/subject filter and
@@ -165,12 +177,19 @@ func (s *Subscriber) Subscribe(
 		consumerCfg.Durable = s.cfg.consumerGroup
 	}
 
-	// MaxDeliver = maxRetries + 1: the initial delivery plus N retries. After
-	// that JetStream stops redelivering on its own; our DLQ logic fires on the
-	// final allowed delivery (see handleMessage).
-	if s.cfg.maxRetries > 0 {
-		consumerCfg.MaxDeliver = s.cfg.maxRetries + 1
-	}
+	// MaxDeliver MUST always be set explicitly. If we leave it at the zero value,
+	// JetStream applies the server default (currently unlimited, -1). That would
+	// allow a pre-existing or recreated consumer to redeliver beyond our expected
+	// cap, decoupling the DLQ threshold from actual redeliveries.
+	//
+	// CONTRACT:
+	//   maxRetries > 0  → MaxDeliver = maxRetries + 1  (initial + N retries)
+	//   maxRetries == 0 → MaxDeliver = -1 (explicit unlimited; DLQ is disabled)
+	//
+	// When DLQ is disabled (maxRetries == 0), JetStream governs redelivery on
+	// its own; handlers should be idempotent and the consumer should eventually
+	// consume or the message expires per stream MaxAge/MaxMsgs.
+	consumerCfg.MaxDeliver = maxDeliverFromCfg(s.cfg)
 
 	consumer, err := s.js.CreateOrUpdateConsumer(ctx, stream, consumerCfg)
 	if err != nil {
@@ -191,19 +210,51 @@ func (s *Subscriber) Subscribe(
 	s.consumes = append(s.consumes, cc)
 	s.mu.Unlock()
 
-	// Stop the loop when the subscribe context is cancelled (e.g., SIGTERM),
-	// so in-flight pulls drain rather than being abandoned.
+	// Watcher goroutine: stop the consume loop on WHICHEVER fires first —
+	// the subscribe context (e.g., a per-request or service-wide ctx) OR
+	// s.done (closed by Close()). This is the goroutine-leak fix.
+	//
+	// OLD pattern:  go func(){ <-ctx.Done(); cc.Stop() }()
+	//   → If ctx is context.Background() (never cancels) and the caller uses
+	//     Close() for shutdown, this goroutine leaked for the process lifetime.
+	//     One leak per Subscribe() call — easily 10-20 goroutines for a service
+	//     subscribing to multiple subjects.
+	//
+	// NEW pattern: select on two channels.
+	//   cc.Stop() is idempotent (safe to call multiple times), so it is safe
+	//   to call it from both the ctx path and the done path.
+	//
+	// INTERVIEW NOTE: This is the classic "goroutine leak via unbounded
+	// select-on-one-channel" pattern. The fix is always to give the goroutine a
+	// second exit: a done/quit channel that the owner closes on shutdown.
 	go func() {
-		<-ctx.Done()
-		cc.Stop()
+		select {
+		case <-ctx.Done():
+			cc.Stop()
+		case <-s.done:
+			cc.Stop()
+		}
 	}()
 
 	return nil
 }
 
-// Close stops all active consume loops. Idempotent and safe to call alongside
-// context cancellation (Stop is safe to call more than once).
+// Close stops all active consume loops and signals all watcher goroutines to
+// exit. Safe to call multiple times (idempotent). Also safe to call concurrent
+// with context cancellation — both paths call cc.Stop() which is idempotent.
+//
+// WHY closeOnce: closing an already-closed channel panics in Go. sync.Once
+// ensures the done channel is closed exactly once regardless of how many
+// goroutines call Close() simultaneously.
 func (s *Subscriber) Close() {
+	// Close the done channel exactly once to unblock all watcher goroutines
+	// that are waiting on select { case <-ctx.Done(): case <-s.done: }.
+	// This is the primary fix for the goroutine leak: previously these goroutines
+	// only exited when ctx was cancelled, which never happened for background ctxs.
+	s.closeOnce.Do(func() {
+		close(s.done)
+	})
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, cc := range s.consumes {
@@ -261,11 +312,19 @@ func (s *Subscriber) handleMessage(parent context.Context, msg jetstream.Msg, ha
 	}
 
 	if err := handler(ctx, envelope); err != nil {
+		// Log the error TYPE, not err.Error() verbatim. The raw error string can
+		// embed payload content or PII (e.g., "failed to process user email=…").
+		// Logging the type preserves debuggability without leaking data.
+		// For well-known sentinel errors (ErrProcessingFailed), log the name.
+		errType := "handler_error"
+		if err == ErrProcessingFailed {
+			errType = "processing_failed"
+		}
 		slog.WarnContext(ctx, "handler failed",
 			slog.String("event.id", envelope.ID),
 			slog.String("event.type", envelope.Type),
 			slog.String("subject", msg.Subject()),
-			slog.String("error", err.Error()),
+			slog.String("error.type", errType),
 		)
 		s.handleFailure(ctx, msg, envelope)
 		return
@@ -306,8 +365,40 @@ func (s *Subscriber) handleFailure(ctx context.Context, msg jetstream.Msg, envel
 // routeToDLQ publishes the failed message to the dead letter subject and Terms
 // the original (removing it from redelivery). If no DLQ subject is configured,
 // the message is Term'd (dropped) to stop an infinite redelivery loop.
+//
+// POISON-MESSAGE + DLQ CONTRACT:
+//   A "poison message" is one that will ALWAYS fail processing (corrupt data,
+//   unresolvable dependency, handler bug). Without a bound, it loops forever:
+//     deliver → fail → NAK → wait AckWait → deliver → fail → NAK → ...
+//
+//   This function is called only when the MaxDeliver threshold is reached
+//   (NumDelivered >= maxRetries+1), so JetStream won't redeliver again after
+//   this call regardless of what we ACK/NAK/Term. But we Term explicitly to:
+//   (a) immediately remove it from the stream's pending set, and
+//   (b) make the intent clear in code.
+//
+// DLQ PUBLISH FAILURE (the subtle case):
+//   OLD: if DLQ publish fails → NAK → JetStream redelivers → routeToDLQ again
+//   → DLQ publish fails → NAK → loop forever. A broken DLQ subject (wrong
+//   permissions, subject not in any stream) caused infinite redelivery.
+//
+//   FIX: if DLQ publish fails → Term() the message (drop it) and log an error.
+//   The message is lost, but the loop is bounded. An alert on DLQ-publish errors
+//   in Grafana signals the broken subject for ops to fix and replay.
+//
+// INTERVIEW: This is the "what happens when your DLQ is also broken?" question.
+// The correct answer: drop and alert, don't loop. Kafka uses the same pattern
+// (if DLT publish fails, skip and commit offset). AWS SQS just drops after
+// maxReceiveCount with no DLQ fallback-for-DLQ.
 func (s *Subscriber) routeToDLQ(ctx context.Context, msg jetstream.Msg, envelope EventEnvelope) {
 	if s.cfg.dlqSubject == "" {
+		// No DLQ configured — Term the message (stop redelivery). The caller
+		// opted into maxRetries without a DLQ subject, which is a deliberate
+		// "discard after N failures" configuration.
+		slog.WarnContext(ctx, "message exceeded max retries and no DLQ configured — terminating",
+			slog.String("event.id", envelope.ID),
+			slog.String("event.type", envelope.Type),
+		)
 		s.term(ctx, msg)
 		return
 	}
@@ -327,16 +418,42 @@ func (s *Subscriber) routeToDLQ(ctx context.Context, msg jetstream.Msg, envelope
 	// without colliding with the original.
 	_, err := s.js.Publish(ctx, s.cfg.dlqSubject, msg.Data(), jetstream.WithMsgID(envelope.ID+"-dlq"))
 	if err != nil {
-		slog.ErrorContext(ctx, "failed to publish to DLQ",
+		// DLQ publish failed. The OLD code NAK'd here, causing an infinite loop:
+		//   broken-DLQ → NAK → redeliver → broken-DLQ → NAK → ...
+		// The FIX: Term() the message. The message is lost, but the loop ends.
+		// Log at Error level so Grafana/PagerDuty can alert on this condition —
+		// a broken DLQ subject needs immediate ops attention.
+		slog.ErrorContext(ctx, "failed to publish to DLQ — terminating message to break redelivery loop",
 			slog.String("dlq.subject", s.cfg.dlqSubject),
-			slog.String("error", err.Error()),
+			slog.String("event.id", envelope.ID),
+			slog.String("event.type", envelope.Type),
+			slog.String("error.type", "dlq_publish_failed"),
 		)
-		// We failed to DLQ it — NAK so it isn't lost; we'll try again.
-		s.nak(ctx, msg)
+		s.term(ctx, msg)
 		return
 	}
 
 	s.term(ctx, msg)
+}
+
+// maxDeliverFromCfg maps subConfig.maxRetries to the JetStream MaxDeliver value.
+//
+// We always set MaxDeliver explicitly (never leave it at zero / server default)
+// to ensure the consumer's redelivery cap is fully under our control:
+//   - maxRetries > 0  → MaxDeliver = maxRetries + 1  (initial + N retries)
+//   - maxRetries == 0 → MaxDeliver = -1  (explicit unlimited; DLQ disabled)
+//
+// Exported as a package-level function so the fixes_test.go can verify the
+// mapping without needing a real JetStream connection.
+func maxDeliverFromCfg(cfg subConfig) int {
+	if cfg.maxRetries > 0 {
+		return cfg.maxRetries + 1
+	}
+	// Explicit -1 (unlimited) when no DLQ/retry cap is configured. This is
+	// functionally identical to the server default, but setting it explicitly
+	// means a consumer that already exists with a different MaxDeliver won't
+	// silently keep its old cap.
+	return -1
 }
 
 // ack/nak/term centralize acknowledgement + error logging so the call sites

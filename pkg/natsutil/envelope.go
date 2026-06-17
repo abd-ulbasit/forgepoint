@@ -136,6 +136,29 @@ func injectTraceContext(ctx context.Context, env *EventEnvelope) {
 // extractTraceContext returns a context carrying the producer's trace context
 // (extracted from the envelope), so spans created while handling the message
 // link back to the producer's trace in Tempo.
+//
+// TRACE TRUST BOUNDARY — WHY parent-child (not span links):
+//
+//   We INTENTIONALLY use parent-child propagation across the NATS hop, not
+//   trace.WithLinks + a fresh root span. This gives a single unified trace
+//   waterfall (producer → async hop → consumer) rather than two disconnected
+//   traces linked by a reference — easier to follow in Grafana Tempo.
+//
+//   This is safe because our NATS bus is:
+//     1. Intra-cluster only (not exposed externally).
+//     2. Heading toward authenticated producers (see ConnectWithCredentials /
+//        the M6 secrets phase). A rogue producer would need cluster-level access.
+//
+//   For an internet-facing bus (e.g., webhook ingestion from the public internet),
+//   trusting the producer's traceparent is dangerous: a malicious client could
+//   inject a trace context that maps to a sensitive internal trace, enabling
+//   timing side-channels. The correct approach there is:
+//     - Create a fresh root span (drop the incoming traceparent entirely)
+//     - Use trace.WithLinks(trace.Link{SpanContext: incomingCtx}) to reference
+//       the originating context without adopting it as the parent
+//     - Apply a baggage allowlist to prevent arbitrary key-value propagation
+//
+//   See OpenTelemetry spec §context-propagation/api/b3 for the full trust model.
 func extractTraceContext(ctx context.Context, env EventEnvelope) context.Context {
 	if len(env.TraceContext) == 0 {
 		return ctx

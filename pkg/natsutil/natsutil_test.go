@@ -51,6 +51,7 @@ func skipIfNoDocker(t *testing.T) {
 // Returns the connection URL and a cleanup function.
 func startNATS(t *testing.T) string {
 	t.Helper()
+	skipIfNoDocker(t) // guard: skip cleanly instead of panicking when Docker is absent
 
 	ctx := context.Background()
 
