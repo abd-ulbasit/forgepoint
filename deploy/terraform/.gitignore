@@ -1,0 +1,24 @@
+# ============================================================================
+# Terraform-specific ignores (scoped to deploy/terraform)
+# ============================================================================
+# The repo root .gitignore already excludes *.tfstate, *.tfstate.backup,
+# .terraform/, and .terraform.lock.hcl. This file adds the bits specific to this
+# tree and documents WHY each is ignored.
+
+# Real per-env variable files. terraform.tfvars.example IS committed (the
+# template); the filled-in terraform.tfvars may contain environment-specific
+# values (e.g. your VPN CIDR) and must NOT be committed.
+terraform.tfvars
+*.auto.tfvars
+
+# Backend config passed via -backend-config=*.hcl (may name your real bucket).
+*.backend.hcl
+
+# Crash logs + plan output files.
+crash.log
+*.tfplan
+
+# NOTE on lock files: .terraform.lock.hcl is ignored by the ROOT .gitignore in
+# this repo. In a production setup you would normally COMMIT the lock file so
+# every machine/CI run resolves identical provider checksums. If you adopt that,
+# add `!**/.terraform.lock.hcl` here to un-ignore it.
