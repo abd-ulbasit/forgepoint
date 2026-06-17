@@ -4,7 +4,7 @@
 [![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A full ML‑lifecycle platform built as **9 Go microservices** — a hands‑on study of production microservices patterns (saga, CQRS, event sourcing, outbox, circuit breaker, choreography) on Kubernetes, with gRPC for sync and NATS JetStream for async.
+A full ML‑lifecycle platform built as **10 Go microservices** — a hands‑on study of production microservices patterns (saga, CQRS, event sourcing, outbox, circuit breaker, choreography, streaming drift detection) on Kubernetes, with gRPC for sync and NATS JetStream for async. The lifecycle runs as a **closed loop** (serve → monitor → retrain) and ships via **GitOps**.
 
 > **Domain as a vehicle.** Forgepoint models an MLOps platform (train → register → deploy → serve → monitor → retrain), but the ML parts are deliberately thin (pre‑trained CPU ONNX models, no GPU). The real subject is **distributed‑systems engineering**: one well‑known pattern implemented properly per service, instrumented and deployed the way you would in production.
 
@@ -33,8 +33,9 @@ Each service follows **Clean Architecture** (`handler → domain → repository`
 | Billing / Usage | **Outbox pattern** (reliable event publishing) | PostgreSQL |
 | Notification | **Choreography** (pure event reactor) | PostgreSQL |
 | Model Serving | **Sidecar**, HPA on custom metrics | In‑memory (ONNX) |
+| Model Monitor | **Streaming drift detection** + closed‑loop retrain trigger | PostgreSQL + Redis |
 
-A **Backend‑for‑Frontend (BFF)** + web UI sit in front of these — see [`docs/adr/0001-bff-for-web-ui.md`](docs/adr/0001-bff-for-web-ui.md).
+A **Backend‑for‑Frontend (BFF)** + web UI and an `fp` **CLI** sit in front of these; the platform is delivered via **GitOps (ArgoCD)**, secured with policy-as-code + a signed supply chain, and autoscaled with **KEDA**. See the [ADRs](docs/adr/) — [BFF](docs/adr/0001-bff-for-web-ui.md), [GitOps](docs/adr/0002-gitops-with-argocd.md), [closed-loop Model Monitor](docs/adr/0003-closed-loop-model-monitor.md).
 
 ---
 
@@ -95,7 +96,7 @@ Common targets (see the [Makefile](Makefile)): `make proto`, `make build SVC=<sv
 proto/        Source of truth for all APIs (Buf)
 gen/go/       Generated proto code (do not edit)
 pkg/          Shared libraries (built & tested)
-services/     The 9 microservices (in progress)
+services/     The 10 microservices (in progress)
 deploy/       Helm, K8s manifests, Terraform, Skaffold
 docs/
   plans/      Platform design + phased implementation plan

@@ -6,11 +6,11 @@
 
 ## Overview
 
-Forgepoint is a full ML lifecycle platform built as a distributed microservices system in Go. It covers model training, registration, deployment, serving, monitoring, and retraining — orchestrated across 9 independent services communicating via gRPC (sync) and NATS JetStream (async), deployed on Kubernetes.
+Forgepoint is a full ML lifecycle platform built as a distributed microservices system in Go. It covers model training, registration, deployment, serving, monitoring, and retraining as a **closed loop** — orchestrated across 10 independent services communicating via gRPC (sync) and NATS JetStream (async), deployed on Kubernetes via GitOps (ArgoCD).
 
 **Goals:**
 - Learn every major microservices pattern (saga, CQRS, event sourcing, choreography, outbox, etc.) with a real, production-standard project
-- Build a portfolio piece targeting remote high-paying roles at YC startups and platform engineering positions
+- Build a portfolio-grade, production-standard project demonstrating platform-engineering practice
 - Demonstrate mastery of Go, Kubernetes, distributed systems, and cloud-native infrastructure
 - Cover the full MLOps lifecycle: train → register → deploy → serve → monitor → retrain
 - Deliver a polished, working product with good UX — including a web UI as a first-class interface alongside the CLI and gRPC/HTTP APIs
@@ -209,6 +209,23 @@ Each step is durable (persisted to DB). If the orchestrator crashes mid-saga, it
 - **Events published:** `ModelLoaded`, `PredictionCompleted`
 - **K8s patterns:** One Deployment per model version. HPA scales on custom metric (inflight requests). Readiness probe = model loaded. Liveness probe = inference latency < threshold.
 
+### Service 10: Model Monitor
+**Pattern:** Streaming Aggregation + Closed-Loop Control
+
+This service **closes the ML lifecycle loop** (`serve → monitor → retrain`). It is the producer
+of `ModelDriftDetected`, the event the Notification service already reacts to.
+
+- **Purpose:** Detect model degradation in production and trigger automated retraining
+- **Data Store:** PostgreSQL (monitors, drift_windows, drift_reports) + Redis (live windows)
+- **gRPC API:** `GetModelHealth`, `ListDriftReports`, `ConfigureMonitor`, `SubmitGroundTruth`
+- **Events consumed:** `InferenceCompleted` (features + predictions)
+- **Events published:** `ModelDriftDetected`
+- **How it works:** Maintains per-model sliding windows over the inference stream and computes
+  **data drift** (PSI/KL/KS vs the training baseline), **prediction drift**, and **performance
+  decay** (when ground-truth labels arrive). On a threshold breach it publishes
+  `ModelDriftDetected` and, if auto-retrain is enabled, calls the Pipeline Orchestrator to run
+  the model's training pipeline — new version → canary → promote. The loop closes.
+
 ## Pattern Coverage
 
 | Pattern | Service | What It Teaches |
@@ -222,6 +239,7 @@ Each step is durable (persisted to DB). If the orchestrator crashes mid-saga, it
 | **API Gateway** | Inference Gateway | Routing, circuit breaking, rate limiting, canary |
 | **Sidecar** | Model Serving | Per-pod patterns, health probes, autoscaling |
 | **Centralized Auth** | Auth/IAM | Cross-cutting concerns, token propagation |
+| **Streaming Aggregation + Closed Loop** | Model Monitor | Windowed stats over event streams, self-healing control loop |
 
 ## Communication Architecture
 
@@ -238,10 +256,11 @@ Each step is durable (persisted to DB). If the orchestrator crashes mid-saga, it
 ```
 NATS JetStream Subjects:
 
-fp.models.>              Model Registry events
+fp.models.>              Model Registry + Model Monitor events
   fp.models.registered
   fp.models.version.created
   fp.models.archived
+  fp.models.drift.detected   (← Model Monitor; closes the loop)
 
 fp.pipelines.>           Pipeline Orchestrator events
   fp.pipelines.started
@@ -283,11 +302,16 @@ Pipeline Orch.    → PipelineStarted         → Notification Service
 
 Inference Gateway → InferenceCompleted      → Billing (meter usage)
                                             → Experiment Tracker
+                                            → Model Monitor (drift windows)
 
 Feature Store     → FeaturesIngested        → Experiment Tracker
 
 Billing           → QuotaExceeded           → Notification Service
                                             → Inference Gateway
+
+Model Monitor     → ModelDriftDetected      → Notification Service (alert)
+                                            → Experiment Tracker (record)
+                                            → Pipeline Orchestrator (auto-retrain) ── closes the loop
 ```
 
 ### Communication Patterns
@@ -340,16 +364,19 @@ forgepoint/
 │   ├── billing/
 │   ├── notification/
 │   ├── model-serving/
+│   ├── model-monitor/              # Drift detection + closed-loop retrain trigger
 │   └── bff/                        # Backend-for-Frontend for the web UI (ADR 0001)
 │                                   #   composition + gRPC↔JSON/SSE, ZERO business logic
 │
 ├── web/                            # Web UI (Vite + React + TS), talks only to the BFF
+├── sdks/python/                    # Generated Python client SDK for ML users
 │
 ├── pkg/                            # Shared libraries
 │   ├── grpcutil/                   # gRPC interceptors, middleware
 │   ├── natsutil/                   # NATS connection helpers
 │   ├── observability/              # OTel tracer/meter setup
 │   ├── auth/                       # JWT validation middleware
+│   ├── audit/                      # Audit-log helper + interceptor (tamper-evident trail)
 │   ├── health/                     # Standardized health checks
 │   ├── config/                     # Env-based config loading
 │   └── testutil/                   # Shared test helpers
@@ -357,11 +384,15 @@ forgepoint/
 ├── deploy/
 │   ├── helm/                       # Helm chart per service
 │   ├── k8s/                        # Namespaces, RBAC, NetworkPolicies
+│   ├── argocd/                     # GitOps: app-of-apps Applications per service
+│   ├── policies/                   # Kyverno policies (admission control)
+│   ├── rollouts/                   # Argo Rollouts/Flagger canary definitions
+│   ├── keda/                       # KEDA ScaledObjects (NATS-lag autoscaling)
 │   ├── terraform/                  # AWS infra (EKS, RDS, S3, etc.)
 │   └── skaffold.yaml               # Local K8s dev workflow
 │
 ├── tools/
-│   ├── fp-cli/                   # CLI for interacting with the platform
+│   ├── fp-cli/                     # CLI for interacting with the platform
 │   └── loadtest/                   # k6 scripts per service
 │
 ├── scripts/
@@ -387,6 +418,12 @@ forgepoint/
 | **12-Factor App** | Config from env, stateless, logs to stdout, port binding |
 | **ADRs** | Every non-obvious decision in `docs/adr/` |
 | **Hermetic builds** | Multi-stage Dockerfiles, pinned deps, distroless base |
+| **Secure supply chain** | govulncheck + Trivy scan, Syft SBOM, cosign signing, verified at admission |
+| **Secrets externalized** | No plaintext secrets in Git; External Secrets Operator + Sealed Secrets |
+| **Policy-as-code** | Kyverno admission policies + default-deny NetworkPolicies, tested in CI |
+| **GitOps** | ArgoCD app-of-apps; Git is the single source of truth, no push-deploy from CI |
+| **Audit trail** | Mutating RPCs recorded via `pkg/audit` to a tamper-evident, hash-chained log |
+| **Closed-loop ML** | Model Monitor detects drift and auto-triggers retraining (monitor → retrain) |
 
 ## Infrastructure
 
@@ -410,7 +447,7 @@ Training/batch: K8s Jobs managed by Pipeline Orchestrator.
 |--------|------|---------------|
 | **Metrics** | Prometheus + Grafana | RED metrics per service, custom business metrics, per-service dashboards |
 | **Logs** | Loki + Promtail | Structured JSON via `slog` to stdout, collected by Promtail |
-| **Traces** | Tempo/Jaeger | Distributed traces across all 9 services via OpenTelemetry SDK |
+| **Traces** | Tempo/Jaeger | Distributed traces across all 10 services via OpenTelemetry SDK |
 
 All services instrumented via `pkg/observability/` — single setup function, all three pillars.
 
@@ -495,8 +532,15 @@ Plus platform-wide cross-service integration tests.
 | **Service Mesh** | Istio |
 | **Observability** | OpenTelemetry → Prometheus + Grafana + Loki + Tempo |
 | **CI/CD** | GitHub Actions |
+| **GitOps / Delivery** | ArgoCD (app-of-apps) + Argo Rollouts/Flagger (progressive delivery) |
+| **Autoscaling** | HPA (custom metrics) + KEDA (NATS-lag, scale-to-zero) |
 | **IaC** | Terraform |
+| **Secrets** | External Secrets Operator + Sealed Secrets (Vault optional) |
+| **Policy** | Kyverno (admission control) + NetworkPolicies |
+| **Supply chain** | govulncheck, Trivy, Syft (SBOM), cosign (signing) |
+| **Backup / DR** | CloudNativePG / Velero |
 | **Dev Workflow** | Skaffold + Kind |
 | **API Linting** | Buf |
 | **DB Migrations** | golang-migrate |
 | **Load Testing** | k6 |
+| **Client SDKs** | Go (generated), Python (generated) |
