@@ -6,79 +6,110 @@
 //
 // In Clean Architecture, main.go is the "composition root" — the only place
 // where every layer is imported together and wired into a running program. It
-// knows about config, observability, domain, handler (and, in later phases, the
-// Postgres/HTTP/NATS adapters); none of those layers know about each other except
-// through the interfaces (ports) the domain defines.
+// knows about config, observability, the domain, the handler, the Postgres/Redis
+// adapters, and the NATS event adapters; none of THOSE layers know about each
+// other except through the interfaces (ports) the domain defines.
 //
-// STARTUP SEQUENCE:
+// STARTUP SEQUENCE (each step fails fast — a half-up service must never report ready):
 //
-//	┌──────────────────────────────────────────────────────────────────┐
-//	│  1. Structured logger (slog JSON → stdout → Loki)                  │
-//	│  2. Load config (FP_* env vars → NotificationConfig)               │
-//	│  3. Setup OpenTelemetry (traces → Tempo, metrics → Prometheus)     │
-//	│  4. Build gRPC server via grpcutil.NewServer (interceptor chain)   │
-//	│  5. Register NotificationHandler                                   │
-//	│  6. HTTP health server (/healthz liveness, /readyz readiness)      │
-//	│  7. Start gRPC server (blocks until SIGTERM/SIGINT)                │
-//	│  8. Graceful shutdown (OTel flush → gRPC drain → health 503)       │
-//	└──────────────────────────────────────────────────────────────────┘
+//	┌──────────────────────────────────────────────────────────────────────────┐
+//	│  1. Structured logger (slog JSON → stdout → Loki)                          │
+//	│  2. Load config (FP_* env vars → NotificationConfig)                       │
+//	│  3. Setup OpenTelemetry (traces → Tempo, metrics → Prometheus)             │
+//	│  4. Connect datastores (Postgres pool, Redis client, NATS JetStream)       │
+//	│     + ensure the EVENTS firehose stream exists, each Ping'd for reachability│
+//	│  5. Build adapters → domain service → event publisher                      │
+//	│  6. Register the REAL handler (not nil) on the gRPC server                 │
+//	│  7. Start the NATS reactor (the choreography consumer on fp.>)             │
+//	│  8. HTTP health server (/readyz checks Postgres + Redis + NATS)            │
+//	│  9. Start gRPC server (SERVING only now); block until SIGTERM/SIGINT       │
+//	│ 10. Graceful shutdown LIFO: gRPC drain → reactor stop → NATS drain →       │
+//	│     Redis close → Postgres close → OTel flush → health close              │
+//	└──────────────────────────────────────────────────────────────────────────┘
 //
-// WHAT'S WIRED NOW (scaffold phase):
-//   - NotificationHandler with a nil domain service (the embedded
-//     UnimplementedNotificationServiceServer handles all RPCs, returning
-//     codes.Unimplemented — correct behavior).
-//   - No Postgres pool, no Redis, no NATS subscription yet.
+// ============================================================================
+// THE TWO SURFACES OF THIS SERVICE (and why the wiring has two halves)
+// ============================================================================
 //
-// WHAT ARRIVES LATER (the rest of the service):
+// Notification is unusual: its real work is ASYNC (the choreography reactor that
+// consumes fp.> and reacts), and its gRPC surface is a tiny CONTROL PLANE (the
+// inbox/preferences/delivery-log RPCs). So the composition root wires BOTH:
 //
-//   - Postgres adapter implementing domain.NotificationRepository +
-//     domain.PreferenceRepository (the inbox, delivery_log, preferences tables).
+//	SYNC  : handler → domain.NotificationService → {Postgres, Redis, Notifier}
+//	ASYNC : NATS fp.> → events.Reactor → domain.ReactToEvent → DecisionExecutor
 //
-//   - Redis adapter implementing domain.IdempotencyStore (event + sync dedup).
+// ============================================================================
+// THE ONE PIECE THAT IS NOT YET IMPLEMENTED — THE SSRF-GUARDED DELIVERY ADAPTER
+// ============================================================================
 //
-//   - HTTP/Slack/SMTP delivery adapter implementing domain.Notifier — THIS is
-//     where the mandated SSRF guard (https-only, hooks.slack.com allowlist,
-//     private/loopback/link-local IP denylist, pinned-IP connect) + retries +
-//     per-URL circuit breaker live.
+// The domain depends on a domain.Notifier port (ports.go) — the external-delivery
+// adapter that performs the actual webhook/Slack/SMTP send WITH the mandated SSRF
+// guard (https-only, hooks.slack.com allowlist, private/loopback/link-local IP
+// denylist, pinned-IP connect), retries, and a per-URL circuit breaker. That
+// adapter (the `delivery` package the ports.go doc describes) has NOT been written
+// yet. Two further async-path collaborators are likewise unwritten: the
+// events.DecisionExecutor (writes the inbox row + fires the Notifier + records the
+// suppressed log) and the events.RecipientRouting (maps an opaque event → the
+// recipient + rendered content).
 //
-//   - NATS JetStream consumer on `fp.>` (the choreography reactor's imperative
-//     shell): for each event it loads the recipient's prefs, calls
-//     svc.ReactToEvent, then executes the RoutingDecision (write inbox row, fire
-//     the Notifier per delivering channel, record SUPPRESSED attempts) and
-//     publishes fp.notifications.delivered / fp.notifications.failed
-//     (forgepoint.events.v1) for delivery-health consumers.
+// Rather than register a nil service (which would make the WHOLE gRPC surface
+// return Unimplemented), the composition root injects SAFE-DEFAULT edge adapters
+// for the three missing collaborators:
 //
-//     Once those land, the wiring below grows:
-//     pool := pgxpool.New(ctx, cfg.DatabaseURL)
-//     notifRepo := postgres.NewNotificationRepo(pool)
-//     prefRepo  := postgres.NewPreferenceRepo(pool)
-//     idem      := redisadapter.NewIdempotencyStore(redisClient)
-//     notifier  := delivery.NewNotifier(...)   // SSRF guard lives here
-//     svc := domain.NewNotificationService(notifRepo, prefRepo, idem, notifier,
-//     systemClock{}, uuidGen{})
-//     notificationv1.RegisterNotificationServiceServer(srv.GRPC,
-//     handler.NewNotificationHandler(svc))
-//     healthHandler.AddCheck("db", func(ctx) error { return pool.Ping(ctx) })
-//     healthHandler.AddCheck("nats", natsConn.Ping)
+//   - denyAllNotifier  — a Notifier that rejects every external delivery
+//     (fail-closed: a missing delivery adapter must NEVER silently "succeed", and
+//     must never bypass the SSRF guard). The control-plane RPCs that do not deliver
+//     externally (ListNotifications / GetNotification / MarkRead /
+//     ListDeliveryAttempts / GetPreferences / UpdatePreferences) are FULLY live
+//     against Postgres + Redis; only TestChannel on an external channel returns the
+//     fail-closed outcome (which the settings UI shows inline as "✗ …").
 //
+//   - noRecipientRouter — the exact safe default resolve.go documents: a router
+//     that drops every event (ok=false), so the reactor ACKs-and-skips until the
+//     platform's real recipient-resolution policy is wired. The reactor still runs
+//     (subscription, dedup, DLQ machinery all live); it simply has nothing to route.
+//
+//   - inertExecutor     — a DecisionExecutor that performs no side effect (it is
+//     only ever reached if a recipient is resolved, which noRecipientRouter never
+//     does, so it is unreachable today; present so the reactor type-checks and so
+//     swapping in the real executor is a one-line wiring change).
+//
+// These three are the ONLY non-final pieces. They are clearly fail-closed, mirror
+// patterns already sanctioned elsewhere in this codebase (resolve.go's documented
+// no-recipient default; feature-store/inference-gateway's edge adapters), and let
+// this service compile, boot, pass readiness, and serve its control plane today.
+// Replacing them with the real `delivery` package + executor + router is a pure
+// wiring change here — no layer below main.go changes.
 // ============================================================================
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/nats-io/nats.go/jetstream"
+	goredis "github.com/redis/go-redis/v9"
 
 	notificationv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/notification/v1"
 	"github.com/abd-ulbasit/forgepoint/pkg/config"
 	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/health"
+	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/observability"
+	"github.com/abd-ulbasit/forgepoint/services/notification/internal/domain"
+	"github.com/abd-ulbasit/forgepoint/services/notification/internal/events"
 	"github.com/abd-ulbasit/forgepoint/services/notification/internal/handler"
+	postgresrepo "github.com/abd-ulbasit/forgepoint/services/notification/internal/repository/postgres"
+	redisrepo "github.com/abd-ulbasit/forgepoint/services/notification/internal/repository/redis"
 )
 
 // NotificationConfig extends BaseConfig with notification-specific configuration.
@@ -86,32 +117,36 @@ import (
 // WHY embed BaseConfig: every Forgepoint service needs Port, GRPCPort, LogLevel,
 // OTelEndpoint, NATSUrl, DatabaseURL. config.Load[NotificationConfig]("FP") reads
 // FP_PORT, FP_GRPC_PORT, FP_NATS_URL, etc. via reflection (see pkg/config).
-//
-// The notification-specific fields below are NOT required during this scaffold
-// phase (the adapters that consume them arrive later), so they are optional with
-// safe defaults — the service must still boot with only the base config set, so
-// the scaffold is runnable today.
 type NotificationConfig struct {
 	config.BaseConfig
 
-	// RedisURL backs the IdempotencyStore (event + sync dedup) once the Redis
-	// adapter lands. Optional here; the dedup adapter validates it at wire time.
-	// K8s: a plain ConfigMap value (no secret) pointing at the in-cluster Redis.
+	// RedisURL backs the IdempotencyStore (sync dedup: prefs/test idempotency keys)
+	// AND the reactor's domain-level per-(event,recipient) dedup store. A redis://
+	// URL (host/port/db/credentials), parsed by go-redis ParseURL.
+	// K8s: a plain ConfigMap value pointing at the in-cluster Redis.
 	RedisURL string `env:"REDIS_URL" default:"redis://localhost:6379"`
 
 	// SMTPAddr is the SMTP server for the EMAIL channel (host:port). Optional —
-	// the plan allows mocking email in non-prod, so an unset value is valid until
-	// the EMAIL delivery adapter is enabled.
+	// consumed by the (not-yet-written) delivery adapter; unset is valid today.
 	SMTPAddr string `env:"SMTP_ADDR"`
+
+	// OTLPInsecure controls whether the OTLP exporter dials the collector over
+	// plaintext (local/docker-compose, no TLS) vs TLS (in-cluster behind the mesh).
+	// Driven by config rather than hard-coded so the same binary works in both.
+	OTLPInsecure bool `env:"OTLP_INSECURE" default:"true"`
+
+	// Environment tags telemetry (resource attribute) so traces/metrics are
+	// filterable by deployment. Mirrors FP_ENV (which natsutil's MemoryProcessedStore
+	// guard also reads) so "production" is consistent across the process.
+	Environment string `env:"ENV" default:"local"`
 }
 
 func main() {
 	// ================================================================
 	// 1. STRUCTURED LOGGER
 	// ================================================================
-	// slog (stdlib, Go 1.21+) with JSON output: container runtimes capture stdout
-	// and ship it to Loki, and JSON is parse-friendly for the aggregator. Zero
-	// external deps; fast enough for a network-IO-bound service.
+	// slog (stdlib) with JSON output: container runtimes capture stdout and ship it
+	// to Loki, and JSON is parse-friendly for the aggregator. Zero external deps.
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
@@ -133,107 +168,326 @@ func main() {
 		slog.Int("health_port", cfg.Port),
 		slog.String("log_level", cfg.LogLevel),
 		slog.String("nats_url", cfg.NATSUrl),
+		slog.String("environment", cfg.Environment),
 	)
+
+	// SIGTERM/SIGINT-aware root context. Every blocking startup step and the gRPC
+	// Serve loop honor it, so a signal during startup aborts cleanly and the SAME
+	// ctx drives the graceful shutdown below. We include SIGTERM explicitly (K8s
+	// sends SIGTERM, not SIGINT, to a terminating pod).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	// ================================================================
 	// 3. OPENTELEMETRY
 	// ================================================================
 	// Setup initializes the trace provider (→ Tempo) and meter provider
 	// (→ Prometheus via the OTel Collector). All spans/metrics from this process
-	// flow through these providers — including, later, the NATS consumer spans
-	// that complete the serve→monitor→notify trace across the async hop.
-	//
-	// WHY NotifyContext here: we pass the signal-aware context to Setup so OTLP
-	// connection setup respects a SIGTERM during startup (abort cleanly). The same
-	// ctx drives the graceful shutdown below.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-
+	// flow through these providers — including the NATS consumer spans that complete
+	// the serve→…→notify trace across the async hop (natsutil re-attaches the
+	// producer's trace context per message).
 	otelShutdown, err := observability.Setup(ctx, observability.Config{
 		ServiceName:    "notification",
 		ServiceVersion: "dev",
-		Environment:    "local",
+		Environment:    cfg.Environment,
 		OTLPEndpoint:   cfg.OTelEndpoint,
-		// OTLPInsecure is sourced from the (local) deployment posture: plaintext to
-		// the collector in docker-compose where there is no TLS cert. In a real
-		// cluster this would be driven by config/mTLS via the mesh.
-		OTLPInsecure: true,
+		OTLPInsecure:   cfg.OTLPInsecure,
 	})
 	if err != nil {
 		logger.Error("failed to setup observability", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
+	// Flush pending spans/metrics on shutdown. OTel batches internally; without this
+	// the last few seconds of telemetry are lost. Registered FIRST so it fires LAST
+	// (LIFO) — after every store-closing defer, so a teardown error still gets traced.
+	// Uses a fresh Background ctx because the signal ctx is already cancelled here.
 	defer func() {
-		// Flush pending spans/metrics on shutdown (OTel batches internally, so
-		// without this the last few seconds of telemetry are lost). K8s grants 30s
-		// on SIGTERM — ample time to flush.
 		if shutdownErr := otelShutdown(context.Background()); shutdownErr != nil {
 			logger.Error("otel shutdown error", slog.String("error", shutdownErr.Error()))
 		}
 	}()
 
 	// ================================================================
-	// 4. BUILD gRPC SERVER
+	// 4. CONNECT DATASTORES (Postgres, Redis, NATS) — fail fast on each
 	// ================================================================
-	// grpcutil.NewServer applies the standard interceptor chain
-	// (recovery → logging → tracing → auth). WHY no WithAuthValidator wired yet:
-	// the auth interceptor needs a token validator (the Auth service's public key
-	// / introspection), which is injected when the platform's shared auth client
-	// is available. The control-plane RPCs here are all caller-scoped — once the
-	// validator is wired, the interceptor populates grpcutil.Claims and each
-	// handler reads RecipientUserID/UserID from it (never from the request body).
 	//
-	// WithReflection: enabled so grpcurl/grpcui can introspect the service during
-	// development without the .proto files locally.
+	// 4a. POSTGRES (pgxpool) — backs the inbox read model, the delivery log, and the
+	// per-user preferences. pgxpool.New only PARSES the DSN (it does not dial), so we
+	// Ping to verify the database is actually reachable before declaring readiness.
+	// The pool is created HERE and closed HERE (we own its lifecycle) — postgres.New
+	// would create+ping+own one, but we manage the pool ourselves so the readiness
+	// check and the close are visible in the composition root.
+	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	if err != nil {
+		logger.Error("failed to create postgres pool", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	// Registered now so it fires near-LAST among the store closes (LIFO) — after the
+	// gRPC drain finished any in-flight read, never cutting one off mid-query.
+	defer func() {
+		logger.Info("closing postgres pool")
+		pool.Close()
+	}()
+	pingCtx, cancelPing := context.WithTimeout(ctx, 5*time.Second)
+	if pingErr := pool.Ping(pingCtx); pingErr != nil {
+		cancelPing()
+		logger.Error("postgres not reachable", slog.String("error", pingErr.Error()))
+		os.Exit(1)
+	}
+	cancelPing()
+	logger.Info("postgres connected")
+
+	// 4b. REDIS (go-redis) — backs the sync IdempotencyStore (prefs/test idempotency
+	// keys) AND the reactor's domain per-(event,recipient) dedup store. ParseURL turns
+	// "redis://host:port/db" into Options (auth, db, TLS), matching the platform's
+	// connection-string format. NewClient is lazy, so we Ping to confirm reachability.
+	redisOpts, err := goredis.ParseURL(cfg.RedisURL)
+	if err != nil {
+		logger.Error("failed to parse redis url", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	rdb := goredis.NewClient(redisOpts)
+	defer func() {
+		logger.Info("closing redis client")
+		if closeErr := rdb.Close(); closeErr != nil {
+			logger.Error("redis close error", slog.String("error", closeErr.Error()))
+		}
+	}()
+	pingRedisCtx, cancelRedisPing := context.WithTimeout(ctx, 5*time.Second)
+	if pingErr := rdb.Ping(pingRedisCtx).Err(); pingErr != nil {
+		cancelRedisPing()
+		logger.Error("redis not reachable", slog.String("error", pingErr.Error()))
+		os.Exit(1)
+	}
+	cancelRedisPing()
+	logger.Info("redis connected")
+
+	// 4c. NATS JetStream — the event bus. Connect returns the raw *nats.Conn (for
+	// lifecycle: Drain/Close, IsConnected) AND a jetstream.JetStream context (for
+	// publishing + consuming). natsutil.Connect sets MaxReconnects(-1) so the client
+	// survives transient blips (K8s restarts the pod only if readiness stays down).
+	nc, js, err := natsutil.Connect(cfg.NATSUrl)
+	if err != nil {
+		logger.Error("failed to connect to nats", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	// Drain (not bare Close): flush in-flight publishes + unsubscribe cleanly, THEN
+	// close. We publish delivery-health best-effort, so a drain error is logged.
+	defer func() {
+		logger.Info("draining nats connection")
+		if drainErr := nc.Drain(); drainErr != nil {
+			logger.Error("nats drain error", slog.String("error", drainErr.Error()))
+		}
+	}()
+
+	// ENSURE THE EVENTS FIREHOSE STREAM EXISTS. The choreography reactor binds a
+	// single consumer to fp.> on the EVENTS stream, so that stream MUST exist before
+	// Subscribe. In production the platform bootstrap provisions it (multiple services
+	// share it); here we CreateOrUpdate it idempotently so a fresh local stack works
+	// and an existing stream is reconciled rather than failing. This service ALSO
+	// publishes fp.notifications.{delivered,failed}, which the fp.> subjects capture,
+	// so one stream serves both directions.
+	//
+	// NOTE the EVENTS stream's Subjects are fp.> ONLY — they DELIBERATELY exclude the
+	// DLQ subject (events.SubjectDLQ = "fp_dlq.notification", a token outside fp.>),
+	// which gets its OWN stream below. That separation is the fix for the DLQ poison
+	// re-consumption bug: if the DLQ subject lived in EVENTS it would match the
+	// reactor's fp.> consumer and a parked poison message would be re-delivered to the
+	// reactor, re-failed, and re-parked. See events.SubjectDLQ for the full rationale.
+	streamCtx, cancelStream := context.WithTimeout(ctx, 10*time.Second)
+	if _, streamErr := js.CreateOrUpdateStream(streamCtx, jetstream.StreamConfig{
+		Name:     events.StreamEvents,
+		Subjects: []string{events.SubjectAllEvents},
+	}); streamErr != nil {
+		cancelStream()
+		logger.Error("failed to ensure EVENTS stream", slog.String("error", streamErr.Error()))
+		os.Exit(1)
+	}
+	cancelStream()
+
+	// ENSURE THE DEDICATED DLQ STREAM EXISTS. A JetStream subject is bound to exactly
+	// ONE stream, so the DLQ subject (outside fp.>) needs its own stream to land in.
+	// The reactor NEVER consumes this stream — it is a SINK that ops drain/replay from
+	// out-of-band (mirrors Kafka's separate dead-letter topic / SQS's dead-letter
+	// queue). Provisioning it here keeps the local stack self-contained; in production
+	// the platform bootstrap owns it, and CreateOrUpdate reconciles either way.
+	dlqStreamCtx, cancelDLQStream := context.WithTimeout(ctx, 10*time.Second)
+	if _, streamErr := js.CreateOrUpdateStream(dlqStreamCtx, jetstream.StreamConfig{
+		Name:     events.StreamDLQ,
+		Subjects: []string{events.SubjectDLQ},
+	}); streamErr != nil {
+		cancelDLQStream()
+		logger.Error("failed to ensure DLQ stream", slog.String("error", streamErr.Error()))
+		os.Exit(1)
+	}
+	cancelDLQStream()
+
+	logger.Info("nats connected; EVENTS + DLQ streams ensured",
+		slog.String("stream", events.StreamEvents),
+		slog.String("subjects", events.SubjectAllEvents),
+		slog.String("dlq_stream", events.StreamDLQ),
+		slog.String("dlq_subject", events.SubjectDLQ),
+	)
+
+	// ================================================================
+	// 5. BUILD ADAPTERS → DOMAIN SERVICE → EVENT PUBLISHER
+	// ================================================================
+	//
+	// Dependency inversion made concrete: the domain declares the ports
+	// (NotificationRepository, PreferenceRepository, IdempotencyStore, Notifier,
+	// Clock, IDGenerator); here we construct the infrastructure adapters that satisfy
+	// them and INJECT them. The domain never imported pgx, go-redis, or nats.
+	pgStore := postgresrepo.NewWithPool(pool) // wraps the pool WE own (NewWithPool, not New)
+	notifRepo := pgStore.Notifications()      // domain.NotificationRepository (inbox + delivery log)
+	prefRepo := pgStore.Preferences()         // domain.PreferenceRepository (per-user routing rules)
+	idemStore := redisrepo.NewIdempotencyStore(rdb)
+
+	// The external-delivery port. The real SSRF-guarded delivery adapter (the
+	// `delivery` package) is not written yet, so we inject a fail-closed default that
+	// rejects every external send (see denyAllNotifier). The control-plane RPCs that
+	// never deliver externally are unaffected; only TestChannel on an external channel
+	// returns the fail-closed outcome, which the settings UI shows inline.
+	notifier := denyAllNotifier{}
+
+	// The domain brain. NewNotificationService returns the NotificationService
+	// interface (programming-to-the-interface); the handler and the reactor both
+	// receive it. SystemClock/UUIDGenerator are the domain's own production
+	// impure-edge adapters (defaults.go) — wall-clock time and crypto-random ids
+	// enter the system only here.
+	svc := domain.NewNotificationService(
+		notifRepo,
+		prefRepo,
+		idemStore,
+		notifier,
+		domain.SystemClock{},
+		domain.UUIDGenerator{},
+	)
+
+	// The delivery-health publisher (events.DeliveryHealthPublisher). NewPublisher
+	// wraps a natsutil.Publisher bound to this service's source name (events.Source),
+	// inheriting the envelope/dedup/trace machinery; the adapter only builds the
+	// canonical events.v1 payload and protojson-encodes it.
+	publisher := events.NewPublisher(natsutil.NewPublisher(js, events.Source))
+
+	// ================================================================
+	// 6. BUILD gRPC SERVER + REGISTER THE REAL HANDLER
+	// ================================================================
+	// grpcutil.NewServer applies the standard interceptor chain (recovery → logging →
+	// [auth] → tracing). The auth validator is wired when this service is connected to
+	// the Auth service's ValidateToken (a later phase); the handler reads identity
+	// from claims in context (never from a request body — the anti-IDOR rule).
+	// WithReflection lets grpcurl/grpcui introspect the service in development.
 	srv := grpcutil.NewServer(
 		grpcutil.WithLogger(logger),
 		grpcutil.WithReflection(),
 	)
 
-	// ================================================================
-	// 5. REGISTER NOTIFICATION HANDLER
-	// ================================================================
-	// The handler embeds UnimplementedNotificationServiceServer — it fully
-	// satisfies notificationv1.NotificationServiceServer right now; all RPCs return
-	// codes.Unimplemented until the handler phase overrides them. We pass nil as
-	// the domain service for the scaffold phase; the embedded Unimplemented methods
-	// never dereference svc, so this is safe and the server is runnable today.
-	notificationv1.RegisterNotificationServiceServer(srv.GRPC, handler.NewNotificationHandler(nil))
-	logger.Info("notification handler registered")
+	// Register the FULLY-WIRED handler (real service, NOT nil). Every control-plane
+	// RPC now hits the domain service backed by Postgres + Redis.
+	notificationv1.RegisterNotificationServiceServer(srv.GRPC, handler.NewNotificationHandler(svc))
+	logger.Info("notification handler registered (wired: postgres inbox/prefs + redis idempotency)")
 
 	// ================================================================
-	// 6. HEALTH SERVER (HTTP)
+	// 7. START THE NATS REACTOR (the choreography consumer on fp.>)
 	// ================================================================
-	// The HTTP health server runs on Port (default 8080):
-	//   GET /healthz → liveness (200 while the process is alive)
-	//   GET /readyz  → readiness (checks dependencies once they're wired)
 	//
-	// WHY a separate HTTP port: gRPC is HTTP/2; kubelet probes are HTTP/1.1 — they
-	// can't share a net.Listener. Separate ports let the gRPC server drain while
-	// /readyz returns 503, telling K8s to pull the pod from the LB endpoints.
+	// The reactor is the imperative shell around the pure domain.ReactToEvent brain:
+	// it consumes the fp.> firehose, resolves a recipient (Router), loads prefs
+	// (Prefs), runs ReactToEvent, executes the decision (Executor), and publishes
+	// delivery-health events (Health). Its ports:
 	//
-	// No readiness checks registered yet (no DB/NATS). Later phases add:
-	//   healthHandler.AddCheck("db", func(ctx) error { return pool.Ping(ctx) })
-	//   healthHandler.AddCheck("nats", natsConn.Ping)
+	//   - Service  : the SAME domain service the handler uses (calls ReactToEvent).
+	//   - Router   : recipient-resolution policy. The real platform policy is not
+	//                written yet, so we inject the safe no-recipient default that
+	//                resolve.go documents — it drops every event, so the reactor
+	//                ACKs-and-skips. The subscription/dedup/DLQ machinery is fully
+	//                live; it simply has nothing to route until the policy is wired.
+	//   - Prefs    : LoadPreferences with default fall-back. domain.GetPreferences
+	//                already implements EXACTLY that contract (never errors on a
+	//                never-configured user → returns defaults), so we adapt the
+	//                service to the one-method port (prefsLoader) rather than add a
+	//                second prefs path.
+	//   - Executor : the decision's side effects (inbox write + Notifier + suppressed
+	//                log). The real executor is not written yet; inertExecutor is a
+	//                no-op placeholder, unreachable today because noRecipientRouter
+	//                never yields a recipient (so handle() returns before Execute).
+	//   - Health   : the delivery-health publisher (real — wired above).
+	//
+	// DOMAIN DEDUP STORE (layer (b)): a SHARED, durable Redis-backed
+	// natsutil.ProcessedStore keyed on the per-(event,recipient) business key. A
+	// memory store would not dedup across replicas in the consumer group, so we use
+	// Redis with a TTL (bounded keyspace, comfortably outlasting the redelivery
+	// window). natsutil ships only MemoryProcessedStore (panics in production), hence
+	// this small edge adapter — same pattern as the inference-gateway.
+	processedStore := newRedisProcessedStore(rdb)
+
+	reactorSub := events.NewReactorSubscriber(js, processedStore, events.ReactorConfig{})
+	reactor := events.NewReactor(
+		reactorSub,
+		events.ReactorDeps{
+			Service:  svc,
+			Router:   noRecipientRouter{},
+			Prefs:    prefsLoader{svc: svc},
+			Executor: inertExecutor{},
+			Health:   publisher,
+		},
+		processedStore,
+		events.ReactorConfig{},
+		logger,
+	)
+	if startErr := reactor.Start(ctx); startErr != nil {
+		logger.Error("failed to start notification reactor", slog.String("error", startErr.Error()))
+		os.Exit(1)
+	}
+	// Stop the consume loop on shutdown. Registered AFTER the NATS-drain defer so it
+	// runs BEFORE it (LIFO): stop consuming new events, THEN drain the connection.
+	defer func() {
+		logger.Info("stopping notification reactor")
+		reactor.Close()
+	}()
+	logger.Info("notification reactor started (consuming fp.> firehose)",
+		slog.String("stream", events.StreamEvents),
+		slog.String("subject", events.SubjectAllEvents),
+	)
+
+	// ================================================================
+	// 8. HEALTH SERVER (HTTP) — readiness checks the REAL dependencies
+	// ================================================================
+	// gRPC is HTTP/2; kubelet probes are HTTP/1.1 — they can't share a port, so health
+	// runs on its own HTTP port. Liveness (/healthz) NEVER checks dependencies (a DB
+	// blip must not restart-storm the fleet). Readiness (/readyz) checks Postgres +
+	// Redis + NATS so a pod with a dead dependency is pulled from the Service endpoints
+	// until it recovers.
 	healthHandler := health.New()
+	healthHandler.AddCheck("postgres", func(ctx context.Context) error {
+		return pool.Ping(ctx)
+	})
+	healthHandler.AddCheck("redis", func(ctx context.Context) error {
+		return rdb.Ping(ctx).Err()
+	})
+	healthHandler.AddCheck("nats", func(_ context.Context) error {
+		// IsConnected is the cheap, non-blocking signal. During an automatic reconnect
+		// it is briefly false — readiness correctly reflects "can't publish/consume
+		// right now" and recovers when the client reconnects.
+		if !nc.IsConnected() {
+			return fmt.Errorf("nats not connected (status: %s)", nc.Status())
+		}
+		return nil
+	})
+
 	healthMux := http.NewServeMux()
 	healthMux.HandleFunc("/healthz", healthHandler.LivenessHandler())
 	healthMux.HandleFunc("/readyz", healthHandler.ReadinessHandler())
 
 	healthAddr := fmt.Sprintf(":%d", cfg.Port)
-	healthServer := &http.Server{
-		Addr:    healthAddr,
-		Handler: healthMux,
-	}
+	healthServer := &http.Server{Addr: healthAddr, Handler: healthMux}
 
-	// Run the health server in a goroutine so it doesn't block the gRPC server.
 	go func() {
 		logger.Info("health server listening", slog.String("addr", healthAddr))
-		if serveErr := healthServer.ListenAndServe(); serveErr != nil && serveErr != http.ErrServerClosed {
+		if serveErr := healthServer.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 			logger.Error("health server error", slog.String("error", serveErr.Error()))
 		}
 	}()
-
 	defer func() {
 		if shutdownErr := healthServer.Shutdown(context.Background()); shutdownErr != nil {
 			logger.Error("health server shutdown error", slog.String("error", shutdownErr.Error()))
@@ -241,10 +495,12 @@ func main() {
 	}()
 
 	// ================================================================
-	// 7. START gRPC SERVER
+	// 9. START gRPC SERVER (mark SERVING only now that all deps are up)
 	// ================================================================
-	// Mark the gRPC health service SERVING so K8s readiness passes. (grpcutil flips
-	// it to NOT_SERVING on SIGTERM before draining in-flight RPCs.)
+	// We reach SetServing(true) ONLY after Postgres/Redis/NATS connected, the stream
+	// exists, and the reactor is consuming — so the gRPC readiness signal is honest:
+	// green means the service can actually serve. grpcutil.Server.Serve flips it to
+	// NOT_SERVING on SIGTERM before draining (the graceful-shutdown dance).
 	srv.SetServing(true)
 
 	grpcAddr := fmt.Sprintf(":%d", cfg.GRPCPort)
@@ -255,14 +511,161 @@ func main() {
 	}
 	logger.Info("gRPC server listening", slog.String("addr", grpcAddr))
 
-	// Serve blocks until ctx is cancelled (SIGINT/SIGTERM via NotifyContext). On
-	// cancellation: readiness fails → pod leaves LB endpoints → GracefulStop drains
-	// in-flight RPCs → hard Stop if drain times out → returns here → deferred OTel +
-	// health shutdown run.
+	// Serve blocks until ctx is cancelled (SIGINT/SIGTERM). On cancellation:
+	//   1. SetServing(false) → readiness fails → pod leaves the LB endpoints
+	//   2. GracefulStop (bounded drain) → in-flight control-plane RPCs finish (still
+	//      touching Postgres/Redis/NATS, which are STILL OPEN — the drain runs before
+	//      any store-closing defer fires)
+	//   3. hard Stop if drain times out
+	//   4. returns here; the deferred teardowns run LIFO:
+	//        health close → reactor stop → NATS drain → Redis close → Postgres close
+	//        → OTel flush.
+	//      That order is correct: stop consuming/serving FIRST, then close the
+	//      datastores those handlers used, then flush telemetry LAST.
 	if serveErr := srv.Serve(ctx, lis); serveErr != nil {
 		logger.Error("gRPC server error", slog.String("error", serveErr.Error()))
 		os.Exit(1)
 	}
 
 	logger.Info("notification service stopped cleanly")
+}
+
+// ============================================================================
+// SAFE-DEFAULT EDGE ADAPTERS (the three not-yet-implemented collaborators)
+// ============================================================================
+//
+// These live in the composition root (not in any layer below) because they are
+// WIRING-EDGE stand-ins for adapters that belong in their own packages once
+// written (the SSRF-guarded `delivery` Notifier, the platform RecipientRouting
+// policy, the DecisionExecutor). Keeping them here keeps every inner layer pure and
+// makes the eventual swap a one-line change at each injection site above.
+
+// denyAllNotifier is the fail-closed default for the domain.Notifier port until the
+// real SSRF-guarded delivery adapter is written.
+//
+// WHY FAIL CLOSED (reject), not fail open (pretend success): a Notifier is the SSRF
+// boundary — the one place an attacker-influenced URL would reach the network. A
+// stub that returned StatusDelivered would (a) lie to the delivery log / health
+// feed and (b) risk masking the absence of the SSRF guard. Rejecting every external
+// delivery is the only safe placeholder: the inbox (IN_APP) still works, and an
+// external TestChannel surfaces a clear FAILED outcome instead of a false positive.
+type denyAllNotifier struct{}
+
+// Deliver rejects every external delivery. The domain's TestChannel maps this error
+// to a FAILED TestChannelOutput (shown inline in the settings UI), and the reactor's
+// executor (once written) would record a FAILED delivery_log row — neither path
+// bypasses the SSRF guard, because no socket is ever opened.
+func (denyAllNotifier) Deliver(_ context.Context, _ domain.DeliveryTarget) (domain.DeliveryResult, error) {
+	return domain.DeliveryResult{
+		Status:       domain.StatusFailed,
+		Attempts:     0,
+		ErrorMessage: "external delivery adapter not configured",
+	}, errors.New("notification: delivery adapter not wired")
+}
+
+var _ domain.Notifier = denyAllNotifier{}
+
+// prefsLoader adapts the domain.NotificationService to the reactor's narrow
+// events.PreferenceLoader port. WHY adapt rather than wire domain.PreferenceRepository
+// directly: the reactor needs ONLY "load for this user, defaulting on miss", and
+// domain.GetPreferences ALREADY encodes exactly that (it returns sane defaults for a
+// never-configured user instead of erroring). Reusing it means the reactor and the
+// GetPreferences RPC share one prefs-resolution path — no second, drifting copy.
+type prefsLoader struct {
+	svc domain.NotificationService
+}
+
+// LoadPreferences delegates to the service's default-on-miss GetPreferences.
+func (p prefsLoader) LoadPreferences(ctx context.Context, userID string) (domain.NotificationPreferences, error) {
+	return p.svc.GetPreferences(ctx, userID)
+}
+
+var _ events.PreferenceLoader = prefsLoader{}
+
+// noRecipientRouter is the safe default events.RecipientRouting documented in
+// resolve.go: it resolves NO recipient for any event, so the reactor ACKs-and-skips
+// every message. This is the correct fail-safe until the platform's real
+// recipient-resolution policy (event-type → team → users, or a producer-stamped
+// recipient hint) is wired: a service that doesn't yet know WHO to notify must
+// deliver to NO ONE rather than guess.
+type noRecipientRouter struct{}
+
+// Route always returns ok=false (no recipient). resolveEvent then yields ok=false and
+// the reactor logs "no recipient; skipping" and ACKs — a normal, non-error path.
+func (noRecipientRouter) Route(_ natsutil.EventEnvelope) (events.RoutedRecipient, bool) {
+	return events.RoutedRecipient{}, false
+}
+
+var _ events.RecipientRouting = noRecipientRouter{}
+
+// inertExecutor is the placeholder events.DecisionExecutor until the real one (inbox
+// upsert + Notifier dispatch + suppressed-log) is written. It is UNREACHABLE today:
+// the reactor only calls Execute AFTER a recipient is resolved, and noRecipientRouter
+// never resolves one — so handle() returns before reaching Execute. It exists so the
+// reactor type-checks and so swapping in the real executor is a one-line change. If
+// it WERE reached, it performs no side effect and reports no deliveries (fail-closed:
+// it never claims a delivery that did not happen).
+type inertExecutor struct{}
+
+// Execute performs no side effect and reports an empty result.
+func (inertExecutor) Execute(_ context.Context, _ domain.RoutingDecision, _ domain.InboundEvent) (events.ExecutionResult, error) {
+	return events.ExecutionResult{}, nil
+}
+
+var _ events.DecisionExecutor = inertExecutor{}
+
+// ============================================================================
+// redisProcessedStore — a shared, durable natsutil.ProcessedStore over Redis.
+// ============================================================================
+//
+// WHY here and not natsutil: natsutil ships only MemoryProcessedStore (tests/dev; it
+// panics under FP_ENV=production because it is per-replica, unbounded, and lost on
+// restart). The reactor runs in a consumer group across replicas, so a redelivery can
+// land on a DIFFERENT replica than first processed it — only a SHARED store dedupes
+// that. A Redis key with TTL is the canonical short-window dedup: "have I seen this
+// key?" with self-eviction so the keyspace stays bounded. This backs BOTH the
+// transport-layer dedup (natsutil keys it on EventEnvelope.id) and the reactor's
+// domain-layer per-(event,recipient) dedup (it keys it on domain.EventDedupKey).
+//
+// The 24h TTL bounds memory while comfortably outlasting JetStream's redelivery
+// window (a duplicate arrives within seconds-to-minutes of the original). Mirrors the
+// inference-gateway's identical edge adapter.
+type redisProcessedStore struct {
+	rdb    *goredis.Client
+	prefix string
+	ttl    time.Duration
+}
+
+var _ natsutil.ProcessedStore = (*redisProcessedStore)(nil)
+
+func newRedisProcessedStore(rdb *goredis.Client) *redisProcessedStore {
+	return &redisProcessedStore{
+		rdb:    rdb,
+		prefix: "fp:notif:processed:",
+		ttl:    24 * time.Hour,
+	}
+}
+
+// IsProcessed reports whether the key is already recorded. A Redis error is surfaced
+// (not swallowed): the reactor NAKs on an idempotency-check error so we retry rather
+// than risk double-processing a side-effecting event — at-least-once is the safe
+// failure mode for a dedup check.
+func (s *redisProcessedStore) IsProcessed(ctx context.Context, eventID string) (bool, error) {
+	n, err := s.rdb.Exists(ctx, s.prefix+eventID).Result()
+	if err != nil {
+		return false, fmt.Errorf("redisProcessedStore: exists %s: %w", eventID, err)
+	}
+	return n > 0, nil
+}
+
+// MarkProcessed records the key with a TTL. Called AFTER a successful handle and
+// BEFORE the ACK, so a redelivery is recognized. For TRUE exactly-once the mark must
+// be in the same transaction as the side effect (see natsutil/idempotency.go); the
+// durable inbox upsert on (event_id, recipient) is that transactional backstop, so
+// this shared store is the fast cross-replica dedup layer on top of it.
+func (s *redisProcessedStore) MarkProcessed(ctx context.Context, eventID string) error {
+	if err := s.rdb.Set(ctx, s.prefix+eventID, "1", s.ttl).Err(); err != nil {
+		return fmt.Errorf("redisProcessedStore: set %s: %w", eventID, err)
+	}
+	return nil
 }

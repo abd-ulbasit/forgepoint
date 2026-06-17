@@ -147,6 +147,8 @@
 //   │ fp.experiments.run.finished      │ RunFinished               │ experiment-tracker   │ notification, experiment-tracker (leaderboard)  │
 //   │ fp.notifications.delivered       │ NotificationDelivered     │ notification         │ experiment-tracker (delivery health)            │
 //   │ fp.notifications.failed          │ NotificationFailed        │ notification         │ experiment-tracker, on-call escalation          │
+//   │ fp.auth.user.created             │ UserCreated               │ auth                 │ notification, billing, experiment-tracker/audit │
+//   │ fp.auth.apikey.rotated           │ ApiKeyRotated             │ auth                 │ notification, inference-gateway (cache evict)    │
 //   └──────────────────────────────────┴───────────────────────────┴──────────────────────┴───────────────────────────────────────────────┘
 //
 //   (The full prose catalog with field-level rationale is docs/design/event-contract.md.)
@@ -1194,4 +1196,103 @@ message NotificationFailed {
 
   // When we gave up (producer clock).
   google.protobuf.Timestamp failed_at = 7;
+}
+
+// ============================================================================
+// AUTH / IAM EVENTS  (domain: fp.auth.*  · producer: auth)
+// ============================================================================
+//
+// The Auth service is the platform's identity authority. It PRODUCES two
+// lifecycle facts other services react to; it CONSUMES nothing (identity is the
+// root of the trust graph, not a downstream of it). Like every other event here
+// these payloads are FLAT and carry NO secret material — never a password hash,
+// never a raw API key. They carry IDs + non-sensitive attributes so a consumer
+// acts without a callback into Auth (and without ever touching a credential).
+//
+// WHY these live under fp.auth.* (not, say, fp.users.*): the RESOURCE these
+// facts are about is the IAM subsystem's own objects (a user account, an API
+// credential). Both are owned and produced by the auth service, and the subject
+// domain matches the producer here (unlike drift, which is about a model but
+// produced by the monitor). EventEnvelope.source = "auth" records the producer.
+
+// UserCreated → fp.auth.user.created
+//   PRODUCER:  auth (after CreateUser commits the new account to Postgres).
+//   CONSUMERS: notification (send a welcome / provisioning message), billing
+//              (open a usage account for the user's team), experiment-tracker /
+//              audit (record that an identity was provisioned). Consumers key off
+//              user_id (stable handle) and team (multi-tenancy scoping).
+//   SECURITY/PII: identity ATTRIBUTES only (id, email, name, team, role) — never
+//   the password hash or any credential. email is carried because notification
+//   needs an address to reach; it is not a secret. SERVER-authoritative: every
+//   field is producer-derived from the committed row, never a client assertion.
+message UserCreated {
+  // Auth user UUID — the stable handle every other service keys off.
+  string user_id = 1;
+
+  // Login email (the addressable identity). Carried so Notification can reach the
+  // user without a callback. NOT a secret; never the password hash.
+  string email = 2;
+
+  // Display name (non-unique, human-friendly).
+  string name = 3;
+
+  // Owning team — the multi-tenancy scope. Billing opens the account against it;
+  // team-scoped consumers filter on it. Producer-assigned, never client-supplied.
+  string team = 4;
+
+  // The role granted at creation (role NAME, e.g. "viewer"). Flat RBAC: a user
+  // has exactly one role. Carried so an audit/consumer sees the initial grant
+  // without a CheckPermission round-trip.
+  string role = 5;
+
+  // When the account was created (producer clock).
+  google.protobuf.Timestamp created_at = 6;
+}
+
+// ApiKeyRotated → fp.auth.apikey.rotated
+//   PRODUCER:  auth (after an API key is minted — and, on a rotation, the prior
+//              key is revoked in the same logical operation; see the blue/green
+//              rotation note in the auth domain's APIKey model).
+//   CONSUMERS: notification (tell the owner a new key was issued — a security-
+//              relevant event a human should see), audit/security log (record the
+//              credential lifecycle), inference-gateway / caches (proactively
+//              invalidate any cached validation for the REPLACED key so the
+//              revoked key stops working before its 30s validation-cache TTL
+//              would naturally expire).
+//   SECURITY/PII (this is the whole point): we publish ONLY the key id + the
+//   8-char display prefix (e.g. "fp_a1b2") and the owner/scopes — NEVER the raw
+//   key. The raw key exists for exactly one moment in CreateAPIKey's return value
+//   and is shown to the caller once (Stripe/GitHub-PAT model); it must never
+//   touch the bus, a log, or the DB. A consumer that needs to know "which key"
+//   uses key_id; a human-facing surface shows key_prefix.
+//   WHY "rotated" (not "created"): the canonical event-contract names this
+//   fp.auth.apikey.rotated. A plain create and a rotation (create-new +
+//   revoke-old) are the same observable fact to consumers — "the set of valid
+//   keys for this user changed". replaced_key_id distinguishes the two: empty on
+//   a first/independent create, set to the revoked key's id on a true rotation,
+//   so a cache-invalidating consumer knows exactly which key to evict.
+message ApiKeyRotated {
+  // The NEW API key's id (UUID) — the stable handle, NOT the secret.
+  string key_id = 1;
+
+  // The owning user (auth user id). Lets a consumer route the "new key issued"
+  // notice to the right human and scope audit entries.
+  string user_id = 2;
+
+  // The new key's 8-char display prefix (e.g. "fp_a1b2") — safe to show/log; it
+  // is NOT enough to authenticate. For human-facing surfaces only.
+  string key_prefix = 3;
+
+  // The new key's scopes ("resource:action" strings). Carried so a security/audit
+  // consumer can see the granted capability set without a callback. The effective
+  // grant is still role ∩ scope, enforced at validation time.
+  repeated string scopes = 4;
+
+  // The id of the key this one REPLACES (and that was revoked as part of the
+  // rotation). Empty on a first/independent create; set on a true rotation. A
+  // cache-invalidating consumer evicts exactly this key id.
+  string replaced_key_id = 5;
+
+  // When the new key was issued / the rotation committed (producer clock).
+  google.protobuf.Timestamp rotated_at = 6;
 }

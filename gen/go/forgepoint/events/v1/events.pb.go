@@ -147,6 +147,8 @@
 //   │ fp.experiments.run.finished      │ RunFinished               │ experiment-tracker   │ notification, experiment-tracker (leaderboard)  │
 //   │ fp.notifications.delivered       │ NotificationDelivered     │ notification         │ experiment-tracker (delivery health)            │
 //   │ fp.notifications.failed          │ NotificationFailed        │ notification         │ experiment-tracker, on-call escalation          │
+//   │ fp.auth.user.created             │ UserCreated               │ auth                 │ notification, billing, experiment-tracker/audit │
+//   │ fp.auth.apikey.rotated           │ ApiKeyRotated             │ auth                 │ notification, inference-gateway (cache evict)    │
 //   └──────────────────────────────────┴───────────────────────────┴──────────────────────┴───────────────────────────────────────────────┘
 //
 //   (The full prose catalog with field-level rationale is docs/design/event-contract.md.)
@@ -3849,6 +3851,230 @@ func (x *NotificationFailed) GetFailedAt() *timestamppb.Timestamp {
 	return nil
 }
 
+// UserCreated → fp.auth.user.created
+//
+//	PRODUCER:  auth (after CreateUser commits the new account to Postgres).
+//	CONSUMERS: notification (send a welcome / provisioning message), billing
+//	           (open a usage account for the user's team), experiment-tracker /
+//	           audit (record that an identity was provisioned). Consumers key off
+//	           user_id (stable handle) and team (multi-tenancy scoping).
+//	SECURITY/PII: identity ATTRIBUTES only (id, email, name, team, role) — never
+//	the password hash or any credential. email is carried because notification
+//	needs an address to reach; it is not a secret. SERVER-authoritative: every
+//	field is producer-derived from the committed row, never a client assertion.
+type UserCreated struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Auth user UUID — the stable handle every other service keys off.
+	UserId string `protobuf:"bytes,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
+	// Login email (the addressable identity). Carried so Notification can reach the
+	// user without a callback. NOT a secret; never the password hash.
+	Email string `protobuf:"bytes,2,opt,name=email,proto3" json:"email,omitempty"`
+	// Display name (non-unique, human-friendly).
+	Name string `protobuf:"bytes,3,opt,name=name,proto3" json:"name,omitempty"`
+	// Owning team — the multi-tenancy scope. Billing opens the account against it;
+	// team-scoped consumers filter on it. Producer-assigned, never client-supplied.
+	Team string `protobuf:"bytes,4,opt,name=team,proto3" json:"team,omitempty"`
+	// The role granted at creation (role NAME, e.g. "viewer"). Flat RBAC: a user
+	// has exactly one role. Carried so an audit/consumer sees the initial grant
+	// without a CheckPermission round-trip.
+	Role string `protobuf:"bytes,5,opt,name=role,proto3" json:"role,omitempty"`
+	// When the account was created (producer clock).
+	CreatedAt     *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UserCreated) Reset() {
+	*x = UserCreated{}
+	mi := &file_forgepoint_events_v1_events_proto_msgTypes[29]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UserCreated) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UserCreated) ProtoMessage() {}
+
+func (x *UserCreated) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_events_v1_events_proto_msgTypes[29]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UserCreated.ProtoReflect.Descriptor instead.
+func (*UserCreated) Descriptor() ([]byte, []int) {
+	return file_forgepoint_events_v1_events_proto_rawDescGZIP(), []int{29}
+}
+
+func (x *UserCreated) GetUserId() string {
+	if x != nil {
+		return x.UserId
+	}
+	return ""
+}
+
+func (x *UserCreated) GetEmail() string {
+	if x != nil {
+		return x.Email
+	}
+	return ""
+}
+
+func (x *UserCreated) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *UserCreated) GetTeam() string {
+	if x != nil {
+		return x.Team
+	}
+	return ""
+}
+
+func (x *UserCreated) GetRole() string {
+	if x != nil {
+		return x.Role
+	}
+	return ""
+}
+
+func (x *UserCreated) GetCreatedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.CreatedAt
+	}
+	return nil
+}
+
+// ApiKeyRotated → fp.auth.apikey.rotated
+//
+//	PRODUCER:  auth (after an API key is minted — and, on a rotation, the prior
+//	           key is revoked in the same logical operation; see the blue/green
+//	           rotation note in the auth domain's APIKey model).
+//	CONSUMERS: notification (tell the owner a new key was issued — a security-
+//	           relevant event a human should see), audit/security log (record the
+//	           credential lifecycle), inference-gateway / caches (proactively
+//	           invalidate any cached validation for the REPLACED key so the
+//	           revoked key stops working before its 30s validation-cache TTL
+//	           would naturally expire).
+//	SECURITY/PII (this is the whole point): we publish ONLY the key id + the
+//	8-char display prefix (e.g. "fp_a1b2") and the owner/scopes — NEVER the raw
+//	key. The raw key exists for exactly one moment in CreateAPIKey's return value
+//	and is shown to the caller once (Stripe/GitHub-PAT model); it must never
+//	touch the bus, a log, or the DB. A consumer that needs to know "which key"
+//	uses key_id; a human-facing surface shows key_prefix.
+//	WHY "rotated" (not "created"): the canonical event-contract names this
+//	fp.auth.apikey.rotated. A plain create and a rotation (create-new +
+//	revoke-old) are the same observable fact to consumers — "the set of valid
+//	keys for this user changed". replaced_key_id distinguishes the two: empty on
+//	a first/independent create, set to the revoked key's id on a true rotation,
+//	so a cache-invalidating consumer knows exactly which key to evict.
+type ApiKeyRotated struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The NEW API key's id (UUID) — the stable handle, NOT the secret.
+	KeyId string `protobuf:"bytes,1,opt,name=key_id,json=keyId,proto3" json:"key_id,omitempty"`
+	// The owning user (auth user id). Lets a consumer route the "new key issued"
+	// notice to the right human and scope audit entries.
+	UserId string `protobuf:"bytes,2,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
+	// The new key's 8-char display prefix (e.g. "fp_a1b2") — safe to show/log; it
+	// is NOT enough to authenticate. For human-facing surfaces only.
+	KeyPrefix string `protobuf:"bytes,3,opt,name=key_prefix,json=keyPrefix,proto3" json:"key_prefix,omitempty"`
+	// The new key's scopes ("resource:action" strings). Carried so a security/audit
+	// consumer can see the granted capability set without a callback. The effective
+	// grant is still role ∩ scope, enforced at validation time.
+	Scopes []string `protobuf:"bytes,4,rep,name=scopes,proto3" json:"scopes,omitempty"`
+	// The id of the key this one REPLACES (and that was revoked as part of the
+	// rotation). Empty on a first/independent create; set on a true rotation. A
+	// cache-invalidating consumer evicts exactly this key id.
+	ReplacedKeyId string `protobuf:"bytes,5,opt,name=replaced_key_id,json=replacedKeyId,proto3" json:"replaced_key_id,omitempty"`
+	// When the new key was issued / the rotation committed (producer clock).
+	RotatedAt     *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=rotated_at,json=rotatedAt,proto3" json:"rotated_at,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ApiKeyRotated) Reset() {
+	*x = ApiKeyRotated{}
+	mi := &file_forgepoint_events_v1_events_proto_msgTypes[30]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ApiKeyRotated) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ApiKeyRotated) ProtoMessage() {}
+
+func (x *ApiKeyRotated) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_events_v1_events_proto_msgTypes[30]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ApiKeyRotated.ProtoReflect.Descriptor instead.
+func (*ApiKeyRotated) Descriptor() ([]byte, []int) {
+	return file_forgepoint_events_v1_events_proto_rawDescGZIP(), []int{30}
+}
+
+func (x *ApiKeyRotated) GetKeyId() string {
+	if x != nil {
+		return x.KeyId
+	}
+	return ""
+}
+
+func (x *ApiKeyRotated) GetUserId() string {
+	if x != nil {
+		return x.UserId
+	}
+	return ""
+}
+
+func (x *ApiKeyRotated) GetKeyPrefix() string {
+	if x != nil {
+		return x.KeyPrefix
+	}
+	return ""
+}
+
+func (x *ApiKeyRotated) GetScopes() []string {
+	if x != nil {
+		return x.Scopes
+	}
+	return nil
+}
+
+func (x *ApiKeyRotated) GetReplacedKeyId() string {
+	if x != nil {
+		return x.ReplacedKeyId
+	}
+	return ""
+}
+
+func (x *ApiKeyRotated) GetRotatedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.RotatedAt
+	}
+	return nil
+}
+
 var File_forgepoint_events_v1_events_proto protoreflect.FileDescriptor
 
 const file_forgepoint_events_v1_events_proto_rawDesc = "" +
@@ -4147,7 +4373,24 @@ const file_forgepoint_events_v1_events_proto_rawDesc = "" +
 	"event_type\x18\x04 \x01(\tR\teventType\x12\x1a\n" +
 	"\battempts\x18\x05 \x01(\x05R\battempts\x12#\n" +
 	"\rerror_message\x18\x06 \x01(\tR\ferrorMessage\x127\n" +
-	"\tfailed_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\bfailedAt*\x8d\x01\n" +
+	"\tfailed_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\bfailedAt\"\xb3\x01\n" +
+	"\vUserCreated\x12\x17\n" +
+	"\auser_id\x18\x01 \x01(\tR\x06userId\x12\x14\n" +
+	"\x05email\x18\x02 \x01(\tR\x05email\x12\x12\n" +
+	"\x04name\x18\x03 \x01(\tR\x04name\x12\x12\n" +
+	"\x04team\x18\x04 \x01(\tR\x04team\x12\x12\n" +
+	"\x04role\x18\x05 \x01(\tR\x04role\x129\n" +
+	"\n" +
+	"created_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\"\xd9\x01\n" +
+	"\rApiKeyRotated\x12\x15\n" +
+	"\x06key_id\x18\x01 \x01(\tR\x05keyId\x12\x17\n" +
+	"\auser_id\x18\x02 \x01(\tR\x06userId\x12\x1d\n" +
+	"\n" +
+	"key_prefix\x18\x03 \x01(\tR\tkeyPrefix\x12\x16\n" +
+	"\x06scopes\x18\x04 \x03(\tR\x06scopes\x12&\n" +
+	"\x0freplaced_key_id\x18\x05 \x01(\tR\rreplacedKeyId\x129\n" +
+	"\n" +
+	"rotated_at\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\trotatedAt*\x8d\x01\n" +
 	"\n" +
 	"ModelStage\x12\x1b\n" +
 	"\x17MODEL_STAGE_UNSPECIFIED\x10\x00\x12\x13\n" +
@@ -4228,7 +4471,7 @@ func file_forgepoint_events_v1_events_proto_rawDescGZIP() []byte {
 }
 
 var file_forgepoint_events_v1_events_proto_enumTypes = make([]protoimpl.EnumInfo, 10)
-var file_forgepoint_events_v1_events_proto_msgTypes = make([]protoimpl.MessageInfo, 31)
+var file_forgepoint_events_v1_events_proto_msgTypes = make([]protoimpl.MessageInfo, 33)
 var file_forgepoint_events_v1_events_proto_goTypes = []any{
 	(ModelStage)(0),               // 0: forgepoint.events.v1.ModelStage
 	(PipelineType)(0),             // 1: forgepoint.events.v1.PipelineType
@@ -4269,77 +4512,81 @@ var file_forgepoint_events_v1_events_proto_goTypes = []any{
 	(*RunFinished)(nil),           // 36: forgepoint.events.v1.RunFinished
 	(*NotificationDelivered)(nil), // 37: forgepoint.events.v1.NotificationDelivered
 	(*NotificationFailed)(nil),    // 38: forgepoint.events.v1.NotificationFailed
-	nil,                           // 39: forgepoint.events.v1.PredictionSummary.OutputStatsEntry
-	nil,                           // 40: forgepoint.events.v1.FeatureSummary.FeatureValuesEntry
-	(*timestamppb.Timestamp)(nil), // 41: google.protobuf.Timestamp
-	(*structpb.Struct)(nil),       // 42: google.protobuf.Struct
-	(*durationpb.Duration)(nil),   // 43: google.protobuf.Duration
-	(*v1.ErrorDetail)(nil),        // 44: forgepoint.common.v1.ErrorDetail
+	(*UserCreated)(nil),           // 39: forgepoint.events.v1.UserCreated
+	(*ApiKeyRotated)(nil),         // 40: forgepoint.events.v1.ApiKeyRotated
+	nil,                           // 41: forgepoint.events.v1.PredictionSummary.OutputStatsEntry
+	nil,                           // 42: forgepoint.events.v1.FeatureSummary.FeatureValuesEntry
+	(*timestamppb.Timestamp)(nil), // 43: google.protobuf.Timestamp
+	(*structpb.Struct)(nil),       // 44: google.protobuf.Struct
+	(*durationpb.Duration)(nil),   // 45: google.protobuf.Duration
+	(*v1.ErrorDetail)(nil),        // 46: forgepoint.common.v1.ErrorDetail
 }
 var file_forgepoint_events_v1_events_proto_depIdxs = []int32{
-	39, // 0: forgepoint.events.v1.PredictionSummary.output_stats:type_name -> forgepoint.events.v1.PredictionSummary.OutputStatsEntry
-	40, // 1: forgepoint.events.v1.FeatureSummary.feature_values:type_name -> forgepoint.events.v1.FeatureSummary.FeatureValuesEntry
+	41, // 0: forgepoint.events.v1.PredictionSummary.output_stats:type_name -> forgepoint.events.v1.PredictionSummary.OutputStatsEntry
+	42, // 1: forgepoint.events.v1.FeatureSummary.feature_values:type_name -> forgepoint.events.v1.FeatureSummary.FeatureValuesEntry
 	7,  // 2: forgepoint.events.v1.DriftMetric.method:type_name -> forgepoint.events.v1.DriftMethod
 	8,  // 3: forgepoint.events.v1.DriftMetric.severity:type_name -> forgepoint.events.v1.DriftSeverity
-	41, // 4: forgepoint.events.v1.MetricPoint.timestamp:type_name -> google.protobuf.Timestamp
-	41, // 5: forgepoint.events.v1.ModelRegistered.registered_at:type_name -> google.protobuf.Timestamp
-	41, // 6: forgepoint.events.v1.ModelVersionCreated.created_at:type_name -> google.protobuf.Timestamp
-	41, // 7: forgepoint.events.v1.ModelVersionReady.ready_at:type_name -> google.protobuf.Timestamp
+	43, // 4: forgepoint.events.v1.MetricPoint.timestamp:type_name -> google.protobuf.Timestamp
+	43, // 5: forgepoint.events.v1.ModelRegistered.registered_at:type_name -> google.protobuf.Timestamp
+	43, // 6: forgepoint.events.v1.ModelVersionCreated.created_at:type_name -> google.protobuf.Timestamp
+	43, // 7: forgepoint.events.v1.ModelVersionReady.ready_at:type_name -> google.protobuf.Timestamp
 	0,  // 8: forgepoint.events.v1.ModelPromoted.from_stage:type_name -> forgepoint.events.v1.ModelStage
 	0,  // 9: forgepoint.events.v1.ModelPromoted.to_stage:type_name -> forgepoint.events.v1.ModelStage
-	41, // 10: forgepoint.events.v1.ModelPromoted.promoted_at:type_name -> google.protobuf.Timestamp
-	41, // 11: forgepoint.events.v1.ModelArchived.archived_at:type_name -> google.protobuf.Timestamp
+	43, // 10: forgepoint.events.v1.ModelPromoted.promoted_at:type_name -> google.protobuf.Timestamp
+	43, // 11: forgepoint.events.v1.ModelArchived.archived_at:type_name -> google.protobuf.Timestamp
 	6,  // 12: forgepoint.events.v1.ModelDriftDetected.drift_type:type_name -> forgepoint.events.v1.DriftType
 	8,  // 13: forgepoint.events.v1.ModelDriftDetected.severity:type_name -> forgepoint.events.v1.DriftSeverity
 	12, // 14: forgepoint.events.v1.ModelDriftDetected.metrics:type_name -> forgepoint.events.v1.DriftMetric
-	41, // 15: forgepoint.events.v1.ModelDriftDetected.window_start:type_name -> google.protobuf.Timestamp
-	41, // 16: forgepoint.events.v1.ModelDriftDetected.window_end:type_name -> google.protobuf.Timestamp
-	42, // 17: forgepoint.events.v1.ModelDriftDetected.retrain_context:type_name -> google.protobuf.Struct
-	41, // 18: forgepoint.events.v1.ModelDriftDetected.detected_at:type_name -> google.protobuf.Timestamp
+	43, // 15: forgepoint.events.v1.ModelDriftDetected.window_start:type_name -> google.protobuf.Timestamp
+	43, // 16: forgepoint.events.v1.ModelDriftDetected.window_end:type_name -> google.protobuf.Timestamp
+	44, // 17: forgepoint.events.v1.ModelDriftDetected.retrain_context:type_name -> google.protobuf.Struct
+	43, // 18: forgepoint.events.v1.ModelDriftDetected.detected_at:type_name -> google.protobuf.Timestamp
 	1,  // 19: forgepoint.events.v1.PipelineStarted.pipeline_type:type_name -> forgepoint.events.v1.PipelineType
-	41, // 20: forgepoint.events.v1.PipelineStarted.started_at:type_name -> google.protobuf.Timestamp
+	43, // 20: forgepoint.events.v1.PipelineStarted.started_at:type_name -> google.protobuf.Timestamp
 	2,  // 21: forgepoint.events.v1.StepCompleted.step_type:type_name -> forgepoint.events.v1.StepType
-	42, // 22: forgepoint.events.v1.StepCompleted.output:type_name -> google.protobuf.Struct
-	41, // 23: forgepoint.events.v1.StepCompleted.completed_at:type_name -> google.protobuf.Timestamp
+	44, // 22: forgepoint.events.v1.StepCompleted.output:type_name -> google.protobuf.Struct
+	43, // 23: forgepoint.events.v1.StepCompleted.completed_at:type_name -> google.protobuf.Timestamp
 	2,  // 24: forgepoint.events.v1.StepFailed.step_type:type_name -> forgepoint.events.v1.StepType
-	41, // 25: forgepoint.events.v1.StepFailed.failed_at:type_name -> google.protobuf.Timestamp
-	41, // 26: forgepoint.events.v1.CompensationTriggered.triggered_at:type_name -> google.protobuf.Timestamp
+	43, // 25: forgepoint.events.v1.StepFailed.failed_at:type_name -> google.protobuf.Timestamp
+	43, // 26: forgepoint.events.v1.CompensationTriggered.triggered_at:type_name -> google.protobuf.Timestamp
 	1,  // 27: forgepoint.events.v1.PipelineCompleted.pipeline_type:type_name -> forgepoint.events.v1.PipelineType
-	43, // 28: forgepoint.events.v1.PipelineCompleted.duration:type_name -> google.protobuf.Duration
-	41, // 29: forgepoint.events.v1.PipelineCompleted.completed_at:type_name -> google.protobuf.Timestamp
+	45, // 28: forgepoint.events.v1.PipelineCompleted.duration:type_name -> google.protobuf.Duration
+	43, // 29: forgepoint.events.v1.PipelineCompleted.completed_at:type_name -> google.protobuf.Timestamp
 	1,  // 30: forgepoint.events.v1.PipelineFailed.pipeline_type:type_name -> forgepoint.events.v1.PipelineType
-	41, // 31: forgepoint.events.v1.PipelineFailed.failed_at:type_name -> google.protobuf.Timestamp
-	41, // 32: forgepoint.events.v1.ModelDeployed.deployed_at:type_name -> google.protobuf.Timestamp
-	41, // 33: forgepoint.events.v1.ModelUndeployed.undeployed_at:type_name -> google.protobuf.Timestamp
-	43, // 34: forgepoint.events.v1.InferenceCompleted.latency:type_name -> google.protobuf.Duration
+	43, // 31: forgepoint.events.v1.PipelineFailed.failed_at:type_name -> google.protobuf.Timestamp
+	43, // 32: forgepoint.events.v1.ModelDeployed.deployed_at:type_name -> google.protobuf.Timestamp
+	43, // 33: forgepoint.events.v1.ModelUndeployed.undeployed_at:type_name -> google.protobuf.Timestamp
+	45, // 34: forgepoint.events.v1.InferenceCompleted.latency:type_name -> google.protobuf.Duration
 	10, // 35: forgepoint.events.v1.InferenceCompleted.prediction_summary:type_name -> forgepoint.events.v1.PredictionSummary
 	11, // 36: forgepoint.events.v1.InferenceCompleted.feature_summary:type_name -> forgepoint.events.v1.FeatureSummary
-	41, // 37: forgepoint.events.v1.InferenceCompleted.completed_at:type_name -> google.protobuf.Timestamp
+	43, // 37: forgepoint.events.v1.InferenceCompleted.completed_at:type_name -> google.protobuf.Timestamp
 	3,  // 38: forgepoint.events.v1.InferenceFailed.reason:type_name -> forgepoint.events.v1.InferenceFailureReason
-	44, // 39: forgepoint.events.v1.InferenceFailed.error:type_name -> forgepoint.common.v1.ErrorDetail
-	41, // 40: forgepoint.events.v1.InferenceFailed.failed_at:type_name -> google.protobuf.Timestamp
-	41, // 41: forgepoint.events.v1.FeatureViewDefined.defined_at:type_name -> google.protobuf.Timestamp
-	41, // 42: forgepoint.events.v1.FeaturesWritten.written_at:type_name -> google.protobuf.Timestamp
+	46, // 39: forgepoint.events.v1.InferenceFailed.error:type_name -> forgepoint.common.v1.ErrorDetail
+	43, // 40: forgepoint.events.v1.InferenceFailed.failed_at:type_name -> google.protobuf.Timestamp
+	43, // 41: forgepoint.events.v1.FeatureViewDefined.defined_at:type_name -> google.protobuf.Timestamp
+	43, // 42: forgepoint.events.v1.FeaturesWritten.written_at:type_name -> google.protobuf.Timestamp
 	4,  // 43: forgepoint.events.v1.UsageRecorded.meter_type:type_name -> forgepoint.events.v1.MeterType
-	41, // 44: forgepoint.events.v1.UsageRecorded.occurred_at:type_name -> google.protobuf.Timestamp
+	43, // 44: forgepoint.events.v1.UsageRecorded.occurred_at:type_name -> google.protobuf.Timestamp
 	4,  // 45: forgepoint.events.v1.QuotaExceeded.meter_type:type_name -> forgepoint.events.v1.MeterType
-	41, // 46: forgepoint.events.v1.QuotaExceeded.occurred_at:type_name -> google.protobuf.Timestamp
-	41, // 47: forgepoint.events.v1.InvoiceGenerated.period_start:type_name -> google.protobuf.Timestamp
-	41, // 48: forgepoint.events.v1.InvoiceGenerated.period_end:type_name -> google.protobuf.Timestamp
-	41, // 49: forgepoint.events.v1.InvoiceGenerated.finalized_at:type_name -> google.protobuf.Timestamp
-	41, // 50: forgepoint.events.v1.RunCreated.started_at:type_name -> google.protobuf.Timestamp
+	43, // 46: forgepoint.events.v1.QuotaExceeded.occurred_at:type_name -> google.protobuf.Timestamp
+	43, // 47: forgepoint.events.v1.InvoiceGenerated.period_start:type_name -> google.protobuf.Timestamp
+	43, // 48: forgepoint.events.v1.InvoiceGenerated.period_end:type_name -> google.protobuf.Timestamp
+	43, // 49: forgepoint.events.v1.InvoiceGenerated.finalized_at:type_name -> google.protobuf.Timestamp
+	43, // 50: forgepoint.events.v1.RunCreated.started_at:type_name -> google.protobuf.Timestamp
 	5,  // 51: forgepoint.events.v1.RunFinished.status:type_name -> forgepoint.events.v1.RunStatus
 	13, // 52: forgepoint.events.v1.RunFinished.final_metrics:type_name -> forgepoint.events.v1.MetricPoint
-	41, // 53: forgepoint.events.v1.RunFinished.ended_at:type_name -> google.protobuf.Timestamp
+	43, // 53: forgepoint.events.v1.RunFinished.ended_at:type_name -> google.protobuf.Timestamp
 	9,  // 54: forgepoint.events.v1.NotificationDelivered.channel:type_name -> forgepoint.events.v1.NotificationChannel
-	41, // 55: forgepoint.events.v1.NotificationDelivered.delivered_at:type_name -> google.protobuf.Timestamp
+	43, // 55: forgepoint.events.v1.NotificationDelivered.delivered_at:type_name -> google.protobuf.Timestamp
 	9,  // 56: forgepoint.events.v1.NotificationFailed.channel:type_name -> forgepoint.events.v1.NotificationChannel
-	41, // 57: forgepoint.events.v1.NotificationFailed.failed_at:type_name -> google.protobuf.Timestamp
-	58, // [58:58] is the sub-list for method output_type
-	58, // [58:58] is the sub-list for method input_type
-	58, // [58:58] is the sub-list for extension type_name
-	58, // [58:58] is the sub-list for extension extendee
-	0,  // [0:58] is the sub-list for field type_name
+	43, // 57: forgepoint.events.v1.NotificationFailed.failed_at:type_name -> google.protobuf.Timestamp
+	43, // 58: forgepoint.events.v1.UserCreated.created_at:type_name -> google.protobuf.Timestamp
+	43, // 59: forgepoint.events.v1.ApiKeyRotated.rotated_at:type_name -> google.protobuf.Timestamp
+	60, // [60:60] is the sub-list for method output_type
+	60, // [60:60] is the sub-list for method input_type
+	60, // [60:60] is the sub-list for extension type_name
+	60, // [60:60] is the sub-list for extension extendee
+	0,  // [0:60] is the sub-list for field type_name
 }
 
 func init() { file_forgepoint_events_v1_events_proto_init() }
@@ -4353,7 +4600,7 @@ func file_forgepoint_events_v1_events_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_forgepoint_events_v1_events_proto_rawDesc), len(file_forgepoint_events_v1_events_proto_rawDesc)),
 			NumEnums:      10,
-			NumMessages:   31,
+			NumMessages:   33,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

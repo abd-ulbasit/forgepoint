@@ -6,39 +6,68 @@
 //
 // In Clean Architecture, main.go is the "composition root" — the only place
 // where all layers are imported together and wired into a running program.
-// It knows about every layer (config, observability, domain, repository,
-// handler) but none of those layers know about each other except through the
-// interfaces they define.
+// It knows about every layer (config, observability, repository adapters, the
+// domain service, the gRPC handler, the event adapter) but none of those layers
+// know about each other except through the interfaces they define. Dependencies
+// are constructed OUTSIDE-IN here and injected INWARD: infrastructure (pools,
+// NATS) → adapters (repos, publisher) → domain service → handler.
 //
-// STARTUP SEQUENCE:
+// STARTUP SEQUENCE (and the strict ORDER, which is the load-bearing part):
 //
-//   ┌──────────────────────────────────────────────────────────────────┐
-//   │  1. Load config (env vars → AuthConfig struct)                  │
-//   │  2. Setup OpenTelemetry (traces + metrics)                      │
-//   │  3. Build gRPC server via grpcutil.NewServer (interceptor chain)│
-//   │  4. Register AuthHandler on the gRPC server                     │
-//   │  5. Mark server SERVING (health probe goes green)               │
-//   │  6. Start HTTP health server (liveness + readiness probes)      │
-//   │  7. Start gRPC server (blocks until SIGTERM/SIGINT)             │
-//   │  8. Graceful shutdown (OTel flush → gRPC drain)                 │
-//   └──────────────────────────────────────────────────────────────────┘
+//	┌──────────────────────────────────────────────────────────────────────┐
+//	│  1. Structured logger (slog JSON → stdout → Loki)                     │
+//	│  2. Load config (FP_* env vars → AuthConfig)                          │
+//	│  3. Setup OpenTelemetry (traces → Tempo, metrics → Prom)             │
+//	│  4. Connect datastores:                                               │
+//	│       a. Postgres pool (pgxpool) — Ping at construct = fail-fast      │
+//	│       b. NATS JetStream — connect + EnsureStream(AUTH)               │
+//	│  5. Construct ADAPTERS: repos (user/apikey/role), event Publisher    │
+//	│  6. Construct DOMAIN service: NewAuthService(repos…, secret, ttl)     │
+//	│  7. Construct HANDLER with the REAL service (no longer nil)           │
+//	│  8. Build gRPC server, register handler                              │
+//	│  9. (Subscribers) auth consumes NOTHING — see note in step 9         │
+//	│ 10. Health server: readiness checks the REAL deps (Postgres, NATS)   │
+//	│ 11. SetServing(true) → Serve (blocks until SIGTERM/SIGINT)           │
+//	│ 12. Graceful shutdown in REVERSE dependency order (see defers)        │
+//	└──────────────────────────────────────────────────────────────────────┘
 //
-// WHAT'S WIRED NOW (scaffold phase, Tasks 1.2–1.4):
-//   - AuthHandler with nil domain service (embedded UnimplementedAuthServiceServer
-//     handles all RPCs, returning codes.Unimplemented — correct behavior).
-//   - No Postgres pool, no NATS connection (those arrive in Tasks 1.3/1.4).
+// SHUTDOWN ORDER (why reverse): things that USE a resource must stop before the
+// resource they use is closed. Go runs deferred funcs LIFO, so registering them
+// in construction order yields the correct teardown order automatically:
 //
-// WHAT ARRIVES LATER:
-//   Task 1.3 (domain impl): NewAuthService(userRepo, apiKeyRepo, roleRepo, secret)
-//   Task 1.4 (repository impl): postgres.NewUserRepo(pool), etc.
-//   Task 1.5 (RPC impl): handler methods call svc.Login, svc.CreateUser, etc.
+//	gRPC drain (Serve returns) → health server stop → NATS drain → Postgres
+//	close → OTel flush.
 //
-// Once Tasks 1.3/1.4 land, the wiring in this file gains:
-//   pool := pgxpool.New(ctx, cfg.DatabaseURL)
-//   userRepo := postgres.NewUserRepo(pool)
-//   svc := authdomain.NewAuthService(userRepo, ...)
-//   h := handler.NewAuthHandler(svc)
-//   healthHandler.AddCheck("db", func(ctx) error { return pool.Ping(ctx) })
+// gRPC drains FIRST (Serve owns that on ctx-cancel) so no in-flight RPC touches
+// a closed pool. OTel flushes LAST so shutdown spans/metrics from every earlier
+// step are still recorded. (Deferred funcs are written in this file in the
+// order they must RUN, exploiting LIFO so the code reads top-to-bottom.)
+//
+// ----------------------------------------------------------------------------
+// STATE OF THE ASYNC EDGE (read this before an interview):
+//
+//   - PUBLISHER (Phase 1.6, DONE): we connect NATS, EnsureStream the AUTH stream,
+//     construct the events.Publisher adapter, and INJECT it into the request path
+//     via the EventingAuthService DECORATOR. Rather than add a publisher parameter
+//     to domain.NewAuthService (which would drag NATS/proto into the domain and
+//     break the dependency rule), the decorator wraps the domain.AuthService at the
+//     SAME interface seam the handler uses and publishes AFTER each mutating write
+//     commits (publish-after-commit). So auth genuinely emits on
+//     fp.auth.user.created (CreateUser) and fp.auth.apikey.rotated (CreateAPIKey).
+//     A publish failure is LOGGED, not surfaced as an RPC error — the write is
+//     already committed; the lost event is the documented at-most-once tradeoff
+//     (the transactional outbox, as in billing, is the upgrade path).
+//
+//   - SUBSCRIBERS: auth CONSUMES nothing by design — identity is the ROOT of the
+//     platform's trust graph, not a downstream of it (see events/events.go). So
+//     "start the subscribers" is intentionally a NO-OP for this service. Other
+//     services (gateway/serving/monitor/billing/notification) wire subscribers
+//     here; auth deliberately does not. This is contract-correct, not an omission.
+//
+//   - REDIS: the design doc lists Redis (validation cache) as a FUTURE optimization
+//     for ValidateToken. No auth code consumes Redis today, so wiring a go-redis
+//     client now would be dead infrastructure with a health check guarding nothing
+//     real. We deliberately do NOT connect Redis until the cache lands.
 //
 // ============================================================================
 package main
@@ -51,22 +80,29 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"syscall"
+	"time"
 
 	authv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/auth/v1"
 	"github.com/abd-ulbasit/forgepoint/pkg/config"
 	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/health"
+	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/observability"
+	authdomain "github.com/abd-ulbasit/forgepoint/services/auth/internal/domain"
+	authevents "github.com/abd-ulbasit/forgepoint/services/auth/internal/events"
 	"github.com/abd-ulbasit/forgepoint/services/auth/internal/handler"
+	"github.com/abd-ulbasit/forgepoint/services/auth/internal/repository/postgres"
 )
 
 // AuthConfig extends BaseConfig with auth-specific configuration.
 //
 // WHY embed BaseConfig:
-//   Every Forgepoint service needs Port, GRPCPort, LogLevel, OTelEndpoint,
-//   NATSUrl, DatabaseURL. Embedding them avoids repeating those field definitions
-//   in every service's config struct. config.Load[AuthConfig]("FP") reads
-//   FP_PORT, FP_GRPC_PORT, FP_JWT_SECRET, etc. via reflection (see pkg/config).
+//
+//	Every Forgepoint service needs Port, GRPCPort, LogLevel, OTelEndpoint,
+//	NATSUrl, DatabaseURL. Embedding them avoids repeating those field definitions
+//	in every service's config struct. config.Load[AuthConfig]("FP") reads
+//	FP_PORT, FP_GRPC_PORT, FP_JWT_SECRET, etc. via reflection (see pkg/config).
 //
 // SECURITY NOTE: JWTSecret is required (required:"true"). The service refuses to
 // start if it's unset — fail-fast is the correct behavior for security config.
@@ -75,24 +111,30 @@ type AuthConfig struct {
 	config.BaseConfig
 
 	// JWTSecret is the HMAC-SHA256 signing key for JWT tokens.
-	// Must be at least 32 bytes of high-entropy random data in production.
-	// K8s: mounted from a Secret (not a ConfigMap — secrets are base64-encoded
-	// and access-controlled, unlike ConfigMaps which are plaintext in etcd).
+	// Must be at least 32 bytes of high-entropy random data in production
+	// (the domain rejects shorter secrets with ErrWeakSecret — 256-bit floor,
+	// matching SHA-256's output width). K8s: mounted from a Secret (not a
+	// ConfigMap — secrets are access-controlled, unlike plaintext ConfigMaps).
 	JWTSecret string `env:"JWT_SECRET" required:"true"`
+
+	// JWTTTL is the lifetime of issued JWTs. Kept short by default (15m) per the
+	// stateless-JWT staleness tradeoff (design D2): a JWT embeds role/claims that
+	// can go stale (e.g. after AssignRole or suspension), and a JWT cannot be
+	// revoked without a blacklist, so a SHORT ttl bounds how long a stale or
+	// compromised token stays valid. We expose it as config (not a hardcoded
+	// const) so ops can tune the security/usability tradeoff per environment.
+	// time.Duration parses Go duration strings ("15m", "1h") via pkg/config.
+	JWTTTL time.Duration `env:"JWT_TTL" default:"15m"`
 }
 
 func main() {
 	// ================================================================
 	// 1. STRUCTURED LOGGER
 	// ================================================================
-	// slog is the stdlib structured logger (Go 1.21+). We use JSON output for
-	// container environments where logs are shipped to Loki via the container
-	// runtime's stdout capture. JSON is parse-friendly for log aggregators.
-	//
-	// WHY not zap or zerolog: stdlib slog is fast enough for this use case,
-	// has zero external dependencies, and is the direction the Go standard
-	// library is heading. We'd adopt zap if benchmarks showed slog as a
-	// bottleneck (unlikely for network-IO-bound services).
+	// slog is the stdlib structured logger (Go 1.21+). JSON output for container
+	// environments where logs are shipped to Loki via the runtime's stdout
+	// capture. JSON is parse-friendly for log aggregators. (We construct it before
+	// config so even a config-load failure logs in the structured format.)
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
@@ -101,9 +143,8 @@ func main() {
 	// ================================================================
 	// 2. LOAD CONFIG
 	// ================================================================
-	// config.Load reads FP_* env vars into AuthConfig using reflection.
-	// It fails fast if any required field is missing. In K8s, required config
-	// comes from Secrets/ConfigMaps mapped to env vars in the Deployment spec.
+	// config.Load reads FP_* env vars into AuthConfig using reflection. It fails
+	// fast if any required field (JWT_SECRET) is missing.
 	cfg, err := config.Load[AuthConfig]("FP")
 	if err != nil {
 		logger.Error("failed to load config", slog.String("error", err.Error()))
@@ -113,96 +154,250 @@ func main() {
 		slog.Int("grpc_port", cfg.GRPCPort),
 		slog.Int("health_port", cfg.Port),
 		slog.String("log_level", cfg.LogLevel),
+		slog.Duration("jwt_ttl", cfg.JWTTTL),
 	)
 
 	// ================================================================
-	// 3. OPENTELEMETRY
+	// 3. SIGNAL-AWARE ROOT CONTEXT + OPENTELEMETRY
 	// ================================================================
-	// Setup initializes the trace provider (→ Tempo) and meter provider
-	// (→ Prometheus via OTel Collector). All spans and metrics from this
-	// process flow through these providers.
-	//
-	// WHY NotifyContext here (not a plain background context):
-	//   We pass the signal-aware context to observability.Setup so that the
-	//   OTLP connection setup respects the process signal (SIGTERM during
-	//   startup = abort cleanly). The same ctx drives the shutdown below.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	// signal.NotifyContext cancels ctx on SIGINT/SIGTERM. SIGTERM is what K8s
+	// sends on pod termination (rolling update, scale-down); SIGINT is Ctrl-C in
+	// local dev. This single ctx drives BOTH the OTLP setup and the gRPC Serve
+	// loop's graceful-shutdown trigger below — one cancellation source, one clean
+	// path. We add SIGTERM explicitly (os.Interrupt alone misses it on Linux).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Setup initializes the trace provider (→ Tempo) and meter provider
+	// (→ Prometheus via the OTel Collector). All spans/metrics from this process
+	// flow through these providers. OTLPInsecure=true because the local
+	// docker-compose collector has no TLS cert; in production this is driven by
+	// config and TLS is on.
 	otelShutdown, err := observability.Setup(ctx, observability.Config{
 		ServiceName:    "auth",
 		ServiceVersion: "dev",
 		Environment:    "local",
 		OTLPEndpoint:   cfg.OTelEndpoint,
-		OTLPInsecure:   true, // plaintext in local docker-compose (no TLS cert on the collector)
+		OTLPInsecure:   true,
 	})
 	if err != nil {
 		logger.Error("failed to setup observability", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
+	// DEFER #LAST-TO-RUN: flush telemetry. Registered first → runs last (LIFO), so
+	// shutdown spans/metrics from every later teardown step are still exported.
+	// We use a FRESH context (not the cancelled ctx) bounded by a timeout: the
+	// root ctx is already Done by the time we get here, and a Done context would
+	// abort the flush immediately, losing the final batch.
 	defer func() {
-		// Flush all pending spans and metrics on shutdown. Without this, the
-		// last ~5 seconds of telemetry are lost (OTel batches internally).
-		// K8s gives us 30s grace on SIGTERM — plenty of time to flush.
-		if shutdownErr := otelShutdown(context.Background()); shutdownErr != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if shutdownErr := otelShutdown(shutdownCtx); shutdownErr != nil {
 			logger.Error("otel shutdown error", slog.String("error", shutdownErr.Error()))
 		}
 	}()
 
 	// ================================================================
-	// 4. BUILD gRPC SERVER
+	// 4a. CONNECT POSTGRES (pgxpool)
 	// ================================================================
-	// grpcutil.NewServer applies the standard interceptor chain:
-	//   recovery → logging → (auth, added in Task 1.3 once we have a validator)
+	// postgres.Connect opens a pgxpool and PINGS it — turning a bad DSN or an
+	// unreachable database into a loud, fast startup failure (this exit) instead
+	// of a confusing error on the first user request. The pool is the SHARED
+	// process-wide handle all three repo adapters borrow connections from.
 	//
-	// WHY no WithAuthValidator here:
-	//   The AuthService itself IS the token validator — it would be circular
-	//   for the auth service to require an auth interceptor on its own RPCs.
-	//   Instead, the auth service's RPCs that require privilege (e.g., CreateUser
-	//   requires admin) validate the caller's token in the handler, not via an
-	//   interceptor, because the service is the source of truth.
-	//   (In Task 1.5 we'll add an internal-only validator for admin RPCs.)
+	// We bound the connect with a timeout so a hung/unreachable Postgres can't
+	// wedge startup forever — the pod would never report ready and K8s would never
+	// learn why. A bounded dial fails fast and the pod restarts.
+	dbCtx, dbCancel := context.WithTimeout(ctx, 10*time.Second)
+	db, err := postgres.Connect(dbCtx, cfg.DatabaseURL)
+	dbCancel()
+	if err != nil {
+		logger.Error("failed to connect to postgres", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	// DEFER: close the pool near-last (after gRPC has drained, so no in-flight
+	// query borrows a connection from a closing pool). Registered here so it runs
+	// before the OTel flush (LIFO) but after the gRPC/NATS teardown registered later.
+	defer db.Close()
+	logger.Info("postgres connected")
+
+	// ================================================================
+	// 4b. CONNECT NATS JETSTREAM + ENSURE STREAM
+	// ================================================================
+	// natsutil.Connect returns the raw *nats.Conn (for lifecycle: IsConnected,
+	// Drain) and a JetStream context (for publish/stream ops). We then EnsureStream
+	// the AUTH stream so published events are PERSISTED — JetStream silently drops
+	// a publish whose subject no stream captures (core-NATS fire-and-forget leaks
+	// through without a stream). The PRODUCER owns its stream; consumers create
+	// consumers ON it, never the stream itself (see events/events.go).
 	//
-	// WithReflection: enabled so grpcurl/grpcui can introspect the service
-	// during development without needing the .proto files locally.
+	// EnsureStream is idempotent (CreateOrUpdateStream), so it is safe on every
+	// boot and converges the stream config under rolling deploys.
+	natsConn, js, err := natsutil.Connect(cfg.NATSUrl)
+	if err != nil {
+		logger.Error("failed to connect to nats", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	// DEFER: drain NATS before closing Postgres/flushing OTel. Drain (not Close)
+	// flushes any buffered publishes and lets in-flight handlers finish — the
+	// graceful analogue of GracefulStop for the message bus. It is registered
+	// AFTER db.Close above, so by LIFO it runs BEFORE db.Close — correct: anything
+	// that might publish during shutdown stops before the DB it reads from closes.
+	defer func() {
+		if drainErr := natsConn.Drain(); drainErr != nil {
+			logger.Error("nats drain error", slog.String("error", drainErr.Error()))
+		}
+	}()
+
+	streamCtx, streamCancel := context.WithTimeout(ctx, 10*time.Second)
+	err = authevents.EnsureStream(streamCtx, js)
+	streamCancel()
+	if err != nil {
+		logger.Error("failed to ensure AUTH jetstream stream", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	logger.Info("nats connected and AUTH stream ensured",
+		slog.String("stream", authevents.StreamName),
+		slog.String("subjects", authevents.StreamSubjects),
+	)
+
+	// ================================================================
+	// 5. CONSTRUCT ADAPTERS (repositories + event publisher)
+	// ================================================================
+	// Repository adapters: the Postgres-backed implementations of the domain's
+	// repository PORTS (domain.UserRepository, APIKeyRepository, RoleRepository).
+	// They share the ONE pool (db) — three pools would triple the connection
+	// budget against the same database for no benefit.
+	userRepo := postgres.NewUserRepo(db)
+	apiKeyRepo := postgres.NewAPIKeyRepo(db)
+	roleRepo := postgres.NewRoleRepo(db)
+
+	// Event publisher adapter: layers auth's domain→events/v1 mapping on top of the
+	// shared natsutil.Publisher (which owns the envelope + dedup + trace policy).
+	// SourceName ("auth") is stamped into every event's envelope for provenance.
+	//
+	// Phase 1.6 (DONE): this Publisher is now INJECTED into the request path via the
+	// EventingAuthService decorator constructed below — auth genuinely emits on
+	// fp.auth.user.created and fp.auth.apikey.rotated. The publisher satisfies the
+	// authevents.EventPublisher PORT the decorator depends on.
+	natsPublisher := natsutil.NewPublisher(js, authevents.SourceName)
+	eventPublisher := authevents.NewPublisher(natsPublisher)
+	logger.Info("auth event publisher constructed",
+		slog.String("source", authevents.SourceName),
+		slog.String("subject_user_created", authevents.SubjectUserCreated),
+		slog.String("subject_apikey_rotated", authevents.SubjectAPIKeyRotated),
+	)
+
+	// ================================================================
+	// 6. CONSTRUCT DOMAIN SERVICE
+	// ================================================================
+	// NewAuthService injects the repository ports + the signing secret + the JWT
+	// ttl, and returns the domain.AuthService INTERFACE (not the concrete struct):
+	// the handler depends on the abstraction, the constructor is the only place
+	// that knows the concrete impl. The secret is passed as []byte (the domain
+	// validates >= 32 bytes at mint/verify time → ErrWeakSecret on a weak key).
+	svc := authdomain.NewAuthService(
+		userRepo,
+		apiKeyRepo,
+		roleRepo,
+		[]byte(cfg.JWTSecret),
+		cfg.JWTTTL,
+	)
+
+	// ================================================================
+	// 6b. DECORATE THE DOMAIN SERVICE WITH EVENT PUBLISHING (Phase 1.6)
+	// ================================================================
+	// The DECORATOR injects the publisher at the SAME seam the handler already uses
+	// (the domain.AuthService interface), so the domain stays free of any NATS/proto
+	// knowledge (the Clean Architecture dependency rule) and the handler is unchanged.
+	//
+	// EventingAuthService forwards every RPC to svc and, on the two MUTATING paths,
+	// publishes AFTER the inner write commits (publish-after-commit, by ordering):
+	//   CreateUser   → fp.auth.user.created    (notification welcome, billing open-account, audit)
+	//   CreateAPIKey → fp.auth.apikey.rotated  (inference-gateway API-key cache eviction, notification)
+	// A publish failure is LOGGED, not surfaced as an RPC error — the user/key is
+	// already committed, so failing the request would be a lie about a success and
+	// invite a duplicate-write retry. The lost event is the documented at-most-once
+	// tradeoff (the outbox, as in billing, is the upgrade path).
+	//
+	// From here on the handler is given `eventingSvc` (still a domain.AuthService),
+	// so non-mutating RPCs (Login/ValidateToken/CheckPermission/...) pass straight
+	// through to svc untouched and only the event-bearing writes are intercepted.
+	eventingSvc := authevents.NewEventingAuthService(svc, eventPublisher, logger)
+
+	// ================================================================
+	// 7. CONSTRUCT HANDLER WITH THE REAL SERVICE (no longer nil)
+	// ================================================================
+	// This is the line the scaffold promised: the handler now holds the fully
+	// wired domain service — wrapped by the event-publishing decorator. Its RPC
+	// methods (auth_handler_rpcs.go) call svc.Login, svc.CreateUser, etc.; the
+	// decorator emits the platform events on the write paths. The nil-svc guards in
+	// those methods are now dead-but-defensive (a real svc is always present here).
+	authHandler := handler.NewAuthHandler(eventingSvc)
+
+	// ================================================================
+	// 8. BUILD gRPC SERVER + REGISTER HANDLER
+	// ================================================================
+	// grpcutil.NewServer applies the standard interceptor chain
+	// (recovery → logging → tracing). We do NOT add WithAuthValidator here:
+	//
+	//	The AuthService itself IS the token validator — it would be circular for
+	//	the auth service to require an auth interceptor on its own RPCs (and Login/
+	//	ValidateToken are unauthenticated by design). Privileged admin RPCs
+	//	(CreateUser/AssignRole/...) enforce authorization IN the handler via
+	//	requireAdmin → CheckPermission until a platform-wide authz interceptor
+	//	lands (see auth_handler_rpcs.go). So the auth service is the source of
+	//	truth, not a consumer of the interceptor.
+	//
+	// WithReflection: lets grpcurl/grpcui introspect the service in dev without
+	// the .proto files locally.
 	srv := grpcutil.NewServer(
 		grpcutil.WithLogger(logger),
 		grpcutil.WithReflection(),
 	)
+	authv1.RegisterAuthServiceServer(srv.GRPC, authHandler)
+	logger.Info("auth handler registered with wired domain service")
 
 	// ================================================================
-	// 5. REGISTER AUTH HANDLER
+	// 9. EVENT SUBSCRIBERS — INTENTIONALLY NONE FOR AUTH
 	// ================================================================
-	// The handler embeds UnimplementedAuthServiceServer — it satisfies
-	// authv1.AuthServiceServer fully right now. All RPCs return Unimplemented
-	// until Task 1.5 overrides them with real logic.
-	//
-	// We pass nil as the domain service for the scaffold phase. The embedded
-	// Unimplemented methods never dereference the svc field, so this is safe.
-	// Once Task 1.3 delivers AuthServiceImpl and Task 1.4 delivers Postgres
-	// repositories, main.go will construct and pass the real service:
-	//   svc := authdomain.NewAuthService(userRepo, apiKeyRepo, roleRepo, cfg.JWTSecret)
-	//   authv1.RegisterAuthServiceServer(srv.GRPC, handler.NewAuthHandler(svc))
-	authv1.RegisterAuthServiceServer(srv.GRPC, handler.NewAuthHandler(nil))
-	logger.Info("auth handler registered")
+	// Auth CONSUMES no events: identity is the ROOT of the platform's trust graph,
+	// not a downstream of it (events/events.go). Every other consuming service
+	// would here construct natsutil.NewSubscriber(...).Subscribe(...) for each
+	// subject it reacts to, and register their lifecycle in shutdown. Auth has
+	// nothing to subscribe to, so this step is a deliberate, contract-correct
+	// NO-OP — recorded in the log so the absence is explicit, not an oversight.
+	logger.Info("no event subscribers for auth (identity is the trust-graph root; consumes nothing)")
 
 	// ================================================================
-	// 6. HEALTH SERVER (HTTP)
+	// 10. HEALTH SERVER (HTTP) — readiness checks the REAL dependencies
 	// ================================================================
-	// The HTTP health server runs on Port (default 8080) and serves:
-	//   GET /healthz → liveness probe (always 200 while process is alive)
-	//   GET /readyz  → readiness probe (checks dependencies are reachable)
+	// The HTTP health server runs on Port (default 8080):
+	//   GET /healthz → liveness  (200 while the process is alive)
+	//   GET /readyz  → readiness (200 iff ALL registered checks pass, else 503)
 	//
-	// WHY a separate HTTP port for health:
-	//   gRPC uses HTTP/2; kubelet health probes use HTTP/1.1. They can't share
-	//   a port on a plain net.Listener. Separate ports keeps them independent:
-	//   the gRPC server can be shut down while the health port returns 503,
-	//   signalling to K8s that the pod is no longer ready for traffic.
+	// WHY a separate HTTP port from gRPC: gRPC is HTTP/2, kubelet HTTP probes are
+	// HTTP/1.1; they can't share a plain listener. Separate ports let the gRPC
+	// server drain (readiness flips to 503) independently of process liveness.
 	//
-	// No readiness checks are registered yet (no DB, no NATS). Task 1.3/1.4
-	// will add:
-	//   healthHandler.AddCheck("db", func(ctx) error { return pool.Ping(ctx) })
+	// Readiness now reflects REALITY — it checks the actual dependencies:
+	//   - "postgres": pool.Ping — is the database reachable RIGHT NOW.
+	//   - "nats":     conn.IsConnected — is the bus reachable (auto-reconnect means
+	//                 a transient blip self-heals; a hard-down NATS fails readiness
+	//                 so K8s pulls the pod from the Service until it recovers).
+	// This is what makes /readyz meaningful: the pod reports ready only when it can
+	// actually do its job, not merely "process is up".
 	healthHandler := health.New()
+	healthHandler.AddCheck("postgres", func(ctx context.Context) error {
+		return db.Pool().Ping(ctx)
+	})
+	healthHandler.AddCheck("nats", func(_ context.Context) error {
+		if !natsConn.IsConnected() {
+			return fmt.Errorf("nats not connected (status: %s)", natsConn.Status())
+		}
+		return nil
+	})
+
 	healthMux := http.NewServeMux()
 	healthMux.HandleFunc("/healthz", healthHandler.LivenessHandler())
 	healthMux.HandleFunc("/readyz", healthHandler.ReadinessHandler())
@@ -211,9 +406,11 @@ func main() {
 	healthServer := &http.Server{
 		Addr:    healthAddr,
 		Handler: healthMux,
+		// A read header timeout bounds slowloris-style stalls on the health port.
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	// Run the health server in a goroutine so it doesn't block the gRPC server.
+	// Run the health server in a goroutine so it doesn't block the gRPC Serve below.
 	go func() {
 		logger.Info("health server listening", slog.String("addr", healthAddr))
 		if serveErr := healthServer.ListenAndServe(); serveErr != nil && serveErr != http.ErrServerClosed {
@@ -221,19 +418,24 @@ func main() {
 		}
 	}()
 
-	// Shut down the health server when the process exits.
+	// DEFER: stop the health server during shutdown. Registered AFTER db/nats
+	// defers, so by LIFO it runs BEFORE them — readiness stops answering 200
+	// before the deps it checks are torn down (no false "ready" mid-shutdown).
 	defer func() {
-		if shutdownErr := healthServer.Shutdown(context.Background()); shutdownErr != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if shutdownErr := healthServer.Shutdown(shutdownCtx); shutdownErr != nil {
 			logger.Error("health server shutdown error", slog.String("error", shutdownErr.Error()))
 		}
 	}()
 
 	// ================================================================
-	// 7. START gRPC SERVER
+	// 11. START gRPC SERVER (blocks until SIGTERM/SIGINT)
 	// ================================================================
-	// Mark the gRPC health service as SERVING so K8s readiness probes pass.
-	// (We flip this back to NOT_SERVING in grpcutil.Server.Serve on SIGTERM,
-	// before draining in-flight RPCs — this is the graceful shutdown dance.)
+	// Flip the gRPC health status to SERVING now that EVERY dependency is wired
+	// and verified (pool pinged, NATS connected, stream ensured). Doing this only
+	// after construction is what makes a gRPC readiness probe meaningful instead
+	// of always-green from the first instant.
 	srv.SetServing(true)
 
 	grpcAddr := fmt.Sprintf(":%d", cfg.GRPCPort)
@@ -244,12 +446,12 @@ func main() {
 	}
 	logger.Info("gRPC server listening", slog.String("addr", grpcAddr))
 
-	// Serve blocks until ctx is cancelled (SIGINT/SIGTERM via NotifyContext above).
-	// On cancellation:
-	//   1. srv.SetServing(false) — readiness probes fail → pod leaves LB endpoints
-	//   2. GracefulStop (up to 25s drain) — in-flight RPCs finish
-	//   3. Hard Stop if drain times out
-	//   4. Returns here, deferred shutdown of OTel + health server run
+	// Serve blocks until ctx is cancelled (SIGINT/SIGTERM). On cancellation it:
+	//   1. SetServing(false) — readiness fails → pod leaves the Service endpoints
+	//   2. GracefulStop (bounded drain) — in-flight RPCs finish, no new ones admitted
+	//   3. hard Stop if drain times out
+	//   4. returns here → the deferred teardown runs in LIFO order:
+	//        health server stop → NATS drain → Postgres close → OTel flush.
 	if serveErr := srv.Serve(ctx, lis); serveErr != nil {
 		logger.Error("gRPC server error", slog.String("error", serveErr.Error()))
 		os.Exit(1)

@@ -1,50 +1,56 @@
 // Package main is the entrypoint for the Model Registry service.
 //
 // ============================================================================
-// WIRING — THE COMPOSITION ROOT
+// WIRING — THE COMPOSITION ROOT (fully wired: Postgres + Redis + NATS)
 // ============================================================================
 //
-// In Clean Architecture, main.go is the "composition root": the only place that
-// imports every layer (config, observability, domain, handler) and wires them into
-// a running program. The layers themselves know each other only through the
-// interfaces the domain defines.
+// In Clean Architecture, main.go is the "composition root": the ONLY place that
+// imports every layer (config, observability, repository adapters, the domain
+// service, the event adapter, the handler) and wires them into a running program.
+// The layers themselves know each other only through the interfaces the domain
+// defines (WriteStore / ReadStore / ProjectionEmitter / Clock / IDGenerator). This
+// file is where those ports get their concrete adapters — "Postgres for writes,
+// Redis for reads, NATS for events" becomes literal here and nowhere else.
 //
-// STARTUP SEQUENCE:
+// THE DEPENDENCY-INJECTION GRAPH WE ASSEMBLE (inner depends on nothing outer):
 //
-//	┌──────────────────────────────────────────────────────────────────┐
-//	│ 1. Structured logger (slog JSON → stdout → Loki)                   │
-//	│ 2. Load config (FP_* env vars → RegistryConfig)                    │
-//	│ 3. Setup OpenTelemetry (traces → Tempo, metrics → Prometheus)      │
-//	│ 4. Build gRPC server via grpcutil (interceptor chain)              │
-//	│ 5. Register RegistryHandler                                        │
-//	│ 6. Start HTTP health server (/healthz + /readyz)                   │
-//	│ 7. Mark SERVING + start gRPC server (blocks until SIGTERM/SIGINT)  │
-//	│ 8. Graceful shutdown (OTel flush → gRPC drain → health close)      │
-//	└──────────────────────────────────────────────────────────────────┘
+//	pgxpool ─► postgres.WriteStore ─┐
+//	go-redis ─► redis.ReadStore ────┤
+//	                                 ├─► domain.NewRegistryService ─► handler.RegistryHandler ─► gRPC
+//	jetstream ─► natsutil.Publisher ─► events.Publisher (ProjectionEmitter) ─┘
+//	                                 │
+//	                  domain.NewRealClock() + domain.NewUUIDGenerator() (pure ports)
 //
-// WHAT'S WIRED NOW (scaffold phase):
-//   - RegistryHandler with a NIL domain service. The embedded
-//     UnimplementedRegistryServiceServer answers every RPC with codes.Unimplemented
-//     and never dereferences the service — so a nil is correct and safe here.
-//   - No Postgres pool, no Redis client, no NATS connection yet.
+// STARTUP SEQUENCE (each step fail-fast — a bad dep aborts boot, never serves):
 //
-// WHAT ARRIVES LATER (and the exact wiring it adds here):
+//	┌──────────────────────────────────────────────────────────────────────────┐
+//	│ 1. Structured logger (slog JSON → stdout → Loki)                           │
+//	│ 2. Load config (FP_* env vars → RegistryConfig); require DatabaseURL       │
+//	│ 3. Setup OpenTelemetry (traces → Tempo, metrics → Prometheus)              │
+//	│ 4. Connect datastores (Postgres pool, Redis client, NATS+JetStream)        │
+//	│    — each constructor PINGS so an unreachable dep fails boot, not RPC #1    │
+//	│ 5. Build adapters → domain service → real handler (NOT nil)                │
+//	│ 6. Build gRPC server, register the WIRED handler                           │
+//	│ 7. Start HTTP health server (/readyz checks Postgres, Redis, NATS live)    │
+//	│ 8. Mark SERVING + start gRPC server (blocks until SIGTERM/SIGINT)          │
+//	│ 9. Graceful shutdown in LIFO order (see the shutdown note at the bottom)   │
+//	└──────────────────────────────────────────────────────────────────────────┘
 //
-//   - Repository phase: a pgx pool (WriteStore) + a Redis client (ReadStore).
+// EVENT SUBSCRIBERS — WHY THERE ARE NONE TO START HERE (deliberate, not missing):
 //
-//   - Events phase:      a NATS JetStream connection behind the ProjectionEmitter.
-//     Then this file constructs the real service and a real handler:
-//
-//     pool   := pgxpool.New(ctx, cfg.DatabaseURL)
-//     rdb    := redis.NewClient(&redis.Options{Addr: cfg.RedisURL})
-//     write  := postgres.NewWriteStore(pool)
-//     read   := redisstore.NewReadStore(rdb)
-//     pub    := events.NewPublisher(natsConn)            // satisfies ProjectionEmitter
-//     svc    := domain.NewRegistryService(write, read, pub,
-//     domain.NewRealClock(), domain.NewUUIDGenerator())
-//     registryv1.RegisterRegistryServiceServer(srv.GRPC, handler.NewRegistryHandler(svc))
-//     healthHandler.AddCheck("postgres", func(ctx) error { return pool.Ping(ctx) })
-//     healthHandler.AddCheck("redis",    func(ctx) error { return rdb.Ping(ctx).Err() })
+//	The Registry is a pure event PRODUCER. Per the event contract (and the header
+//	of internal/events/publisher.go) it emits five model-lifecycle facts
+//	(fp.models.registered / version.created / version.ready / promoted / archived)
+//	and CONSUMES none — so there is no subscriber to register or start in this
+//	composition root. The one async INPUT the registry has — the projection
+//	consumer that rebuilds the Redis read model from those same events — is a
+//	SEPARATE deployable (a later phase) precisely so the read side can be scaled,
+//	replayed, and rebuilt independently of the command server (the whole point of
+//	the CQRS split documented in domain/ports.go). When it lands it will be its own
+//	process wiring redis.(projection writer) to a natsutil subscriber; it does not
+//	belong inside this gRPC server's lifecycle. So step 5's "start subscribers" is
+//	intentionally a no-op for THIS service — wiring a fake subscriber would be a
+//	lie about the architecture.
 //
 // ============================================================================
 package main
@@ -57,14 +63,31 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	goredis "github.com/redis/go-redis/v9"
 
 	registryv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/registry/v1"
 	"github.com/abd-ulbasit/forgepoint/pkg/config"
 	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/health"
+	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/observability"
+	"github.com/abd-ulbasit/forgepoint/services/registry/internal/domain"
+	"github.com/abd-ulbasit/forgepoint/services/registry/internal/events"
 	"github.com/abd-ulbasit/forgepoint/services/registry/internal/handler"
+	"github.com/abd-ulbasit/forgepoint/services/registry/internal/repository/postgres"
+	redisstore "github.com/abd-ulbasit/forgepoint/services/registry/internal/repository/redis"
 )
+
+// depConnectTimeout bounds how long we wait, AT BOOT, for each datastore's
+// fail-fast ping. WHY a bound: a constructor that blocks forever on an
+// unreachable dependency would hang the pod in a not-ready state with no signal;
+// a bounded ctx turns "DB is down" into a clear boot error K8s can act on (the
+// pod CrashLoops and surfaces the cause in logs/events). Kept short — if a core
+// dependency isn't reachable in 10s at startup, failing fast is the right call.
+const depConnectTimeout = 10 * time.Second
 
 // RegistryConfig extends BaseConfig with registry-specific configuration.
 //
@@ -79,9 +102,11 @@ type RegistryConfig struct {
 
 	// RedisURL is the connection string for the CQRS READ projection (Redis). It is
 	// distinct from DatabaseURL (the Postgres WRITE store) precisely because the two
-	// stores are separate in CQRS. Not required at scaffold time (no Redis client is
-	// built yet); the read adapter phase will mark it required and add a /readyz check.
-	RedisURL string `env:"REDIS_URL" default:"redis://localhost:6379"`
+	// stores are separate in CQRS. NewReadStore takes a host:port "addr" (not a URL),
+	// so the default is bare host:port and we pass it through directly. A full
+	// "redis://" URL with auth/db would need redis.ParseURL — a later concern when
+	// Redis grows credentials; bare addr is correct for the local/in-cluster stack.
+	RedisURL string `env:"REDIS_URL" default:"localhost:6379"`
 
 	// OTelInsecure controls whether the OTLP exporter uses plaintext (no TLS). It is
 	// true in local docker-compose (the collector has no cert) and false in
@@ -108,10 +133,22 @@ func main() {
 		logger.Error("failed to load config", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
+
+	// DatabaseURL has no compile-time `required` tag because it lives on the SHARED
+	// BaseConfig (some services — e.g. a pure gateway — have no DB). For the registry
+	// it is mandatory: the WriteStore is the source of truth. We enforce it HERE, at
+	// the one place that knows this service needs a DB, rather than mutating the
+	// shared struct. Failing now (not on the first CreateModel) is the fail-fast rule.
+	if cfg.DatabaseURL == "" {
+		logger.Error("FP_DATABASE_URL is required for the registry service (the Postgres write store)")
+		os.Exit(1)
+	}
+
 	logger.Info("config loaded",
 		slog.Int("grpc_port", cfg.GRPCPort),
 		slog.Int("health_port", cfg.Port),
 		slog.String("log_level", cfg.LogLevel),
+		slog.String("nats_url", cfg.NATSUrl),
 		slog.Bool("otel_insecure", cfg.OTelInsecure),
 	)
 
@@ -135,48 +172,170 @@ func main() {
 		logger.Error("failed to setup observability", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	defer func() {
-		// Flush pending spans/metrics on shutdown; without this the last batch of
-		// telemetry is lost. K8s gives 30s grace on SIGTERM — ample to flush.
-		if shutdownErr := otelShutdown(context.Background()); shutdownErr != nil {
-			logger.Error("otel shutdown error", slog.String("error", shutdownErr.Error()))
-		}
-	}()
+	// NOTE ON SHUTDOWN ORDERING: we DON'T `defer otelShutdown` here. Telemetry must
+	// flush LAST (after the gRPC server has drained and the stores are closed) so the
+	// spans/metrics emitted DURING shutdown are captured. All cleanup is therefore
+	// hung off an explicit, ordered shutdown() closure invoked once at the very end,
+	// rather than a stack of defers whose LIFO order is hard to read. See the bottom.
 
 	// ================================================================
-	// 4. BUILD gRPC SERVER (recovery → logging interceptor chain)
+	// 4. CONNECT DATASTORES (Postgres WRITE, Redis READ, NATS events) — fail-fast
+	// ================================================================
+	// We own the RAW pgxpool.Pool and go-redis.Client here (not just the adapters)
+	// for two reasons the adapters' own constructors can't give us from main:
+	//   - /readyz needs a live ping handle on each dep, and
+	//   - ordered shutdown needs to Close the pool/client at the right moment.
+	// We PING each at boot (fail-fast: an unreachable dep aborts startup, never
+	// serves) and then wrap the pool/client with the adapters' *FromPool / *FromClient
+	// constructors — the exact seam the adapters expose for "I already hold the handle"
+	// (the same one the integration tests use to share one pool). A BOUNDED ctx (not
+	// the signal ctx) guards against a hung dial wedging startup indefinitely.
+	bootCtx, bootCancel := context.WithTimeout(context.Background(), depConnectTimeout)
+	defer bootCancel()
+
+	// --- Postgres: the CQRS WRITE store (source of truth) ---
+	// pgxpool.New is LAZY (no TCP until first use); Ping forces a real connection so a
+	// bad DSN / unreachable DB fails boot here, not on the first RegisterModel RPC.
+	pgPool, err := pgxpool.New(bootCtx, cfg.DatabaseURL)
+	if err != nil {
+		logger.Error("failed to create Postgres pool", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	if err := pgPool.Ping(bootCtx); err != nil {
+		pgPool.Close()
+		logger.Error("failed to ping Postgres", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	writeStore := postgres.NewWriteStoreFromPool(pgPool) // domain.WriteStore
+	logger.Info("postgres write store connected")
+
+	// --- Redis: the CQRS READ projection (eventually-consistent query side) ---
+	// go-redis's Client is itself a pool; Ping fails fast on an unreachable server.
+	rdb := goredis.NewClient(&goredis.Options{Addr: cfg.RedisURL})
+	if err := rdb.Ping(bootCtx).Err(); err != nil {
+		_ = rdb.Close()
+		pgPool.Close()
+		logger.Error("failed to ping Redis", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	readStore := redisstore.NewReadStoreFromClient(rdb) // domain.ReadStore
+	logger.Info("redis read store connected")
+
+	// --- NATS JetStream: the event transport behind the ProjectionEmitter ---
+	// Connect returns the raw conn (for lifecycle: Drain on shutdown, IsConnected for
+	// the readiness check) AND the JetStream context (for the Publisher). We keep the
+	// conn so /readyz can report NATS health and so shutdown can DRAIN it (flush
+	// buffered publishes) rather than hard-Close mid-flight.
+	natsConn, js, err := natsutil.Connect(cfg.NATSUrl)
+	if err != nil {
+		_ = rdb.Close()
+		pgPool.Close()
+		logger.Error("failed to connect NATS", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	logger.Info("nats connected", slog.String("url", natsConn.ConnectedUrl()))
+
+	// --- ENSURE THE MODELS STREAM EXISTS (producer owns its stream) ---
+	// The registry is the OWNER and sole producer of the fp.models.* lifecycle tree.
+	// JetStream REJECTS a publish whose subject no stream captures ("no stream matches
+	// subject", 10073), and our documented Emit posture is to LOG that error WITHOUT
+	// failing the already-committed write — so on a fresh cluster with no MODELS stream,
+	// every lifecycle event would be silently dropped while writes commit, and the whole
+	// downstream serve/deploy/meter/route/re-baseline flow would die. We therefore
+	// GUARANTEE our own stream here, before wiring the emitter, exactly as auth and
+	// feature-store do for their trees. EnsureStream uses CreateOrUpdateStream
+	// (idempotent + convergent — safe on every boot and under rolling deploys / a
+	// concurrent model-monitor declaring fp.models.drift.detected on the same stream).
+	// We FAIL FAST: an unprovisionable stream aborts boot (K8s CrashLoops with the cause
+	// in logs) rather than letting the pod serve and drop every event at runtime. The
+	// context is bounded (10s, like the dep pings) so a hung NATS server can't wedge boot.
+	streamCtx, streamCancel := context.WithTimeout(context.Background(), depConnectTimeout)
+	if err := events.EnsureStream(streamCtx, js); err != nil {
+		streamCancel()
+		_ = natsConn.Drain()
+		_ = rdb.Close()
+		pgPool.Close()
+		logger.Error("failed to ensure MODELS stream", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	streamCancel()
+	logger.Info("MODELS stream ensured",
+		slog.String("stream", events.StreamName),
+		slog.String("subjects", events.StreamSubjects),
+	)
+
+	// ================================================================
+	// 5. BUILD ADAPTERS → DOMAIN SERVICE → REAL HANDLER
+	// ================================================================
+	// The event adapter chain: a pkg/natsutil.Publisher (envelope/dedup/trace) wrapped
+	// by events.Publisher, which maps a domain.ProjectionEvent → the canonical
+	// eventsv1.* payload + fp.models.* subject. events.Publisher satisfies the
+	// domain.ProjectionEmitter port — the domain stays wire-agnostic, this is the seam.
+	natsPub := natsutil.NewPublisher(js, events.ServiceName) // source = "registry"
+	emitter := events.NewPublisher(natsPub)                  // domain.ProjectionEmitter
+
+	// The CQRS service: WRITE store (Postgres) + READ store (Redis) + the emitter,
+	// plus the two pure ports — the production wall clock and the UUIDv4 id generator.
+	// These last two are injected (not called inline) so tests stay deterministic;
+	// production wires the real implementations here.
+	svc := domain.NewRegistryService(
+		writeStore,                // domain.WriteStore  (commands → source of truth)
+		readStore,                 // domain.ReadStore   (queries → projection)
+		emitter,                   // domain.ProjectionEmitter (CQRS sync seam → NATS)
+		domain.NewRealClock(),     // domain.Clock       (time.Now)
+		domain.NewUUIDGenerator(), // domain.IDGenerator (UUIDv4)
+	)
+
+	// ================================================================
+	// 6. BUILD gRPC SERVER + REGISTER THE WIRED HANDLER (real svc, NOT nil)
 	// ================================================================
 	// WHY no WithAuthValidator yet: the registry's RPCs DO require auth in
 	// production (owner/team come from validated claims), but the auth interceptor
 	// needs an auth-service TokenValidator client, which is wired in a later phase.
-	// Adding it now with a nil validator would reject every call. The scaffold runs
-	// without it; the handler phase adds:
-	//   grpcutil.WithAuthValidator(authClient, /* no public methods to skip */)
-	// WithReflection lets grpcurl/grpcui introspect the service during development.
+	// Adding it now with a nil validator would reject every call. WithReflection lets
+	// grpcurl/grpcui introspect the service during development.
 	srv := grpcutil.NewServer(
 		grpcutil.WithLogger(logger),
 		grpcutil.WithReflection(),
 	)
 
-	// ================================================================
-	// 5. REGISTER REGISTRY HANDLER (nil service — see the handler's doc comment)
-	// ================================================================
-	// The handler embeds UnimplementedRegistryServiceServer, so it fully satisfies
-	// registryv1.RegistryServiceServer right now: every RPC returns
-	// codes.Unimplemented until the handler phase overrides it. nil svc is safe (the
-	// embedded base never dereferences it).
-	registryv1.RegisterRegistryServiceServer(srv.GRPC, handler.NewRegistryHandler(nil))
-	logger.Info("registry handler registered")
+	// The composition is complete: hand the fully-wired domain service to the handler.
+	// The handler holds the RegistryService INTERFACE — it has no idea the impl is
+	// Postgres-write/Redis-read/NATS-emit. This single line is the difference between
+	// the scaffold (NewRegistryHandler(nil) → every RPC Unimplemented) and a working
+	// service.
+	registryv1.RegisterRegistryServiceServer(srv.GRPC, handler.NewRegistryHandler(svc))
+	logger.Info("registry handler registered with wired service")
 
 	// ================================================================
-	// 6. HEALTH SERVER (HTTP /healthz liveness + /readyz readiness)
+	// 7. HEALTH SERVER (HTTP /healthz liveness + /readyz readiness over real deps)
 	// ================================================================
 	// WHY a separate HTTP port from gRPC: gRPC is HTTP/2, kubelet probes are
 	// HTTP/1.1 — they can't share a net.Listener. Separate ports also let us flip
 	// /readyz to 503 (drain) while gRPC finishes in-flight calls on shutdown.
-	// No dependency checks are registered yet (no Postgres/Redis client). The repo
-	// phase adds AddCheck("postgres", pool.Ping) and AddCheck("redis", rdb.Ping).
+	//
+	// READINESS over the REAL dependencies: each check is what makes /readyz
+	// meaningful. If Postgres/Redis/NATS goes away, /readyz → 503, K8s pulls the pod
+	// from the Service endpoints (no traffic) WITHOUT restarting it (liveness stays
+	// green) — the correct posture for a transient dependency outage (see pkg/health).
 	healthHandler := health.New()
+	healthHandler.AddCheck("postgres", func(ctx context.Context) error {
+		// Borrow a conn and round-trip — proves the pool can actually reach Postgres.
+		return pgPool.Ping(ctx)
+	})
+	healthHandler.AddCheck("redis", func(ctx context.Context) error {
+		return rdb.Ping(ctx).Err()
+	})
+	healthHandler.AddCheck("nats", func(_ context.Context) error {
+		// IsConnected reflects the live transport state (the client auto-reconnects in
+		// the background; this reports whether it currently HAS a connection). Cheaper
+		// and more accurate than a round-trip publish for a liveness-of-transport check.
+		if !natsConn.IsConnected() {
+			return fmt.Errorf("nats: not connected (status %v)", natsConn.Status())
+		}
+		return nil
+	})
+
 	healthMux := http.NewServeMux()
 	healthMux.HandleFunc("/healthz", healthHandler.LivenessHandler())
 	healthMux.HandleFunc("/readyz", healthHandler.ReadinessHandler())
@@ -190,34 +349,78 @@ func main() {
 			logger.Error("health server error", slog.String("error", serveErr.Error()))
 		}
 	}()
-	defer func() {
-		if shutdownErr := healthServer.Shutdown(context.Background()); shutdownErr != nil {
-			logger.Error("health server shutdown error", slog.String("error", shutdownErr.Error()))
+
+	// shutdown runs cleanup in the CORRECT order, ONCE, after Serve returns. Defining
+	// it as a closure (not a pile of defers) makes the ordering explicit and readable —
+	// the order below is load-bearing, see the per-step rationale.
+	shutdown := func() {
+		// Use a fresh, bounded context — the signal ctx is already cancelled by now,
+		// so anything that honors it would return ctx.Canceled immediately. K8s gives
+		// terminationGracePeriodSeconds (30s default); this stays well within it.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		// (a) Stop accepting health probes. By now gRPC has already drained (Serve
+		//     returned) and SetServing(false) flipped readiness, so the LB has long
+		//     since stopped routing here; closing the HTTP server just releases the port.
+		if err := healthServer.Shutdown(shutdownCtx); err != nil {
+			logger.Error("health server shutdown error", slog.String("error", err.Error()))
 		}
-	}()
+
+		// (b) DRAIN NATS (not Close): Drain flushes any buffered publishes and lets
+		//     in-flight messages complete before tearing down the connection — so the
+		//     last events a draining RPC emitted are not lost. Close would discard them.
+		if err := natsConn.Drain(); err != nil {
+			logger.Error("nats drain error", slog.String("error", err.Error()))
+		}
+
+		// (c) Close the datastore pools. Safe now because gRPC has drained: no handler
+		//     is still mid-query holding a borrowed connection. Closing earlier could
+		//     fail an in-flight RPC's query. We close the RAW handles we own (the
+		//     adapters are thin wrappers over exactly these).
+		if err := rdb.Close(); err != nil {
+			logger.Error("redis close error", slog.String("error", err.Error()))
+		}
+		pgPool.Close() // pgxpool.Close has no error to return
+
+		// (d) FLUSH OpenTelemetry LAST so the spans/metrics produced during (a)-(c)
+		//     (and during the gRPC drain) are exported, not dropped. This is exactly
+		//     why otelShutdown was NOT deferred up top.
+		if err := otelShutdown(shutdownCtx); err != nil {
+			logger.Error("otel shutdown error", slog.String("error", err.Error()))
+		}
+	}
 
 	// ================================================================
-	// 7. START gRPC SERVER (mark SERVING, listen, block until signal)
+	// 8. START gRPC SERVER (mark SERVING, listen, block until signal)
 	// ================================================================
-	// SetServing(true) flips the gRPC health service to SERVING so K8s readiness
-	// passes. Serve flips it back to NOT_SERVING on SIGTERM before draining.
+	// SetServing(true) flips the gRPC health service to SERVING only NOW — after every
+	// dependency connected and the handler is wired — so a gRPC readiness probe is
+	// honest (green means actually-serviceable). Serve flips it back to NOT_SERVING on
+	// SIGTERM before draining.
 	srv.SetServing(true)
 
 	grpcAddr := fmt.Sprintf(":%d", cfg.GRPCPort)
 	lis, err := net.Listen("tcp", grpcAddr)
 	if err != nil {
 		logger.Error("failed to listen on gRPC port", slog.String("addr", grpcAddr), slog.String("error", err.Error()))
+		shutdown() // release the deps we already opened before exiting
 		os.Exit(1)
 	}
 	logger.Info("gRPC server listening", slog.String("addr", grpcAddr))
 
-	// Serve blocks until ctx is cancelled (SIGINT/SIGTERM). On cancellation it
-	// drains in-flight RPCs (bounded), then returns here so the deferred shutdowns
-	// (OTel flush, health close) run in order.
+	// Serve blocks until ctx is cancelled (SIGINT/SIGTERM). On cancellation it marks
+	// the server NOT_SERVING (probes fail → pod leaves the LB), drains in-flight RPCs
+	// (bounded), then returns here so our ordered shutdown() runs.
 	if serveErr := srv.Serve(ctx, lis); serveErr != nil {
 		logger.Error("gRPC server error", slog.String("error", serveErr.Error()))
+		shutdown()
 		os.Exit(1)
 	}
 
+	// ================================================================
+	// 9. GRACEFUL SHUTDOWN (ordered: gRPC already drained → health → NATS → pools → otel)
+	// ================================================================
+	shutdown()
 	logger.Info("registry service stopped cleanly")
 }
