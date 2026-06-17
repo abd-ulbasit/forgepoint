@@ -12,3 +12,7 @@ zero-padded (`0001`, `0002`, …). Use `docs/adr/template.md` as the starting po
 | [0001](0001-bff-for-web-ui.md) | Backend-for-Frontend (BFF) for the Web UI | Accepted | 2026-06-10 |
 | [0002](0002-gitops-with-argocd.md) | GitOps delivery with ArgoCD | Accepted | 2026-06-17 |
 | [0003](0003-closed-loop-model-monitor.md) | Closed-loop model monitoring (Model Monitor service) | Accepted | 2026-06-17 |
+| [0004](0004-decoupled-event-schema.md) | Decoupled event schema (`forgepoint.events.v1`) | Accepted | 2026-06-17 |
+| [0005](0005-ports-in-domain-hexagonal.md) | Hexagonal ports live in the domain package | Accepted | 2026-06-17 |
+| [0006](0006-go-workspace-monorepo.md) | Go-workspace monorepo with one module per service | Accepted | 2026-06-17 |
+| [0007](0007-one-pattern-per-service.md) | One distributed-systems pattern per service | Accepted | 2026-06-17 |
