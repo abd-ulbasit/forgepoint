@@ -1,0 +1,51 @@
+============================================================================
+  {{ include "fp-model-serving.fullname" . }} deployed to namespace "{{ .Release.Namespace }}"
+  Chart {{ .Chart.Name }}-{{ .Chart.Version }}  •  App version {{ .Chart.AppVersion }}
+============================================================================
+
+Image:     {{ include "fp-model-serving.image" . }}
+Model:     {{ .Values.config.modelName }}:{{ .Values.config.modelVersion }}
+Artifact:  {{ .Values.config.artifactURI }}
+Replicas:  {{ if .Values.autoscaling.enabled }}autoscaled {{ .Values.autoscaling.minReplicas }}..{{ .Values.autoscaling.maxReplicas }} (HPA){{ else }}{{ .Values.replicaCount }} (fixed){{ end }}
+
+PORTS
+  gRPC API (ModelServingService):  {{ .Values.ports.grpc }}  (in-cluster only — ClusterIP)
+  HTTP health/metrics:             {{ .Values.ports.health }}  (/healthz, /readyz{{ if .Values.serviceMonitor.enabled }}, {{ .Values.serviceMonitor.path }}{{ end }})
+
+1. Watch the rollout reach Ready (a pod is Ready only once its model is LOADED):
+
+   kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "fp-model-serving.fullname" . }}
+
+2. Check pod health:
+
+   kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+
+3. Probe the health endpoints (port-forward the HTTP health port):
+
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "fp-model-serving.fullname" . }} {{ .Values.ports.health }}:{{ .Values.ports.health }}
+   curl -s localhost:{{ .Values.ports.health }}/healthz   # liveness
+   curl -s localhost:{{ .Values.ports.health }}/readyz    # readiness (green only when model is StateReady)
+
+4. Call the gRPC API from inside the cluster:
+
+   grpcurl -plaintext {{ include "fp-model-serving.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.ports.grpc }} list
+
+{{- if .Values.secrets.create }}
+
+⚠️  SECRETS: this release rendered an IN-CHART Secret from values (DEV ONLY) —
+   the MinIO/S3 object-storage credentials the pod uses to fetch its artifact.
+   For any real environment, set `secrets.create=false` and provide an
+   externally-managed Secret named via `secrets.existingSecret`
+   (External Secrets Operator or Sealed Secrets). Never commit real credentials.
+{{- else }}
+
+SECRETS: using externally-managed Secret "{{ .Values.secrets.existingSecret }}".
+   Ensure it exists in namespace "{{ .Release.Namespace }}" with keys
+   FP_S3_ACCESS_KEY and FP_S3_SECRET_KEY before pods will start.
+{{- end }}
+
+{{- if not .Values.networkPolicy.enabled }}
+
+NOTE: NetworkPolicy is DISABLED. This model is reachable from any namespace.
+   Enable `networkPolicy.enabled=true` on a CNI that enforces policy (Calico/Cilium).
+{{- end }}

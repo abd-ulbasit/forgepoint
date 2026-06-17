@@ -1,0 +1,45 @@
+{{- if .Values.serviceMonitor.enabled -}}
+# ============================================================================
+# ServiceMonitor (Prometheus Operator CRD) — declarative scrape target.
+# ============================================================================
+# A ServiceMonitor tells the Prometheus Operator "scrape the pods behind any
+# Service matching this selector, on this port/path/interval". The Operator
+# translates it into Prometheus scrape config — so we never hand-edit
+# prometheus.yml; the scrape target travels WITH the chart (GitOps-friendly).
+#
+# ⚠️ READ THIS — why it's disabled by default:
+#   Forgepoint's canonical metrics path is OTLP PUSH to the OTel Collector, which
+#   Prometheus then scrapes (see pkg/observability/setup.go). In that design
+#   there is NO per-pod /metrics endpoint, so this ServiceMonitor would scrape
+#   nothing. Enable it ONLY when the service is configured to ALSO expose a
+#   Prometheus /metrics endpoint on the health port (the alternative pull model
+#   the dev prometheus.yml assumes). Guarding on a value also means
+#   `helm template` won't emit a CR for a CRD the cluster might not have
+#   installed (which would fail a strict apply / kubeconform-with-schemas).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "fp-model-monitor.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fp-model-monitor.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  # Match THIS chart's Service by its identity labels.
+  selector:
+    matchLabels:
+      {{- include "fp-model-monitor.selectorLabels" . | nindent 6 }}
+  namespaceSelector:
+    matchNames:
+      - {{ .Release.Namespace }}
+  endpoints:
+    # port references the Service port BY NAME (the "health" port that serves
+    # /metrics), so the scrape stays correct if the number changes.
+    - port: {{ .Values.serviceMonitor.portName }}
+      path: {{ .Values.serviceMonitor.path }}
+      interval: {{ .Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
+      scheme: http
+{{- end }}

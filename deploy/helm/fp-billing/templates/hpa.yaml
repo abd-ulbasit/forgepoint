@@ -1,0 +1,69 @@
+{{- if .Values.autoscaling.enabled -}}
+# ============================================================================
+# HorizontalPodAutoscaler (autoscaling/v2) — scale replicas on load.
+# ============================================================================
+# The HPA controller samples metrics every ~15s and adjusts the Deployment's
+# replica count to keep each metric near its target. autoscaling/v2 is the
+# stable API that supports MULTIPLE metrics and custom/external metrics (the v1
+# API was CPU-only) — that's why we use v2 even for a CPU-only setup, so adding a
+# custom metric later needs no API migration.
+#
+# WHY the Deployment omits `replicas` when this is enabled: if both set the
+# count, every `helm upgrade` resets replicas to replicaCount and then the HPA
+# corrects it — visible flapping. With the HPA as sole owner, scaling is stable.
+#
+# MULTI-METRIC SEMANTICS (interview-probe): when several metrics are listed, the
+# HPA computes the desired replicas for EACH and takes the MAXIMUM — it scales to
+# satisfy the most-pressed metric, never under-provisioning.
+#
+# BILLING ANGLE: the natural custom metric here is the metering CONSUMER's NATS
+# lag (the consumer that turns inference events into usage records). When that
+# backs up, scale out billing to drain it. Wire it via autoscaling.customMetrics
+# (KEDA / Prometheus-Adapter) when that path lands.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "fp-billing.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fp-billing.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "fp-billing.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    {{- if .Values.autoscaling.targetCPUUtilizationPercentage }}
+    # Resource metric: target average CPU utilization as a % of the pod's CPU
+    # REQUEST (not limit). This is why requests must be set realistically —
+    # they are the denominator of the HPA's utilization math.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+    {{- end }}
+    {{- if .Values.autoscaling.targetMemoryUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetMemoryUtilizationPercentage }}
+    {{- end }}
+    {{- with .Values.autoscaling.customMetrics }}
+    # Custom/external metrics passed through verbatim. This is the hook for the
+    # platform's later autoscaling work (Prometheus-Adapter for gRPC RPS, or KEDA
+    # for NATS consumer lag — the metering consumer). Example shape is in values.yaml.
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.autoscaling.behavior }}
+  # behavior tunes scale-up/down velocity. A long scale-down stabilization window
+  # prevents flapping (rapid scale-in then back out) when load is spiky.
+  behavior:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

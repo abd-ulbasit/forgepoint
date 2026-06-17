@@ -1,0 +1,48 @@
+apiVersion: v2
+
+# fp-feature-store MIRRORS the reference chart fp-auth exactly (same templates,
+# same hardening, same labels). Only the name, image, and service-specific
+# config differ. Keeping every chart boringly uniform makes the platform's
+# deployment surface interview-explainable and easy to audit. To see the design
+# rationale for any template here, read the heavily-commented fp-auth chart —
+# this one is a faithful copy with feature-store's data stores wired in.
+name: fp-feature-store
+description: Forgepoint Feature Store service (event-sourced features — append-only log + Redis online store + Postgres offline store).
+
+# CHART TYPE: "application" (the default) vs "library".
+#   application → renders into deployable K8s objects (what we want).
+#   library     → reusable templates only, never installed directly.
+type: application
+
+# TWO DISTINCT VERSIONS — a common point of confusion:
+#   version    = the CHART's own version. Bump on ANY template change (SemVer).
+#   appVersion = the APPLICATION (container) version this chart ships by default.
+#                It is purely informational and is what `helm list` shows as
+#                APP VERSION; the actual image tag still comes from values.yaml
+#                (.Values.image.tag), falling back to appVersion when tag is "".
+version: 0.1.0
+appVersion: "0.1.0"
+
+# kubeVersion gates installs to a cluster new enough for the APIs we use
+# (autoscaling/v2 HPA, policy/v1 PDB, networking.k8s.io/v1 NetworkPolicy all
+# stabilized by 1.21+). Helm refuses to install on older clusters with a clear
+# error instead of failing later with an unknown-API surprise.
+kubeVersion: ">=1.23.0-0"
+
+home: https://github.com/abd-ulbasit/forgepoint
+# icon is purely cosmetic (shown in chart registries/UIs). Set to silence the
+# `helm lint` "icon is recommended" INFO and to brand the chart in repo UIs.
+icon: https://raw.githubusercontent.com/abd-ulbasit/forgepoint/main/docs/assets/logo.png
+sources:
+  - https://github.com/abd-ulbasit/forgepoint
+
+maintainers:
+  - name: Forgepoint Platform Team
+
+keywords:
+  - forgepoint
+  - feature-store
+  - event-sourcing
+  - cqrs
+  - grpc
+  - microservice

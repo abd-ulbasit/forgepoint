@@ -1,0 +1,48 @@
+============================================================================
+  {{ include "fp-experiment-tracker.fullname" . }} deployed to namespace "{{ .Release.Namespace }}"
+  Chart {{ .Chart.Name }}-{{ .Chart.Version }}  •  App version {{ .Chart.AppVersion }}
+============================================================================
+
+Image:     {{ include "fp-experiment-tracker.image" . }}
+Replicas:  {{ if .Values.autoscaling.enabled }}autoscaled {{ .Values.autoscaling.minReplicas }}..{{ .Values.autoscaling.maxReplicas }} (HPA){{ else }}{{ .Values.replicaCount }} (fixed){{ end }}
+
+PORTS
+  gRPC API (ExperimentTrackerService): {{ .Values.ports.grpc }}  (in-cluster only — ClusterIP)
+  HTTP health/metrics:      {{ .Values.ports.health }}  (/healthz, /readyz{{ if .Values.serviceMonitor.enabled }}, {{ .Values.serviceMonitor.path }}{{ end }})
+
+1. Watch the rollout reach Ready:
+
+   kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "fp-experiment-tracker.fullname" . }}
+
+2. Check pod health:
+
+   kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+
+3. Probe the health endpoints (port-forward the HTTP health port):
+
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "fp-experiment-tracker.fullname" . }} {{ .Values.ports.health }}:{{ .Values.ports.health }}
+   curl -s localhost:{{ .Values.ports.health }}/healthz   # liveness
+   curl -s localhost:{{ .Values.ports.health }}/readyz    # readiness (+ dependency status)
+
+4. Call the gRPC API from inside the cluster:
+
+   grpcurl -plaintext {{ include "fp-experiment-tracker.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.ports.grpc }} list
+
+{{- if .Values.secrets.create }}
+
+⚠️  SECRETS: this release rendered an IN-CHART Secret from values (DEV ONLY).
+   For any real environment, set `secrets.create=false` and provide an
+   externally-managed Secret named via `secrets.existingSecret`
+   (External Secrets Operator or Sealed Secrets). Never commit real credentials.
+{{- else }}
+
+SECRETS: using externally-managed Secret "{{ .Values.secrets.existingSecret }}".
+   Ensure it exists in namespace "{{ .Release.Namespace }}" with key
+   FP_DATABASE_URL before pods will start.
+{{- end }}
+
+{{- if not .Values.networkPolicy.enabled }}
+
+NOTE: NetworkPolicy is DISABLED. experiment-tracker is reachable from any namespace. Enable
+   `networkPolicy.enabled=true` on a CNI that enforces policy (Calico/Cilium).
+{{- end }}

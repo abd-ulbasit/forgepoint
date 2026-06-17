@@ -1,0 +1,69 @@
+{{- if .Values.autoscaling.enabled -}}
+# ============================================================================
+# HorizontalPodAutoscaler (autoscaling/v2) — scale replicas on load.
+# ============================================================================
+# The HPA controller samples metrics every ~15s and adjusts the Deployment's
+# replica count to keep each metric near its target. autoscaling/v2 is the
+# stable API that supports MULTIPLE metrics and custom/external metrics (the v1
+# API was CPU-only) — that's why we use v2 even for a CPU-only setup, so adding a
+# custom metric later needs no API migration.
+#
+# WHY the Deployment omits `replicas` when this is enabled: if both set the
+# count, every `helm upgrade` resets replicas to replicaCount and then the HPA
+# corrects it — visible flapping. With the HPA as sole owner, scaling is stable.
+#
+# SERVING-SPECIFIC (interview-probe): CPU% is a WEAK signal for an inference pod —
+# it can be latency-degraded (predicts queueing) while CPU looks moderate. The
+# platform's real autoscale signal is a CUSTOM metric (p99 inference latency or
+# gRPC RPS via Prometheus-Adapter), wired through `autoscaling.customMetrics`.
+# The CPU target below is kept only as a coarse fallback. MULTI-METRIC SEMANTICS:
+# when several metrics are listed the HPA computes desired replicas for EACH and
+# takes the MAXIMUM — it scales to satisfy the most-pressed metric.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "fp-model-serving.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fp-model-serving.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "fp-model-serving.fullname" . }}
+  minReplicas: {{ .Values.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  metrics:
+    {{- if .Values.autoscaling.targetCPUUtilizationPercentage }}
+    # Resource metric: target average CPU utilization as a % of the pod's CPU
+    # REQUEST (not limit). This is why requests must be set realistically —
+    # they are the denominator of the HPA's utilization math.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+    {{- end }}
+    {{- if .Values.autoscaling.targetMemoryUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.autoscaling.targetMemoryUtilizationPercentage }}
+    {{- end }}
+    {{- with .Values.autoscaling.customMetrics }}
+    # Custom/external metrics passed through verbatim. For model-serving this is
+    # the PRIMARY autoscale signal (inference latency / RPS via Prometheus-Adapter
+    # or KEDA), not an afterthought. Example shape is in values.yaml.
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.autoscaling.behavior }}
+  # behavior tunes scale-up/down velocity. A long scale-down stabilization window
+  # prevents flapping AND avoids repeatedly paying the model COLD-START cost as
+  # pods churn (a serving pod's scale-up cost includes loading the weights).
+  behavior:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

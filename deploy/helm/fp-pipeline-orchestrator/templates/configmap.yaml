@@ -1,0 +1,39 @@
+# ============================================================================
+# ConfigMap — NON-SECRET environment configuration.
+# ============================================================================
+# These keys are mapped into the container as env vars via `envFrom` in the
+# Deployment. The service reads them with the FP_ prefix
+# (config.Load[PipelineConfig]("FP") → FP_PORT, FP_GRPC_PORT, ...). Keep ONLY
+# non-sensitive values here — a ConfigMap is stored in plaintext in etcd and
+# readable by anyone with get on ConfigMaps in the namespace. The DB DSN (with
+# password) lives in the Secret.
+#
+# WHY ports come from values, not hardcoded: the container, the Service, and the
+# probes must all agree on the port numbers; sourcing them from one place
+# (.Values.ports) keeps them in lockstep.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "fp-pipeline-orchestrator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fp-pipeline-orchestrator.labels" . | nindent 4 }}
+data:
+  # Ports — stringified because ConfigMap values are always strings.
+  FP_PORT: {{ .Values.ports.health | quote }}
+  FP_GRPC_PORT: {{ .Values.ports.grpc | quote }}
+  # Observability + async bus endpoints (in-cluster service DNS).
+  FP_LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  FP_OTEL_ENDPOINT: {{ .Values.config.otelEndpoint | quote }}
+  FP_NATS_URL: {{ .Values.config.natsUrl | quote }}
+  # FP_ENV labels logs/traces with the deployment environment.
+  FP_ENV: {{ .Values.config.env | quote }}
+  # ORCHESTRATOR-SPECIFIC: PipelineConfig.CompensationTimeout (saga rollback budget
+  # per step before COMPENSATION_FAILED). Go duration string, parsed by pkg/config.
+  FP_COMPENSATION_TIMEOUT: {{ .Values.config.compensationTimeout | quote }}
+  {{- with .Values.config.extraEnv }}
+  # Free-form additional non-secret env. Keys used verbatim.
+  {{- range $key, $val := . }}
+  {{ $key }}: {{ $val | quote }}
+  {{- end }}
+  {{- end }}

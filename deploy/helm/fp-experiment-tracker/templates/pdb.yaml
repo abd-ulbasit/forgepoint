@@ -1,0 +1,33 @@
+{{- if .Values.podDisruptionBudget.enabled -}}
+# ============================================================================
+# PodDisruptionBudget — availability floor during VOLUNTARY disruptions.
+# ============================================================================
+# A PDB constrains how many pods the cluster may voluntarily evict at once:
+# node drains (`kubectl drain`), cluster autoscaler scale-down, rolling node
+# upgrades. minAvailable: 1 tells the eviction API "never let experiment-tracker
+# drop below 1 Ready pod" — a node drain that would take the last replica is
+# BLOCKED until
+# a replacement is Ready elsewhere.
+#
+# IMPORTANT — what a PDB does NOT do: it does not protect against INVOLUNTARY
+# disruptions (node crash, OOM-kill, kubelet death). Those bypass the eviction
+# API entirely. The PDB plus replicaCount: 2 plus topology spread together give
+# real HA; the PDB alone is only half the story.
+#
+# minAvailable vs maxUnavailable: with 2 replicas, minAvailable: 1 == allow at
+# most 1 evicted at a time. We use minAvailable because it stays correct even if
+# replicaCount/HPA changes the total (always keep at least 1), whereas a fixed
+# maxUnavailable count couples to the replica number.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "fp-experiment-tracker.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fp-experiment-tracker.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "fp-experiment-tracker.selectorLabels" . | nindent 6 }}
+{{- end }}

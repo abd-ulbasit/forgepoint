@@ -1,0 +1,193 @@
+# ============================================================================
+# Deployment — the desired-state controller for the model-serving pods.
+# ============================================================================
+# A Deployment manages a ReplicaSet, which manages the Pods. We declare WHAT we
+# want (N replicas of this pod spec) and the controller reconciles reality to
+# match — including orchestrating rolling updates and self-healing crashed pods.
+#
+# SIDECAR / "the pod IS the model": one Deployment per model VERSION. Every pod
+# in this Deployment self-loads the SAME artifact (from the per-pod identity env
+# vars) into its OWN in-memory ONNX session — shared-nothing, so scaling out adds
+# independent inference capacity for this exact model version.
+#
+# The hardening below (security contexts, probes, spread, rolling strategy) is the
+# platform baseline inherited from the fp-auth reference chart, kept byte-for-byte
+# uniform except where serving genuinely differs (a writable emptyDir is used for
+# the artifact fetch, not just /tmp scratch).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "fp-model-serving.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fp-model-serving.labels" . | nindent 4 }}
+spec:
+  # When the HPA owns scaling, OMIT replicas here. If we always set it, every
+  # `helm upgrade` would reset the count to replicaCount and fight the HPA
+  # (flapping the pod count on each deploy). So: set replicas only when
+  # autoscaling is disabled.
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  # revisionHistoryLimit caps retained old ReplicaSets (for rollback). Default 10
+  # is wasteful; 5 is plenty of rollback depth without etcd clutter.
+  revisionHistoryLimit: 5
+  strategy:
+    type: {{ .Values.updateStrategy.type }}
+    {{- if eq .Values.updateStrategy.type "RollingUpdate" }}
+    rollingUpdate:
+      # maxUnavailable: 0 + maxSurge: 1 = surge-then-retire: never dip below
+      # desired capacity during a roll, add at most one extra pod at a time. The
+      # new pod only counts as available once its model is LOADED (readiness gates
+      # on StateReady), so a roll never serves before the new weights are resident.
+      maxUnavailable: {{ .Values.updateStrategy.rollingUpdate.maxUnavailable }}
+      maxSurge: {{ .Values.updateStrategy.rollingUpdate.maxSurge }}
+    {{- end }}
+  # selector is IMMUTABLE post-create and must equal the pod template's identity
+  # labels — both come from the same helper so they can't drift.
+  selector:
+    matchLabels:
+      {{- include "fp-model-serving.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "fp-model-serving.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # checksum/config + checksum/secret: hash the ConfigMap/Secret contents
+        # into the pod template. WHY: changing a ConfigMap/Secret does NOT by
+        # itself restart pods (env vars are read at process start). Embedding the
+        # checksum changes the pod template → the Deployment rolls the pods so the
+        # new config actually takes effect. This is the standard Helm idiom for
+        # "restart on config change".
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.secrets.create }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "fp-model-serving.serviceAccountName" . }}
+      # Belt-and-suspenders: also deny token automount at the pod level (the SA
+      # already defaults it). model-serving doesn't talk to the K8s API.
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # Pod-level hardening (runAsNonRoot, nonroot UID, fsGroup, seccomp).
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      # Must exceed the gRPC graceful-drain timeout (25s) so in-flight predicts
+      # finish before SIGKILL — see pkg/grpcutil drain logic.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: {{ include "fp-model-serving.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Container-level hardening (no priv-esc, read-only rootfs, drop ALL caps).
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.ports.grpc }}
+              protocol: TCP
+            - name: health
+              containerPort: {{ .Values.ports.health }}
+              protocol: TCP
+          # envFrom pulls ALL keys from the ConfigMap (non-secret) and the Secret
+          # (sensitive S3 creds) as env vars in one shot — the service reads FP_*
+          # from env. Order matters: Secret last so a secret key would win on a
+          # name clash (there are none here, but the precedence is intentional).
+          envFrom:
+            - configMapRef:
+                name: {{ include "fp-model-serving.fullname" . }}
+            - secretRef:
+                name: {{ include "fp-model-serving.secretName" . }}
+          # PROBES — all hit the HTTP health port.
+          #   liveness  → /healthz: process-alive only; failure RESTARTS the pod.
+          #   readiness → /readyz : real dependency checks; for a serving pod this
+          #               goes green only once the model is StateReady (loaded in
+          #               memory). Failure pulls the pod from Service endpoints (no
+          #               traffic) without restarting.
+          #   startup   → guards the SLOW cold model load (artifact fetch + ONNX
+          #               session init) so liveness doesn't kill a pod that's
+          #               merely still loading its weights.
+          {{- if .Values.probes.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.probes.startup.path }}
+              port: health
+            initialDelaySeconds: {{ .Values.probes.startup.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          {{- end }}
+          {{- if .Values.probes.liveness.enabled }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: health
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          {{- end }}
+          {{- if .Values.probes.readiness.enabled }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: health
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          # readOnlyRootFilesystem: true means the container CANNOT write to its
+          # own filesystem. The artifact fetch (ModelFetcher pulls the ONNX file
+          # from object storage to a local path before the engine loads it) needs
+          # a writable scratch dir — that's this RAM-backed emptyDir at /tmp.
+          # Ephemeral by design: the model is re-fetched on every pod start (the
+          # pod is the model's runtime, not its store of record).
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          # emptyDir for the fetched artifact + scratch. sizeLimit caps it so a
+          # runaway/oversized artifact can't fill the node's memory (emptyDir with
+          # no medium is node-disk-backed; bump or set medium: Memory per model).
+          emptyDir:
+            sizeLimit: 2Gi
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # topologySpreadConstraints — spread replicas across nodes/zones so one
+      # failure domain can't host a disproportionate share of this model's pods.
+      # The label selector is injected from the chart's selector labels so it
+      # always targets exactly this workload's pods.
+      {{- if .Values.topologySpread.enabled }}
+      topologySpreadConstraints:
+        {{- range .Values.topologySpread.constraints }}
+        - maxSkew: {{ .maxSkew }}
+          topologyKey: {{ .topologyKey }}
+          whenUnsatisfiable: {{ .whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "fp-model-serving.selectorLabels" $ | nindent 14 }}
+        {{- end }}
+      {{- end }}

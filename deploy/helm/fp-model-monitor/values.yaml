@@ -1,0 +1,402 @@
+# ============================================================================
+# fp-model-monitor — default values
+# ============================================================================
+# Mirrors the fp-auth REFERENCE values file. Everything the templates render is
+# driven from here so the manifests stay declarative and nothing is hardcoded.
+# Override per-environment with `-f values-prod.yaml` or `--set key=value`.
+#
+# WHAT'S DIFFERENT FROM fp-auth (the service-specific surface):
+#   - image.repository → fp-model-monitor
+#   - config: adds retrainCooldown + orchestratorEndpoint (non-secret knobs of
+#     the closed loop); the live-window/retrain-gate store is Redis.
+#   - secrets: NO jwtSecret (this service has no signing key — it VALIDATES JWTs
+#     via the shared auth interceptor, it doesn't mint them). It DOES carry the
+#     Postgres DSN (fp_monitor) and the Redis URL (which may embed a password).
+#   - networkPolicy egress: adds Redis (live windows + retrain gate) and the
+#     Pipeline Orchestrator in fp-system (the loop-closer gRPC call).
+#
+# SECURITY CONTRACT (read this before touching `secrets:` below):
+#   The plaintext secret values in this file are DEV-ONLY placeholders so the
+#   chart renders and runs on a local Kind cluster. In any real environment the
+#   Secret is produced by External Secrets Operator (pulls from AWS Secrets
+#   Manager / Vault) or Sealed Secrets — NOT from committed values. See
+#   `secrets.create` and templates/secret.yaml for how to turn the in-chart
+#   Secret off and point at an externally-managed one.
+# ============================================================================
+
+# replicaCount: 2 is the floor for a stateless HA service. Two replicas means a
+# single node drain or pod eviction never takes the service fully down, and the
+# PodDisruptionBudget (minAvailable: 1) can always be satisfied. When autoscaling
+# is enabled the HPA owns the replica count and this value is ignored.
+#
+# CONCURRENCY NOTE: model-monitor's streaming aggregation is keyed per monitor in
+# Redis (LoadOrOpen/Save/Close) and reports are saved IDEMPOTENTLY on WindowID,
+# so running >1 replica is safe — two replicas folding the same window converge,
+# and exactly one report survives. So HA here costs nothing in correctness.
+replicaCount: 2
+
+image:
+  repository: ghcr.io/abd-ulbasit/forgepoint/model-monitor
+  # tag "" → the chart falls back to Chart.appVersion (see _helpers "image").
+  # Pin an explicit immutable tag (git SHA or semver) in prod; never :latest,
+  # which breaks reproducibility and defeats rollbacks.
+  tag: ""
+  # IfNotPresent: don't re-pull an image the node already has (faster, fewer
+  # registry round-trips). Use Always only for mutable dev tags.
+  pullPolicy: IfNotPresent
+
+# imagePullSecrets: names of pre-existing docker-registry Secrets for private
+# registries. Empty for public ghcr; populated in prod from a registry secret.
+imagePullSecrets: []
+
+# nameOverride / fullnameOverride let an operator rename the release-derived
+# resource names without editing templates (see _helpers "fullname").
+nameOverride: ""
+fullnameOverride: ""
+
+# ----------------------------------------------------------------------------
+# Ports — two distinct listeners (see services/model-monitor/cmd/server/main.go).
+#   grpc:   HTTP/2, the actual MonitorService API.
+#   health: HTTP/1.1, serves /healthz, /readyz, and /metrics. Kept on a separate
+#           port because gRPC (HTTP/2) and kubelet probes (HTTP/1.1) cannot share
+#           one net.Listener.
+# These names ("grpc", "health") are referenced by service.yaml, the probes, and
+# the ServiceMonitor — change them here and they propagate everywhere.
+# ----------------------------------------------------------------------------
+ports:
+  grpc: 9090
+  health: 8080
+
+service:
+  type: ClusterIP
+  annotations: {}
+
+# ----------------------------------------------------------------------------
+# Non-secret configuration → rendered into a ConfigMap, injected via envFrom.
+# These map 1:1 to FP_* env vars the service reads (config.Load[MonitorConfig]
+# ("FP") → FP_PORT, FP_GRPC_PORT, FP_RETRAIN_COOLDOWN, ...). The service prefixes
+# every env var with FP_. DATABASE_URL/REDIS_URL are NOT here — they may carry
+# credentials, so they live in the Secret (see `secrets:`).
+# ----------------------------------------------------------------------------
+config:
+  # FP_ENV labels telemetry/logs with the deployment environment.
+  env: "local"
+  logLevel: "info"
+  # In-cluster service DNS. fp-infra is the namespace hosting shared infra
+  # (NATS, Postgres, Redis, OTel collector) per CLAUDE.md K8s namespaces.
+  otelEndpoint: "otel-collector.fp-infra.svc.cluster.local:4317"
+  natsUrl: "nats://nats.fp-infra.svc.cluster.local:4222"
+  # ----------------------------------------------------------------------
+  # CLOSED-LOOP KNOBS — model-monitor specific (see internal/config/config.go).
+  # ----------------------------------------------------------------------
+  # FP_RETRAIN_COOLDOWN: minimum gap between auto-retrains for one model — the
+  # ANTI-STORM interval. A sustained drift breaches CRITICAL on every window
+  # close; this cooldown is the debounce that stops a busy model from firing a
+  # retrain every few seconds (same idea as Alertmanager repeat_interval). 1h is
+  # long enough for one retrain → canary → promote (baseline reset) to finish.
+  retrainCooldown: "1h"
+  # FP_ORCHESTRATOR_ENDPOINT: the FIXED in-cluster gRPC address of the Pipeline
+  # Orchestrator the loop calls to trigger a retrain. WHY a fixed configured
+  # endpoint (not a target derived from event data): a poisoned inference/drift
+  # payload must NOT redirect the retrain to an attacker-chosen host (SSRF-class
+  # footgun). The loop's target is operator config, full stop. Lives in fp-system
+  # alongside this service — hence the orchestrator egress rule in networkPolicy.
+  orchestratorEndpoint: "fp-pipeline-orchestrator.fp-system.svc.cluster.local:9090"
+  # Extra free-form non-secret env keys (rendered into the ConfigMap as-is).
+  # Keys are used verbatim — DO NOT prefix with FP_ here unless the service
+  # actually reads that prefix; mirror existing FP_* naming.
+  extraEnv: {}
+
+# ----------------------------------------------------------------------------
+# Secrets — DEV placeholders only. See the SECURITY CONTRACT at the top.
+#   secrets.create: true  → chart renders templates/secret.yaml from the values
+#                           below. Convenient for local Kind; NEVER commit real
+#                           values here.
+#   secrets.create: false → chart renders NO Secret. You must provide a Secret
+#                           named `secrets.existingSecret` out-of-band (External
+#                           Secrets / Sealed Secrets / kubectl). The Deployment
+#                           still envFrom's it.
+#
+# NOTE vs fp-auth: model-monitor has NO jwtSecret (it does not mint tokens). Its
+# secret surface is the Postgres DSN and the Redis URL (both may embed creds).
+# ----------------------------------------------------------------------------
+secrets:
+  create: true
+  # When create=false, the Deployment envFrom's this externally-managed Secret.
+  # Defaults to the chart's fullname when empty (see _helpers "secretName").
+  existingSecret: ""
+  # DEV-ONLY values. Override via --set or a non-committed -f secrets.local.yaml.
+  # Full Postgres DSN the service reads as FP_DATABASE_URL. Database is fp_monitor
+  # (this service owns it — "database per service"). In prod the password
+  # component comes from a managed secret store, not from this file.
+  databaseUrl: "postgres://monitor:dev-only-change-me@postgres.fp-infra.svc.cluster.local:5432/fp_monitor?sslmode=disable"
+  # Redis URL the service reads as FP_REDIS_URL — the live sliding-window store
+  # and the retrain-gate (SET NX PX). Treated as a secret because a real Redis
+  # URL carries an auth password (redis://:password@host:6379). In prod the
+  # password comes from a managed secret store.
+  redisUrl: "redis://redis.fp-infra.svc.cluster.local:6379"
+
+# ----------------------------------------------------------------------------
+# Resources — requests AND limits both set (a "Guaranteed" QoS-friendly shape).
+#   requests = what the scheduler reserves; sets the floor and drives HPA math.
+#   limits   = the ceiling; CPU is throttled, memory OOM-kills above it.
+# model-monitor does MORE per request than auth: it FOLDS every inference event
+# into a live window (Redis round-trips on each event) and runs drift math
+# (PSI/KL/KS histogram comparison) on every window close. So it gets a higher
+# CPU/memory floor than auth's JWT-only profile. Still modest — drift math is
+# bounded by bin count, not data volume. Tune from real RED metrics + the NATS
+# consumer's processing latency before raising.
+# ----------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# ----------------------------------------------------------------------------
+# Autoscaling — HPA. Disabled by default; replicaCount governs when off.
+# When enabled the HPA, not replicaCount, owns the replica number.
+# `customMetrics` is wired for the Prometheus-Adapter / KEDA path the platform
+# uses later — see templates/hpa.yaml.
+#
+# MODEL-MONITOR'S NATURAL SCALE SIGNAL is NATS CONSUMER LAG (the backlog of
+# unprocessed inference events), NOT CPU. The streaming-aggregation consumer is
+# this service's heartbeat; if events arrive faster than it folds them, lag
+# grows. That's the KEDA `stan`/`jetstream` scaler trigger the platform adds
+# later — drop it into customMetrics (external metric) when KEDA lands.
+# ----------------------------------------------------------------------------
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+  # Optional memory target; null/omit to disable the memory metric.
+  targetMemoryUtilizationPercentage: 80
+  # Extra metrics passed through verbatim into the HPA spec.metrics list
+  # (autoscaling/v2). For model-monitor the high-value one is NATS consumer lag
+  # via an External metric (KEDA-managed). Example (custom Pods metric):
+  #   - type: Pods
+  #     pods:
+  #       metric:
+  #         name: grpc_requests_per_second
+  #       target:
+  #         type: AverageValue
+  #         averageValue: "100"
+  customMetrics: []
+  # Scaling behavior — conservative scale-down to avoid flapping (thundering herd
+  # of pod churn). Tune per service SLO.
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+
+# PodDisruptionBudget — protects availability during VOLUNTARY disruptions only
+# (node drains, cluster upgrades), NOT crashes. minAvailable: 1 lets the cluster
+# evict at most (replicas-1) pods at once, so a drain never zeroes the service.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# ServiceAccount — own identity per service (least privilege, audit trail).
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # automountServiceAccountToken: false — model-monitor does NOT call the K8s API
+  # (it talks to Postgres/Redis/NATS and the orchestrator over gRPC, never the API
+  # server), so it has no reason to carry a mountable API token. Mounting one
+  # needlessly widens blast radius if the pod is compromised (token → API server).
+  # Flip to true only for a service that genuinely uses the in-cluster K8s client.
+  automountServiceAccountToken: false
+
+# ----------------------------------------------------------------------------
+# Pod-level security context — the non-negotiable hardened baseline. Applied to
+# every service. These satisfy the "restricted" Pod Security Standard.
+# ----------------------------------------------------------------------------
+podSecurityContext:
+  # runAsNonRoot makes the kubelet REFUSE to start the pod if the image's user
+  # resolves to UID 0 — a guard against an accidentally-root image.
+  runAsNonRoot: true
+  # 65532 = the "nonroot" UID/GID baked into gcr.io/distroless/* base images,
+  # which our multi-stage Dockerfile uses. Matches the image's filesystem owner.
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  # seccompProfile RuntimeDefault → the container runtime's default syscall
+  # filter (blocks ~44 dangerous syscalls). Cheap, strong kernel-surface
+  # reduction; required by the restricted PSS.
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level security context — defense in depth on top of the pod context.
+containerSecurityContext:
+  allowPrivilegeEscalation: false  # blocks setuid/gainprivs (no sudo-up inside)
+  readOnlyRootFilesystem: true     # immutable rootfs; tamper-resistant, forces
+                                   # explicit emptyDir for any writable path
+  runAsNonRoot: true
+  runAsUser: 65532
+  capabilities:
+    # Drop ALL Linux capabilities. A network service needs none — it binds a
+    # high port (>1024) and does no privileged kernel ops. Least privilege.
+    drop:
+      - ALL
+
+# ----------------------------------------------------------------------------
+# Rolling update strategy — zero-downtime deploys for a stateless service.
+#   maxUnavailable: 0 → never drop below desired count during a roll (no capacity
+#                       dip; the PDB also enforces this for disruptions).
+#   maxSurge: 1       → bring up one extra new pod, wait for it Ready, then retire
+#                       an old one. Bounded extra cost (one pod) per step.
+# ----------------------------------------------------------------------------
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+# ----------------------------------------------------------------------------
+# Probes — liveness on /healthz (process-alive only), readiness on /readyz
+# (real dependency checks — DB/Redis/NATS Ping once the adapters land). Both hit
+# the HTTP health port. Tunable so each service can match its own startup
+# profile. startupProbe shields slow cold starts from premature liveness restarts.
+# ----------------------------------------------------------------------------
+probes:
+  liveness:
+    enabled: true
+    path: /healthz
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    enabled: true
+    path: /readyz
+    initialDelaySeconds: 3
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 2
+  startup:
+    enabled: true
+    path: /healthz
+    initialDelaySeconds: 0
+    periodSeconds: 3
+    # 30 * 3s = 90s budget for the process to come up before liveness engages.
+    failureThreshold: 30
+    timeoutSeconds: 2
+
+# ----------------------------------------------------------------------------
+# topologySpreadConstraints — spread replicas across failure domains so a single
+# node/zone loss can't take out a disproportionate share of pods. whenUnsatisfiable
+# ScheduleAnyway keeps scheduling possible on small/single-zone clusters (Kind)
+# while still preferring spread. The selector is injected by the template from the
+# chart's standard selector labels.
+# ----------------------------------------------------------------------------
+topologySpread:
+  enabled: true
+  constraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+
+# Generic scheduling knobs, passed through untouched.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Extra pod annotations/labels (merged into pod template metadata).
+podAnnotations: {}
+podLabels: {}
+
+# terminationGracePeriodSeconds — must exceed the gRPC drain timeout (25s in
+# pkg/grpcutil) so in-flight RPCs finish before SIGKILL. 30s gives 5s slack.
+terminationGracePeriodSeconds: 30
+
+# ----------------------------------------------------------------------------
+# ServiceMonitor (Prometheus Operator CRD) — DISABLED by default ON PURPOSE.
+#
+# Forgepoint's canonical metrics path is OTLP PUSH to the OTel Collector, which
+# Prometheus then scrapes (see pkg/observability/setup.go). So there is normally
+# NO per-pod /metrics endpoint to scrape. This ServiceMonitor exists for the
+# alternative setup where a service is configured to expose /metrics directly on
+# the health port (the prometheus.yml dev scrape config assumes this). Enable it
+# only when you've turned on the in-process Prometheus exporter for the service.
+# Guarded so `helm template` never emits a ServiceMonitor referencing a CRD the
+# cluster may not have.
+# ----------------------------------------------------------------------------
+serviceMonitor:
+  enabled: false
+  # path/port of the metrics endpoint when enabled.
+  path: /metrics
+  portName: health
+  interval: 30s
+  scrapeTimeout: 10s
+  # Extra labels so a Prometheus Operator with a label selector picks this up
+  # (e.g. release: kube-prometheus-stack).
+  labels: {}
+
+# ----------------------------------------------------------------------------
+# NetworkPolicy — default-deny ingress, allow only what the service needs.
+# Zero-trust east-west: even inside the cluster, only fp-system callers reach
+# model-monitor, and model-monitor may only egress to the data stores + control
+# plane it actually uses.
+#
+# MODEL-MONITOR'S EGRESS FOOTPRINT (wider than auth — this service closes a loop):
+#   - DNS    : resolve service names (always).
+#   - Postgres (fp-infra:5432) : durable drift_reports + monitors + ground truth.
+#   - Redis    (fp-infra:6379) : live sliding windows + retrain-gate cooldown.
+#   - NATS     (fp-infra:4222) : consume inference events, publish drift events.
+#   - OTLP     (fp-infra:4317) : push traces + metrics to the collector.
+#   - Orchestrator (fp-system:9090) : the LOOP-CLOSER — gRPC TriggerRetrain to the
+#     Pipeline Orchestrator. This is the one egress auth doesn't have; it's an
+#     in-cluster service-to-service call within fp-system, scoped to that one port.
+# Disable on clusters whose CNI doesn't enforce NetworkPolicy (it becomes a
+# silent no-op there anyway).
+# ----------------------------------------------------------------------------
+networkPolicy:
+  enabled: true
+  # Namespaces allowed to send INGRESS to model-monitor. fp-system holds the
+  # platform services (gateway, UI BFF, other services) that call MonitorService
+  # (ModelHealth / drift history reads, ConfigureMonitor writes).
+  ingressNamespaces:
+    - fp-system
+  # Egress allow-list. dns is special-cased to the kube-system resolver.
+  egress:
+    dns:
+      enabled: true
+    postgres:
+      enabled: true
+      namespace: fp-infra
+      port: 5432
+    redis:
+      enabled: true
+      namespace: fp-infra
+      port: 6379
+    nats:
+      enabled: true
+      namespace: fp-infra
+      port: 4222
+    otlp:
+      enabled: true
+      namespace: fp-infra
+      port: 4317
+    # The loop-closer: gRPC to the Pipeline Orchestrator. Unlike the fp-infra
+    # data stores, the orchestrator is a PLATFORM SERVICE in fp-system, so this
+    # rule allows egress to that namespace on the gRPC port only.
+    orchestrator:
+      enabled: true
+      namespace: fp-system
+      port: 9090

@@ -1,0 +1,401 @@
+# ============================================================================
+# fp-model-serving — default values
+# ============================================================================
+# Mirrors the fp-auth REFERENCE values file; read fp-auth/values.yaml for the
+# full rationale on each block. This file changes ONLY what is genuinely
+# different for an ONNX inference pod (the Sidecar pattern):
+#
+#   * NO Postgres, NO Redis — the model is held resident IN MEMORY (the ONNX
+#     session); the artifact is pulled ONCE at startup from object storage. So
+#     there is no DATABASE_URL config, no Postgres egress, and the Secret holds
+#     OBJECT-STORAGE credentials (MinIO/S3) instead of a DB DSN + JWT key.
+#   * NO NATS — services/model-serving/cmd/server/main.go never opens a NATS
+#     connection; the serving data plane is event-bus-agnostic by design (the
+#     gateway/registry own the control plane). So natsUrl is omitted and NATS
+#     egress is closed.
+#   * Larger memory — an ONNX session's weights dominate resident memory, so
+#     requests/limits are sized for a model, not a stateless JWT service.
+#   * Per-pod model identity — MODEL_NAME/MODEL_VERSION/ARTIFACT_URI are the
+#     SERVER-side identity of "the model this pod IS" (one Deployment per model
+#     version). They default here for chart rendering; the operator/controller
+#     overrides them per version. See the ServingConfig struct in main.go.
+#
+# SECURITY CONTRACT (same as fp-auth): the plaintext secret values below are
+# DEV-ONLY placeholders. In any real environment the Secret is produced by
+# External Secrets Operator / Sealed Secrets (set secrets.create=false +
+# secrets.existingSecret), never from committed values.
+# ============================================================================
+
+# replicaCount: 2 is the floor for HA. Each serving pod loads its OWN copy of the
+# model into memory (shared-nothing), so two replicas means a node drain never
+# zeroes capacity for this model version and the PDB (minAvailable: 1) is always
+# satisfiable. When autoscaling is enabled the HPA owns the count and this is
+# ignored.
+replicaCount: 2
+
+image:
+  repository: ghcr.io/abd-ulbasit/forgepoint/model-serving
+  # tag "" → the chart falls back to Chart.appVersion (see _helpers "image").
+  # Pin an explicit immutable tag (git SHA or semver) in prod; never :latest,
+  # which breaks reproducibility and defeats rollbacks.
+  tag: ""
+  # IfNotPresent: don't re-pull an image the node already has (faster, fewer
+  # registry round-trips). Use Always only for mutable dev tags.
+  pullPolicy: IfNotPresent
+
+# imagePullSecrets: names of pre-existing docker-registry Secrets for private
+# registries. Empty for public ghcr; populated in prod from a registry secret.
+imagePullSecrets: []
+
+# nameOverride / fullnameOverride let an operator rename the release-derived
+# resource names without editing templates (see _helpers "fullname").
+nameOverride: ""
+fullnameOverride: ""
+
+# ----------------------------------------------------------------------------
+# Ports — two distinct listeners (see services/model-serving/cmd/server/main.go).
+#   grpc:   HTTP/2, the actual ModelServingService API (Predict/GetModelInfo).
+#   health: HTTP/1.1, serves /healthz, /readyz, and /metrics. Kept on a separate
+#           port because gRPC (HTTP/2) and kubelet probes (HTTP/1.1) cannot share
+#           one net.Listener.
+# These names ("grpc", "health") are referenced by service.yaml, the probes, and
+# the ServiceMonitor — change them here and they propagate everywhere.
+# ----------------------------------------------------------------------------
+ports:
+  grpc: 9090
+  health: 8080
+
+service:
+  type: ClusterIP
+  annotations: {}
+
+# ----------------------------------------------------------------------------
+# Non-secret configuration → rendered into a ConfigMap, injected via envFrom.
+# These map 1:1 to FP_* env vars the service reads (pkg/config BaseConfig +
+# ServingConfig). The service prefixes every env var with FP_
+# (config.Load[ServingConfig]("FP")). The S3 access/secret KEYS are secrets and
+# live in the Secret; the bucket/endpoint/model-identity values are NOT secret.
+#
+# NOTE: there is deliberately NO databaseUrl and NO natsUrl here — this service
+# uses neither (see the header). OTLP IS used (observability.Setup pushes to it).
+# ----------------------------------------------------------------------------
+config:
+  # FP_ENV labels telemetry/logs with the deployment environment.
+  env: "local"
+  logLevel: "info"
+  # In-cluster service DNS. fp-infra is the namespace hosting shared infra
+  # (OTel collector, MinIO) per CLAUDE.md K8s namespaces.
+  otelEndpoint: "otel-collector.fp-infra.svc.cluster.local:4317"
+
+  # --- Object storage (MinIO/S3) — where this pod fetches its ONNX artifact ---
+  # The S3-compatible endpoint the storage adapter dials. In-cluster MinIO lives
+  # in fp-infra. (Access/secret KEYS are sensitive → in the Secret, not here.)
+  s3Endpoint: "minio.fp-infra.svc.cluster.local:9000"
+
+  # --- Per-pod MODEL IDENTITY (the Sidecar "the pod IS the model" contract) ---
+  # These are REQUIRED by ServingConfig (MODEL_NAME/MODEL_VERSION/ARTIFACT_URI
+  # are required:"true"). One Deployment per model version overrides them; the
+  # placeholders below let the chart render and the binary start in dev.
+  modelName: "placeholder-model"
+  modelVersion: "v0"
+  # ArtifactURI MUST sit under artifactBucketURI (the SSRF allow-list root) or the
+  # domain rejects the load (fail-closed). Keep them consistent.
+  artifactURI: "s3://fp-models/placeholder-model/v0/model.onnx"
+  # Optional expected sha256 of the artifact for supply-chain integrity. Empty in
+  # dev (no integrity check); set to "sha256:..." in prod so the pod refuses to
+  # serve weights whose digest does not match.
+  artifactDigest: ""
+  # The allow-listed bucket/prefix the pod may load from (the SSRF allow-list
+  # root). The domain rejects any ArtifactURI outside it.
+  artifactBucketURI: "s3://fp-models/"
+  # Inference-latency threshold (ms) above which the liveness signal degrades and
+  # the pod is pulled from rotation. Inference latency — not CPU — is the health
+  # signal for an inference pod (see the HPA rationale below + the proto).
+  livenessLatencyMs: 1000
+
+  # Extra free-form non-secret env keys (rendered into the ConfigMap as-is).
+  # Keys are used verbatim — DO NOT prefix with FP_ here unless the service
+  # actually reads that prefix; mirror existing FP_* naming.
+  extraEnv: {}
+
+# ----------------------------------------------------------------------------
+# Secrets — DEV placeholders only. See the SECURITY CONTRACT at the top.
+#   secrets.create: true  → chart renders templates/secret.yaml from the values
+#                           below. Convenient for local Kind; NEVER commit real
+#                           values here.
+#   secrets.create: false → chart renders NO Secret. You must provide a Secret
+#                           named `secrets.existingSecret` out-of-band (External
+#                           Secrets / Sealed Secrets / kubectl). The Deployment
+#                           still envFrom's it.
+#
+# Unlike fp-auth (JWT key + DB DSN), model-serving's ONLY secret is the
+# OBJECT-STORAGE credential pair the storage adapter uses to pull the artifact.
+# ----------------------------------------------------------------------------
+secrets:
+  create: true
+  # When create=false, the Deployment envFrom's this externally-managed Secret.
+  # Defaults to the chart's fullname when empty (see _helpers "secretName").
+  existingSecret: ""
+  # DEV-ONLY MinIO credentials (match docker-compose / fp-infra MinIO defaults).
+  # In prod these come from a managed secret store, never from this file. Rendered
+  # as FP_S3_ACCESS_KEY / FP_S3_SECRET_KEY env vars (consumed by the storage
+  # adapter, internal/storage, which lands in a later phase).
+  s3AccessKey: "minioadmin"
+  s3SecretKey: "dev-only-change-me-minio-secret"
+
+# ----------------------------------------------------------------------------
+# Resources — requests AND limits both set (a "Guaranteed" QoS-friendly shape).
+#   requests = what the scheduler reserves; sets the floor and drives HPA math.
+#   limits   = the ceiling; CPU is throttled, memory OOM-kills above it.
+# Model-serving is the HEAVY service: the ONNX session holds the model's weights
+# resident, and inference is CPU-bound. memory request==limit (no overcommit) so
+# a model that loads must STAY loaded — an OOM-kill mid-serve would drop the
+# pod's only purpose. CPU limit > request lets a burst of predicts use idle node
+# CPU. Tune from real RED metrics + the actual model's footprint before raising.
+# ----------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+# ----------------------------------------------------------------------------
+# Autoscaling — HPA. Disabled by default; replicaCount governs when off.
+# When enabled the HPA, not replicaCount, owns the replica number.
+#
+# INFERENCE-SPECIFIC RATIONALE: for a serving pod, CPU% is a POOR scaling signal
+# — a pod can be latency-degraded (queueing predicts) while CPU looks moderate.
+# The platform's real signal is a CUSTOM metric (p99 inference latency or gRPC
+# RPS via Prometheus-Adapter). The `customMetrics` passthrough below is exactly
+# that hook; the CPU target is kept only as a coarse fallback. See templates/hpa.yaml.
+# ----------------------------------------------------------------------------
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 8
+  targetCPUUtilizationPercentage: 70
+  # Memory is NOT a useful autoscale signal here (the model footprint is roughly
+  # constant per pod regardless of load), so the memory target is disabled.
+  targetMemoryUtilizationPercentage: null
+  # Extra metrics passed through verbatim into the HPA spec.metrics list
+  # (autoscaling/v2). For serving the intended metric is inference latency / RPS:
+  #   - type: Pods
+  #     pods:
+  #       metric:
+  #         name: inference_request_latency_p99_ms
+  #       target:
+  #         type: AverageValue
+  #         averageValue: "800"
+  customMetrics: []
+  # Scaling behavior — conservative scale-down to avoid flapping (and to avoid
+  # repeatedly paying the model COLD-START / load cost on scale-up churn).
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+
+# PodDisruptionBudget — protects availability during VOLUNTARY disruptions only
+# (node drains, cluster upgrades), NOT crashes. minAvailable: 1 lets the cluster
+# evict at most (replicas-1) pods at once, so a drain never zeroes this model.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# ServiceAccount — own identity per service (least privilege, audit trail).
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # automountServiceAccountToken: false — model-serving does NOT call the K8s
+  # API (it fetches from object storage, not the API server), so it has no reason
+  # to carry a mountable API token. Mounting one needlessly widens blast radius.
+  # Flip to true only for a service that genuinely uses the in-cluster K8s client.
+  automountServiceAccountToken: false
+
+# ----------------------------------------------------------------------------
+# Pod-level security context — the non-negotiable hardened baseline. Applied to
+# every service. These satisfy the "restricted" Pod Security Standard.
+# ----------------------------------------------------------------------------
+podSecurityContext:
+  # runAsNonRoot makes the kubelet REFUSE to start the pod if the image's user
+  # resolves to UID 0 — a guard against an accidentally-root image.
+  runAsNonRoot: true
+  # 65532 = the "nonroot" UID/GID baked into gcr.io/distroless/* base images,
+  # which our multi-stage Dockerfile uses. Matches the image's filesystem owner.
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  # seccompProfile RuntimeDefault → the container runtime's default syscall
+  # filter (blocks ~44 dangerous syscalls). Cheap, strong kernel-surface
+  # reduction; required by the restricted PSS.
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level security context — defense in depth on top of the pod context.
+containerSecurityContext:
+  allowPrivilegeEscalation: false  # blocks setuid/gainprivs (no sudo-up inside)
+  readOnlyRootFilesystem: true     # immutable rootfs; tamper-resistant, forces
+                                   # explicit emptyDir for any writable path
+                                   # (model-serving fetches the artifact to a
+                                   # writable emptyDir at /tmp — see deployment).
+  runAsNonRoot: true
+  runAsUser: 65532
+  capabilities:
+    # Drop ALL Linux capabilities. A network service needs none — it binds a
+    # high port (>1024) and does no privileged kernel ops. Least privilege.
+    drop:
+      - ALL
+
+# ----------------------------------------------------------------------------
+# Rolling update strategy — zero-downtime deploys.
+#   maxUnavailable: 0 → never drop below desired count during a roll (no capacity
+#                       dip; the PDB also enforces this for disruptions).
+#   maxSurge: 1       → bring up one extra new pod, wait for it Ready (which for
+#                       a serving pod means its model is LOADED — readiness gates
+#                       on StateReady), then retire an old one.
+# ----------------------------------------------------------------------------
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+# ----------------------------------------------------------------------------
+# Probes — liveness on /healthz (process-alive only), readiness on /readyz
+# (real dependency checks). Both hit the HTTP health port.
+#
+# SERVING-SPECIFIC TUNING: a serving pod is NOT ready until its model is loaded
+# into memory (the handler phase adds a "model" readiness check that goes green
+# only at StateReady — see main.go header). Loading an ONNX artifact (fetch from
+# object storage + session init) is SLOW relative to a stateless service, so the
+# startupProbe budget is generous (it shields the cold model load from premature
+# liveness restarts).
+# ----------------------------------------------------------------------------
+probes:
+  liveness:
+    enabled: true
+    path: /healthz
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    enabled: true
+    path: /readyz
+    initialDelaySeconds: 3
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 2
+  startup:
+    enabled: true
+    path: /healthz
+    initialDelaySeconds: 0
+    periodSeconds: 5
+    # 60 * 5s = 300s budget for the process to fetch the artifact and initialize
+    # the ONNX session before liveness engages. Larger than fp-auth's 90s because
+    # model load (network pull + session init) dominates a serving pod's cold start.
+    failureThreshold: 60
+    timeoutSeconds: 2
+
+# ----------------------------------------------------------------------------
+# topologySpreadConstraints — spread replicas across failure domains so a single
+# node/zone loss can't take out a disproportionate share of this model's pods.
+# whenUnsatisfiable ScheduleAnyway keeps scheduling possible on small/single-zone
+# clusters (Kind) while still preferring spread. The selector is injected by the
+# template from the chart's standard selector labels.
+# ----------------------------------------------------------------------------
+topologySpread:
+  enabled: true
+  constraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+
+# Generic scheduling knobs, passed through untouched.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Extra pod annotations/labels (merged into pod template metadata).
+podAnnotations: {}
+podLabels: {}
+
+# terminationGracePeriodSeconds — must exceed the gRPC drain timeout (25s in
+# pkg/grpcutil) so in-flight predicts finish before SIGKILL. 30s gives 5s slack.
+terminationGracePeriodSeconds: 30
+
+# ----------------------------------------------------------------------------
+# ServiceMonitor (Prometheus Operator CRD) — DISABLED by default ON PURPOSE.
+#
+# Forgepoint's canonical metrics path is OTLP PUSH to the OTel Collector, which
+# Prometheus then scrapes (see pkg/observability/setup.go). So there is normally
+# NO per-pod /metrics endpoint to scrape. This ServiceMonitor exists for the
+# alternative setup where a service is configured to expose /metrics directly on
+# the health port. Enable it only when you've turned on the in-process Prometheus
+# exporter for the service. Guarded so `helm template` never emits a
+# ServiceMonitor referencing a CRD the cluster may not have.
+# ----------------------------------------------------------------------------
+serviceMonitor:
+  enabled: false
+  # path/port of the metrics endpoint when enabled.
+  path: /metrics
+  portName: health
+  interval: 30s
+  scrapeTimeout: 10s
+  # Extra labels so a Prometheus Operator with a label selector picks this up
+  # (e.g. release: kube-prometheus-stack).
+  labels: {}
+
+# ----------------------------------------------------------------------------
+# NetworkPolicy — default-deny ingress, allow only what the service needs.
+# Zero-trust east-west: only fp-system callers (the Inference Gateway, which
+# fronts every model and does traffic splitting) and fp-models peers reach a
+# serving pod — this chart deploys into fp-models so the gateway's egress
+# allow-list (fp-models:9090) and the intra-namespace permit both apply.
+# A serving pod may only egress to DNS, the OTel collector, and MinIO (object
+# storage) — NOT Postgres and NOT NATS, because it uses neither (see header).
+# Disable on clusters whose CNI doesn't enforce NetworkPolicy (silent no-op there).
+# ----------------------------------------------------------------------------
+networkPolicy:
+  enabled: true
+  # Namespaces allowed to send INGRESS to a serving pod on gRPC :9090 and
+  # health :8080.
+  #   fp-system — the Inference Gateway lives here and forwards every prediction
+  #               to model-serving over gRPC (the hot-path callers).
+  #   fp-models — intra-namespace: other pods in this namespace (e.g. a per-
+  #               version sidecar or a co-located monitor probe) may reach the
+  #               serving pod without leaving the namespace boundary. Also
+  #               required so the NetworkPolicy doesn't block the gateway's
+  #               packets once this chart correctly deploys into fp-models (the
+  #               gateway's egress allow-list targets fp-models:9090).
+  ingressNamespaces:
+    - fp-system
+    - fp-models
+  # Egress allow-list. dns is special-cased to the kube-system resolver.
+  # NOTE vs fp-auth: postgres and nats are OMITTED (this service uses neither);
+  # minio is ADDED (artifact fetch). otlp stays (telemetry push).
+  egress:
+    dns:
+      enabled: true
+    otlp:
+      enabled: true
+      namespace: fp-infra
+      port: 4317
+    minio:
+      enabled: true
+      namespace: fp-infra
+      port: 9000

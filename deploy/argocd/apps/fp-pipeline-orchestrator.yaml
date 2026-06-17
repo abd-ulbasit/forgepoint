@@ -1,0 +1,117 @@
+# ============================================================================
+# CHILD APPLICATION — fp-pipeline-orchestrator (Helm)
+# ============================================================================
+# Created by copying the fp-auth child-app template (THE reference). Managed BY the
+# root app-of-apps. Deploys the Pipeline Orchestrator service from its Helm chart
+# at deploy/helm/fp-pipeline-orchestrator. ArgoCD renders the chart with
+# `helm template` (it does NOT run `helm install` / Tiller — there is no Helm
+# release in the cluster; ArgoCD owns the resources directly).
+#
+# ── WHAT CHANGED FROM THE fp-auth TEMPLATE ──────────────────────────────────
+# Exactly the three documented per-service fields:
+#   1. metadata.name        : fp-auth  → fp-pipeline-orchestrator
+#   2. source.path          : deploy/helm/fp-auth → deploy/helm/fp-pipeline-orchestrator
+#   3. helm.releaseName     : fp-auth  → fp-pipeline-orchestrator
+# destination.namespace stays fp-system (the orchestrator is a platform service per
+# CLAUDE.md's namespace map); project, sync policy, and retry are identical across
+# the platform's stateless services. This uniformity is the payoff of the
+# reference-chart approach carried into the delivery layer.
+#
+# ── DEV vs PROD SYNC STRATEGY (the load-bearing distinction) ─────────────────
+# This file is the DEV variant: automated sync + selfHeal + prune. Stateless
+# services are cheap to re-create, so aggressive auto-reconcile is ideal in dev:
+# commit → ArgoCD deploys within ~minutes, drift is auto-reverted, deleted
+# manifests are pruned.
+#
+# The orchestrator is stateless at the POD level — its durable saga state lives in
+# Postgres, not on disk — so selfHeal/prune are safe here too: a pruned-and-
+# recreated pod resumes in-flight sagas from the database checkpoint.
+#
+# PROD is PR-GATED and MANUAL: the prod copy of this app sets
+#   syncPolicy: {}            # no `automated:` block at all
+# so ArgoCD DETECTS drift / new commits and shows the app "OutOfSync", but waits
+# for a human to click Sync (or `argocd app sync fp-pipeline-orchestrator`). Prod
+# also keeps selfHeal OFF and prune OFF so an incident responder's emergency
+# `kubectl` edit is NOT instantly reverted, and nothing is deleted without explicit
+# approval. See README "values-per-env" for the side-by-side.
+# ============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: fp-pipeline-orchestrator
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+  labels:
+    app.kubernetes.io/part-of: forgepoint
+    forgepoint.dev/layer: service
+  annotations:
+    # Services sync AFTER infra (wave -1). Wave "0" = default; named explicitly
+    # for readability and so a future "wave 1" (e.g. inference-gateway depending
+    # on registry) has an obvious anchor.
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  project: forgepoint
+
+  source:
+    # REPO_URL — same mono-repo (charts live in-repo alongside code; one source
+    # of truth, atomic commits that bump code + chart together).
+    repoURL: https://github.com/abd-ulbasit/forgepoint.git
+    targetRevision: main
+    path: deploy/helm/fp-pipeline-orchestrator
+    helm:
+      # releaseName names the Helm release for templating (drives `.Release.Name`
+      # → resource names via the chart's _helpers fullname). Keep == service name.
+      releaseName: fp-pipeline-orchestrator
+      # valueFiles layered LEFT→RIGHT (later overrides earlier). The chart's
+      # committed values.yaml carries DEV-safe defaults (per its SECURITY
+      # CONTRACT: in-chart Secret with placeholder creds, FP_ENV=local). For prod
+      # you ADD `- values-prod.yaml` here (External Secrets, real image tag,
+      # higher replicas) — that file is the env override surface.
+      valueFiles:
+        - values.yaml
+      # ----------------------------------------------------------------------
+      # IMAGE TAG — the ONE value CI bumps in Git (see README "how images update").
+      # The chart defaults image.tag to "" → falls back to Chart.appVersion. In a
+      # real GitOps flow, CI rewrites THIS line (or a values-<env>.yaml) to the
+      # freshly built immutable tag (git SHA / semver), commits, and pushes. That
+      # Git commit is the deploy trigger — ArgoCD syncs the new tag. No cluster
+      # creds in CI; the only thing CI touches is Git.
+      #
+      # Left empty here so the committed default (appVersion) renders; CI's job is
+      # to fill it. Never set ":latest" — immutable tags make rollbacks a revert.
+      # ----------------------------------------------------------------------
+      parameters:
+        - name: image.tag
+          value: ""   # CI overwrites with the built image's immutable tag
+
+  destination:
+    server: https://kubernetes.default.svc
+    # Platform services live in fp-system (per CLAUDE.md namespace map). Must be
+    # an allowed destination in the AppProject, or sync is refused.
+    namespace: fp-system
+
+  # --------------------------------------------------------------------------
+  # syncPolicy — DEV profile for a STATELESS service: full auto-reconcile.
+  #   prune:true    — manifest removed from chart → resource deleted. Safe: the
+  #                   pod is stateless and instantly re-creatable (saga state is
+  #                   in Postgres, not on the pod).
+  #   selfHeal:true — live `kubectl edit` drift is reverted to Git on next loop.
+  # This is the fast inner loop: push to Git, watch it roll out, no manual step.
+  # (Prod flips ALL of this off — manual, PR-gated — see header + README.)
+  # --------------------------------------------------------------------------
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      # Create fp-system if it doesn't already exist (infra app normally owns it,
+      # but this keeps the service app self-sufficient if applied standalone).
+      - CreateNamespace=true
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

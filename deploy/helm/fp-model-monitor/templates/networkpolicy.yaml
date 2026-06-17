@@ -1,0 +1,137 @@
+{{- if .Values.networkPolicy.enabled -}}
+# ============================================================================
+# NetworkPolicy — zero-trust east-west isolation for the model-monitor pods.
+# ============================================================================
+# By DEFAULT, Kubernetes pod networking is wide open: any pod can reach any other
+# pod on any port. A NetworkPolicy flips a workload to default-deny for the
+# directions it lists in policyTypes, then re-allows ONLY the explicit rules.
+#
+# This policy:
+#   INGRESS → default-deny, allow only from the fp-system namespace (the platform
+#             services / gateway / UI BFF that legitimately call MonitorService).
+#             Nothing else in the cluster can even open a connection.
+#   EGRESS  → default-deny, allow only what this service actually uses:
+#               DNS          — resolve service names (mandatory).
+#               Postgres     — durable drift_reports + monitors + ground truth.
+#               Redis        — live sliding windows + the retrain-gate cooldown.
+#               NATS         — consume inference events, publish drift events.
+#               OTLP         — push traces + metrics to the collector.
+#               Orchestrator — the LOOP-CLOSER gRPC call (fp-system, not fp-infra).
+#             If compromised, the pod cannot exfiltrate to arbitrary endpoints.
+#
+# WIDER THAN fp-auth ON PURPOSE: model-monitor closes the serve→monitor→retrain
+# loop, so it adds Redis (the live-window store auth doesn't have) and an egress
+# to a PLATFORM service (the orchestrator in fp-system, on the gRPC port only).
+#
+# ENFORCEMENT CAVEAT (interview-critical): a NetworkPolicy is only enforced if
+# the cluster's CNI supports it (Calico, Cilium, etc.). On a CNI without policy
+# support it is silently ignored — present but not enforced. So this is defense
+# in depth, not a substitute for authn/authz at the app layer.
+#
+# DNS GOTCHA: forget the DNS egress rule and the pod can't resolve ANY service
+# DNS name, so every outbound connection fails with NXDOMAIN — a classic
+# self-inflicted outage when first adding egress policies. We always allow it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "fp-model-monitor.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fp-model-monitor.labels" . | nindent 4 }}
+spec:
+  # podSelector scopes this policy to THIS chart's pods (by identity labels).
+  podSelector:
+    matchLabels:
+      {{- include "fp-model-monitor.selectorLabels" . | nindent 6 }}
+  # Listing both types makes the policy default-deny for BOTH directions; the
+  # rules below are the only allowances.
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow gRPC + health traffic from the permitted namespaces only.
+    - from:
+        {{- range .Values.networkPolicy.ingressNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              # Relies on the standard kubernetes.io/metadata.name label that the
+              # control plane auto-applies to every Namespace (K8s 1.21+). No need
+              # to hand-label namespaces.
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.ports.grpc }}
+        - protocol: TCP
+          port: {{ .Values.ports.health }}
+  egress:
+    {{- if .Values.networkPolicy.egress.dns.enabled }}
+    # DNS to the cluster resolver (kube-dns/CoreDNS in kube-system), UDP+TCP/53.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.postgres.enabled }}
+    # Postgres (per-service database fp_monitor lives in fp-infra) — durable
+    # drift reports, monitor config, and the ground-truth store.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.postgres.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.postgres.port }}
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.redis.enabled }}
+    # Redis (fp-infra) — the live sliding-window store (folded on every inference
+    # event) and the retrain-gate cooldown (SET NX PX). model-monitor specific;
+    # auth has no Redis egress.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.redis.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.redis.port }}
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.nats.enabled }}
+    # NATS JetStream (async event bus) — consume inference events, publish drift.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.nats.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.nats.port }}
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.otlp.enabled }}
+    # OTLP/gRPC to the OpenTelemetry Collector (traces + metrics push).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.otlp.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.otlp.port }}
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.orchestrator.enabled }}
+    # Pipeline Orchestrator gRPC (the LOOP-CLOSER). Unlike the fp-infra data
+    # stores, this target is a PLATFORM service in fp-system, so the rule allows
+    # egress to that namespace on the gRPC port only — TriggerRetrain and nothing
+    # more. The orchestrator address itself is a FIXED config value, never derived
+    # from event data (anti-SSRF — see internal/config OrchestratorEndpoint).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.orchestrator.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.orchestrator.port }}
+    {{- end }}
+{{- end }}

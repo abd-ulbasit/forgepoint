@@ -1,0 +1,53 @@
+# ============================================================================
+# ConfigMap — NON-SECRET environment configuration.
+# ============================================================================
+# These keys are mapped into the container as env vars via `envFrom` in the
+# Deployment. The service reads them with the FP_ prefix
+# (config.Load[ServingConfig]("FP") → FP_PORT, FP_GRPC_PORT, FP_MODEL_NAME, ...).
+# Keep ONLY non-sensitive values here — a ConfigMap is stored in plaintext in
+# etcd and readable by anyone with get on ConfigMaps in the namespace. The
+# object-storage CREDENTIALS (S3 access/secret key) live in the Secret.
+#
+# WHAT'S DIFFERENT vs fp-auth's ConfigMap:
+#   * NO FP_NATS_URL — main.go never opens a NATS connection (serving data plane
+#     is event-bus-agnostic).
+#   * + FP_S3_ENDPOINT and the per-pod MODEL IDENTITY block (the Sidecar "the pod
+#     IS the model" contract): FP_MODEL_NAME / FP_MODEL_VERSION / FP_ARTIFACT_URI
+#     / FP_ARTIFACT_DIGEST / FP_ARTIFACT_BUCKET_URI / FP_LIVENESS_LATENCY_MS.
+#
+# WHY ports come from values, not hardcoded: the container, the Service, and the
+# probes must all agree on the port numbers; sourcing them from one place
+# (.Values.ports) keeps them in lockstep.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "fp-model-serving.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fp-model-serving.labels" . | nindent 4 }}
+data:
+  # Ports — stringified because ConfigMap values are always strings.
+  FP_PORT: {{ .Values.ports.health | quote }}
+  FP_GRPC_PORT: {{ .Values.ports.grpc | quote }}
+  # Observability endpoint (in-cluster service DNS). No NATS — unused here.
+  FP_LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  FP_OTEL_ENDPOINT: {{ .Values.config.otelEndpoint | quote }}
+  # FP_ENV labels logs/traces with the deployment environment.
+  FP_ENV: {{ .Values.config.env | quote }}
+  # Object storage (MinIO/S3) endpoint the storage adapter dials for the artifact.
+  FP_S3_ENDPOINT: {{ .Values.config.s3Endpoint | quote }}
+  # --- Per-pod MODEL IDENTITY (required by ServingConfig) ---
+  # MODEL_NAME/MODEL_VERSION/ARTIFACT_URI are required:"true" in the config
+  # struct: a serving pod with no model identity is misconfigured and fails fast.
+  FP_MODEL_NAME: {{ .Values.config.modelName | quote }}
+  FP_MODEL_VERSION: {{ .Values.config.modelVersion | quote }}
+  FP_ARTIFACT_URI: {{ .Values.config.artifactURI | quote }}
+  FP_ARTIFACT_DIGEST: {{ .Values.config.artifactDigest | quote }}
+  FP_ARTIFACT_BUCKET_URI: {{ .Values.config.artifactBucketURI | quote }}
+  FP_LIVENESS_LATENCY_MS: {{ .Values.config.livenessLatencyMs | quote }}
+  {{- with .Values.config.extraEnv }}
+  # Free-form additional non-secret env. Keys used verbatim.
+  {{- range $key, $val := . }}
+  {{ $key }}: {{ $val | quote }}
+  {{- end }}
+  {{- end }}

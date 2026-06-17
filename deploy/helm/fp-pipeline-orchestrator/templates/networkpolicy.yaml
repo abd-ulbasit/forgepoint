@@ -1,0 +1,146 @@
+{{- if .Values.networkPolicy.enabled -}}
+# ============================================================================
+# NetworkPolicy — zero-trust east-west isolation for the orchestrator pods.
+# ============================================================================
+# By DEFAULT, Kubernetes pod networking is wide open: any pod can reach any other
+# pod on any port. A NetworkPolicy flips a workload to default-deny for the
+# directions it lists in policyTypes, then re-allows ONLY the explicit rules.
+#
+# This policy:
+#   INGRESS → default-deny, allow only from the fp-system namespace (the platform
+#             services / gateway that legitimately call PipelineOrchestratorService).
+#             Nothing else in the cluster can even open a connection to it.
+#   EGRESS  → default-deny, allow only: DNS (so the pod can resolve service names
+#             at all), Postgres (saga state), NATS (events), the OTel collector,
+#             and the PEER fp-system services its saga executors drive over gRPC
+#             (registry, inference-gateway). It has no business talking to anything
+#             else; if compromised it can't exfiltrate to arbitrary endpoints.
+#
+# WHAT'S DELIBERATELY ABSENT (least privilege): this service uses NO Redis and NO
+# object store, so those egress rules are disabled in values.yaml and emit nothing
+# here. We open exactly the paths the saga engine needs and not one more.
+#
+# ENFORCEMENT CAVEAT (interview-critical): a NetworkPolicy is only enforced if
+# the cluster's CNI supports it (Calico, Cilium, etc.). On a CNI without policy
+# support it is silently ignored — present but not enforced. So this is defense
+# in depth, not a substitute for authn/authz at the app layer.
+#
+# DNS GOTCHA: forget the DNS egress rule and the pod can't resolve ANY service
+# DNS name, so every outbound connection fails with NXDOMAIN — a classic
+# self-inflicted outage when first adding egress policies. We always allow it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "fp-pipeline-orchestrator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fp-pipeline-orchestrator.labels" . | nindent 4 }}
+spec:
+  # podSelector scopes this policy to THIS chart's pods (by identity labels).
+  podSelector:
+    matchLabels:
+      {{- include "fp-pipeline-orchestrator.selectorLabels" . | nindent 6 }}
+  # Listing both types makes the policy default-deny for BOTH directions; the
+  # rules below are the only allowances.
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow gRPC + health traffic from the permitted namespaces only.
+    - from:
+        {{- range .Values.networkPolicy.ingressNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              # Relies on the standard kubernetes.io/metadata.name label that the
+              # control plane auto-applies to every Namespace (K8s 1.21+). No need
+              # to hand-label namespaces.
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.ports.grpc }}
+        - protocol: TCP
+          port: {{ .Values.ports.health }}
+  egress:
+    {{- if .Values.networkPolicy.egress.dns.enabled }}
+    # DNS to the cluster resolver (kube-dns/CoreDNS in kube-system), UDP+TCP/53.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.postgres.enabled }}
+    # Postgres — this service's own `fp_pipeline` database (lives in fp-infra).
+    # Holds durable saga/execution state and checkpoints.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.postgres.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.postgres.port }}
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.nats.enabled }}
+    # NATS JetStream (async event bus) — saga lifecycle events (started, step
+    # completed, compensated, failed) published for downstream choreography.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.nats.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.nats.port }}
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.otlp.enabled }}
+    # OTLP/gRPC to the OpenTelemetry Collector (traces + metrics push).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.otlp.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.otlp.port }}
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.redis.enabled }}
+    # Redis — NOT used by the orchestrator; this block only renders if a future
+    # need flips redis.enabled=true. Kept for parity with the cache-using charts.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.redis.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.redis.port }}
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.minio.enabled }}
+    # MinIO / object store — NOT used by the orchestrator (it stores no artifacts).
+    # Only renders if minio.enabled=true. Kept for parity with artifact-storing charts.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.minio.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.minio.port }}
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.peerServices.enabled }}
+    # Peer in-cluster services the saga EXECUTORS call over gRPC (registry to
+    # resolve model versions, inference-gateway to flip traffic splits for a canary
+    # step). Without this, the egress default-deny would block the orchestrator's
+    # OWN outbound gRPC to its dependencies — a subtle break unique to a service
+    # that is itself a CLIENT of other services (unlike auth, a pure server).
+    # Scoped to fp-system on the service gRPC port only.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.peerServices.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.peerServices.port }}
+    {{- end }}
+{{- end }}

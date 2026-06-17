@@ -1,0 +1,53 @@
+apiVersion: v2
+
+# fp-billing MIRRORS the reference chart fp-auth. Every Forgepoint service copies
+# the fp-auth chart and changes only the name, image, ports, and service-specific
+# config. Keeping the structure boringly uniform makes the platform's deployment
+# surface interview-explainable and easy to audit.
+#
+# WHAT MAKES BILLING SPECIFIC (vs the reference): it implements the OUTBOX
+# pattern. The service write and an outbox event commit in ONE Postgres tx; a
+# relay goroutine tails the outbox table and publishes to NATS. So this chart
+# wires BOTH Postgres (the per-service fp_billing DB, which also holds the outbox
+# table) AND NATS egress — there is no Redis and no MinIO for billing.
+name: fp-billing
+description: Forgepoint Billing/Usage service (metering, rate plans, invoices) — Outbox pattern (Postgres → NATS). Mirrors the fp-auth reference chart.
+
+# CHART TYPE: "application" (the default) vs "library".
+#   application → renders into deployable K8s objects (what we want).
+#   library     → reusable templates only, never installed directly.
+type: application
+
+# TWO DISTINCT VERSIONS — a common point of confusion:
+#   version    = the CHART's own version. Bump on ANY template change (SemVer).
+#   appVersion = the APPLICATION (container) version this chart ships by default.
+#                It is purely informational and is what `helm list` shows as
+#                APP VERSION; the actual image tag still comes from values.yaml
+#                (.Values.image.tag), falling back to appVersion when tag is "".
+version: 0.1.0
+appVersion: "0.1.0"
+
+# kubeVersion gates installs to a cluster new enough for the APIs we use
+# (autoscaling/v2 HPA, policy/v1 PDB, networking.k8s.io/v1 NetworkPolicy all
+# stabilized by 1.21+). Helm refuses to install on older clusters with a clear
+# error instead of failing later with an unknown-API surprise.
+kubeVersion: ">=1.23.0-0"
+
+home: https://github.com/abd-ulbasit/forgepoint
+# icon is purely cosmetic (shown in chart registries/UIs). Set to silence the
+# `helm lint` "icon is recommended" INFO and to brand the chart in repo UIs.
+icon: https://raw.githubusercontent.com/abd-ulbasit/forgepoint/main/docs/assets/logo.png
+sources:
+  - https://github.com/abd-ulbasit/forgepoint
+
+maintainers:
+  - name: Forgepoint Platform Team
+
+keywords:
+  - forgepoint
+  - billing
+  - usage
+  - metering
+  - outbox
+  - grpc
+  - microservice

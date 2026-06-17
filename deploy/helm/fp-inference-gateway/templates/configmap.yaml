@@ -1,0 +1,46 @@
+# ============================================================================
+# ConfigMap — NON-SECRET environment configuration.
+# ============================================================================
+# These keys are mapped into the container as env vars via `envFrom` in the
+# Deployment. The service reads them with the FP_ prefix (config.Load[...]("FP")
+# → FP_PORT, FP_GRPC_PORT, ...). Keep ONLY non-sensitive values here — a
+# ConfigMap is stored in plaintext in etcd and readable by anyone with get on
+# ConfigMaps in the namespace. The sensitive value (FP_REDIS_URL, which may embed
+# a password) lives in the Secret.
+#
+# WHY ports come from values, not hardcoded: the container, the Service, and the
+# probes must all agree on the port numbers; sourcing them from one place
+# (.Values.ports) keeps them in lockstep.
+#
+# SERVICE-SPECIFIC KEYS (vs the reference fp-auth ConfigMap): the gateway adds
+# the rate-limit and circuit-breaker tuning it reads (FP_RATE_LIMIT_*,
+# FP_CIRCUIT_*). It deliberately has NO FP_DATABASE_URL — it owns no Postgres.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "fp-inference-gateway.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fp-inference-gateway.labels" . | nindent 4 }}
+data:
+  # Ports — stringified because ConfigMap values are always strings.
+  FP_PORT: {{ .Values.ports.health | quote }}
+  FP_GRPC_PORT: {{ .Values.ports.grpc | quote }}
+  # Observability + async bus endpoints (in-cluster service DNS).
+  FP_LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  FP_OTEL_ENDPOINT: {{ .Values.config.otelEndpoint | quote }}
+  FP_NATS_URL: {{ .Values.config.natsUrl | quote }}
+  # FP_ENV labels logs/traces with the deployment environment.
+  FP_ENV: {{ .Values.config.env | quote }}
+  # Rate limiting — per-API-key token bucket (refill rate + burst depth).
+  FP_RATE_LIMIT_PER_SEC: {{ .Values.config.rateLimitPerSec | quote }}
+  FP_RATE_LIMIT_BURST: {{ .Values.config.rateLimitBurst | quote }}
+  # Circuit breaker — consecutive failures to trip OPEN + OPEN cooldown seconds.
+  FP_CIRCUIT_FAILURE_THRESHOLD: {{ .Values.config.circuitFailureThreshold | quote }}
+  FP_CIRCUIT_RESET_SECONDS: {{ .Values.config.circuitResetSeconds | quote }}
+  {{- with .Values.config.extraEnv }}
+  # Free-form additional non-secret env. Keys used verbatim.
+  {{- range $key, $val := . }}
+  {{ $key }}: {{ $val | quote }}
+  {{- end }}
+  {{- end }}

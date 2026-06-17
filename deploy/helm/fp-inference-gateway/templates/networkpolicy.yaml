@@ -1,0 +1,124 @@
+{{- if .Values.networkPolicy.enabled -}}
+# ============================================================================
+# NetworkPolicy — zero-trust east-west isolation for the inference-gateway pods.
+# ============================================================================
+# By DEFAULT, Kubernetes pod networking is wide open: any pod can reach any other
+# pod on any port. A NetworkPolicy flips a workload to default-deny for the
+# directions it lists in policyTypes, then re-allows ONLY the explicit rules.
+#
+# This policy:
+#   INGRESS → default-deny, allow only from the fp-system namespace (the platform
+#             services / API gateway that legitimately call InferenceGatewayService).
+#             Nothing else in the cluster can even open a connection to it.
+#   EGRESS  → default-deny, allow only: DNS (so the pod can resolve service names
+#             at all), Redis (its only datastore), NATS, the OTel collector, and
+#             the model-serving backends it forwards predictions to. The gateway
+#             has no business talking to anything else; if it's compromised it
+#             can't exfiltrate to arbitrary endpoints.
+#
+# WHAT'S DIFFERENT FROM THE REFERENCE CHART (fp-auth): NO Postgres egress — the
+# gateway owns no Postgres database. Instead it egresses to Redis (rate-limit
+# buckets, route mirror, quota cache, breaker state) and to model-serving in
+# fp-models (the forward path). We open ONLY the ports the service actually uses.
+#
+# ENFORCEMENT CAVEAT (interview-critical): a NetworkPolicy is only enforced if
+# the cluster's CNI supports it (Calico, Cilium, etc.). On a CNI without policy
+# support it is silently ignored — present but not enforced. So this is defense
+# in depth, not a substitute for authn/authz at the app layer.
+#
+# DNS GOTCHA: forget the DNS egress rule and the pod can't resolve ANY service
+# DNS name, so every outbound connection fails with NXDOMAIN — a classic
+# self-inflicted outage when first adding egress policies. We always allow it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "fp-inference-gateway.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fp-inference-gateway.labels" . | nindent 4 }}
+spec:
+  # podSelector scopes this policy to THIS chart's pods (by identity labels).
+  podSelector:
+    matchLabels:
+      {{- include "fp-inference-gateway.selectorLabels" . | nindent 6 }}
+  # Listing both types makes the policy default-deny for BOTH directions; the
+  # rules below are the only allowances.
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow gRPC + health traffic from the permitted namespaces only.
+    - from:
+        {{- range .Values.networkPolicy.ingressNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              # Relies on the standard kubernetes.io/metadata.name label that the
+              # control plane auto-applies to every Namespace (K8s 1.21+). No need
+              # to hand-label namespaces.
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.ports.grpc }}
+        - protocol: TCP
+          port: {{ .Values.ports.health }}
+  egress:
+    {{- if .Values.networkPolicy.egress.dns.enabled }}
+    # DNS to the cluster resolver (kube-dns/CoreDNS in kube-system), UDP+TCP/53.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.redis.enabled }}
+    # Redis (the gateway's ONLY datastore: rate-limit token buckets, the route
+    # table mirror, the quota cache, and shared circuit-breaker state).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.redis.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.redis.port }}
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.nats.enabled }}
+    # NATS JetStream (async event bus): publishes Inference{Completed,Failed} and
+    # subscribes to ModelDeployed/Undeployed/Promoted/Archived to update routes.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.nats.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.nats.port }}
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.otlp.enabled }}
+    # OTLP/gRPC to the OpenTelemetry Collector (traces + metrics push).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.otlp.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.otlp.port }}
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.modelServing.enabled }}
+    # Model-serving backends (fp-models): the FORWARD path. The gateway dials a
+    # model-serving pod over gRPC for every prediction, at the SERVER-resolved
+    # endpoint from the route target (anti-SSRF — never a client-supplied address).
+    # Allowing the whole fp-models namespace on the gRPC port is the right grain
+    # since backends are created dynamically per model version.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.modelServing.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.modelServing.port }}
+    {{- end }}
+{{- end }}

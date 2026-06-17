@@ -1,0 +1,28 @@
+# Patterns to exclude from the packaged chart (.tgz). Same glob syntax as
+# .gitignore. Keeps build/editor/VCS cruft out of the artifact so the chart is
+# reproducible and small.
+.DS_Store
+# Version control
+.git/
+.gitignore
+.bzr/
+.hg/
+.hgignore
+.svn/
+# Common backup / temp files
+*.swp
+*.bak
+*.tmp
+*.orig
+*~
+# IDE / editor
+.idea/
+.vscode/
+*.iml
+# CI / docs that don't belong in the runtime artifact
+.github/
+*.md
+# Local, non-committed value overrides (e.g. real secrets) — never package them
+values.local.yaml
+secrets.local.yaml
+*.local.yaml

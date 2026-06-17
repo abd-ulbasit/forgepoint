@@ -1,0 +1,361 @@
+# ============================================================================
+# fp-billing — default values
+# ============================================================================
+# This chart MIRRORS the reference values file (fp-auth). Everything the
+# templates render is driven from here so the manifests stay declarative and
+# nothing is hardcoded. Override per-environment with `-f values-prod.yaml` or
+# `--set key=value`.
+#
+# BILLING-SPECIFIC SHAPE (vs the reference):
+#   - DATA STORES: Postgres (the per-service `fp_billing` DB — also home to the
+#     OUTBOX table) + NATS (the relay publishes outbox events; a consumer meters
+#     inference events). NO Redis, NO MinIO for billing.
+#   - SECRET: only FP_DATABASE_URL. Billing VALIDATES JWT claims (via an auth
+#     interceptor) but never SIGNS tokens, so it has no FP_JWT_SECRET like auth.
+#   - CONFIG: adds FP_DEFAULT_CURRENCY (ISO-4217 settlement currency).
+#
+# SECURITY CONTRACT (read this before touching `secrets:` below):
+#   The plaintext secret values in this file are DEV-ONLY placeholders so the
+#   chart renders and runs on a local Kind cluster. In any real environment the
+#   Secret is produced by External Secrets Operator (pulls from AWS Secrets
+#   Manager / Vault) or Sealed Secrets — NOT from committed values. See
+#   `secrets.create` and templates/secret.yaml for how to turn the in-chart
+#   Secret off and point at an externally-managed one.
+# ============================================================================
+
+# replicaCount: 2 is the floor for a stateless HA service. Two replicas means a
+# single node drain or pod eviction never takes the service fully down, and the
+# PodDisruptionBudget (minAvailable: 1) can always be satisfied. When autoscaling
+# is enabled the HPA owns the replica count and this value is ignored.
+#
+# OUTBOX RELAY NOTE: the relay goroutine that tails the outbox table and
+# publishes to NATS runs in EVERY replica. That is safe because the relay claims
+# rows with SELECT ... FOR UPDATE SKIP LOCKED (or a status flip in one tx), so
+# two replicas never publish the same event twice — competing-consumers, not
+# duplicate-publishers. Running it in all replicas means no single-point relay.
+replicaCount: 2
+
+image:
+  repository: ghcr.io/abd-ulbasit/forgepoint/billing
+  # tag "" → the chart falls back to Chart.appVersion (see _helpers "image").
+  # Pin an explicit immutable tag (git SHA or semver) in prod; never :latest,
+  # which breaks reproducibility and defeats rollbacks.
+  tag: ""
+  # IfNotPresent: don't re-pull an image the node already has (faster, fewer
+  # registry round-trips). Use Always only for mutable dev tags.
+  pullPolicy: IfNotPresent
+
+# imagePullSecrets: names of pre-existing docker-registry Secrets for private
+# registries. Empty for public ghcr; populated in prod from a registry secret.
+imagePullSecrets: []
+
+# nameOverride / fullnameOverride let an operator rename the release-derived
+# resource names without editing templates (see _helpers "fullname").
+nameOverride: ""
+fullnameOverride: ""
+
+# ----------------------------------------------------------------------------
+# Ports — two distinct listeners (see services/billing/cmd/server/main.go).
+#   grpc:   HTTP/2, the actual BillingService API.
+#   health: HTTP/1.1, serves /healthz, /readyz, and /metrics. Kept on a separate
+#           port because gRPC (HTTP/2) and kubelet probes (HTTP/1.1) cannot share
+#           one net.Listener.
+# These names ("grpc", "health") are referenced by service.yaml, the probes, and
+# the ServiceMonitor — change them here and they propagate everywhere.
+# ----------------------------------------------------------------------------
+ports:
+  grpc: 9090
+  health: 8080
+
+service:
+  type: ClusterIP
+  annotations: {}
+
+# ----------------------------------------------------------------------------
+# Non-secret configuration → rendered into a ConfigMap, injected via envFrom.
+# These map 1:1 to FP_* env vars the service reads (pkg/config BaseConfig +
+# BillingConfig). The service prefixes every env var with FP_
+# (config.Load[BillingConfig]("FP")). DATABASE_URL is NOT here — it is a secret
+# (see `secrets:`).
+# ----------------------------------------------------------------------------
+config:
+  # FP_ENV labels telemetry/logs with the deployment environment.
+  env: "local"
+  logLevel: "info"
+  # In-cluster service DNS. fp-infra is the namespace hosting shared infra
+  # (NATS, Postgres, OTel collector) per CLAUDE.md K8s namespaces.
+  otelEndpoint: "otel-collector.fp-infra.svc.cluster.local:4317"
+  natsUrl: "nats://nats.fp-infra.svc.cluster.local:4222"
+  # FP_DEFAULT_CURRENCY — billing-specific. The deployment's settlement currency
+  # (ISO-4217). Fallback currency for server-built artifacts when no plan
+  # currency applies (BillingConfig.DefaultCurrency, default "USD").
+  defaultCurrency: "USD"
+  # Extra free-form non-secret env keys (rendered into the ConfigMap as-is).
+  # Keys are used verbatim — DO NOT prefix with FP_ here unless the service
+  # actually reads that prefix; mirror existing FP_* naming.
+  extraEnv: {}
+
+# ----------------------------------------------------------------------------
+# Secrets — DEV placeholders only. See the SECURITY CONTRACT at the top.
+#   secrets.create: true  → chart renders templates/secret.yaml from the values
+#                           below. Convenient for local Kind; NEVER commit real
+#                           values here.
+#   secrets.create: false → chart renders NO Secret. You must provide a Secret
+#                           named `secrets.existingSecret` out-of-band (External
+#                           Secrets / Sealed Secrets / kubectl). The Deployment
+#                           still envFrom's it.
+#
+# Billing has ONE secret: the Postgres DSN. (No JWT signing key — see the header.)
+# ----------------------------------------------------------------------------
+secrets:
+  create: true
+  # When create=false, the Deployment envFrom's this externally-managed Secret.
+  # Defaults to the chart's fullname when empty (see _helpers "secretName").
+  existingSecret: ""
+  # DEV-ONLY value. Override via --set or a non-committed -f secrets.local.yaml.
+  # Full Postgres DSN the service reads as FP_DATABASE_URL — points at the shared
+  # Postgres in fp-infra, database `fp_billing` (this service owns that DB; no
+  # cross-service DB access). In prod the password comes from a managed secret
+  # store, not from this file.
+  databaseUrl: "postgres://billing:dev-only-change-me@postgres.fp-infra.svc.cluster.local:5432/fp_billing?sslmode=disable"
+
+# ----------------------------------------------------------------------------
+# Resources — requests AND limits both set (a "Guaranteed" QoS-friendly shape).
+#   requests = what the scheduler reserves; sets the floor and drives HPA math.
+#   limits   = the ceiling; CPU is throttled, memory OOM-kills above it.
+# Billing is light-to-moderate: the hot path is metering writes (one tx each) and
+# a relay goroutine tailing the outbox on a short poll. Period-close invoice
+# aggregation is heavier but infrequent and DB-side (GROUP BY). Slightly more CPU
+# headroom than auth for the relay+metering loop; memory stays modest. Tune from
+# real RED metrics before raising. memory request==limit avoids OOM surprises
+# under burst; CPU limit > request lets short bursts use idle node CPU.
+# ----------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 75m
+    memory: 96Mi
+  limits:
+    cpu: 500m
+    memory: 192Mi
+
+# ----------------------------------------------------------------------------
+# Autoscaling — HPA. Disabled by default; replicaCount governs when off.
+# When enabled the HPA, not replicaCount, owns the replica number.
+# `customMetrics` is wired for the Prometheus-Adapter / KEDA path the platform
+# uses later (e.g. NATS consumer lag for the metering consumer, gRPC RPS) — see
+# templates/hpa.yaml.
+# ----------------------------------------------------------------------------
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 6
+  targetCPUUtilizationPercentage: 70
+  # Optional memory target; null/omit to disable the memory metric.
+  targetMemoryUtilizationPercentage: 80
+  # Extra metrics passed through verbatim into the HPA spec.metrics list
+  # (autoscaling/v2). Example (custom Pods metric):
+  #   - type: Pods
+  #     pods:
+  #       metric:
+  #         name: grpc_requests_per_second
+  #       target:
+  #         type: AverageValue
+  #         averageValue: "100"
+  customMetrics: []
+  # Scaling behavior — conservative scale-down to avoid flapping (thundering herd
+  # of pod churn). Tune per service SLO.
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+
+# PodDisruptionBudget — protects availability during VOLUNTARY disruptions only
+# (node drains, cluster upgrades), NOT crashes. minAvailable: 1 lets the cluster
+# evict at most (replicas-1) pods at once, so a drain never zeroes the service.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# ServiceAccount — own identity per service (least privilege, audit trail).
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # automountServiceAccountToken: false — billing does NOT call the K8s API, so
+  # it has no reason to carry a mountable API token. Mounting one needlessly
+  # widens blast radius if the pod is compromised (token → API server). Flip to
+  # true only for a service that genuinely uses the in-cluster K8s client.
+  automountServiceAccountToken: false
+
+# ----------------------------------------------------------------------------
+# Pod-level security context — the non-negotiable hardened baseline. Applied to
+# every service. These satisfy the "restricted" Pod Security Standard.
+# ----------------------------------------------------------------------------
+podSecurityContext:
+  # runAsNonRoot makes the kubelet REFUSE to start the pod if the image's user
+  # resolves to UID 0 — a guard against an accidentally-root image.
+  runAsNonRoot: true
+  # 65532 = the "nonroot" UID/GID baked into gcr.io/distroless/* base images,
+  # which our multi-stage Dockerfile uses. Matches the image's filesystem owner.
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  # seccompProfile RuntimeDefault → the container runtime's default syscall
+  # filter (blocks ~44 dangerous syscalls). Cheap, strong kernel-surface
+  # reduction; required by the restricted PSS.
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level security context — defense in depth on top of the pod context.
+containerSecurityContext:
+  allowPrivilegeEscalation: false  # blocks setuid/gainprivs (no sudo-up inside)
+  readOnlyRootFilesystem: true     # immutable rootfs; tamper-resistant, forces
+                                   # explicit emptyDir for any writable path
+  runAsNonRoot: true
+  runAsUser: 65532
+  capabilities:
+    # Drop ALL Linux capabilities. A network service needs none — it binds a
+    # high port (>1024) and does no privileged kernel ops. Least privilege.
+    drop:
+      - ALL
+
+# ----------------------------------------------------------------------------
+# Rolling update strategy — zero-downtime deploys for a stateless service.
+#   maxUnavailable: 0 → never drop below desired count during a roll (no capacity
+#                       dip; the PDB also enforces this for disruptions).
+#   maxSurge: 1       → bring up one extra new pod, wait for it Ready, then retire
+#                       an old one. Bounded extra cost (one pod) per step.
+# ----------------------------------------------------------------------------
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+# ----------------------------------------------------------------------------
+# Probes — liveness on /healthz (process-alive only), readiness on /readyz
+# (real dependency checks — billing's readiness pings Postgres, the outbox's
+# home). Both hit the HTTP health port. Tunable so each service can match its own
+# startup profile. startupProbe shields slow cold starts from premature liveness
+# restarts.
+# ----------------------------------------------------------------------------
+probes:
+  liveness:
+    enabled: true
+    path: /healthz
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    enabled: true
+    path: /readyz
+    initialDelaySeconds: 3
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 2
+  startup:
+    enabled: true
+    path: /healthz
+    initialDelaySeconds: 0
+    periodSeconds: 3
+    # 30 * 3s = 90s budget for the process to come up before liveness engages.
+    failureThreshold: 30
+    timeoutSeconds: 2
+
+# ----------------------------------------------------------------------------
+# topologySpreadConstraints — spread replicas across failure domains so a single
+# node/zone loss can't take out a disproportionate share of pods. whenUnsatisfiable
+# ScheduleAnyway keeps scheduling possible on small/single-zone clusters (Kind)
+# while still preferring spread. The selector is injected by the template from the
+# chart's standard selector labels.
+# ----------------------------------------------------------------------------
+topologySpread:
+  enabled: true
+  constraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+
+# Generic scheduling knobs, passed through untouched.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Extra pod annotations/labels (merged into pod template metadata).
+podAnnotations: {}
+podLabels: {}
+
+# terminationGracePeriodSeconds — must exceed the gRPC drain timeout (25s in
+# pkg/grpcutil) so in-flight RPCs finish before SIGKILL. 30s gives 5s slack.
+terminationGracePeriodSeconds: 30
+
+# ----------------------------------------------------------------------------
+# ServiceMonitor (Prometheus Operator CRD) — DISABLED by default ON PURPOSE.
+#
+# Forgepoint's canonical metrics path is OTLP PUSH to the OTel Collector, which
+# Prometheus then scrapes (see pkg/observability/setup.go). So there is normally
+# NO per-pod /metrics endpoint to scrape. This ServiceMonitor exists for the
+# alternative setup where a service is configured to expose /metrics directly on
+# the health port (the prometheus.yml dev scrape config assumes this). Enable it
+# only when you've turned on the in-process Prometheus exporter for the service.
+# Guarded so `helm template` never emits a ServiceMonitor referencing a CRD the
+# cluster may not have.
+# ----------------------------------------------------------------------------
+serviceMonitor:
+  enabled: false
+  # path/port of the metrics endpoint when enabled.
+  path: /metrics
+  portName: health
+  interval: 30s
+  scrapeTimeout: 10s
+  # Extra labels so a Prometheus Operator with a label selector picks this up
+  # (e.g. release: kube-prometheus-stack).
+  labels: {}
+
+# ----------------------------------------------------------------------------
+# NetworkPolicy — default-deny ingress, allow only what the service needs.
+# Zero-trust east-west: even inside the cluster, only fp-system callers reach
+# billing, and billing may only egress to DNS, Postgres, NATS, and the OTel
+# collector. Billing uses NO Redis and NO MinIO, so no egress is opened to them.
+# Disable on clusters whose CNI doesn't enforce NetworkPolicy (it becomes a
+# silent no-op there anyway).
+# ----------------------------------------------------------------------------
+networkPolicy:
+  enabled: true
+  # Namespaces allowed to send INGRESS to billing. fp-system holds the platform
+  # services (gateway, other services) that call BillingService.
+  ingressNamespaces:
+    - fp-system
+  # Egress allow-list. dns is special-cased to the kube-system resolver.
+  # Billing's real egress surface: Postgres (business writes + the outbox table),
+  # NATS (the relay PUBLISHES outbox events and a consumer SUBSCRIBES to inference
+  # events for metering), and OTLP. No Redis/MinIO — those keys are intentionally
+  # absent so the policy never opens a path billing doesn't use.
+  egress:
+    dns:
+      enabled: true
+    postgres:
+      enabled: true
+      namespace: fp-infra
+      port: 5432
+    nats:
+      enabled: true
+      namespace: fp-infra
+      port: 4222
+    otlp:
+      enabled: true
+      namespace: fp-infra
+      port: 4317

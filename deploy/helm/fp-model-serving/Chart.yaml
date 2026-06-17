@@ -1,0 +1,51 @@
+apiVersion: v2
+
+# fp-model-serving mirrors the fp-auth REFERENCE chart. It deviates from the
+# template ONLY where the service genuinely differs: model-serving has NO
+# Postgres and NO Redis — a serving pod holds its model resident IN MEMORY (the
+# ONNX session) and pulls the artifact ONCE at startup from object storage
+# (MinIO/S3). So this chart drops the Postgres egress/secret and adds MinIO
+# egress + larger memory limits (an ONNX session is the dominant resident cost).
+# Everything else (security contexts, probes, PDB, NetworkPolicy shape, labels)
+# is kept byte-for-byte uniform with fp-auth so the platform stays auditable.
+name: fp-model-serving
+description: Forgepoint Model Serving service (ONNX inference, Sidecar pattern, HPA on inference latency) — in-memory model + MinIO artifact fetch.
+
+# CHART TYPE: "application" (the default) vs "library".
+#   application → renders into deployable K8s objects (what we want).
+#   library     → reusable templates only, never installed directly.
+type: application
+
+# TWO DISTINCT VERSIONS — a common point of confusion:
+#   version    = the CHART's own version. Bump on ANY template change (SemVer).
+#   appVersion = the APPLICATION (container) version this chart ships by default.
+#                It is purely informational and is what `helm list` shows as
+#                APP VERSION; the actual image tag still comes from values.yaml
+#                (.Values.image.tag), falling back to appVersion when tag is "".
+version: 0.1.0
+appVersion: "0.1.0"
+
+# kubeVersion gates installs to a cluster new enough for the APIs we use
+# (autoscaling/v2 HPA, policy/v1 PDB, networking.k8s.io/v1 NetworkPolicy all
+# stabilized by 1.21+). Helm refuses to install on older clusters with a clear
+# error instead of failing later with an unknown-API surprise.
+kubeVersion: ">=1.23.0-0"
+
+home: https://github.com/abd-ulbasit/forgepoint
+# icon is purely cosmetic (shown in chart registries/UIs). Set to silence the
+# `helm lint` "icon is recommended" INFO and to brand the chart in repo UIs.
+icon: https://raw.githubusercontent.com/abd-ulbasit/forgepoint/main/docs/assets/logo.png
+sources:
+  - https://github.com/abd-ulbasit/forgepoint
+
+maintainers:
+  - name: Forgepoint Platform Team
+
+keywords:
+  - forgepoint
+  - model-serving
+  - onnx
+  - inference
+  - sidecar
+  - grpc
+  - microservice
