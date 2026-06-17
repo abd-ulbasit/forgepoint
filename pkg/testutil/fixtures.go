@@ -53,9 +53,10 @@ func SampleModelMetadata() map[string]any {
 // SampleAPIKey returns a test API key for gateway/auth tests.
 func SampleAPIKey() map[string]any {
 	return map[string]any{
-		"id":         "key_test_001",
-		"key":        "fp_test_sk_abcdef1234567890",
-		"user_id":    "usr_test_001",
+		"id": "key_test_001",
+		// Non-credential test fixture — NOT a real key; safe to commit.
+		"key":     "fp_TEST_FIXTURE_NOT_A_REAL_KEY",
+		"user_id": "usr_test_001",
 		"name":       "test-key",
 		"scopes":     []string{"inference:invoke"},
 		"rate_limit": 100, // requests per minute

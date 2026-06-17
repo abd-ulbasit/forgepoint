@@ -66,6 +66,7 @@ func SkipIfNoDocker(t *testing.T) {
 //	db, err := sql.Open("pgx", dsn)
 func StartPostgres(t *testing.T) string {
 	t.Helper()
+	SkipIfNoDocker(t) // skip cleanly when Docker is unavailable rather than panicking
 	ctx := context.Background()
 
 	// postgres module creates a container with the given image,
@@ -105,6 +106,7 @@ func StartPostgres(t *testing.T) string {
 //	rdb := redis.NewClient(&redis.Options{Addr: addr})
 func StartRedis(t *testing.T) string {
 	t.Helper()
+	SkipIfNoDocker(t)
 	ctx := context.Background()
 
 	container, err := redis.Run(ctx, "redis:7")
@@ -138,6 +140,7 @@ func StartRedis(t *testing.T) string {
 //	conn, js, err := natsutil.Connect(url)
 func StartNATS(t *testing.T) string {
 	t.Helper()
+	SkipIfNoDocker(t)
 	ctx := context.Background()
 
 	container, err := natscontainer.Run(ctx, "nats:2.11")
@@ -159,6 +162,14 @@ func StartNATS(t *testing.T) string {
 	return url
 }
 
+// minioImage is pinned to a specific release rather than "latest" to ensure
+// reproducible test runs. "latest" can pull a breaking change silently between
+// CI runs, causing flaky tests with no obvious cause.
+//
+// To update: verify the new tag at https://hub.docker.com/r/minio/minio/tags
+// then update this constant and re-run the integration tests.
+const minioImage = "minio/minio:RELEASE.2025-04-22T22-12-26Z"
+
 // StartMinIO spins up a real MinIO (S3-compatible) object store via testcontainers.
 // Returns the endpoint URL (http://host:port).
 //
@@ -170,9 +181,10 @@ func StartNATS(t *testing.T) string {
 //	client, err := minio.New(endpoint, &minio.Options{...})
 func StartMinIO(t *testing.T) string {
 	t.Helper()
+	SkipIfNoDocker(t)
 	ctx := context.Background()
 
-	container, err := minio.Run(ctx, "minio/minio:latest")
+	container, err := minio.Run(ctx, minioImage)
 	if err != nil {
 		t.Fatalf("failed to start MinIO container: %v", err)
 	}
