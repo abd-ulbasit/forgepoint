@@ -39,4 +39,13 @@ use (
 	./gen/go
 	./pkg
 	./services/auth
+	./services/billing
+	./services/experiment-tracker
+	./services/feature-store
+	./services/inference-gateway
+	./services/model-monitor
+	./services/model-serving
+	./services/notification
+	./services/pipeline-orchestrator
+	./services/registry
 )
