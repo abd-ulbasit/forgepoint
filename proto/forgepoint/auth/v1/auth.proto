@@ -1,0 +1,624 @@
+// ============================================================================
+// Forgepoint Auth Service Proto Definitions
+// ============================================================================
+//
+// WHY: The Auth service is the security perimeter for the entire platform.
+// Every other service delegates authentication (token validation) and
+// authorization (permission checks) here, rather than implementing their own.
+// This is the "Centralized Auth" microservices pattern.
+//
+// WHAT'S HERE:
+//   - Core domain messages: User, APIKey, Role, Permission, TokenClaims
+//   - AuthService RPCs: login, user management, API keys, RBAC, token validation
+//
+// PATTERN — Centralized Auth vs Distributed Auth:
+//   CENTRALIZED (this approach): One Auth service holds all identity and
+//   permission data. Other services call ValidateToken + CheckPermission per
+//   request via gRPC interceptors. Simple to reason about, single source of
+//   truth, easy to revoke tokens.
+//
+//   DISTRIBUTED: Each service validates JWTs locally (using the public key)
+//   and caches permission decisions. Lower latency, but revocation is hard —
+//   a revoked token stays valid until it expires.
+//
+//   WHY CENTRALIZED FOR FORGEPOINT:
+//   - We need real-time revocation (revoking an API key must take effect
+//     immediately, not after JWT expiry). Centralized allows us to check
+//     a blacklist on every call.
+//   - The AuthService can cache ValidateToken results in Redis with a short
+//     TTL (~30s), keeping p99 latency acceptable without sacrificing revocability.
+//   - Portfolio clarity: one service owns auth, every other service is a client.
+//
+// REAL-WORLD COMPARISON:
+//   - HashiCorp Vault: Centralized secrets + auth, revocation-first design
+//   - AWS IAM: Centralized identity; STS tokens are validated via AWS API calls
+//   - Istio + JWKS: Distributed JWT validation but no real-time revocation
+//   - Keycloak: Centralized IdP, services validate locally (hybrid)
+//
+// CALL FLOW:
+//   Client ──HTTP──► API Gateway ──gRPC──► Auth.Login() → JWT
+//   Client ──gRPC──► ModelRegistry (with JWT in metadata)
+//                       └──► auth interceptor calls Auth.ValidateToken()
+//                       └──► auth interceptor calls Auth.CheckPermission()
+//
+// VERSIONING: Package path includes v1 following Buf/Google convention.
+// Breaking changes require a new forgepoint.auth.v2 package.
+// ============================================================================
+
+syntax = "proto3";
+
+package forgepoint.auth.v1;
+
+// go_package follows the pattern established in common.proto:
+//   "github.com/abd-ulbasit/forgepoint/gen/go/{package};{shortname}"
+// The semicolon-separated short name (authv1) is the Go package identifier,
+// which avoids conflicts when multiple proto packages are imported.
+option go_package = "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/auth/v1;authv1";
+
+import "google/protobuf/timestamp.proto";
+import "forgepoint/common/v1/common.proto";
+
+// ============================================================================
+// DOMAIN MESSAGES
+// ============================================================================
+
+// ============================================================================
+// User
+// ============================================================================
+//
+// WHY: The core identity principal. A User belongs to a Team and has a Role
+// that determines what they can do on the platform. All audit trails and
+// API keys are linked to a User.
+//
+// TEAM vs ORGANIZATION:
+//   We use "team" (a string label) rather than a first-class Team entity for
+//   now. This avoids a separate teams table and FK joins on every auth check.
+//   Tradeoff: teams can't have their own settings or quotas without a schema
+//   change. For M1, this simplicity is the right call; the billing service can
+//   track quotas per team_id string without a foreign key.
+//
+// ROLE MODEL — RBAC (Role-Based Access Control):
+//   User → Role → [Permission, Permission, ...]
+//   This is the classic RBAC model (NIST Level 1). Alternatives:
+//     - ABAC (Attribute-Based): Rules on arbitrary attributes. Very flexible,
+//       very complex to audit. Overkill for an internal ML platform.
+//     - ReBAC (Relation-Based, e.g., Zanzibar/OpenFGA): Object-level
+//       relationships. Necessary for "user A can see model B because A is
+//       in team B". We can migrate to this in M4 if needed.
+//     - API-key scopes (OAuth 2.0 scopes): Fine-grained, per-key. We layer
+//       these ON TOP of RBAC — an API key can only do a subset of what the
+//       user's role permits.
+//
+// INTERVIEW NOTE: Be ready to explain why we store role as a string name
+// here (denormalized) rather than a role_id FK. Answer: this is the JWT claims
+// shape — when we issue a token, we embed role name (not ID) so ValidateToken
+// can return claims without a database join. The canonical role definition
+// lives in the roles table; the name is stable and human-readable.
+// ============================================================================
+message User {
+  // UUID v4. Primary key, immutable once created.
+  string id = 1;
+
+  // Email is the unique login identifier. Normalized to lowercase on write.
+  string email = 2;
+
+  // Display name, not unique. Used in audit logs and UI.
+  string name = 3;
+
+  // Team label (e.g., "ml-platform", "search"). Groups users for billing and
+  // access namespacing. See design note above on why this is a string, not FK.
+  string team = 4;
+
+  // The role assigned to this user (e.g., "admin", "engineer", "viewer").
+  // Role defines the set of Permissions the user has. See Role message below.
+  string role = 5;
+
+  // When the user account was created. Immutable.
+  google.protobuf.Timestamp created_at = 6;
+}
+
+// ============================================================================
+// APIKey
+// ============================================================================
+//
+// WHY: API keys allow programmatic access without browser-based login flows.
+// They're used by CI/CD pipelines, training scripts, and SDK clients.
+//
+// SECURITY DESIGN — Key Prefix + Hash:
+//   We NEVER store the full raw API key. Instead:
+//     1. Generate a random key: "fp_live_<32-random-bytes-base58>"
+//     2. Store key_prefix (first 8 chars, e.g., "fp_live_") for human display
+//     3. Store SHA-256 hash of the full key for validation
+//   The full raw key is returned ONCE to the caller (in CreateAPIKeyResponse)
+//   and then it's gone. If lost, user must revoke and create a new key.
+//
+//   This follows Stripe's API key design. Alternatives:
+//     - Store encrypted key: Requires key management, adds complexity
+//     - Store plaintext: Security anti-pattern, plaintext secrets in DB
+//     - JWT as API key: Can't be revoked without a blacklist; larger payload
+//
+// SCOPES — Layered Authorization:
+//   A key's scopes are a SUBSET of the owning user's role permissions.
+//   E.g., a user with "engineer" role (can read/write models) can create
+//   a key scoped to ["models:read"] only — for a read-only CI job.
+//   Scope strings follow the format "{resource}:{action}".
+//
+// EXPIRY: expires_at is optional (zero value = no expiry). For service
+// accounts, short-lived keys (rotated by CI) are preferred over eternal keys.
+// ============================================================================
+message APIKey {
+  // UUID v4. Used for revocation — never the raw key.
+  string id = 1;
+
+  // Human-readable prefix (first 8 chars of the raw key). Shown in UI for
+  // identification without exposing the secret. E.g., "fp_live_".
+  string key_prefix = 2;
+
+  // The user this key belongs to. When a key is used, the auth service looks
+  // up this user_id to resolve the role and enforce scope restrictions.
+  string user_id = 3;
+
+  // OAuth 2.0-style scopes restricting what this key can do.
+  // Must be a subset of the user's role permissions at key creation time.
+  // Format: "{resource}:{action}" e.g., ["models:read", "pipelines:write"].
+  repeated string scopes = 4;
+
+  // When this key stops being valid. Zero value (not set) means no expiry.
+  // Recommended: set short TTLs (days/weeks) for keys used in automation.
+  google.protobuf.Timestamp expires_at = 5;
+
+  // When this key was created. Useful for audit and rotation reminders.
+  google.protobuf.Timestamp created_at = 6;
+}
+
+// ============================================================================
+// Role
+// ============================================================================
+//
+// WHY: Roles are named collections of Permissions. Rather than assigning
+// permissions individually to each user, we assign a role. This is the
+// defining characteristic of RBAC over simple ACLs.
+//
+// BUILT-IN ROLES (not defined in proto, just examples for documentation):
+//   - "admin":    all permissions on all resources
+//   - "engineer": read/write on models, pipelines, experiments; read billing
+//   - "viewer":   read-only on models, experiments; no billing access
+//   - "svc-acct": narrow set of scopes used by machine API keys
+//
+// WHY NOT HIERARCHICAL ROLES:
+//   Some systems support role inheritance (admin extends engineer). We keep
+//   roles flat for simplicity — explicit permission lists are easier to audit
+//   in interviews ("what exactly can an engineer do?") and reduce surprise.
+//   If we need hierarchy later, we add parent_role_id to this message.
+// ============================================================================
+message Role {
+  // UUID v4.
+  string id = 1;
+
+  // Unique, human-readable role name: "admin", "engineer", "viewer".
+  // This name is embedded in JWT claims (TokenClaims.role), so it must be
+  // stable — renaming a role is a breaking change requiring a token re-issue.
+  string name = 2;
+
+  // The set of permissions this role grants. Evaluated as a logical OR —
+  // if ANY permission matches the requested resource+action, access is granted.
+  repeated Permission permissions = 3;
+}
+
+// ============================================================================
+// Permission
+// ============================================================================
+//
+// WHY resource + action vs. a flat permission string:
+//   Structured fields (resource + action) enable:
+//     - Wildcard matching at code level: resource="*" grants all resources
+//     - Consistent naming enforced by validation: actions are an enum-like set
+//     - Clear audit log: "user X was denied action=write on resource=models"
+//
+//   A flat string ("models:write") is simpler but loses structure for
+//   programmatic checks. We choose structured fields.
+//
+// RESOURCE NAMES (not enforced in proto, documented here):
+//   "models", "experiments", "pipelines", "features", "billing", "users",
+//   "api-keys", "deployments", "monitoring"
+//
+// ACTION NAMES:
+//   "read", "write", "delete", "admin"
+//   "admin" action means full control including granting the resource to others.
+//
+// INTERVIEW NOTE: Interviewer might ask "how do you check a wildcard admin
+// permission that grants everything?" Answer: CheckPermission on the Auth
+// service iterates the user's role permissions. If any Permission has
+// resource="*" and action="*", it short-circuits to allowed.
+// ============================================================================
+message Permission {
+  // The resource being protected. E.g., "models", "pipelines", "billing".
+  // Use "*" to mean all resources (admin wildcard).
+  string resource = 1;
+
+  // The action being requested. E.g., "read", "write", "delete", "admin".
+  // Use "*" to mean all actions (admin wildcard).
+  string action = 2;
+}
+
+// ============================================================================
+// TokenClaims
+// ============================================================================
+//
+// WHY: The decoded payload of a JWT. Other services call ValidateToken and
+// receive these claims — they don't need to decode the JWT themselves, which
+// avoids distributing the JWT secret and simplifies revocation checks.
+//
+// JWT STRUCTURE RECAP (for interview clarity):
+//   Header.Payload.Signature (base64url encoded, dot-separated)
+//   Payload contains claims: sub (subject/user_id), exp, iat, custom fields.
+//   We embed role + scopes in the payload so the auth interceptor has enough
+//   context to call CheckPermission without a separate DB lookup per request.
+//
+// WHY Timestamp for exp/iat instead of int64:
+//   The JWT standard uses Unix epoch integers for exp/iat. We use
+//   google.protobuf.Timestamp for consistency with other timestamp fields in
+//   this proto (Timestamp is richer: has nanos, implements proto well-known
+//   type). The Auth service converts when issuing/validating JWTs.
+//
+// SCOPES IN CLAIMS:
+//   When a user logs in, scopes defaults to the role's full permission set
+//   (serialized as "resource:action" strings).
+//   When a user authenticates via API key, scopes is the key's restricted
+//   scope list. This lets downstream services check scopes without knowing
+//   whether it's a JWT or API key auth.
+// ============================================================================
+message TokenClaims {
+  // The authenticated user's UUID.
+  string user_id = 1;
+
+  // The authenticated user's email. Included for audit logging in downstream
+  // services without requiring a lookup to the auth service.
+  string email = 2;
+
+  // The team this user belongs to. Useful for namespacing resources by team
+  // without an extra auth check.
+  string team = 3;
+
+  // The user's role name. Downstream services can use this for coarse-grained
+  // checks ("is this an admin?") without a CheckPermission RPC.
+  string role = 4;
+
+  // Fine-grained scope strings for this token. Format: "resource:action".
+  // For JWT logins: derived from role permissions.
+  // For API key auth: the key's restricted scopes.
+  repeated string scopes = 5;
+
+  // Token expiry time. Auth interceptors must reject requests where
+  // exp is in the past (the auth service validates this in ValidateToken).
+  google.protobuf.Timestamp exp = 6;
+
+  // Token issued-at time. Used for detecting clock skew and for audit logs.
+  google.protobuf.Timestamp iat = 7;
+}
+
+// ============================================================================
+// REQUEST / RESPONSE MESSAGES
+// ============================================================================
+
+// ============================================================================
+// Login
+// ============================================================================
+
+// LoginRequest carries email + password credentials for the password grant flow.
+// WHY NOT OAuth 2.0 authorization_code flow:
+//   For an internal ML platform (no external users, no 3rd-party apps), the
+//   resource owner password credentials grant (email+password → JWT) is simpler
+//   and avoids running a full OAuth 2.0 authorization server.
+//   In production: migrate to OIDC + device flow for CLI, and authorization_code
+//   flow for web UI. This is a known tradeoff, intentional for M1 scope.
+message LoginRequest {
+  // User's email address. Case-insensitive, normalized server-side.
+  string email = 1;
+
+  // Plaintext password (TLS in transit). Auth service hashes and compares
+  // against bcrypt hash in database. NEVER log this field.
+  string password = 2;
+}
+
+// LoginResponse returns a short-lived JWT access token.
+// WHY no refresh_token in M1:
+//   Refresh tokens require a separate token store and rotation logic. For an
+//   internal platform where sessions are re-established frequently (CLI logins,
+//   notebook kernels), a slightly longer-lived access_token (e.g., 24h) is
+//   pragmatic. Refresh tokens are an M3 hardening item.
+message LoginResponse {
+  // Signed JWT. Include in gRPC metadata: "authorization: Bearer <token>"
+  string access_token = 1;
+
+  // When this token expires. Client should re-login before this time.
+  google.protobuf.Timestamp expires_at = 2;
+
+  // The authenticated user's profile (avoids a separate GetUser call after login).
+  User user = 3;
+}
+
+// ============================================================================
+// CreateUser
+// ============================================================================
+
+// CreateUserRequest carries the fields needed to provision a new user account.
+// Password is only accepted here (creation time) — password changes would be
+// a separate ChangePassword RPC (not in M1 scope, omitted deliberately).
+message CreateUserRequest {
+  // New user's email. Must be unique across the platform.
+  string email = 1;
+
+  // Display name. Not unique.
+  string name = 2;
+
+  // Plaintext password. Auth service bcrypt-hashes before storage.
+  string password = 3;
+
+  // Team this user belongs to (e.g., "ml-platform").
+  string team = 4;
+}
+
+// CreateUserResponse wraps the created User.
+// WHY not return User directly:
+//   Buf STANDARD lint rule RPC_RESPONSE_STANDARD_NAME requires every RPC
+//   response to be named "<Rpc>Response" or "<Service><Rpc>Response". This is
+//   a forward-compatibility guard — if we later add fields (e.g., a welcome
+//   email sent flag), we can add them to CreateUserResponse without changing
+//   the User message (which is a shared domain type).
+message CreateUserResponse {
+  // The newly created user. Password field is never populated in responses.
+  User user = 1;
+}
+
+// ============================================================================
+// CreateAPIKey
+// ============================================================================
+
+message CreateAPIKeyRequest {
+  // The user for whom this key is being created. Usually the authenticated
+  // caller's own user_id; admins can create keys for other users.
+  string user_id = 1;
+
+  // Scope restrictions for this key. Must be a subset of the user's role
+  // permissions. Auth service validates this at creation time.
+  repeated string scopes = 2;
+
+  // Optional: when this key should expire. Zero value = no expiry.
+  google.protobuf.Timestamp expires_at = 3;
+}
+
+// CreateAPIKeyResponse returns the raw key ONCE. It is never retrievable again.
+// WHY return only once:
+//   We store a SHA-256 hash of the key, not the plaintext. After this response
+//   is sent, there is no way to recover the raw key — only revoke it.
+//   This is the same design used by Stripe, GitHub, and AWS IAM access keys.
+//   The key_prefix in the APIKey metadata lets users identify which key they're
+//   looking at in the UI without revealing the secret.
+message CreateAPIKeyResponse {
+  // The full raw API key. COPY THIS NOW — it will not be shown again.
+  // Format: "fp_<32-chars-base58>" (url-safe, easy to copy-paste).
+  string raw_key = 1;
+
+  // Metadata about the created key (id, key_prefix, scopes, etc.).
+  // Does NOT include the raw key — that's in raw_key above.
+  APIKey api_key = 2;
+}
+
+// ============================================================================
+// RevokeAPIKey
+// ============================================================================
+
+message RevokeAPIKeyRequest {
+  // The UUID of the API key to revoke (from APIKey.id, NOT the raw key).
+  // Using ID (not key prefix) prevents any accidental partial-match revocation.
+  string key_id = 1;
+}
+
+// RevokeAPIKeyResponse is intentionally empty.
+// WHY a named empty response instead of google.protobuf.Empty:
+//   Buf STANDARD lint requires "<Rpc>Response" naming for all RPC responses.
+//   A dedicated named empty message is also forward-compatible: if we later
+//   need to return a confirmation (e.g., revoked_at timestamp), we can add
+//   fields without changing the RPC signature.
+message RevokeAPIKeyResponse {}
+
+// ============================================================================
+// ValidateToken
+// ============================================================================
+
+// ValidateTokenRequest is called by auth interceptors in every other service.
+// The interceptor extracts the Bearer token from gRPC metadata and passes it
+// here. The auth service validates signature, expiry, and revocation status.
+message ValidateTokenRequest {
+  // The raw JWT string (without "Bearer " prefix) OR a raw API key.
+  // Auth service detects which format by the token prefix ("fp_" = API key).
+  string token = 1;
+}
+
+// ValidateTokenResponse wraps the decoded TokenClaims.
+// WHY not return TokenClaims directly:
+//   Buf STANDARD lint requires "<Rpc>Response" naming. A wrapper also lets us
+//   add fields in the future (e.g., token_type: "jwt" | "api_key", or a
+//   warning when the token is close to expiry) without touching TokenClaims.
+message ValidateTokenResponse {
+  // The decoded claims from the validated token.
+  TokenClaims claims = 1;
+}
+
+// ============================================================================
+// CheckPermission
+// ============================================================================
+
+message CheckPermissionRequest {
+  // The user_id whose permissions to check. Typically taken from TokenClaims
+  // returned by a prior ValidateToken call.
+  string user_id = 1;
+
+  // The resource being accessed (e.g., "models", "pipelines").
+  string resource = 2;
+
+  // The action being attempted (e.g., "read", "write", "delete").
+  string action = 3;
+}
+
+// CheckPermissionResponse is a simple allow/deny gate.
+// WHY include reason:
+//   A plain bool `allowed` is sufficient for enforcement, but the optional
+//   `reason` field enables better error messages and audit logs:
+//     - "User has 'viewer' role, which lacks 'write' on 'models'"
+//   This is the design used by AWS IAM policy evaluation responses.
+message CheckPermissionResponse {
+  // true = access granted, false = access denied.
+  bool allowed = 1;
+
+  // Human-readable reason for the decision. Always populated.
+  // Examples:
+  //   "allowed: user role 'admin' has wildcard permission"
+  //   "denied: role 'viewer' does not have action 'write' on resource 'models'"
+  string reason = 2;
+}
+
+// ============================================================================
+// AssignRole
+// ============================================================================
+
+message AssignRoleRequest {
+  // The user whose role is being changed.
+  string user_id = 1;
+
+  // The role name to assign (e.g., "admin", "engineer", "viewer").
+  // Must exist in the roles table. Auth service validates this.
+  string role_name = 2;
+}
+
+// AssignRoleResponse is intentionally empty — success is implicit.
+// WHY named empty vs google.protobuf.Empty:
+//   Same reason as RevokeAPIKeyResponse: Buf STANDARD naming + forward compat.
+//   If we later add "effective_from" or "previous_role" for audit, we can
+//   add it here without changing the RPC signature.
+message AssignRoleResponse {}
+
+// ============================================================================
+// ListUsers
+// ============================================================================
+
+// ListUsersRequest reuses PaginationRequest from common.proto.
+// WHY: Consistency across all list RPCs in the platform. Every service
+// uses the same cursor-based pagination shape. See common.proto for
+// the WHY on cursor-based vs offset-based pagination.
+message ListUsersRequest {
+  // Optional filter: return only users in this team.
+  // Empty = return all users (admin only).
+  string team_filter = 1;
+
+  // Cursor-based pagination. page_size defaults to 20, max 100.
+  forgepoint.common.v1.PaginationRequest pagination = 2;
+}
+
+message ListUsersResponse {
+  // The page of users matching the request.
+  repeated User users = 1;
+
+  // Pagination metadata: next_page_token + total_count.
+  forgepoint.common.v1.PaginationResponse pagination = 2;
+}
+
+// ============================================================================
+// AUTH SERVICE
+// ============================================================================
+//
+// WHY a single AuthService vs separate UserService, TokenService, etc.:
+//   Identity, credentials, and access control are tightly coupled. Splitting
+//   them into separate services would require inter-service calls for common
+//   flows (e.g., Login needs User lookup, token issuance, and permission
+//   loading). A single AuthService keeps the auth boundary clean.
+//
+//   Real-world parallel: Keycloak, Auth0, and Ory Kratos all handle user
+//   management + token issuance in a single service boundary. The split only
+//   makes sense at org scale (separate teams owning identity vs. access control).
+//
+// RPC CATEGORIES:
+//   IDENTITY MANAGEMENT: CreateUser, ListUsers
+//   CREDENTIALS: Login, CreateAPIKey, RevokeAPIKey
+//   TOKEN VALIDATION: ValidateToken (called by every other service's interceptor)
+//   ACCESS CONTROL: CheckPermission, AssignRole
+//
+// INTERCEPTOR CALL PATTERN (interview-critical):
+//   Every gRPC service in Forgepoint has an auth interceptor that:
+//     1. Extracts "authorization: Bearer <token>" from incoming metadata
+//     2. Calls AuthService.ValidateToken() → gets TokenClaims
+//     3. Calls AuthService.CheckPermission() with the resource+action for that RPC
+//     4. Injects TokenClaims into gRPC context for handler use
+//   The interceptor is registered via grpc.ChainUnaryInterceptor in pkg/grpcutil.
+//
+// ASCII DIAGRAM — Token Validation Flow:
+//
+//   gRPC Client
+//       │ metadata: authorization=Bearer <jwt>
+//       ▼
+//   ModelRegistry gRPC Server
+//       │
+//       ├─ Recovery Interceptor (panic → gRPC Internal)
+//       ├─ Logging Interceptor (structured log per RPC)
+//       ├─ Tracing Interceptor (OpenTelemetry span)
+//       └─ Auth Interceptor ──► AuthService.ValidateToken(token)
+//                           ──► AuthService.CheckPermission(user_id, "models", "write")
+//                           ──► injects claims into ctx
+//                               │
+//                               ▼
+//                           Handler (sees claims via ctx)
+// ============================================================================
+service AuthService {
+  // Login authenticates a user with email + password and returns a signed JWT.
+  // This is the entry point for human users (CLI login, web UI login).
+  // For machine-to-machine auth, use API keys instead.
+  rpc Login(LoginRequest) returns (LoginResponse);
+
+  // CreateUser provisions a new user account. Requires admin role.
+  // Password is bcrypt-hashed before storage. Returns the user profile (no
+  // password field — passwords are write-only).
+  rpc CreateUser(CreateUserRequest) returns (CreateUserResponse);
+
+  // ListUsers returns a paginated list of users. Requires admin role.
+  // Supports filtering by team via ListUsersRequest.team_filter.
+  rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
+
+  // CreateAPIKey creates a new API key for a user.
+  // The raw key is returned ONCE in CreateAPIKeyResponse.raw_key.
+  // After that, only the key_prefix is visible (for identification in UI).
+  // Use API keys for CI/CD pipelines, training scripts, and SDK clients.
+  rpc CreateAPIKey(CreateAPIKeyRequest) returns (CreateAPIKeyResponse);
+
+  // RevokeAPIKey immediately invalidates an API key by ID.
+  // Revocation takes effect immediately — the next request using this key
+  // will receive UNAUTHENTICATED. No expiry window; this is why centralized
+  // auth beats distributed JWT validation for revocability.
+  rpc RevokeAPIKey(RevokeAPIKeyRequest) returns (RevokeAPIKeyResponse);
+
+  // ValidateToken is the workhorse called by auth interceptors in ALL other
+  // services. It validates the JWT signature, checks expiry, verifies the
+  // token is not in the revocation blacklist, and returns decoded TokenClaims.
+  //
+  // Performance note: the auth service caches validation results in Redis
+  // with a 30-second TTL. This keeps auth overhead below 1ms p99 while
+  // still enforcing near-real-time revocation.
+  //
+  // INTERVIEW NOTE: Interviewers often ask "what happens if the auth service
+  // goes down?" Answer: the other services' interceptors can be configured
+  // with a fail-open (allow) or fail-closed (deny) policy. Forgepoint uses
+  // fail-closed (safe default for a security service). A circuit breaker on
+  // the auth gRPC client prevents cascade failures during auth service outages.
+  rpc ValidateToken(ValidateTokenRequest) returns (ValidateTokenResponse);
+
+  // CheckPermission evaluates whether a user's role permits a specific
+  // resource+action. Called by auth interceptors after ValidateToken to
+  // enforce RBAC. Returns allowed bool + human-readable reason.
+  rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
+
+  // AssignRole changes a user's role. Requires admin permission.
+  // NOTE: The newly assigned role takes effect on the NEXT token issuance —
+  // existing JWTs retain the old role until they expire (or are revoked).
+  // For immediate role change enforcement, also revoke the user's existing tokens.
+  rpc AssignRole(AssignRoleRequest) returns (AssignRoleResponse);
+}
