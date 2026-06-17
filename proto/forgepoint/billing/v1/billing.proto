@@ -1,0 +1,736 @@
+// ============================================================================
+// Forgepoint Billing / Usage Service Proto Definitions
+// ============================================================================
+//
+// WHY: The Billing service meters every billable action on the platform —
+// primarily inference calls — attributes cost to a team/rate-plan, enforces
+// quotas, and rolls metered usage up into invoices. It is the platform's
+// "money truth": once an event is recorded here it must NEVER be lost and must
+// NEVER be double-counted (both directions are real money errors).
+//
+// WHAT'S HERE:
+//   - Domain messages: Money, RatePlan, UsageRecord, UsageSummary, Invoice,
+//     InvoiceLineItem
+//   - BillingService RPCs: RecordUsage (meter), GetUsage (aggregate, paged),
+//     GetInvoice, ListInvoices (paged)
+//   - Event payload messages: UsageRecorded, InvoiceGenerated, QuotaExceeded —
+//     the typed payloads carried in common.v1.EventEnvelope.data and published
+//     via the OUTBOX poller (see pattern note below)
+//
+// PATTERN — Outbox (Transactional Outbox / reliable event publishing):
+//   The hard problem this service exists to demonstrate is the DUAL-WRITE
+//   problem. When we record usage we must do TWO things that look atomic to the
+//   rest of the platform:
+//     (1) UPDATE the usage counters / INSERT the usage row in Postgres, and
+//     (2) PUBLISH an event (UsageRecorded / QuotaExceeded) to NATS.
+//   If we write the DB then crash before publishing, downstream (Notification,
+//   the Inference Gateway's quota cache) never learns. If we publish then the
+//   DB write fails, we've told the world something that isn't true. There is no
+//   distributed transaction spanning Postgres and NATS, so we CANNOT make (1)
+//   and (2) atomic directly.
+//
+//   THE OUTBOX FIX:
+//     - In ONE local Postgres transaction we write the business rows AND insert
+//       a row into an `outbox` table: {id, aggregate_id, event_type, payload,
+//       created_at, published_at=NULL}. One transaction, one commit, no dual
+//       write — the event is now as durable as the data that justifies it.
+//     - A SEPARATE poller goroutine reads `WHERE published_at IS NULL ORDER BY
+//       created_at`, publishes each to NATS, then stamps `published_at=NOW()`.
+//     - Guarantee: if the DB commit succeeded, the event WILL eventually be
+//       published (at-least-once). Consumers are idempotent (EventEnvelope.id)
+//       so at-least-once is safe.
+//
+//   WHY THE API SHAPE REFLECTS THIS:
+//     - RecordUsage carries an `idempotency_key` so a REDELIVERED upstream
+//       InferenceCompleted (NATS is at-least-once too) does not bill twice. The
+//       outbox protects DB→NATS; the idempotency key protects NATS→DB. Both ends
+//       of the pipe must be idempotent for the whole thing to be exactly-once
+//       *in effect*.
+//     - The event payload messages live in THIS proto (not raw JSON) so the
+//       outbox `payload` column is a typed, versioned, buf-breaking-checked
+//       contract — the same "typed payload in a generic envelope" discipline as
+//       the registry service.
+//
+//   REAL-WORLD COMPARISON:
+//     - This is exactly how Stripe, Shopify, and most ledger systems publish
+//       events reliably. Debezium + Kafka Connect productize the "tail the
+//       outbox/WAL" half. Temporal sidesteps it with durable workflow state.
+//     - INTERVIEW NOTE: the classic probe is "why not just publish to NATS
+//       inside the same code path after the DB commit?" — answer: the process
+//       can die in the gap between commit and publish; the outbox moves the
+//       publish intent INTO the committed transaction so a crash loses nothing.
+//
+// METERING SOURCE — consumes InferenceCompleted:
+//   The primary feeder is the async event `fp.inference.completed` emitted by
+//   the Inference Gateway. The billing consumer turns each into a RecordUsage
+//   (internally) so the same metering path serves both the event consumer and
+//   any direct gRPC caller (e.g. a backfill tool). RecordUsage is therefore
+//   exposed on the gRPC surface even though, in steady state, most traffic
+//   arrives via NATS.
+//
+// SECURITY / TRUST BOUNDARY (this is a billing service — get this right):
+//   EVERY money-bearing or attribution field is SERVER-AUTHORITATIVE. Clients
+//   submit only the raw, verifiable METERING FACTS (which model/version, how
+//   many requests, how many tokens/compute-units). The server looks up the
+//   rate plan and COMPUTES the cost. A client may never assert a price, a
+//   discount, a cost, an invoice total, a quota, a status, a timestamp, or
+//   whose account to bill. Accepting any of those would be a mass-assignment
+//   vulnerability with a direct financial blast radius. See per-field notes.
+//
+// VERSIONING: Package path includes v1 per Buf/Google convention. Breaking
+// changes require a new forgepoint.billing.v2 package.
+// ============================================================================
+
+syntax = "proto3";
+
+package forgepoint.billing.v1;
+
+// go_package follows the pattern established in common.proto:
+//   "github.com/abd-ulbasit/forgepoint/gen/go/{package};{shortname}"
+// The semicolon short name (billingv1) is the Go package identifier, keeping
+// imports unambiguous when several proto packages are pulled into one file.
+option go_package = "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/billing/v1;billingv1";
+
+import "google/protobuf/timestamp.proto";
+import "forgepoint/common/v1/common.proto";
+
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+// ============================================================================
+// MeterType — what kind of resource a usage record measures.
+// ============================================================================
+//
+// WHY an enum, not a free string:
+//   Closed, validated set at the wire boundary. The rate plan prices each meter
+//   type differently, so a typo ("infernce") must not silently fall through to
+//   a zero price. Buf STANDARD requires the _UNSPECIFIED zero value and the
+//   ENUM_NAME prefix on every value.
+//
+// WHY separate inference-request vs inference-tokens:
+//   Real ML billing meters on MORE than one axis simultaneously — a single
+//   inference call costs a per-request fee AND a per-token (or per-compute-unit)
+//   fee. Modeling them as distinct meter types lets one InferenceCompleted
+//   produce multiple priced line items, which is how OpenAI/Anthropic-style
+//   token billing actually works.
+// ============================================================================
+enum MeterType {
+  // Required zero value. Unknown/unset meter — the server rejects RecordUsage
+  // with this value rather than guessing a price.
+  METER_TYPE_UNSPECIFIED = 0;
+
+  // One billable inference REQUEST (the per-call fee), regardless of size.
+  METER_TYPE_INFERENCE_REQUEST = 1;
+
+  // Tokens processed by an inference call (prompt + completion). Priced
+  // per-1k-tokens by the rate plan. The dominant cost axis for LLM serving.
+  METER_TYPE_INFERENCE_TOKENS = 2;
+
+  // Compute-seconds consumed by serving (for non-token models priced on
+  // wall-clock / GPU time rather than tokens).
+  METER_TYPE_COMPUTE_SECONDS = 3;
+
+  // Artifact bytes stored in the model registry / object store, metered
+  // periodically. Lets storage cost ride the same pipeline as inference cost.
+  METER_TYPE_STORAGE_BYTES = 4;
+}
+
+// ============================================================================
+// InvoiceStatus — lifecycle of an invoice.
+// ============================================================================
+//
+// WHY an enum: invoice status drives money-moving side effects (you can only
+// charge a card on a FINALIZED invoice, you can't re-finalize a PAID one). A
+// closed validated set with explicit transitions is mandatory for an auditable
+// ledger. Status is SERVER-authoritative — a client can never set it.
+// ============================================================================
+enum InvoiceStatus {
+  // Required zero value. Unknown/unset.
+  INVOICE_STATUS_UNSPECIFIED = 0;
+
+  // Accumulating: the billing period is still open and line items are still
+  // being metered onto this invoice. Not yet collectible.
+  INVOICE_STATUS_DRAFT = 1;
+
+  // Period closed and totals locked. The InvoiceGenerated event fires on this
+  // transition. Collectible but not yet paid.
+  INVOICE_STATUS_FINALIZED = 2;
+
+  // Payment received and reconciled. Terminal (happy path).
+  INVOICE_STATUS_PAID = 3;
+
+  // Finalized but unpaid past its due date. Drives dunning / Notification.
+  INVOICE_STATUS_OVERDUE = 4;
+
+  // Reversed/written off (e.g. credit issued). Terminal. Kept for audit, never
+  // deleted — ledgers are append-only.
+  INVOICE_STATUS_VOID = 5;
+}
+
+// ============================================================================
+// DOMAIN MESSAGES
+// ============================================================================
+
+// ============================================================================
+// Money — a precise monetary amount.
+// ============================================================================
+//
+// WHY integer minor units, NOT double:
+//   Floating point cannot represent most decimal money values exactly
+//   (0.10 + 0.20 != 0.30 in IEEE-754). Accumulating float errors over millions
+//   of metered calls produces real money discrepancies and fails reconciliation.
+//   We store the amount as an INTEGER in the currency's minor unit so all
+//   arithmetic is exact integer math. This mirrors Stripe's Money model and the
+//   google.type.Money guidance.
+//
+// WHY micro-units (1e-6) rather than cents:
+//   Per-token / per-request prices are tiny — a single token might cost
+//   0.0000004 USD. Cents (1e-2) would round that to zero. We use MICRO units
+//   (1/1,000,000 of the major unit, i.e. micro-dollars) so we can price and sum
+//   sub-cent meters exactly and only round to cents at invoice finalization.
+//   So amount_micros = 1_000_000 means 1.00 USD; 4 means 0.000004 USD.
+//
+// WHY currency_code is here on every amount:
+//   Self-describing money prevents the classic "is this dollars or cents? USD
+//   or EUR?" ambiguity at every boundary. ISO 4217 code ("USD", "EUR").
+//
+// SECURITY: Money only ever appears in RESPONSES and in server-built event
+// payloads. It is NEVER a field on a client write request — clients submit
+// quantities, the server attaches the price.
+// ============================================================================
+message Money {
+  // Amount in micro-units of the currency's major unit (1e-6). Exact integer.
+  // 1_000_000 == 1.00 of the currency. May be negative for credits/refunds.
+  int64 amount_micros = 1;
+
+  // ISO 4217 currency code, uppercase: "USD", "EUR". Empty is invalid.
+  string currency_code = 2;
+}
+
+// ============================================================================
+// RatePlan — the pricing the server applies to metered usage.
+// ============================================================================
+//
+// WHY this lives server-side and is referenced, not supplied:
+//   The rate plan is the SOURCE of every price. A usage record references a rate
+//   plan by id; the server reads the plan's unit prices to compute cost. The
+//   client never sees or sends prices on the write path — it can only learn them
+//   after the fact via GetUsage/GetInvoice. This is the structural guarantee
+//   that "the client cannot set its own price".
+//
+// NOTE: RatePlan management RPCs (CreateRatePlan, etc.) are intentionally NOT in
+// this file's M2 surface — the platform design lists CreateRatePlan as a later
+// admin concern. The message is defined now because GetUsage/Invoice responses
+// reference the plan that was applied, and because it documents the pricing
+// model the metering math depends on. Adding the admin RPCs later is additive
+// (buf-breaking-safe).
+// ============================================================================
+message RatePlan {
+  // UUID v4. Stable identifier referenced by usage records and invoices.
+  string id = 1;
+
+  // Human-readable plan name: "free-tier", "standard", "enterprise".
+  string name = 2;
+
+  // Per-meter unit prices. Key is the MeterType's string name (e.g.
+  // "METER_TYPE_INFERENCE_TOKENS"); value is the price for ONE unit of that
+  // meter (per request, per token, per compute-second, per byte) as Money.
+  // WHY a map keyed by meter rather than fixed fields: meter types grow over
+  // time; a map lets us add a meter's price without a schema change.
+  map<string, Money> unit_prices = 3;
+
+  // Included free allowance per billing period, keyed by meter name. Usage
+  // beyond the allowance is what gets charged. Empty = no free tier.
+  map<string, int64> included_quantities = 4;
+
+  // Monthly quota cap per meter name (hard limit). Exceeding it is what fires
+  // the QuotaExceeded event. 0 / absent for a given meter = no hard cap.
+  map<string, int64> quota_limits = 5;
+
+  // When this plan was created. Server-set, immutable.
+  google.protobuf.Timestamp created_at = 6;
+}
+
+// ============================================================================
+// UsageRecord — one metered, priced fact (the atom of the ledger).
+// ============================================================================
+//
+// WHY this is the unit of record:
+//   Every billable action becomes exactly one UsageRecord. Invoices are just
+//   aggregations of UsageRecords over a period. Keeping the atom immutable and
+//   append-only (we never UPDATE a recorded usage row, we only INSERT) makes the
+//   ledger auditable and reconciliation tractable — the same append-only
+//   discipline as the Feature Store's event log.
+//
+// EVERY money/attribution field below is SERVER-COMPUTED. The client side of a
+// RecordUsage supplies only meter_type + quantity (+ what was served). See
+// RecordUsageRequest for the strict input contract.
+// ============================================================================
+message UsageRecord {
+  // UUID v4 assigned by the server. Primary key of the ledger row.
+  string id = 1;
+
+  // The team this usage is billed to. SERVER-derived from the authenticated
+  // caller's claims (team) or, for the InferenceCompleted consumer, from the
+  // API key that made the inference. NEVER taken from a client write field —
+  // letting a caller name the billed team is account-takeover-for-money.
+  string team = 2;
+
+  // The rate plan that was applied to price this record. SERVER-resolved from
+  // the team's current plan at metering time, and pinned here so the price is
+  // reproducible even if the team's plan later changes.
+  string rate_plan_id = 3;
+
+  // What was metered.
+  MeterType meter_type = 4;
+
+  // How many units of that meter (request count, token count, compute-seconds,
+  // bytes). This is the one quantity the client/event supplies and the server
+  // validates (non-negative, sane bounds).
+  int64 quantity = 5;
+
+  // The price the server computed for this record: quantity * plan unit price
+  // (after free-allowance logic). Authoritative; clients cannot supply it.
+  Money cost = 6;
+
+  // What produced the usage — for attribution and per-model usage reports.
+  // SERVER-populated from the inference event / request context.
+  string model_id = 7;
+  string model_version = 8;
+
+  // The inference request id (or upstream event id) this record was derived
+  // from. Doubles as the natural idempotency anchor: two records must never
+  // share a source_request_id. SERVER-stored from the metering input.
+  string source_request_id = 9;
+
+  // When the metered action occurred (event time, not insert time).
+  // SERVER-stamped from the source event; clients cannot backdate usage.
+  google.protobuf.Timestamp occurred_at = 10;
+}
+
+// ============================================================================
+// UsageSummary — an aggregated usage rollup (the shape GetUsage returns).
+// ============================================================================
+//
+// WHY a summary type distinct from UsageRecord:
+//   GetUsage answers "how much has team X used / spent this period?" — callers
+//   (dashboards, the BFF) want a ROLLUP, not millions of raw records. Returning
+//   raw UsageRecords for a heavy team would be unbounded and useless for a
+//   dashboard. The summary buckets quantity and cost per meter type.
+// ============================================================================
+message UsageSummary {
+  // The team this summary covers.
+  string team = 1;
+
+  // The window this rollup aggregates over (inclusive start, exclusive end).
+  google.protobuf.Timestamp period_start = 2;
+  google.protobuf.Timestamp period_end = 3;
+
+  // Per-meter aggregation. Key is the MeterType string name; value is the
+  // bucketed totals for that meter over the window.
+  map<string, MeterUsage> by_meter = 4;
+
+  // Total cost across all meters in the window. Server-computed sum.
+  Money total_cost = 5;
+}
+
+// MeterUsage — one meter's bucket inside a UsageSummary.
+message MeterUsage {
+  // Which meter this bucket is for (redundant with the map key, included so the
+  // value is self-describing if extracted from the map).
+  MeterType meter_type = 1;
+
+  // Total units of this meter over the window.
+  int64 total_quantity = 2;
+
+  // Total cost attributed to this meter over the window.
+  Money total_cost = 3;
+}
+
+// ============================================================================
+// Invoice — a finalized (or draft) bill for a team over a billing period.
+// ============================================================================
+//
+// WHY invoices are derived, never client-authored:
+//   An invoice is a server-built aggregation of UsageRecords plus the plan's
+//   pricing over a closed period. There is no "create invoice from client data"
+//   path — that would let a customer write their own bill. Invoices are produced
+//   by the period-close job, which emits InvoiceGenerated through the outbox.
+// ============================================================================
+message Invoice {
+  // UUID v4. Stable invoice identifier.
+  string id = 1;
+
+  // Human-facing invoice number (e.g. "INV-2026-000042"). Server-assigned,
+  // monotonic, distinct from the UUID so it's safe to print/share.
+  string invoice_number = 2;
+
+  // Team being billed.
+  string team = 3;
+
+  // The rate plan in effect for this period.
+  string rate_plan_id = 4;
+
+  // Lifecycle status. SERVER-authoritative; drives collectibility.
+  InvoiceStatus status = 5;
+
+  // Billing period covered (inclusive start, exclusive end).
+  google.protobuf.Timestamp period_start = 6;
+  google.protobuf.Timestamp period_end = 7;
+
+  // The priced breakdown that sums to the total. One line per meter (and/or per
+  // model), so the customer can see WHERE cost came from.
+  repeated InvoiceLineItem line_items = 8;
+
+  // The invoice total. Server-computed sum of line_items, rounded to the
+  // currency's minor unit (cents) at finalization. Authoritative.
+  Money total = 9;
+
+  // When the invoice was created (period open) and finalized (period close).
+  // finalized_at is unset while status == DRAFT.
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp finalized_at = 11;
+
+  // When payment is due (set on finalization). Past-due drives OVERDUE.
+  google.protobuf.Timestamp due_at = 12;
+}
+
+// InvoiceLineItem — one priced row on an invoice.
+message InvoiceLineItem {
+  // What this line meters.
+  MeterType meter_type = 1;
+
+  // Free-text description for the customer: "Inference tokens (gpt-mini v3)".
+  string description = 2;
+
+  // Total billable units on this line (after free allowance).
+  int64 quantity = 3;
+
+  // Per-unit price applied (from the pinned rate plan), for transparency.
+  Money unit_price = 4;
+
+  // Line total = quantity * unit_price. Server-computed.
+  Money amount = 5;
+}
+
+// ============================================================================
+// REQUEST / RESPONSE MESSAGES
+// ============================================================================
+
+// ============================================================================
+// RecordUsage
+// ============================================================================
+//
+// RecordUsageRequest is the STRICT metering-input contract. This is the single
+// most security-sensitive write in the platform, so the input surface is
+// deliberately MINIMAL: the caller supplies only the verifiable raw facts, and
+// the server attaches everything that touches money or attribution.
+//
+// WHAT THE CLIENT MAY SEND (and only this):
+//   meter_type, quantity, model_id, model_version, source_request_id,
+//   occurred_at, idempotency_key.
+//
+// WHAT THE CLIENT MAY NOT SEND (server-authoritative — absent by design):
+//   team / billed account  → derived from auth claims or the inference API key
+//   rate_plan_id           → resolved from the team's current plan
+//   cost / price / Money   → computed by the server from the plan
+//   any invoice/status     → never settable
+//
+// WHY occurred_at is accepted but still constrained:
+//   The metering source (InferenceCompleted) carries the true event time, which
+//   can legitimately be slightly in the past (queue lag). We accept it so usage
+//   lands in the correct billing period, but the server CLAMPS it to a sane
+//   window (e.g. not in the future, not older than the open period) so a caller
+//   can't backdate usage into a closed/paid invoice. Empty = server uses now().
+//
+// IDEMPOTENCY (critical for an at-least-once meter):
+//   The upstream InferenceCompleted is delivered at-least-once, and clients
+//   retry. A duplicate must NOT bill twice. idempotency_key (client-generated,
+//   stable per logical action — typically the inference request id) is stored
+//   with the created UsageRecord; a repeat with the same key returns the
+//   ORIGINAL record instead of inserting a second one. This is the NATS→DB half
+//   of the exactly-once-in-effect guarantee (the outbox is the DB→NATS half).
+// ============================================================================
+message RecordUsageRequest {
+  // What is being metered. Must be a known, non-UNSPECIFIED meter.
+  MeterType meter_type = 1;
+
+  // How many units (requests, tokens, compute-seconds, bytes). Server validates
+  // non-negative and within sane per-record bounds.
+  int64 quantity = 2;
+
+  // What produced the usage (for attribution / per-model reports). Optional but
+  // strongly recommended; used only for reporting, never for pricing.
+  string model_id = 3;
+  string model_version = 4;
+
+  // The originating inference request id (or upstream event id). Used for
+  // lineage and as the natural dedupe anchor. SHOULD be set for inference usage.
+  string source_request_id = 5;
+
+  // Event time of the metered action. Server clamps to the valid window; empty
+  // means "use server now()". See WHY note above — cannot backdate into a
+  // closed period.
+  google.protobuf.Timestamp occurred_at = 6;
+
+  // Idempotency key (UUID/stable string). A repeat returns the original record.
+  // See IDEMPOTENCY note above — this is what makes redelivery safe.
+  string idempotency_key = 7;
+}
+
+// RecordUsageResponse returns the server-built, priced UsageRecord.
+// WHY return the full record: the caller (and the integration test) can see the
+// authoritative team, rate_plan_id, and computed cost the server attached —
+// proving the price was server-derived, not client-supplied.
+message RecordUsageResponse {
+  // The committed, priced ledger record (id, team, cost all server-set).
+  UsageRecord record = 1;
+
+  // True if this call hit the idempotency path (the key was already recorded)
+  // and `record` is the pre-existing one rather than a newly inserted row.
+  // Lets retrying clients distinguish "I just created it" from "already there".
+  bool deduplicated = 2;
+}
+
+// ============================================================================
+// GetUsage
+// ============================================================================
+//
+// GetUsageRequest asks for an AGGREGATED, paginated usage view for a team over
+// a time window. Returns UsageSummary rollups, not raw records (see UsageSummary
+// WHY note). Pagination applies when the window is broken into sub-period
+// buckets (e.g. daily) so a long range stays bounded.
+//
+// AUTHORIZATION NOTE: a non-admin caller may only query their OWN team. The
+// `team` filter is enforced server-side against auth claims — supplying another
+// team is rejected unless the caller is an admin. The field exists so admins and
+// the BFF can scope queries; it is NOT a way to bypass tenant isolation.
+message GetUsageRequest {
+  // Team to report on. For non-admins the server overrides this with the
+  // caller's own team (cannot read another team's spend). Required for admins.
+  string team = 1;
+
+  // Inclusive start / exclusive end of the reporting window. Empty start =
+  // current billing period start; empty end = now. Server caps the maximum
+  // span to bound query cost.
+  google.protobuf.Timestamp period_start = 2;
+  google.protobuf.Timestamp period_end = 3;
+
+  // Optional: restrict to a single meter type. UNSPECIFIED = all meters.
+  MeterType meter_type_filter = 4;
+
+  // Cursor-based pagination over sub-period buckets. page_size defaults to 20,
+  // capped at 100 server-side (see common.proto). See PaginationRequest.
+  forgepoint.common.v1.PaginationRequest pagination = 5;
+}
+
+// GetUsageResponse returns the page of usage summaries plus a grand total.
+message GetUsageResponse {
+  // Per-bucket rollups for this page (e.g. one summary per day in the window).
+  repeated UsageSummary summaries = 1;
+
+  // The aggregate cost across the ENTIRE requested window (not just this page),
+  // so a dashboard can show the period total without paging through everything.
+  Money grand_total = 2;
+
+  // Pagination metadata: next_page_token + total_count of buckets.
+  forgepoint.common.v1.PaginationResponse pagination = 3;
+}
+
+// ============================================================================
+// GetInvoice
+// ============================================================================
+
+// GetInvoiceRequest fetches a single invoice by id.
+message GetInvoiceRequest {
+  // The invoice UUID (Invoice.id). Server enforces that the caller's team owns
+  // this invoice (or the caller is admin) — no cross-team invoice reads.
+  string invoice_id = 1;
+}
+
+// GetInvoiceResponse wraps the invoice.
+// WHY wrap rather than return Invoice directly: Buf RPC_RESPONSE_STANDARD_NAME,
+// and forward-compat (we may later add e.g. a payment_url alongside the invoice
+// without touching the Invoice domain message).
+message GetInvoiceResponse {
+  // The requested invoice with its line items and server-computed totals.
+  Invoice invoice = 1;
+}
+
+// ============================================================================
+// ListInvoices
+// ============================================================================
+
+// ListInvoicesRequest lists a team's invoices, newest first, paginated.
+message ListInvoicesRequest {
+  // Team whose invoices to list. Non-admins are scoped to their own team
+  // server-side regardless of this value (tenant isolation).
+  string team = 1;
+
+  // Optional status filter (e.g. only OVERDUE for a dunning view).
+  // UNSPECIFIED = all statuses.
+  InvoiceStatus status_filter = 2;
+
+  // Cursor-based pagination. page_size defaults to 20, capped at 100
+  // server-side. See common.proto PaginationRequest for the WHY on cursors.
+  forgepoint.common.v1.PaginationRequest pagination = 3;
+}
+
+// ListInvoicesResponse returns the page of invoices.
+message ListInvoicesResponse {
+  // The page of invoices (server orders by created_at DESC — newest first).
+  repeated Invoice invoices = 1;
+
+  // Pagination metadata: next_page_token + total_count.
+  forgepoint.common.v1.PaginationResponse pagination = 2;
+}
+
+// ============================================================================
+// EVENT PAYLOAD MESSAGES (published via the OUTBOX, carried in EventEnvelope.data)
+// ============================================================================
+//
+// WHY typed event payloads (not raw JSON):
+//   These messages are what the outbox poller packs into
+//   common.v1.EventEnvelope.data (a google.protobuf.Any) before publishing to
+//   NATS. Defining them as protos gives consumers (Notification, the Inference
+//   Gateway's quota cache, Experiment Tracker) a typed, versioned,
+//   buf-breaking-checked contract — and gives the outbox `payload` column a
+//   stable schema. The Any's type_url tells the consumer which message to
+//   unmarshal. Same discipline as the registry service's event payloads.
+//
+// WHY events are SELF-CONTAINED:
+//   A consumer must act WITHOUT calling back into billing (that would defeat the
+//   async decoupling and risk reading not-yet-committed state). So each payload
+//   carries the fields its consumers need — the billed team, the meter, the
+//   computed cost — rather than just an id to look up.
+//
+// SUBJECT MAPPING (from the platform design's NATS hierarchy):
+//   UsageRecorded    → fp.billing.usage.recorded
+//   InvoiceGenerated → fp.billing.invoice.generated
+//   QuotaExceeded    → fp.billing.quota.exceeded
+// ============================================================================
+
+// UsageRecorded — emitted after a UsageRecord commits (via the outbox).
+// CONSUMERS: Experiment Tracker (attribute cost to a run/model), and any
+// real-time usage dashboard. Carries the full priced record so consumers need
+// no callback.
+message UsageRecorded {
+  // The committed, priced ledger record. Self-contained: includes team, meter,
+  // quantity, and server-computed cost.
+  UsageRecord record = 1;
+}
+
+// QuotaExceeded — emitted when recorded usage pushes a team OVER its rate plan's
+// quota for a meter. Written to the outbox in the SAME transaction as the usage
+// update (the canonical outbox example from the implementation plan), so the
+// alert is as durable as the usage that triggered it.
+// CONSUMERS: Notification (alert the team), Inference Gateway (flip the team's
+// quota cache to "blocked" so subsequent inferences are rejected/throttled).
+message QuotaExceeded {
+  // The team that exceeded quota.
+  string team = 1;
+
+  // The rate plan whose quota was hit.
+  string rate_plan_id = 2;
+
+  // Which meter's quota was exceeded.
+  MeterType meter_type = 3;
+
+  // The plan's quota cap for that meter (the limit that was crossed).
+  int64 quota_limit = 4;
+
+  // The team's current usage of that meter (>= quota_limit), so the consumer
+  // can show "1,012 / 1,000" without a callback.
+  int64 current_usage = 5;
+
+  // When the threshold was crossed (event time).
+  google.protobuf.Timestamp occurred_at = 6;
+}
+
+// InvoiceGenerated — emitted when a billing period closes and an invoice
+// transitions DRAFT → FINALIZED (totals locked). Published via the outbox.
+// CONSUMERS: Notification (email/Slack the finalized invoice), and any external
+// payment/accounting integration.
+message InvoiceGenerated {
+  // The finalized invoice, including line items and the server-computed total.
+  // Self-contained so the consumer can render/send it without a callback.
+  Invoice invoice = 1;
+}
+
+// ============================================================================
+// BILLING SERVICE
+// ============================================================================
+//
+// WHY a single BillingService (not separate Usage / Invoice services):
+//   Usage and invoicing are the same bounded context — invoices ARE aggregated
+//   usage. Splitting them would force a cross-service call on every period close
+//   and fracture the ledger's single source of truth. One service owns the
+//   `fp_billing` database (usage_events, quotas, rate_plans, invoices, outbox)
+//   per the database-per-service standard.
+//
+// RPC CATEGORIES:
+//   METERING (write): RecordUsage — the outbox-protected write path. In steady
+//     state this is driven by the InferenceCompleted NATS consumer; exposed on
+//     gRPC for backfills and direct metering.
+//   REPORTING (read): GetUsage (aggregated, paged), GetInvoice, ListInvoices
+//     (paged) — read-only views over the ledger.
+//
+// WHY ALL UNARY (no streaming):
+//   - RecordUsage is a single fact-in / record-out — request/reply.
+//   - GetUsage/ListInvoices return BOUNDED, PAGINATED pages; pagination (not a
+//     server stream) is the right tool because it gives clients resumability,
+//     cacheable page tokens, and a natural total_count — the same choice the
+//     registry's list RPCs made. A server stream would suit an UNBOUNDED live
+//     feed (e.g. tail usage in real time); that real-time need is served by the
+//     async UsageRecorded NATS event instead, keeping the gRPC surface simple.
+//
+// WHERE CheckQuota / CreateRatePlan WENT (scope note, not a TODO):
+//   The platform design also lists CheckQuota (gateway pre-flight) and
+//   CreateRatePlan (admin). They are deliberately OUT of this proto's scope per
+//   the task brief (RecordUsage / GetUsage / GetInvoice / ListInvoices). Quota
+//   enforcement is realized here via the QuotaExceeded outbox event that flips
+//   the gateway's Redis quota cache (eventual consistency is acceptable for the
+//   gateway pre-flight). Adding CheckQuota/CreateRatePlan later is purely
+//   additive and buf-breaking-safe.
+//
+// ASCII DIAGRAM — the outbox metering pipeline (interview-critical):
+//
+//   Inference Gateway ──fp.inference.completed──► Billing NATS consumer
+//                                                      │ (idempotency_key dedupe)
+//                                                      ▼
+//                                         ┌─ BEGIN tx ──────────────────────┐
+//                                         │  INSERT usage_record (priced)   │
+//                                         │  UPDATE quota counter           │
+//                                         │  INSERT outbox(UsageRecorded)   │
+//                                         │  if over quota:                 │
+//                                         │     INSERT outbox(QuotaExceeded)│
+//                                         └─ COMMIT ────────────────────────┘
+//                                                      │
+//                            outbox poller (separate goroutine, at-least-once)
+//                                                      ▼
+//                            NATS  fp.billing.usage.recorded / .quota.exceeded
+//                                                      ▼
+//                            Notification / Inference Gateway / Experiment Tracker
+// ============================================================================
+service BillingService {
+  // RecordUsage meters one billable action and writes it to the ledger via the
+  // outbox. The cost is COMPUTED server-side from the team's rate plan — the
+  // request carries only meter facts, never a price (see RecordUsageRequest).
+  // Idempotent via idempotency_key, so a redelivered InferenceCompleted or a
+  // client retry never double-bills. This is the outbox pattern's write half.
+  rpc RecordUsage(RecordUsageRequest) returns (RecordUsageResponse);
+
+  // GetUsage returns aggregated, paginated usage summaries (per-meter rollups +
+  // grand total) for a team over a time window. Non-admins are scoped to their
+  // own team server-side. Read-only.
+  rpc GetUsage(GetUsageRequest) returns (GetUsageResponse);
+
+  // GetInvoice fetches a single invoice by id, with its server-computed line
+  // items and total. Cross-team reads are denied (tenant isolation). Read-only.
+  rpc GetInvoice(GetInvoiceRequest) returns (GetInvoiceResponse);
+
+  // ListInvoices returns a team's invoices newest-first, paginated, optionally
+  // filtered by status (e.g. OVERDUE for dunning). Read-only.
+  rpc ListInvoices(ListInvoicesRequest) returns (ListInvoicesResponse);
+}

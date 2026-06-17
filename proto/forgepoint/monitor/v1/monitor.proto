@@ -1,0 +1,842 @@
+// ============================================================================
+// Forgepoint Model Monitor Service Proto Definitions
+// ============================================================================
+//
+// WHY: This service CLOSES the ML lifecycle loop. The platform promises
+// `train → register → deploy → serve → monitor → retrain`, but until this
+// service exists nothing actually *monitors* production models or *triggers*
+// retraining. The Notification service already subscribes to a
+// `ModelDriftDetected` event that no one publishes — Model Monitor is that
+// missing producer, and the loop-closer.
+//
+// WHAT'S HERE:
+//   - Domain messages: Monitor (config + baseline), DriftReport, DriftMetric,
+//     MonitorStatus, GroundTruthLabel
+//   - MonitorService RPCs: configure monitors, read drift reports (one +
+//     paginated list), read live status, submit delayed ground truth, and
+//     stream drift events live (server-streaming)
+//   - Event-payload messages: ModelDriftDetectedEvent — the typed payload that
+//     rides inside the common EventEnvelope's Any field on fp.models.drift.detected
+//
+// PATTERN — Streaming Aggregation + Closed-Loop Control:
+//   This is the most "alive" part of the platform. Two ideas combine:
+//
+//   1. STREAMING AGGREGATION (windowed statistics over an event stream):
+//      The monitor consumes the `fp.inference.completed` event stream and folds
+//      each event into a per-model SLIDING WINDOW. It never stores raw requests;
+//      it maintains running distributional summaries (histograms / quantile
+//      sketches) and periodically compares the current window against the
+//      training-time BASELINE. This is exactly how Flink / Kafka Streams /
+//      Spark Structured Streaming do windowed aggregation — except the
+//      "aggregate" here is a drift statistic (PSI / KL / KS), not a SUM.
+//
+//   2. CLOSED-LOOP CONTROL (a self-healing control plane):
+//      When a window breaches a configured threshold, a POLICY fires a
+//      control-plane action: publish `ModelDriftDetected` and, if auto-retrain
+//      is enabled, ask the Pipeline Orchestrator to re-run the model's training
+//      pipeline. The new version is canaried and promoted — and the loop closes.
+//      This is a classic control loop (sense → decide → act), the same shape as
+//      a Kubernetes controller's reconcile loop or a thermostat.
+//
+//   ASCII — the loop this service closes:
+//
+//     serve → InferenceCompleted ─→ Model Monitor (windows) ─→ drift? ─yes─→ ModelDriftDetected
+//        ↑                                                                        │
+//        └────── promote new version ←── canary ←── retrain DAG ←── Orchestrator ←─┘
+//
+// REAL-WORLD COMPARISON:
+//   - AWS SageMaker Model Monitor: baseline + scheduled drift jobs (batch).
+//     Ours is streaming (windowed over an event bus) rather than scheduled.
+//   - Arize / WhyLabs / Evidently: production ML observability; PSI/KS/KL are
+//     the same drift statistics these tools compute.
+//   - Prometheus + Alertmanager: the alerting half of our control loop, but
+//     they don't act — our loop additionally *triggers a remediation* (retrain).
+//
+// WHY DRIFT MATH LIVES SERVER-SIDE (and what the API exposes):
+//   Clients never push raw distributions or computed drift scores. They CONFIGURE
+//   thresholds and READ reports. The monitor itself owns the math, so drift
+//   scores are SERVER-authoritative — a client cannot fabricate a "no drift"
+//   verdict to dodge a retrain, nor a "drift" verdict to force one. See the
+//   per-message SECURITY notes.
+//
+// DRIFT TAXONOMY (three independent signals, all modeled here):
+//   - DATA DRIFT: the input feature distribution shifts away from the training
+//     baseline. Detected with PSI (Population Stability Index), KL-divergence,
+//     or the KS-test. "The world changed; our inputs no longer look like
+//     training data." Detectable immediately from the feature stream.
+//   - PREDICTION DRIFT: the output distribution shifts over time (e.g., the
+//     model suddenly predicts "fraud" 10x more often). Detectable immediately
+//     from predictions, no labels needed — an early-warning signal.
+//   - PERFORMANCE DECAY: actual accuracy/F1 drops vs the registered baseline.
+//     This is the *truth* but it is DELAYED — it needs ground-truth labels,
+//     which arrive minutes/days later via SubmitGroundTruth. Data/prediction
+//     drift are leading indicators; performance decay is the lagging confirmation.
+//
+// VERSIONING: Package path includes v1 following Buf/Google convention.
+// Breaking changes require a new forgepoint.monitor.v2 package.
+// ============================================================================
+
+syntax = "proto3";
+
+package forgepoint.monitor.v1;
+
+// go_package follows the pattern established in common.proto:
+//   "github.com/abd-ulbasit/forgepoint/gen/go/{package};{shortname}"
+// The semicolon-separated short name (monitorv1) is the Go package identifier.
+option go_package = "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/monitor/v1;monitorv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "forgepoint/common/v1/common.proto";
+
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+// ============================================================================
+// DriftType
+// ============================================================================
+//
+// WHY an enum (not a free string): the three drift signals are a CLOSED set
+// with distinct math and distinct meaning to consumers (Notification renders a
+// different alert per type; the retrain policy may weight performance decay
+// higher than a transient prediction-drift blip). An enum makes the set
+// exhaustive and lint-checkable; a string would let "data_drift" and
+// "DataDrift" diverge across services.
+//
+// Buf STANDARD requires the zero value suffixed _UNSPECIFIED and every value
+// prefixed with the enum name (DRIFT_TYPE_).
+// ============================================================================
+enum DriftType {
+  // Default / unknown. A well-formed report always sets a concrete type;
+  // _UNSPECIFIED surfaces serialization bugs rather than silently defaulting.
+  DRIFT_TYPE_UNSPECIFIED = 0;
+
+  // Input feature distribution shifted vs the training baseline (PSI/KL/KS).
+  DRIFT_TYPE_DATA = 1;
+
+  // Output/prediction distribution shifted over time (label-free early signal).
+  DRIFT_TYPE_PREDICTION = 2;
+
+  // Actual accuracy/F1 dropped vs the registered baseline (needs ground truth).
+  DRIFT_TYPE_PERFORMANCE = 3;
+}
+
+// ============================================================================
+// DriftMethod
+// ============================================================================
+//
+// WHY surface the statistical METHOD: PSI, KL-divergence, and the KS-test
+// answer "did the distribution move?" differently, and an interviewer will ask
+// "which test, and why?". Exposing the method on every metric makes the report
+// self-describing — a reader (or the Web UI) knows a score of 0.3 means
+// "PSI=0.3 (significant)" vs "KS=0.3 (a p-value-ish distance)". Different
+// methods have different threshold conventions, so the method must travel with
+// the score.
+//
+// METHOD CHEAT-SHEET (interview-critical):
+//   - PSI (Population Stability Index): bins both distributions, sums
+//     (curr% - base%) * ln(curr%/base%) per bin. Rule of thumb: <0.1 stable,
+//     0.1–0.25 moderate shift, >0.25 significant. Cheap, interpretable, the
+//     industry default for tabular features. Asymmetric handling of empty bins
+//     needs care (add epsilon) — a classic gotcha.
+//   - KL-divergence: relative entropy of curr vs base. Unbounded, asymmetric;
+//     sensitive to bins where base≈0. Good for prediction-probability drift.
+//   - KS-test (Kolmogorov–Smirnov): max gap between the two empirical CDFs.
+//     Non-parametric, distribution-free, yields a p-value; great for continuous
+//     features but weak on heavy multimodality.
+// ============================================================================
+enum DriftMethod {
+  DRIFT_METHOD_UNSPECIFIED = 0;
+
+  // Population Stability Index — binned, interpretable, the tabular default.
+  DRIFT_METHOD_PSI = 1;
+
+  // Kullback–Leibler divergence — relative entropy, asymmetric.
+  DRIFT_METHOD_KL = 2;
+
+  // Kolmogorov–Smirnov two-sample test — max CDF gap, yields a p-value.
+  DRIFT_METHOD_KS = 3;
+}
+
+// ============================================================================
+// DriftSeverity
+// ============================================================================
+//
+// WHY a severity ladder (not just a boolean breached/ok): a single threshold
+// hides nuance the control loop needs. A WARNING means "watch this" (alert a
+// human, do NOT auto-retrain); CRITICAL means "act now" (fire the retrain). The
+// policy maps a numeric score against the monitor's configured thresholds to a
+// severity, and consumers branch on severity rather than re-deriving it from
+// raw scores. This mirrors Prometheus/Alertmanager severity labels.
+//
+// SERVER-AUTHORITATIVE: severity is computed by the monitor from the score and
+// the configured thresholds — never supplied by a client.
+// ============================================================================
+enum DriftSeverity {
+  DRIFT_SEVERITY_UNSPECIFIED = 0;
+
+  // Score is within configured limits. No action. Reports may still be stored
+  // for the time series even when OK (so the UI can show "stable for 14 days").
+  DRIFT_SEVERITY_OK = 1;
+
+  // Score crossed the warn threshold but not the critical one. Alert a human;
+  // do NOT auto-retrain. The leading-indicator zone.
+  DRIFT_SEVERITY_WARNING = 2;
+
+  // Score crossed the critical threshold. This is what fires ModelDriftDetected
+  // and (if enabled) the auto-retrain control action.
+  DRIFT_SEVERITY_CRITICAL = 3;
+}
+
+// ============================================================================
+// MonitorState
+// ============================================================================
+//
+// WHY a lifecycle state on the monitor itself: a monitor can exist but not yet
+// be usable. Drift math is meaningless until we have a baseline AND enough
+// samples in the current window to be statistically sound (comparing 3 requests
+// to a 50k-row baseline produces noise, not signal). State lets the monitor
+// say "I'm collecting, ask me later" instead of emitting garbage drift scores.
+//
+// SERVER-AUTHORITATIVE: the monitor advances its own state as baselines load
+// and windows fill. Clients can PAUSE/RESUME via ConfigureMonitor.enabled, but
+// they cannot fake ACTIVE to force premature scoring.
+// ============================================================================
+enum MonitorState {
+  MONITOR_STATE_UNSPECIFIED = 0;
+
+  // Configured but waiting for a training baseline (fetched from Registry /
+  // Experiment Tracker). No scoring yet.
+  MONITOR_STATE_PENDING_BASELINE = 1;
+
+  // Baseline loaded but the current window has not reached min_samples.
+  // Accumulating; not yet scoring.
+  MONITOR_STATE_WARMING_UP = 2;
+
+  // Baseline present, window full enough — actively computing drift and able to
+  // fire the control loop.
+  MONITOR_STATE_ACTIVE = 3;
+
+  // Explicitly paused by an operator (ConfigureMonitor.enabled=false). Events
+  // are still consumed/windowed but no drift is scored and nothing is fired.
+  MONITOR_STATE_PAUSED = 4;
+}
+
+// ============================================================================
+// DOMAIN MESSAGES
+// ============================================================================
+
+// ============================================================================
+// ThresholdConfig
+// ============================================================================
+//
+// WHY per-(drift-type) thresholds, not one global number: data drift, prediction
+// drift, and performance decay live on different scales and warrant different
+// sensitivities. A PSI of 0.2 on features might be "warn", while a 5-point
+// accuracy drop is already "critical". So a monitor carries a SET of these,
+// keyed by drift type, rather than a single scalar.
+//
+// WARN vs CRITICAL: two thresholds give the severity ladder its two rungs.
+// warn_score ≤ critical_score is enforced server-side; crossing critical is
+// what arms the auto-retrain action.
+// ============================================================================
+message ThresholdConfig {
+  // Which drift signal this threshold governs (data / prediction / performance).
+  DriftType drift_type = 1;
+
+  // The statistical method to apply for this drift type (PSI/KL/KS). The
+  // monitor uses this to compute the score the thresholds are compared against.
+  DriftMethod method = 2;
+
+  // Score at/above which severity becomes WARNING (alert, no retrain).
+  // For performance decay this is interpreted as a *drop* magnitude vs baseline.
+  double warn_score = 3;
+
+  // Score at/above which severity becomes CRITICAL (fires ModelDriftDetected
+  // and, if enabled, auto-retrain). Must be >= warn_score (validated on write).
+  double critical_score = 4;
+}
+
+// ============================================================================
+// Monitor
+// ============================================================================
+//
+// WHY this is the central config aggregate: one Monitor governs one model's
+// drift detection — its window shape, its thresholds, its baseline reference,
+// and its auto-retrain switch. It is the read model returned by ConfigureMonitor
+// and embedded in MonitorStatus.
+//
+// SECURITY — what is SERVER-AUTHORITATIVE here (NOT client-writable on configure):
+//   - id, created_at, updated_at: identity & audit, owned by the server.
+//   - state: lifecycle, advanced by the monitor as baselines/windows fill.
+//   - baseline_version / baseline_captured_at: the training-time distribution
+//     reference is resolved by the monitor from the Model Registry / Experiment
+//     Tracker — a client cannot point a monitor at an arbitrary baseline (that
+//     would let someone choose a baseline that conveniently "matches" current
+//     traffic to suppress a real drift signal).
+//   What IS client-controlled (via ConfigureMonitorRequest): model identity,
+//   window shape, thresholds, and the auto-retrain toggle. See that request
+//   message for the exact accepted fields (mass-assignment guard).
+// ============================================================================
+message Monitor {
+  // UUID v4. Primary key, immutable, SERVER-assigned.
+  string id = 1;
+
+  // The model this monitor watches (e.g., "fraud-detector"). Stable name from
+  // the Model Registry; combined with the live serving version at event time.
+  string model_name = 2;
+
+  // Window length over which drift is computed. Two ways to bound a sliding
+  // window — by TIME (this field) or by COUNT (window_size below). The monitor
+  // uses whichever is set; if both are set, a window closes when EITHER bound is
+  // hit (whichever comes first), which keeps low-traffic models from waiting
+  // forever and high-traffic models from accumulating unbounded memory.
+  google.protobuf.Duration window_duration = 3;
+
+  // Max number of inference events per window (count-based bound). See above for
+  // how it interacts with window_duration. 0 = unbounded by count (time only).
+  int32 window_size = 4;
+
+  // Minimum samples before the monitor will SCORE a window. Below this the
+  // monitor stays WARMING_UP — comparing a near-empty window to a large baseline
+  // yields noise, so we refuse to emit a verdict until the sample is sound.
+  int32 min_samples = 5;
+
+  // Per-drift-type thresholds (data / prediction / performance). A monitor may
+  // configure any subset; an unconfigured type is simply not scored.
+  repeated ThresholdConfig thresholds = 6;
+
+  // The auto-retrain switch — the heart of the closed loop. When true and a
+  // CRITICAL breach fires, the monitor calls the Pipeline Orchestrator to run
+  // the model's training pipeline. When false, a breach only alerts (human in
+  // the loop). Defaults to false: self-healing must be opted into, because an
+  // accidental retrain storm is expensive and disruptive.
+  bool auto_retrain = 7;
+
+  // The training pipeline to trigger on auto-retrain (Pipeline Orchestrator's
+  // pipeline id). Required when auto_retrain=true; the monitor validates that it
+  // is set before enabling the loop. It is an OPAQUE identifier here — Model
+  // Monitor does not import the pipeline proto (services are decoupled; the loop
+  // is closed via the event bus / a gRPC client, not a compile-time dependency).
+  string retrain_pipeline_id = 8;
+
+  // SERVER-AUTHORITATIVE. Lifecycle state (pending baseline → warming → active).
+  MonitorState state = 9;
+
+  // SERVER-AUTHORITATIVE. The model version whose training-time distribution is
+  // the comparison baseline (e.g., "v7"). Resolved from Registry/Experiment
+  // Tracker, not chosen by the client.
+  string baseline_version = 10;
+
+  // SERVER-AUTHORITATIVE. When the baseline distribution was captured. Lets the
+  // UI show "baseline is 40 days old — consider refreshing".
+  google.protobuf.Timestamp baseline_captured_at = 11;
+
+  // SERVER-AUTHORITATIVE. When this monitor was created. Immutable.
+  google.protobuf.Timestamp created_at = 12;
+
+  // SERVER-AUTHORITATIVE. Last config change (bumped on every ConfigureMonitor).
+  google.protobuf.Timestamp updated_at = 13;
+}
+
+// ============================================================================
+// DriftMetric
+// ============================================================================
+//
+// WHY a per-feature/per-output metric (not just one number per report): drift
+// is rarely uniform — usually ONE feature moved (a sensor recalibrated, an
+// upstream join changed units) while the rest are stable. Reporting the score
+// per feature is what makes a drift report ACTIONABLE: "income_drift PSI=0.41,
+// everything else <0.05" tells an engineer exactly where to look. Aggregating to
+// a single model-level number would throw that away.
+// ============================================================================
+message DriftMetric {
+  // The thing whose distribution was measured: a feature name for data drift
+  // (e.g., "income"), an output name/class for prediction drift (e.g., "fraud"),
+  // or a metric name for performance decay (e.g., "accuracy", "f1").
+  string name = 1;
+
+  // The statistical method used to produce `score` (PSI/KL/KS). Travels with the
+  // score because thresholds are method-specific (see DriftMethod cheat-sheet).
+  DriftMethod method = 2;
+
+  // The computed drift score under `method`. Higher = more drift. SERVER-computed.
+  double score = 3;
+
+  // The baseline (training-time) summary value for context, e.g., baseline mean.
+  // Lets the UI render "was 5.1, now 7.8" without a second lookup.
+  double baseline_value = 4;
+
+  // The current-window summary value, paired with baseline_value above.
+  double current_value = 5;
+
+  // Severity for THIS metric, derived from `score` vs the monitor's thresholds.
+  // The report's overall severity is the max across its metrics.
+  DriftSeverity severity = 6;
+}
+
+// ============================================================================
+// DriftReport
+// ============================================================================
+//
+// WHY a first-class, persisted report (not just an event): the report is the
+// durable record of a single window's verdict. It backs the paginated history
+// (ListDriftReports), the Web UI time series, and the audit trail ("why did the
+// model retrain at 03:14?"). The ModelDriftDetected event carries a *reference*
+// to this report; the report itself is the source of truth.
+//
+// IDEMPOTENCY — window_id is the natural key: each closed window has a stable
+// id, and a report is persisted idempotently on it (Task 16.3: "idempotent on
+// window id"). If the stream redelivers events or the scorer runs twice for the
+// same window, we get ONE report, not duplicates — and exactly one event fires.
+// This is the same idempotency-key discipline every consumer in the platform uses.
+// ============================================================================
+message DriftReport {
+  // UUID v4. Report identity. SERVER-assigned.
+  string id = 1;
+
+  // The monitor that produced this report.
+  string monitor_id = 2;
+
+  // The model + the serving version that was live during this window. Version is
+  // captured from the inference events, so a report is always tied to the exact
+  // version that drifted (critical when a canary is splitting traffic).
+  string model_name = 3;
+  string model_version = 4;
+
+  // The dominant drift type for this report (the type whose breach triggered it).
+  // A window can show multiple signals; this is the headline.
+  DriftType drift_type = 5;
+
+  // Overall severity = max severity across `metrics`. This is what the policy
+  // and consumers branch on. SERVER-computed.
+  DriftSeverity severity = 6;
+
+  // Per-feature / per-output / per-performance-metric breakdown. The actionable
+  // detail — see DriftMetric. Empty only for a degenerate OK report.
+  repeated DriftMetric metrics = 7;
+
+  // The stable id of the window this report scored. The IDEMPOTENCY KEY for
+  // persistence and event emission (see message-level note). SERVER-assigned.
+  string window_id = 8;
+
+  // How many inference samples were in the scored window. Surfaces statistical
+  // confidence ("PSI=0.4 over 12 samples" is far weaker than over 12,000).
+  int32 sample_count = 9;
+
+  // Window bounds [start, end). Lets the UI place the report on a timeline and
+  // correlate with deploys/incidents.
+  google.protobuf.Timestamp window_start = 10;
+  google.protobuf.Timestamp window_end = 11;
+
+  // When the report was computed/persisted. SERVER-assigned.
+  google.protobuf.Timestamp created_at = 12;
+}
+
+// ============================================================================
+// MonitorStatus
+// ============================================================================
+//
+// WHY a separate "live status" view distinct from the Monitor config: config is
+// what you SET; status is what's HAPPENING right now — the in-flight window's
+// fill level, the freshest scores, and the latest report. Splitting them keeps
+// ConfigureMonitor focused on intent and GetMonitorStatus focused on
+// observability (it reads the live Redis window, not just Postgres config).
+// ============================================================================
+message MonitorStatus {
+  // The monitor's configuration (so a status call is self-contained for a UI).
+  Monitor monitor = 1;
+
+  // Live lifecycle state, mirrored from monitor.state for at-a-glance reads.
+  MonitorState state = 2;
+
+  // How many samples are in the CURRENT (still-open) window. Compared against
+  // monitor.min_samples this tells you "scoring in 230 more requests".
+  int32 current_window_samples = 3;
+
+  // The most recent completed drift report, if any. Null until the first window
+  // closes. The cheapest "is my model healthy?" read.
+  DriftReport latest_report = 4;
+
+  // When the monitor last consumed an inference event. A stale value means the
+  // model is getting no traffic (its own kind of alert) or the consumer stalled.
+  google.protobuf.Timestamp last_event_at = 5;
+
+  // Count of CRITICAL reports in this monitor's lifetime — a cheap health KPI
+  // and the source of the `model_drift_detected_total` metric.
+  int64 drift_events_total = 6;
+}
+
+// ============================================================================
+// GroundTruthLabel
+// ============================================================================
+//
+// WHY a dedicated message for delayed labels: performance decay is the only
+// drift signal that needs the TRUTH, and the truth arrives LATE — a fraud label
+// might be confirmed days after the prediction. SubmitGroundTruth lets an
+// upstream system backfill the actual outcome for a past prediction, keyed by
+// the inference request_id, so the monitor can compute rolling accuracy/F1.
+//
+// WHY request_id as the join key: the Inference Gateway stamps a SERVER-
+// authoritative request_id on every PredictResponse and carries it on the
+// InferenceCompleted event. That id is the only thing tying "a prediction we
+// saw" to "the outcome you now know", without shipping PII or raw features.
+// ============================================================================
+message GroundTruthLabel {
+  // The inference request this label is the outcome for. Must match a request_id
+  // the monitor previously observed on the inference stream (else it's buffered
+  // or dropped per retention policy). This is the join key — NOT a user/PII id.
+  string request_id = 1;
+
+  // The actual observed outcome (e.g., "fraud" / "not_fraud", or a regression
+  // target as a string). Compared against the recorded prediction for that id.
+  string actual_label = 2;
+
+  // When the true outcome became known (NOT when the prediction was made). Lets
+  // the monitor measure label latency and weight recent labels for rolling F1.
+  google.protobuf.Timestamp observed_at = 3;
+}
+
+// ============================================================================
+// REQUEST / RESPONSE MESSAGES
+// ============================================================================
+
+// ============================================================================
+// ConfigureMonitor
+// ============================================================================
+
+// ConfigureMonitorRequest creates or updates a model's monitor (upsert on
+// model_name). This is the ONLY write path for monitor config.
+//
+// SECURITY — MASS-ASSIGNMENT GUARD: this request deliberately accepts ONLY the
+// operator-owned fields. It does NOT accept id, state, baseline_version,
+// baseline_captured_at, created_at, or updated_at — all of those are SERVER-
+// authoritative on the Monitor (see Monitor's security note). Accepting them
+// here would let a client point a monitor at a hand-picked baseline or fake its
+// state to force/suppress retrains. We model the writable surface explicitly as
+// scalar fields rather than embedding a Monitor, precisely so unwritable fields
+// cannot even be expressed on the wire.
+message ConfigureMonitorRequest {
+  // The model to monitor. Identifies the monitor for upsert (one monitor per
+  // model name). Required.
+  string model_name = 1;
+
+  // Window shape (see Monitor.window_duration / window_size / min_samples).
+  google.protobuf.Duration window_duration = 2;
+  int32 window_size = 3;
+  int32 min_samples = 4;
+
+  // Per-drift-type thresholds to apply. Replaces the existing set on update
+  // (PUT-style, not PATCH-style) — simpler to reason about than field-merging,
+  // and a full set is what an operator edits in the UI anyway.
+  repeated ThresholdConfig thresholds = 5;
+
+  // The closed-loop switch. When true, retrain_pipeline_id must be set.
+  bool auto_retrain = 6;
+
+  // Pipeline to trigger on auto-retrain (opaque Orchestrator pipeline id).
+  string retrain_pipeline_id = 7;
+
+  // Pause/resume without losing config: false moves the monitor to PAUSED
+  // (events still windowed, nothing scored/fired); true resumes scoring.
+  // Distinct from auto_retrain — you can be enabled+alert-only, or paused.
+  bool enabled = 8;
+
+  // Idempotency key for safe retries of this mutation. WHY it matters even for
+  // an upsert: a retried ConfigureMonitor after a network blip must not bump
+  // updated_at twice or race two concurrent edits. The server records the key
+  // (short TTL) and returns the first result for a duplicate. Empty = treated
+  // as a unique request. Same discipline as every mutating RPC in the platform.
+  string idempotency_key = 9;
+}
+
+// ConfigureMonitorResponse returns the resulting monitor config.
+// WHY wrap (not return Monitor directly): Buf RPC_RESPONSE_STANDARD_NAME, and a
+// wrapper lets us later add fields (e.g., a `created` bool to distinguish insert
+// from update) without touching the shared Monitor domain message.
+message ConfigureMonitorResponse {
+  // The monitor after the upsert. Includes SERVER-authoritative fields (id,
+  // state, baseline_*) the request could not set.
+  Monitor monitor = 1;
+
+  // True if this call created a new monitor, false if it updated an existing
+  // one. Cheap signal for the UI/CLI to print "created" vs "updated".
+  bool created = 2;
+}
+
+// ============================================================================
+// GetMonitorStatus
+// ============================================================================
+
+// GetMonitorStatusRequest reads the live status for one model's monitor.
+message GetMonitorStatusRequest {
+  // The model whose monitor status to read. Required.
+  string model_name = 1;
+}
+
+// GetMonitorStatusResponse wraps the live MonitorStatus.
+// WHY wrap: RPC_RESPONSE_STANDARD_NAME + forward compatibility.
+message GetMonitorStatusResponse {
+  MonitorStatus status = 1;
+}
+
+// ============================================================================
+// GetDriftReport
+// ============================================================================
+
+// GetDriftReportRequest fetches a single drift report by id.
+// WHY by report id (not model+window): report id is the stable, shareable handle
+// the event and the UI deep-link both reference ("open report <id>").
+message GetDriftReportRequest {
+  // The drift report's UUID (DriftReport.id). Required.
+  string report_id = 1;
+}
+
+// GetDriftReportResponse wraps the report.
+// WHY wrap: RPC_RESPONSE_STANDARD_NAME + forward compatibility.
+message GetDriftReportResponse {
+  DriftReport report = 1;
+}
+
+// ============================================================================
+// ListDriftReports
+// ============================================================================
+
+// ListDriftReportsRequest returns a model's drift history, newest first.
+// Reuses the common cursor-based PaginationRequest (consistency across the
+// platform; see common.proto for the WHY on cursor vs offset).
+message ListDriftReportsRequest {
+  // Filter to one model's reports. Required — drift history is always read
+  // per-model (a global firehose of every model's reports has no use case and
+  // would be an expensive unbounded scan).
+  string model_name = 1;
+
+  // Optional: return only reports at/above this severity (e.g., only CRITICAL).
+  // DRIFT_SEVERITY_UNSPECIFIED = no severity filter (return all).
+  DriftSeverity min_severity = 2;
+
+  // Optional time-range filter on window_end. Zero values = unbounded on that
+  // side. Lets the UI scope to "last 7 days" without paging through everything.
+  google.protobuf.Timestamp since = 3;
+  google.protobuf.Timestamp until = 4;
+
+  // Cursor-based pagination. page_size defaults to 20; the server CAPS it at 100
+  // regardless of a larger client request (DoS / accidental-firehose guard,
+  // matching the platform-wide max documented in common.proto).
+  forgepoint.common.v1.PaginationRequest pagination = 5;
+}
+
+message ListDriftReportsResponse {
+  // The page of reports, newest window_end first.
+  repeated DriftReport reports = 1;
+
+  // next_page_token + total_count.
+  forgepoint.common.v1.PaginationResponse pagination = 2;
+}
+
+// ============================================================================
+// SubmitGroundTruth
+// ============================================================================
+
+// SubmitGroundTruthRequest backfills delayed true outcomes so the monitor can
+// compute performance decay. Accepts a BATCH because labels typically arrive in
+// bulk from an upstream labeling/ETL job, and per-label RPCs would be chatty.
+//
+// SECURITY: the monitor only accepts labels for request_ids it has actually
+// observed on the inference stream — a caller cannot inject labels for arbitrary
+// or fabricated ids to skew a model's measured accuracy. Unknown ids are
+// reported back, not silently trusted.
+message SubmitGroundTruthRequest {
+  // The model these labels belong to (scopes the request_id lookups). Required.
+  string model_name = 1;
+
+  // The batch of (request_id → actual outcome) labels. May be large; the server
+  // caps batch size and returns INVALID_ARGUMENT above the cap.
+  repeated GroundTruthLabel labels = 2;
+
+  // Idempotency key — re-submitting the same labeling batch after a retry must
+  // not double-count outcomes in the rolling accuracy window. The server records
+  // the key (short TTL) and treats a duplicate as a no-op returning the first
+  // result. Empty = treated as unique.
+  string idempotency_key = 3;
+}
+
+// SubmitGroundTruthResponse reports how the batch was applied — NOT just an
+// empty ack. WHY: ground truth is fuzzy (some ids won't match an observed
+// prediction; some may be late past the retention window), and the caller needs
+// to know what stuck so it can retry or alert on its side.
+message SubmitGroundTruthResponse {
+  // How many labels were matched to an observed prediction and recorded.
+  int32 accepted = 1;
+
+  // request_ids that did not match any observed prediction (unknown or aged out
+  // of the monitor's retention window). The caller can investigate/resubmit.
+  repeated string unmatched_request_ids = 2;
+}
+
+// ============================================================================
+// StreamDriftEvents
+// ============================================================================
+
+// StreamDriftEventsRequest opens a SERVER-STREAMING subscription to live drift
+// events as they fire. WHY server-streaming (not client polling ListDriftReports
+// in a loop): drift is push-shaped — a dashboard or `fp monitor --watch` wants
+// to be NOTIFIED the instant a window breaches, not to poll every N seconds and
+// add latency + load. One long-lived gRPC stream replaces a polling storm. This
+// is the same reason Pipeline Orchestrator uses a streaming WatchExecution.
+//
+// WHY a SEPARATE stream from the NATS event bus: NATS fan-out (ModelDriftDetected)
+// is for SERVICE-to-service reactions (Notification, Orchestrator). This gRPC
+// stream is for INTERACTIVE clients (UI, CLI) that hold an authenticated request
+// scope and want a filtered, backpressure-aware feed — without granting them a
+// NATS connection. Two transports, two audiences.
+message StreamDriftEventsRequest {
+  // Optional filter: stream only this model's drift events. Empty = all models
+  // the caller is authorized to see (authorization is enforced by the auth
+  // interceptor, not by this field — never trust a client-supplied scope).
+  string model_name = 1;
+
+  // Optional: only stream events at/above this severity (e.g., CRITICAL only,
+  // to drive a pager). DRIFT_SEVERITY_UNSPECIFIED = all severities.
+  DriftSeverity min_severity = 2;
+}
+
+// StreamDriftEventsResponse is ONE drift event in the stream. Each message
+// carries the full report so a client renders without a follow-up GetDriftReport.
+// WHY a wrapper message (not streaming DriftReport directly): keeps room to add
+// stream-control fields later (e.g., a heartbeat flag to keep idle connections
+// alive, or a resume cursor) without breaking the stream contract.
+message StreamDriftEventsResponse {
+  // The drift report that just fired. For OK/heartbeat frames this may be unset
+  // if heartbeat is later added; today every frame carries a report.
+  DriftReport report = 1;
+}
+
+// ============================================================================
+// EVENT PAYLOAD MESSAGES (typed NATS payloads)
+// ============================================================================
+//
+// WHY typed event payloads live in the proto: the common EventEnvelope.data is
+// a google.protobuf.Any. Defining the concrete payload here gives the Any a
+// real, versioned, lint-checked schema — producers marshal this message into
+// the Any, consumers unmarshal by its type URL. Without it, consumers would
+// parse untyped JSON and break silently on a field change. (Same approach as
+// inference.proto's InferenceCompletedEvent.)
+// ============================================================================
+
+// ============================================================================
+// ModelDriftDetectedEvent  →  subject: fp.models.drift.detected
+// ============================================================================
+//
+// THE LOOP-CLOSER. This is the event the platform was missing — Notification
+// already subscribes to it; here is its producer. Consumers and what each needs:
+//   - Notification Service: alerts a human → needs model_name, version,
+//     drift_type, severity, and a report link.
+//   - Experiment Tracker: records the drift against the model's history →
+//     needs model identity + report_id + scores.
+//   - Pipeline Orchestrator: on CRITICAL + auto_retrain, runs the retrain
+//     pipeline → needs retrain_pipeline_id and the drift context as input.
+//
+// WHY embed the DriftReport AND scalar headline fields: the report is the full
+// detail; the duplicated headline fields (model_name, drift_type, severity) let
+// a consumer route/filter WITHOUT deserializing the whole report — cheap subject
+// filtering and alert templating. A small, deliberate denormalization.
+//
+// IDEMPOTENCY: this event is emitted once per drift report (which is itself
+// idempotent on window_id). Consumers dedupe on EventEnvelope.id; the report_id
+// here is a second, business-level idempotency handle.
+message ModelDriftDetectedEvent {
+  // The model and the exact serving version that drifted.
+  string model_name = 1;
+  string model_version = 2;
+
+  // Headline drift type + severity, duplicated from the report for cheap
+  // routing/filtering by consumers (see message note). Severity is always
+  // CRITICAL for an event that fired the loop, but carried explicitly so the
+  // schema also supports WARNING-level informational emissions if enabled.
+  DriftType drift_type = 3;
+  DriftSeverity severity = 4;
+
+  // The full drift report (per-feature breakdown, window bounds, sample count).
+  // Embedded so a reactor like Experiment Tracker records the detail without a
+  // synchronous call back into Model Monitor.
+  DriftReport report = 5;
+
+  // The report's id — a stable handle for deep-linking and business-level dedupe
+  // (redundant with report.id but convenient for consumers that only index this).
+  string report_id = 6;
+
+  // Whether auto-retrain is armed for this model. The Pipeline Orchestrator (or
+  // the monitor's own loop) uses this to decide whether a retrain should fire.
+  bool auto_retrain = 7;
+
+  // The retrain pipeline to run if auto_retrain is true (opaque Orchestrator id).
+  // Carried on the event so the loop can be closed by a reactor without a lookup.
+  string retrain_pipeline_id = 8;
+
+  // Free-form drift context passed as input to the retrain pipeline (e.g.,
+  // {"top_drifted_feature": "income", "psi": 0.41}). google.protobuf.Struct
+  // because the retrain DAG's expected inputs vary per model — a typed message
+  // would couple this event to every pipeline's input schema. Kept SMALL and
+  // PII-free (summaries only, same trust boundary as the inference event).
+  google.protobuf.Struct retrain_context = 9;
+}
+
+// ============================================================================
+// MODEL MONITOR SERVICE
+// ============================================================================
+//
+// WHY a single MonitorService (not split Config/Report/Stream services): the
+// config, the reports it produces, and the live stream are one cohesive bounded
+// context — "the drift monitoring of models". Splitting them would force
+// inter-service calls for flows that are naturally one boundary (configuring a
+// monitor and reading its reports). One service, one Postgres+Redis store.
+//
+// NOTE ON THE CONTROL LOOP: the most important behavior — consuming
+// `fp.inference.completed`, windowing, scoring, and firing the retrain — is NOT
+// an RPC. It is an event-driven loop running inside the service (NATS consumer +
+// scorer + policy). This gRPC surface is the CONTROL & OBSERVABILITY plane over
+// that loop: configure it, read what it found, watch it live, feed it truth.
+//
+// RPC CATEGORIES:
+//   CONFIG:        ConfigureMonitor  (set thresholds + auto-retrain toggle)
+//   OBSERVABILITY: GetMonitorStatus, GetDriftReport, ListDriftReports, StreamDriftEvents
+//   FEEDBACK:      SubmitGroundTruth (delayed labels → performance decay)
+//
+// AUTH: every RPC is guarded by the shared auth interceptor (see auth.proto).
+// Drift scores and config are operationally sensitive; reads require monitoring
+// read scope, writes (ConfigureMonitor, SubmitGroundTruth) require write scope.
+// ============================================================================
+service MonitorService {
+  // ConfigureMonitor upserts a model's monitor: window shape, per-drift-type
+  // thresholds, and the auto-retrain switch. The ONLY config write path.
+  // SERVER-authoritative fields (id, state, baseline_*) are not accepted here.
+  rpc ConfigureMonitor(ConfigureMonitorRequest) returns (ConfigureMonitorResponse);
+
+  // GetMonitorStatus returns the live status for a model: lifecycle state,
+  // current-window fill, the latest report, and lifetime drift count. The
+  // cheapest "is this model healthy right now?" read (hits the live Redis window).
+  rpc GetMonitorStatus(GetMonitorStatusRequest) returns (GetMonitorStatusResponse);
+
+  // GetDriftReport fetches a single persisted drift report by id (the handle the
+  // ModelDriftDetected event and UI deep-links reference).
+  rpc GetDriftReport(GetDriftReportRequest) returns (GetDriftReportResponse);
+
+  // ListDriftReports returns a model's drift history (newest first), paginated,
+  // with optional severity and time-range filters. Page size is capped server-
+  // side at 100.
+  rpc ListDriftReports(ListDriftReportsRequest) returns (ListDriftReportsResponse);
+
+  // SubmitGroundTruth backfills delayed true outcomes (batched) so the monitor
+  // can compute PERFORMANCE DECAY — the lagging, ground-truth confirmation of
+  // drift. Returns how many labels matched an observed prediction.
+  rpc SubmitGroundTruth(SubmitGroundTruthRequest) returns (SubmitGroundTruthResponse);
+
+  // StreamDriftEvents opens a long-lived SERVER-STREAM of drift events as they
+  // fire, optionally filtered by model and min severity. Powers live dashboards
+  // and `fp monitor --watch` without polling. (Server-streaming: one request,
+  // many responses, until the client cancels or the deadline elapses.)
+  rpc StreamDriftEvents(StreamDriftEventsRequest) returns (stream StreamDriftEventsResponse);
+}

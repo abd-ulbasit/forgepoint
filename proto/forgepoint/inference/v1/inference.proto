@@ -1,0 +1,1041 @@
+// ============================================================================
+// Forgepoint Inference Gateway Service Proto Definitions
+// ============================================================================
+//
+// WHY: The Inference Gateway is the SINGLE FRONT DOOR for all online prediction
+// traffic. External clients never talk to a model-serving pod directly; they
+// talk to this gateway, which decides WHICH model version handles the request,
+// PROTECTS the backends from overload, and RECORDS what happened. It is the
+// "API Gateway" microservices pattern specialized for ML inference.
+//
+// WHAT'S HERE:
+//   - Tensor I/O types (TensorData) — the wire shape of model inputs/outputs
+//   - Predict / BatchPredict (unary) + StreamPredict (server-streaming batch)
+//   - Routing & traffic-split admin RPCs (the canary control plane)
+//   - Circuit-breaker observability RPCs
+//   - InferenceCompletedEvent / InferenceFailedEvent — typed NATS payloads
+//
+// PATTERN — API GATEWAY + RESILIENCE STACK:
+//   This service composes FOUR classic resilience patterns into one request
+//   path. Each is interview-namable and each is realized by a part of this API:
+//
+//     1. TRAFFIC SPLITTING (canary / A-B): a model has N candidate versions,
+//        each with a weight. The gateway picks one per request by weighted
+//        random selection. Realized by Route + RouteTarget.weight_bps and the
+//        SetTrafficSplit RPC. The CLIENT does not choose the version (that
+//        would defeat canarying); the SERVER resolves it and reports it back
+//        in PredictResponse.served_version.
+//
+//     2. CIRCUIT BREAKER (3-state: closed → open → half-open): per backend
+//        endpoint. When a version's serving pods start failing, its breaker
+//        trips OPEN and the gateway stops sending it traffic (fail fast)
+//        instead of piling requests onto a sick backend. Observable via
+//        GetCircuitState / ListCircuitStates.
+//
+//     3. RATE LIMITING (token bucket, per API key): caps request rate so one
+//        tenant can't exhaust shared capacity. Enforced in the interceptor /
+//        handler, not modeled as an RPC — but the rejection surfaces as a
+//        gRPC RESOURCE_EXHAUSTED status (HTTP 429 at the edge).
+//
+//     4. BULKHEAD (per-model concurrency semaphore): isolates models so a slow
+//        model can't consume every worker and starve the others. Like rate
+//        limiting it is enforced inline; over the limit → RESOURCE_EXHAUSTED.
+//
+// WHY THE GATEWAY DOES NOT IMPORT serving.proto:
+//   Tempting: the gateway forwards to model-serving, so why not reuse its
+//   PredictRequest? Because services are DECOUPLED — proto-level coupling
+//   would mean a change to serving's contract forces a gateway redeploy, and
+//   buf-breaking on serving.proto would fail the gateway's lint. Instead the
+//   gateway owns its OWN external contract (this file) and maps to/from the
+//   serving client at the repository boundary. The tensor types here are a
+//   deliberate, stable mirror — the public API the gateway promises clients,
+//   independent of how serving happens to model tensors internally. This is
+//   the standard gateway discipline (Kong/Envoy don't share upstream protos).
+//
+// REAL-WORLD COMPARISON:
+//   - Envoy / Istio: weighted clusters + outlier detection (circuit breaking)
+//     + local rate limiting — exactly this stack, generic for HTTP/gRPC.
+//   - AWS SageMaker endpoints: "production variants" with traffic weights for
+//     A/B and canary — RouteTarget.weight_bps is our production-variant weight.
+//   - Seldon / KServe: InferenceService with canary traffic percentage; the
+//     "transformer/router" component is this gateway's job.
+//   - Stripe API: per-key rate limits returning 429 + Retry-After.
+//
+// CALL FLOW (the hot path):
+//   Client ──HTTP/gRPC──► Inference Gateway.Predict
+//        │ 1. auth interceptor (ValidateToken via Auth service)
+//        │ 2. rate limit (token bucket, per API key, Redis-backed)
+//        │ 3. route lookup (RouteTable: model_name → [versions+weights])
+//        │ 4. traffic split (weighted random → chosen version)
+//        │ 5. circuit breaker check (is this version's breaker closed?)
+//        │ 6. bulkhead acquire (per-model concurrency slot)
+//        │ 7. forward to model-serving (gRPC, with retry+backoff)
+//        │ 8. record outcome → publish InferenceCompleted/Failed (async)
+//        ▼
+//   PredictResponse (outputs + served_version + latency_ms + request_id)
+//
+// EVENTS PUBLISHED (subject hierarchy from the platform design):
+//   fp.inference.completed → InferenceCompletedEvent
+//   fp.inference.failed    → InferenceFailedEvent
+//   Consumed by: Billing (meter usage), Experiment Tracker (record),
+//                Model Monitor (drift windows over features + predictions).
+//
+// VERSIONING: Package path includes v1 following Buf/Google convention.
+// Breaking changes require a new forgepoint.inference.v2 package.
+// ============================================================================
+
+syntax = "proto3";
+
+package forgepoint.inference.v1;
+
+// go_package follows the pattern established in common.proto / auth.proto:
+//   "github.com/abd-ulbasit/forgepoint/gen/go/{package};{shortname}"
+// The semicolon short name (inferencev1) is the Go package identifier, keeping
+// imports unambiguous when several proto packages are pulled into one file.
+option go_package = "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/inference/v1;inferencev1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+import "forgepoint/common/v1/common.proto";
+
+// ============================================================================
+// TENSOR I/O TYPES
+// ============================================================================
+
+// ============================================================================
+// DataType
+// ============================================================================
+//
+// WHY an explicit dtype enum: a model input is just bytes on the wire; the
+// receiver must know how to interpret those bytes (4-byte float vs 8-byte
+// float vs int). Carrying the dtype with the tensor makes the payload
+// self-describing — the gateway can validate against the model's declared
+// input schema before forwarding, catching client mistakes (sending int32
+// where float32 is expected) at the edge with a clear INVALID_ARGUMENT
+// instead of a cryptic failure deep in the ONNX runtime.
+//
+// WHY only a small numeric set: Forgepoint serves tiny CPU ONNX models
+// (tabular/iris-class). float32 covers ~all feature vectors; we add a few
+// common types for completeness. STRING is included for categorical/text
+// inputs that some models embed. Adding more later is backward compatible
+// (appending enum values never breaks the wire format).
+// ============================================================================
+enum DataType {
+  // Required zero value (Buf ENUM_ZERO_VALUE_SUFFIX). Treat as "unset" —
+  // the gateway rejects tensors with an unspecified dtype.
+  DATA_TYPE_UNSPECIFIED = 0;
+
+  // IEEE-754 32-bit float. The default for ML feature vectors.
+  DATA_TYPE_FLOAT32 = 1;
+
+  // IEEE-754 64-bit float. For models that need double precision.
+  DATA_TYPE_FLOAT64 = 2;
+
+  // Signed 32-bit integer (e.g., categorical indices, token IDs).
+  DATA_TYPE_INT32 = 3;
+
+  // Signed 64-bit integer.
+  DATA_TYPE_INT64 = 4;
+
+  // UTF-8 strings (categorical/text features). Encoded length-prefixed in
+  // the bytes payload; the runtime decodes per the model's string handling.
+  DATA_TYPE_STRING = 5;
+
+  // Boolean (1 byte per element). For binary flags.
+  DATA_TYPE_BOOL = 6;
+}
+
+// ============================================================================
+// TensorData
+// ============================================================================
+//
+// WHY raw bytes + shape + dtype instead of repeated float / repeated double:
+//   - PERFORMANCE: a 1000-feature vector as `repeated float` is 1000 protobuf
+//     varint-tagged fields; as packed bytes it's a single length-delimited
+//     blob the runtime can memcpy straight into a tensor. This is how every
+//     serious inference protocol (KServe v2, TF Serving, Triton) does it.
+//   - ZERO-COPY: the gateway forwards the bytes to model-serving without
+//     deserializing the numbers it doesn't need to inspect — it only reads
+//     shape/dtype for validation. Cheaper gateway = lower added latency.
+//   - DTYPE FLEXIBILITY: one message type carries float/int/string tensors;
+//     no separate FloatTensor / IntTensor messages.
+//
+// TRADEOFF: bytes are opaque to JSON/grpcurl — you can't eyeball the numbers.
+// For the external HTTP API the gateway accepts/returns JSON arrays and
+// converts; this binary form is the efficient internal/gRPC representation.
+//
+// INTERVIEW NOTE: be ready to explain "why not repeated float?" — answer:
+// wire size + zero-copy forwarding. shape carries dimensions (e.g., [1, 4]
+// for one iris sample of 4 features); data length must equal product(shape) *
+// sizeof(dtype), which the gateway validates.
+// ============================================================================
+message TensorData {
+  // Tensor dimensions, outermost first. E.g., [1, 4] = batch of 1, 4 features.
+  // An empty shape denotes a scalar. The gateway validates that
+  // len(data) == product(shape) * elem_size(dtype).
+  repeated int64 shape = 1;
+
+  // Element type of the bytes in `data`. Required (non-UNSPECIFIED).
+  DataType dtype = 2;
+
+  // The raw tensor contents, densely packed in row-major (C) order for the
+  // given dtype. Opaque to the gateway except for length validation.
+  bytes data = 3;
+}
+
+// ============================================================================
+// PredictionSummary
+// ============================================================================
+//
+// WHY a SEPARATE summary type (not the full tensors) on events: the
+// InferenceCompleted event is consumed by Billing, Experiment Tracker, and
+// Model Monitor — none of them need (or should receive) the raw output
+// tensors of every prediction. Shipping full tensors on every event would
+// flood NATS and leak potentially sensitive payloads to three services.
+// Instead we ship a COMPACT, PRIVACY-CONSCIOUS summary: enough for drift
+// detection and metering, not the raw user data.
+//
+// SECURITY/PII: this is the payload that leaves the gateway over the event
+// bus. It deliberately carries statistics and the top label, NOT the full
+// feature vector or full output tensor. Model Monitor gets distributional
+// summaries (means/mins/maxes) sufficient for PSI/KS drift math without the
+// raw rows. If a model needs full-fidelity monitoring, that is an explicit,
+// separately-authorized data path — never the default event.
+// ============================================================================
+message PredictionSummary {
+  // For classifiers: the predicted class label / argmax index as a string.
+  // For regressors: a string-formatted scalar. Empty if not applicable.
+  string top_label = 1;
+
+  // Confidence / probability of top_label for classifiers (0.0–1.0).
+  // Zero for regression or when the model emits no probabilities.
+  double top_score = 2;
+
+  // Per-output simple statistics (e.g., {"score_mean": 0.31, "score_max": 0.9}).
+  // Compact, model-agnostic numeric summary for monitoring/drift — NOT the
+  // raw output tensor. Keep this small; it rides on every event.
+  map<string, double> output_stats = 3;
+
+  // Number of elements in the model's output (e.g., number of classes).
+  // Lets monitor track output-shape changes across versions cheaply.
+  int32 output_cardinality = 4;
+}
+
+// ============================================================================
+// FeatureSummary
+// ============================================================================
+//
+// WHY: Model Monitor computes DATA drift (have the inputs shifted vs the
+// training baseline?). It needs a description of the request's features, but —
+// same reasoning as PredictionSummary — not the raw feature bytes on every
+// event. This carries per-feature scalar summaries the monitor can fold into
+// its sliding-window PSI/KS computations.
+//
+// SECURITY/PII: summaries only. A feature like "user_age" rides as a numeric
+// value or a bucketed stat, never as a join-key back to a person. The gateway
+// is the trust boundary that decides what feature signal is safe to emit.
+// ============================================================================
+message FeatureSummary {
+  // Per-feature numeric value or summary statistic keyed by feature name,
+  // e.g., {"sepal_length": 5.1, "sepal_width": 3.5}. For high-dimensional
+  // inputs the gateway may emit only a sampled/aggregated subset.
+  map<string, double> feature_values = 1;
+
+  // Total number of input features in the request (dimensionality). Lets the
+  // monitor detect schema/shape drift independent of the sampled values above.
+  int32 feature_count = 2;
+}
+
+// ============================================================================
+// ROUTING DOMAIN MESSAGES (the canary control plane)
+// ============================================================================
+
+// ============================================================================
+// RouteTarget
+// ============================================================================
+//
+// WHY weights in BASIS POINTS (per-10,000) not percent: integer basis points
+// let us express fine-grained canaries (e.g., 0.5% = 50 bps) exactly, with no
+// float rounding when the weights must sum to a fixed total. This is the same
+// reason finance uses bps. The set of a model's RouteTargets must have
+// weight_bps summing to 10000 (100%); the gateway enforces this on write.
+//
+// WHY status here: a target can exist but be temporarily DRAINING (taking no
+// new traffic while in-flight requests finish) during a rollback. Status is
+// SERVER-authoritative — clients propose weights, the gateway owns lifecycle.
+// ============================================================================
+message RouteTarget {
+  // The model version this target points to (e.g., "v3", "2024-06-01-a").
+  // Combined with the parent Route's model_name, this identifies a backend.
+  string version = 1;
+
+  // The model-serving endpoint for this version (e.g., a K8s Service DNS name
+  // like "iris-v3.fp-models.svc:9090"). SERVER-authoritative: it is resolved
+  // from the ModelDeployed event the gateway consumed, NOT supplied by API
+  // clients — accepting an arbitrary endpoint from a client would be an SSRF
+  // hole (the gateway would forward to anywhere). Read-only in responses.
+  string endpoint = 2;
+
+  // Traffic share for this version in basis points (0–10000). All targets of
+  // a model must sum to 10000. E.g., stable=9000 (90%), canary=1000 (10%).
+  int32 weight_bps = 3;
+
+  // Lifecycle status of this target. SERVER-authoritative.
+  TargetStatus status = 4;
+}
+
+// ============================================================================
+// TargetStatus
+// ============================================================================
+//
+// WHY a status enum vs a bare bool "active": a canary rollout has more than
+// two states. DRAINING (let in-flight finish, send no new traffic) is what
+// makes a graceful rollback possible — flipping straight to removed would
+// kill in-flight predictions. This mirrors Envoy/K8s endpoint draining.
+// ============================================================================
+enum TargetStatus {
+  // Required zero value.
+  TARGET_STATUS_UNSPECIFIED = 0;
+
+  // Receiving traffic per its weight_bps.
+  TARGET_STATUS_ACTIVE = 1;
+
+  // No new traffic; in-flight requests allowed to complete. Used during
+  // rollback/promotion before full removal. Effective weight is treated as 0.
+  TARGET_STATUS_DRAINING = 2;
+
+  // Quarantined by the circuit breaker (backend unhealthy). The gateway sets
+  // this automatically; it is not a client-settable state.
+  TARGET_STATUS_UNHEALTHY = 3;
+}
+
+// ============================================================================
+// Route
+// ============================================================================
+//
+// WHY a Route per model (not per version): clients call by MODEL NAME (e.g.,
+// "fraud-detector"); the gateway hides which versions exist behind it. A Route
+// is the routing-table row for one model — the list of candidate versions and
+// how traffic splits among them. This indirection is the whole point of a
+// gateway: the client's contract ("predict with fraud-detector") is stable
+// while we shift traffic between v1/v2/v3 underneath.
+//
+// HOW IT'S POPULATED: the routing table is driven by EVENTS, not API writes in
+// the common case. The gateway consumes fp.pipelines.model.deployed (the saga
+// promotes a version) and adds/updates targets. The admin RPCs (UpsertRoute /
+// SetTrafficSplit) are the manual override / break-glass control plane for
+// operators and the canary executor.
+// ============================================================================
+message Route {
+  // The public model name clients call (e.g., "fraud-detector"). Unique key
+  // of the routing table.
+  string model_name = 1;
+
+  // The candidate versions and their traffic weights. weight_bps across all
+  // ACTIVE targets must sum to 10000.
+  repeated RouteTarget targets = 2;
+
+  // When this route was last changed (deploy event or admin write).
+  // SERVER-authoritative timestamp — never accepted on write.
+  google.protobuf.Timestamp updated_at = 3;
+}
+
+// ============================================================================
+// CircuitState
+// ============================================================================
+//
+// WHY expose circuit state at all: the breaker is internal machinery, but
+// OPERATORS and dashboards need to see it ("why is v3 getting no traffic?
+// because its breaker is OPEN"). Exposing it read-only turns an invisible
+// failure mode into an observable one. The metric
+// fp_gateway_circuit_breaker_state mirrors this for Prometheus.
+//
+// THE 3-STATE MACHINE (interview-critical):
+//
+//   ┌─────────┐  failures ≥ threshold   ┌──────┐
+//   │ CLOSED  │ ──────────────────────► │ OPEN │
+//   │ (normal)│                          │(fail │
+//   └─────────┘ ◄──── successes ≥ ─────┐ │ fast)│
+//        ▲       success_threshold     │ └──────┘
+//        │                             │     │ after open_timeout
+//        │                        ┌──────────┐│
+//        └────── any failure ─────│ HALF_OPEN│◄ (send 1 probe)
+//                                 └──────────┘
+//
+//   CLOSED: requests flow; count failures. Too many → OPEN.
+//   OPEN: reject immediately (fail fast) for open_timeout; don't hammer a
+//         sick backend. After the timeout → HALF_OPEN.
+//   HALF_OPEN: allow a few probe requests. If they succeed → CLOSED (recovered);
+//         if any fails → back to OPEN (still sick).
+// ============================================================================
+message CircuitState {
+  // The model + version (backend) this breaker guards.
+  string model_name = 1;
+  string version = 2;
+
+  // Current breaker state.
+  CircuitBreakerState state = 3;
+
+  // Consecutive failures observed in the current window (drives the trip
+  // decision). SERVER-authoritative observability field.
+  int32 consecutive_failures = 4;
+
+  // When the breaker last changed state. With state=OPEN this anchors the
+  // open_timeout countdown to HALF_OPEN. SERVER-authoritative.
+  google.protobuf.Timestamp last_transition_at = 5;
+}
+
+// ============================================================================
+// CircuitBreakerState
+// ============================================================================
+enum CircuitBreakerState {
+  // Required zero value.
+  CIRCUIT_BREAKER_STATE_UNSPECIFIED = 0;
+
+  // Normal operation: requests pass through, failures are counted.
+  CIRCUIT_BREAKER_STATE_CLOSED = 1;
+
+  // Tripped: requests fail fast without hitting the backend.
+  CIRCUIT_BREAKER_STATE_OPEN = 2;
+
+  // Probing: a limited number of trial requests determine recovery.
+  CIRCUIT_BREAKER_STATE_HALF_OPEN = 3;
+}
+
+// ============================================================================
+// PREDICT REQUEST / RESPONSE MESSAGES
+// ============================================================================
+
+// ============================================================================
+// Predict
+// ============================================================================
+
+// PredictRequest is the hot-path message: one inference call.
+//
+// WHY the client may NOT pick the served version freely: if a client could
+// pin every request to "v-stable", canary versions would never receive the
+// traffic they need to be evaluated — defeating the whole traffic-split
+// pattern. So we model TWO knobs with different trust levels:
+//   - model_name (required): WHICH model. Client-chosen, always honored.
+//   - version_override (optional): pin a specific version. This is a
+//     PRIVILEGED escape hatch (debugging a specific version, the canary
+//     executor probing the new version). The gateway authorizes it; ordinary
+//     traffic leaves it empty and is split by weight. Documented as override
+//     so it's obvious it bypasses canary splitting.
+message PredictRequest {
+  // The public model name to predict with (e.g., "fraud-detector"). Required.
+  string model_name = 1;
+
+  // The named input tensors, keyed by the model's input names
+  // (e.g., {"features": TensorData{...}}). The gateway validates names/shapes
+  // against the model's declared input schema before forwarding.
+  map<string, TensorData> inputs = 2;
+
+  // OPTIONAL privileged override: force a specific version, bypassing weighted
+  // traffic splitting. Empty = let the gateway split by weight (the norm).
+  // Requires elevated permission; used by the canary executor and for debug.
+  string version_override = 3;
+
+  // Idempotency key for safe retries. WHY on a PREDICT (a read-ish op)?
+  // Predictions can have side effects downstream — every call emits an
+  // InferenceCompleted event that Billing meters. If a client retries after a
+  // timeout, a duplicate key lets the gateway recognize the retry and avoid
+  // DOUBLE-BILLING / double-emitting. The gateway caches recent keys (short
+  // TTL in Redis). Empty = no idempotency guarantee (gateway treats as unique).
+  string idempotency_key = 4;
+}
+
+// PredictResponse returns the model outputs plus the metadata that makes the
+// gateway's decisions OBSERVABLE to the caller.
+//
+// WHY echo served_version: the client asked for a model, not a version, but it
+// MUST be told which version actually answered — for A/B analysis ("which
+// variant produced this?"), for debugging, and so the client can correlate
+// with the InferenceCompleted event. This is SERVER-authoritative: it reflects
+// what the gateway chose, never what the client requested.
+message PredictResponse {
+  // The named output tensors, keyed by the model's output names
+  // (e.g., {"probabilities": TensorData{...}}).
+  map<string, TensorData> outputs = 1;
+
+  // Which model version actually served this request. SERVER-authoritative —
+  // the result of weighted traffic splitting (or version_override).
+  string served_version = 2;
+
+  // End-to-end latency the gateway observed for the backend call. WHY Duration
+  // not int64 ms: google.protobuf.Duration is the typed well-known unit, has
+  // sub-ms precision, and avoids "is this ms or µs?" ambiguity. The event's
+  // latency_ms is a denormalized convenience for metering/dashboards.
+  google.protobuf.Duration latency = 3;
+
+  // Unique ID the gateway assigned to this request (UUID). Returned to the
+  // client AND carried on the InferenceCompleted event, so the client can
+  // join its logs to platform events/traces. SERVER-authoritative.
+  string request_id = 4;
+}
+
+// ============================================================================
+// BatchPredict
+// ============================================================================
+
+// BatchPredictRequest carries MANY independent inputs in one call.
+//
+// WHY a unary batch RPC in addition to streaming: for a bounded, modest batch
+// (a few hundred rows) a single request/response is simpler for clients than
+// managing a stream, and lets the gateway fan out to the backend efficiently.
+// For UNBOUNDED or very large batches, use StreamPredict (server-streaming)
+// so results flow back incrementally without buffering everything in memory.
+// We offer BOTH and document when to reach for which (see service comments).
+message BatchPredictRequest {
+  // The public model name. Required. One model per batch (a batch is N rows
+  // for the SAME model, not a mix).
+  string model_name = 1;
+
+  // The batch items. Each is one independent prediction's named inputs.
+  // The gateway caps batch size server-side (default 256; see service docs)
+  // and returns INVALID_ARGUMENT above the cap to bound memory/latency.
+  repeated BatchPredictItem items = 2;
+
+  // OPTIONAL privileged version override applied to the WHOLE batch (debug /
+  // canary probing). Empty = weighted split, decided once per item.
+  string version_override = 3;
+
+  // Idempotency key for the whole batch (safe retry without double-billing).
+  string idempotency_key = 4;
+}
+
+// BatchPredictItem is one row in a batch — its inputs plus a client-supplied
+// id so the client can correlate each result back to its request (order is
+// preserved, but an explicit id is robust to partial failures / reordering).
+message BatchPredictItem {
+  // Client-chosen correlation id for this item (e.g., a row key). Echoed back
+  // in the matching BatchPredictResult. Opaque to the gateway.
+  string item_id = 1;
+
+  // Named input tensors for this single prediction (same shape rules as
+  // PredictRequest.inputs).
+  map<string, TensorData> inputs = 2;
+}
+
+// BatchPredictResponse returns one result per input item.
+//
+// WHY per-item status instead of failing the whole batch: in a batch, item 7
+// being malformed shouldn't discard the other 255 valid predictions. Each
+// result carries its own success/error (PARTIAL SUCCESS semantics), which is
+// far more useful for bulk scoring jobs than all-or-nothing.
+message BatchPredictResponse {
+  // One result per request item, correlated by item_id. Same length/order as
+  // the request items (barring explicit reordering, item_id is authoritative).
+  repeated BatchPredictResult results = 1;
+
+  // Unique ID for the whole batch call. SERVER-authoritative.
+  string request_id = 2;
+}
+
+// BatchPredictResult is the outcome for a single batch item — either outputs
+// or a structured error, never silently dropped.
+message BatchPredictResult {
+  // The client's item_id this result corresponds to.
+  string item_id = 1;
+
+  // The output tensors for this item. Empty if `error` is set.
+  map<string, TensorData> outputs = 2;
+
+  // Which version served THIS item. Items in one batch can be served by
+  // different versions (weighted split is per-item). SERVER-authoritative.
+  string served_version = 3;
+
+  // Per-item error if this prediction failed. Nil/unset on success. Reuses
+  // the common structured error type so clients handle it uniformly with
+  // single-predict errors. PARTIAL-SUCCESS marker for this item.
+  forgepoint.common.v1.ErrorDetail error = 4;
+}
+
+// ============================================================================
+// StreamPredict (server-streaming)
+// ============================================================================
+
+// StreamPredictRequest is a single request that yields a STREAM of results.
+//
+// WHY SERVER-STREAMING (1 request → N responses) and not bidi here: the
+// client knows all its inputs up front (it's a batch job), so it sends them
+// once; the gateway streams results back AS each prediction completes. This
+// gives incremental delivery (client starts processing result 1 while result
+// 500 is still computing) and bounded gateway memory (no need to hold the
+// whole response set). Use this for LARGE batches; use unary BatchPredict for
+// small ones.
+//
+// WHEN BIDI WOULD BE RIGHT (and why we DON'T use it): bidirectional streaming
+// fits an OPEN-ENDED feed where the client keeps sending inputs over a long-
+// lived connection (e.g., a sensor stream). Forgepoint's online predict is
+// request/response and its batch is "submit N, get N back" — neither needs
+// the client to keep pushing after the initial request. We deliberately avoid
+// bidi's added complexity (flow control on both directions, harder retries).
+message StreamPredictRequest {
+  // The public model name. Required.
+  string model_name = 1;
+
+  // All batch items to score. The gateway streams a StreamPredictResponse per
+  // item as each completes. No fixed cap (that's the point of streaming) but
+  // the bulkhead still bounds in-flight concurrency to the backend.
+  repeated BatchPredictItem items = 2;
+
+  // OPTIONAL privileged version override for the whole stream.
+  string version_override = 3;
+
+  // Idempotency key for the streamed batch.
+  string idempotency_key = 4;
+}
+
+// StreamPredictResponse is ONE message in the response stream — the result for
+// a single item, delivered as soon as it's ready.
+//
+// RPC_RESPONSE_STANDARD_NAME note: a server-streaming RPC's response type must
+// still be named "<Rpc>Response"; the streaming is expressed by `stream` on
+// the RPC, not by the type name. Each streamed message is one of these.
+message StreamPredictResponse {
+  // The result for one item (outputs or per-item error), correlated by
+  // item_id. Reuses BatchPredictResult so streamed and batched results share
+  // one shape — clients write one result handler for both paths.
+  BatchPredictResult result = 1;
+
+  // Unique ID of the overall stream call, repeated on each message so a client
+  // can attribute every streamed result to the same call. SERVER-authoritative.
+  string request_id = 2;
+}
+
+// ============================================================================
+// ROUTING ADMIN REQUEST / RESPONSE MESSAGES
+// ============================================================================
+
+// ============================================================================
+// GetRoute
+// ============================================================================
+
+// GetRouteRequest fetches the current routing-table entry for one model.
+message GetRouteRequest {
+  // The model whose route to fetch.
+  string model_name = 1;
+}
+
+// GetRouteResponse wraps the Route. WHY wrap (not return Route directly): Buf
+// RPC_RESPONSE_STANDARD_NAME, plus forward-compat (we can later add e.g. a
+// resolved_at or source field without touching the shared Route domain type).
+message GetRouteResponse {
+  // The current route, including all targets and their weights.
+  Route route = 1;
+}
+
+// ============================================================================
+// ListRoutes
+// ============================================================================
+
+// ListRoutesRequest lists all routing-table entries (the whole routing table),
+// paginated. Reuses common pagination for table-wide consistency.
+message ListRoutesRequest {
+  // Cursor-based pagination. page_size defaults to 20, capped at 100
+  // server-side (see common.proto). Prevents a client from pulling the entire
+  // routing table in one unbounded response.
+  forgepoint.common.v1.PaginationRequest pagination = 1;
+}
+
+message ListRoutesResponse {
+  // The page of routes.
+  repeated Route routes = 1;
+
+  // Pagination metadata: next_page_token + total_count.
+  forgepoint.common.v1.PaginationResponse pagination = 2;
+}
+
+// ============================================================================
+// UpsertRoute
+// ============================================================================
+
+// UpsertRouteRequest is the BREAK-GLASS manual control to create/replace a
+// route. In normal operation routes are driven by ModelDeployed events; this
+// RPC is for operators and the canary executor to override.
+//
+// SECURITY — what is and isn't accepted (anti mass-assignment):
+//   - The caller supplies model_name and the desired targets' version +
+//     weight_bps ONLY.
+//   - endpoint is NOT honored from the request — the gateway resolves each
+//     version's endpoint from its deploy record. Accepting a client endpoint
+//     would let a caller make the gateway forward to an arbitrary host (SSRF).
+//   - status and updated_at are SERVER-authoritative and ignored on input.
+//   - The gateway validates that ACTIVE targets' weight_bps sum to 10000.
+message UpsertRouteRequest {
+  // The model whose route to create or replace.
+  string model_name = 1;
+
+  // Desired targets. Only `version` and `weight_bps` are read from each;
+  // `endpoint`, `status` are server-resolved/ignored (see message doc).
+  repeated RouteTarget targets = 2;
+
+  // Idempotency key — UpsertRoute is a mutation; a retried create/replace with
+  // the same key must not produce a divergent table or duplicate audit events.
+  string idempotency_key = 3;
+}
+
+// UpsertRouteResponse returns the route AS STORED (with server-resolved
+// endpoints, status, and updated_at), so the caller sees the authoritative
+// result of its write, not just an echo of its input.
+message UpsertRouteResponse {
+  Route route = 1;
+}
+
+// ============================================================================
+// SetTrafficSplit
+// ============================================================================
+
+// SetTrafficSplitRequest adjusts ONLY the weights of an existing route — the
+// canary "dial". WHY a dedicated RPC separate from UpsertRoute: shifting
+// traffic (90/10 → 50/50 → 0/100) is the single most common, highest-stakes
+// operation in a rollout, and it's done repeatedly by the canary executor as
+// metrics pass thresholds. A narrow, purpose-built RPC is safer (you can't
+// accidentally drop a target) and clearer in audit logs ("traffic shifted")
+// than a full route replace.
+message SetTrafficSplitRequest {
+  // The model whose traffic to re-weight.
+  string model_name = 1;
+
+  // New weights per version. Each entry must reference a version already
+  // present in the route. weight_bps across all referenced ACTIVE targets
+  // must sum to 10000. The gateway rejects unknown versions and bad sums.
+  repeated TrafficWeight weights = 2;
+
+  // Idempotency key — re-applying the same split (retry) is a no-op, not a
+  // double shift.
+  string idempotency_key = 3;
+}
+
+// TrafficWeight is a (version, weight) pair — the minimal payload for the
+// traffic dial. Deliberately NOT RouteTarget: SetTrafficSplit must not let a
+// caller smuggle in endpoint/status changes, so it accepts only the two
+// fields it is allowed to change.
+message TrafficWeight {
+  // An existing version in the route.
+  string version = 1;
+
+  // New traffic share in basis points (0–10000). Setting 0 effectively drains
+  // a version of new traffic without removing it from the route.
+  int32 weight_bps = 2;
+}
+
+// SetTrafficSplitResponse returns the updated route so the caller confirms the
+// new weights took effect exactly as intended.
+message SetTrafficSplitResponse {
+  Route route = 1;
+}
+
+// ============================================================================
+// DeleteRoute
+// ============================================================================
+
+// DeleteRouteRequest removes a model from the routing table entirely. After
+// this, predict calls for the model fail with NOT_FOUND. Normally driven by a
+// ModelUndeployed event; the RPC is the manual override.
+message DeleteRouteRequest {
+  // The model to remove from routing.
+  string model_name = 1;
+
+  // Idempotency key — deleting an already-deleted route is a safe no-op.
+  string idempotency_key = 2;
+}
+
+// DeleteRouteResponse is intentionally empty. WHY a named empty message vs
+// google.protobuf.Empty: Buf RPC_RESPONSE_STANDARD_NAME requires "<Rpc>Response"
+// naming, and a named type is forward-compatible (we could later add e.g.
+// drained_request_count without changing the RPC signature).
+message DeleteRouteResponse {}
+
+// ============================================================================
+// CIRCUIT-BREAKER OBSERVABILITY REQUEST / RESPONSE MESSAGES
+// ============================================================================
+
+// ============================================================================
+// GetCircuitState
+// ============================================================================
+
+// GetCircuitStateRequest inspects one backend's breaker. WHY model+version:
+// breakers are PER BACKEND (per version), not per model — v2 can be tripped
+// while v1 stays healthy, which is exactly what protects you during a bad
+// canary.
+message GetCircuitStateRequest {
+  string model_name = 1;
+  string version = 2;
+}
+
+message GetCircuitStateResponse {
+  // The current breaker state for the requested backend.
+  CircuitState circuit_state = 1;
+}
+
+// ============================================================================
+// ListCircuitStates
+// ============================================================================
+
+// ListCircuitStatesRequest lists breaker states across backends, for
+// dashboards/operators. Optional model filter; paginated.
+message ListCircuitStatesRequest {
+  // Optional: only breakers for this model. Empty = all backends.
+  string model_name_filter = 1;
+
+  // Cursor-based pagination (page_size default 20, max 100 server-side).
+  forgepoint.common.v1.PaginationRequest pagination = 2;
+}
+
+message ListCircuitStatesResponse {
+  // The page of breaker states.
+  repeated CircuitState circuit_states = 1;
+
+  // Pagination metadata.
+  forgepoint.common.v1.PaginationResponse pagination = 2;
+}
+
+// ============================================================================
+// EVENT PAYLOADS (typed bodies for the NATS EventEnvelope.data Any)
+// ============================================================================
+//
+// WHY these live in the proto: the platform's EventEnvelope carries data as a
+// google.protobuf.Any (see common.proto). For that Any to be TYPE-SAFE, the
+// payload must be a registered proto message with a stable type URL. Defining
+// the event bodies here lets producers pack and consumers unpack them with
+// compile-time types instead of hand-rolled JSON. This is the contract Billing,
+// Experiment Tracker, and Model Monitor code-generate against.
+// ============================================================================
+
+// ============================================================================
+// InferenceCompletedEvent  →  subject: fp.inference.completed
+// ============================================================================
+//
+// CONSUMERS & WHY EACH FIELD EXISTS:
+//   - Billing: meters usage → needs api_key_id, model_id, version, timestamp.
+//   - Experiment Tracker: records A/B outcomes → served_version, summaries.
+//   - Model Monitor: drift windows → feature_summary (data drift),
+//     prediction_summary (prediction drift), latency (performance decay).
+//
+// SECURITY/PII (critical — this leaves the gateway over the bus):
+//   We ship IDs and SUMMARIES, never raw input/output tensors and never an
+//   end-user identity. api_key_id (not the raw key), model_id, version are
+//   safe references. The summaries are statistical (see PredictionSummary /
+//   FeatureSummary docs). This keeps three downstream services from each
+//   becoming a copy of every prediction's raw data.
+//
+// IDEMPOTENCY: the envelope's `id` (UUID) dedupes redeliveries; request_id
+// here lets a consumer additionally tie the event to the original predict call
+// and dedupe at the business level (e.g., Billing won't double-count a
+// request_id it already metered).
+message InferenceCompletedEvent {
+  // The gateway-assigned request ID (matches PredictResponse.request_id).
+  // Business-level idempotency key for consumers (Billing dedupes on it).
+  string request_id = 1;
+
+  // The model that served the request (registry model identifier).
+  string model_id = 2;
+
+  // The public model name (human-readable; convenience for dashboards).
+  string model_name = 3;
+
+  // The version that actually served (post traffic-split). KEY for A/B
+  // analysis and per-version metering/monitoring.
+  string version = 4;
+
+  // The API key that made the call (ID, never the raw secret). Billing meters
+  // against this; it maps to a team/rate-plan. SERVER-stamped from the
+  // authenticated request — not client-supplied in the event.
+  string api_key_id = 5;
+
+  // Observed backend latency. WHY both a Duration AND latency_ms below:
+  // latency is the precise typed value; latency_ms is a denormalized integer
+  // convenience so simple consumers/dashboards don't have to convert.
+  google.protobuf.Duration latency = 6;
+
+  // Latency in whole milliseconds — denormalized convenience for metering and
+  // Grafana panels (derived from `latency`).
+  int64 latency_ms = 7;
+
+  // Compact prediction summary for monitoring/A-B (NOT raw outputs).
+  PredictionSummary prediction_summary = 8;
+
+  // Compact input feature summary for data-drift detection (NOT raw inputs).
+  FeatureSummary feature_summary = 9;
+
+  // When the inference completed (gateway clock). SERVER-authoritative.
+  google.protobuf.Timestamp timestamp = 10;
+}
+
+// ============================================================================
+// InferenceFailedEvent  →  subject: fp.inference.failed
+// ============================================================================
+//
+// WHY a separate failure event: failures are first-class signal. The Model
+// Monitor watches error RATES (a spiking failure rate is its own kind of
+// "drift"/degradation), and operators alert on it. Emitting a typed failure
+// event (rather than just logging) lets those consumers react via the same
+// event bus they already subscribe to.
+//
+// WHY no payload summaries here: on failure there may be no prediction to
+// summarize, and we avoid echoing the (possibly malformed) input. We carry the
+// classification of the failure instead.
+message InferenceFailedEvent {
+  // The gateway-assigned request ID (idempotency + correlation).
+  string request_id = 1;
+
+  // The model name the client targeted.
+  string model_name = 2;
+
+  // The version the gateway attempted (if routing got that far; may be empty
+  // if the failure was before version selection, e.g., NOT_FOUND).
+  string version = 3;
+
+  // The API key that made the call (ID only). Lets Billing decide policy on
+  // failed calls (typically NOT metered) and lets per-tenant error rates be
+  // computed. SERVER-stamped.
+  string api_key_id = 4;
+
+  // Why it failed — the resilience-pattern outcome. Drives monitor/alerts.
+  FailureReason reason = 5;
+
+  // Human-readable detail for logs/debugging (e.g., the upstream gRPC status
+  // message). Not for end-user display.
+  string message = 6;
+
+  // When the failure occurred. SERVER-authoritative.
+  google.protobuf.Timestamp timestamp = 7;
+}
+
+// ============================================================================
+// FailureReason
+// ============================================================================
+//
+// WHY enumerate failure causes: each maps to a DIFFERENT operational response,
+// and each names a resilience pattern firing. An interviewer can ask "what
+// happens when the backend is down?" and you point at CIRCUIT_OPEN. Distinct
+// reasons let Monitor/alerts treat a capacity problem (RATE_LIMITED) very
+// differently from a backend health problem (CIRCUIT_OPEN / UPSTREAM_ERROR).
+// ============================================================================
+enum FailureReason {
+  // Required zero value.
+  FAILURE_REASON_UNSPECIFIED = 0;
+
+  // No route for the requested model (not deployed / undeployed). → NOT_FOUND.
+  FAILURE_REASON_NO_ROUTE = 1;
+
+  // Rate limiter rejected the call (token bucket empty). → RESOURCE_EXHAUSTED
+  // (HTTP 429 + Retry-After at the edge). A CAPACITY/quota signal.
+  FAILURE_REASON_RATE_LIMITED = 2;
+
+  // Bulkhead full: per-model concurrency limit reached. → RESOURCE_EXHAUSTED.
+  // Distinct from RATE_LIMITED: this is concurrency isolation, not rate.
+  FAILURE_REASON_BULKHEAD_FULL = 3;
+
+  // Circuit breaker OPEN for the chosen backend: failed fast without calling
+  // it. → UNAVAILABLE. A backend-HEALTH signal.
+  FAILURE_REASON_CIRCUIT_OPEN = 4;
+
+  // The backend (model-serving) returned an error or was unreachable after
+  // retries. → UNAVAILABLE / INTERNAL depending on the upstream status.
+  FAILURE_REASON_UPSTREAM_ERROR = 5;
+
+  // The backend exceeded the gateway's deadline. → DEADLINE_EXCEEDED.
+  FAILURE_REASON_TIMEOUT = 6;
+
+  // The request was malformed (bad tensor shape/dtype, unknown input name).
+  // → INVALID_ARGUMENT. A CLIENT error, not a backend problem.
+  FAILURE_REASON_INVALID_INPUT = 7;
+
+  // The tenant's billing quota is exhausted (CheckQuota denied). →
+  // RESOURCE_EXHAUSTED. Driven by Billing's QuotaExceeded eventual state.
+  FAILURE_REASON_QUOTA_EXCEEDED = 8;
+}
+
+// ============================================================================
+// INFERENCE GATEWAY SERVICE
+// ============================================================================
+//
+// WHY one service with both a hot DATA plane (Predict*) and a CONTROL plane
+// (route/breaker admin): they're cohesive — the control plane configures
+// exactly what the data plane enforces, and both live in the same process that
+// holds the in-memory routing table and breaker state. Splitting them would
+// force the data plane to fetch routing config over the network on the hot
+// path (latency) or duplicate it. Envoy follows the same shape: one proxy
+// process, an xDS control surface plus the data path.
+//
+// RPC CATEGORIES:
+//   DATA PLANE (hot path):   Predict, BatchPredict, StreamPredict
+//   ROUTING CONTROL PLANE:   GetRoute, ListRoutes, UpsertRoute,
+//                            SetTrafficSplit, DeleteRoute
+//   RESILIENCE OBSERVABILITY: GetCircuitState, ListCircuitStates
+//
+// NOTE ON THE EXTERNAL HTTP API: the platform also exposes
+// POST /v1/models/{model}/predict via an HTTP handler (JSON in/out). That
+// handler maps onto Predict here — gRPC is the canonical internal contract;
+// the HTTP edge is a thin JSON adapter over it (TensorData bytes ↔ JSON arrays).
+//
+// AUTH: every RPC runs behind the shared auth interceptor (ValidateToken +
+// CheckPermission). Data-plane calls require an inference scope; control-plane
+// RPCs require an elevated deploy/admin scope (only operators and the canary
+// executor reshape routes). version_override on Predict requires elevation too.
+// ============================================================================
+service InferenceGatewayService {
+  // ----- DATA PLANE -------------------------------------------------------
+
+  // Predict routes a single inference request to a model-serving backend via
+  // the full resilience stack (rate limit → route → traffic split → circuit
+  // breaker → bulkhead → forward with retry) and returns the outputs plus the
+  // version that served and the latency observed. Emits InferenceCompleted on
+  // success / InferenceFailed on failure (async, off the response path).
+  rpc Predict(PredictRequest) returns (PredictResponse);
+
+  // BatchPredict scores many inputs for one model in a single request,
+  // returning one result per item with PARTIAL-SUCCESS semantics (a bad item
+  // doesn't fail the batch). Use for BOUNDED batches (capped at 256 items
+  // server-side); for large/unbounded batches use StreamPredict.
+  rpc BatchPredict(BatchPredictRequest) returns (BatchPredictResponse);
+
+  // StreamPredict scores a (potentially large) batch and SERVER-STREAMS one
+  // result per item as each completes — incremental delivery with bounded
+  // gateway memory. The single request carries all items; results flow back
+  // until the stream ends. Choose this over BatchPredict when the batch is
+  // large or you want to start consuming results before the batch finishes.
+  rpc StreamPredict(StreamPredictRequest) returns (stream StreamPredictResponse);
+
+  // ----- ROUTING CONTROL PLANE -------------------------------------------
+
+  // GetRoute returns the current routing-table entry (versions + weights) for
+  // one model. Read-only; used by operators, the UI, and the canary executor
+  // to inspect current splits.
+  rpc GetRoute(GetRouteRequest) returns (GetRouteResponse);
+
+  // ListRoutes returns the whole routing table, paginated (page_size capped at
+  // 100 server-side). For the operator dashboard / `fp` CLI.
+  rpc ListRoutes(ListRoutesRequest) returns (ListRoutesResponse);
+
+  // UpsertRoute creates or replaces a model's route (break-glass manual
+  // control; routes are normally driven by ModelDeployed events). Endpoints
+  // are server-resolved (never accepted from the client) and weights must sum
+  // to 10000. Requires elevated permission. Idempotent via idempotency_key.
+  rpc UpsertRoute(UpsertRouteRequest) returns (UpsertRouteResponse);
+
+  // SetTrafficSplit adjusts ONLY the version weights of an existing route —
+  // the canary dial (e.g., 90/10 → 50/50 → 0/100). The most common rollout
+  // operation; narrow and audit-friendly by design. Requires elevated
+  // permission. Idempotent.
+  rpc SetTrafficSplit(SetTrafficSplitRequest) returns (SetTrafficSplitResponse);
+
+  // DeleteRoute removes a model from routing entirely (subsequent predicts get
+  // NOT_FOUND). Normally driven by ModelUndeployed; this is the override.
+  // Requires elevated permission. Idempotent (deleting twice is a no-op).
+  rpc DeleteRoute(DeleteRouteRequest) returns (DeleteRouteResponse);
+
+  // ----- RESILIENCE OBSERVABILITY ----------------------------------------
+
+  // GetCircuitState reports the breaker state for one backend (model+version):
+  // CLOSED / OPEN / HALF_OPEN plus failure count and last transition. Turns
+  // an invisible failure mode into an observable one for dashboards/operators.
+  rpc GetCircuitState(GetCircuitStateRequest) returns (GetCircuitStateResponse);
+
+  // ListCircuitStates lists breaker states across backends (optional model
+  // filter), paginated — the at-a-glance health view of all routed backends.
+  rpc ListCircuitStates(ListCircuitStatesRequest) returns (ListCircuitStatesResponse);
+}

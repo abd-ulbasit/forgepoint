@@ -1,0 +1,883 @@
+// ============================================================================
+// Forgepoint Model Registry Service Proto Definitions
+// ============================================================================
+//
+// WHY: The Model Registry is the system of record for ML models on the
+// platform. It answers two distinct questions for two distinct audiences:
+//   1. WRITE side (ML engineers, pipelines): "register this model, cut a new
+//      version, promote v3 to production, archive this old model."
+//   2. READ side (serving, gateway, UI, monitor): "what is the production
+//      version of model X right now? list all models tagged team=search."
+// These two access patterns have wildly different shapes and SLAs, which is
+// exactly why this service is built on CQRS.
+//
+// PATTERN — CQRS (Command Query Responsibility Segregation):
+//   COMMAND (write) path: RPCs that mutate state (RegisterModel, CreateVersion,
+//   PromoteVersion, DeleteModel) write to the NORMALIZED PostgreSQL store —
+//   the source of truth with strong consistency, FK integrity, transactions.
+//   On commit, the service publishes a domain event to NATS.
+//
+//   QUERY (read) path: RPCs that only read (GetModel, ListModels, GetVersion,
+//   ListVersions, SearchByTag) are served from a DENORMALIZED Redis projection
+//   built by a NATS consumer reacting to those same events. Reads are O(1)
+//   key lookups / sorted-set range scans — no joins, no table scans.
+//
+//   ASCII — the CQRS loop this API realizes:
+//
+//     WRITE                                            READ
+//     ─────                                            ────
+//     RegisterModel ─► Postgres (tx) ─► publish ─┐
+//     CreateVersion ─►  (truth)        NATS event │
+//     PromoteVersion ► commit                     │
+//                                                 ▼
+//                                    fp.models.>  projection consumer
+//                                                 │  (idempotent)
+//                                                 ▼
+//                                          Redis projection
+//                                                 ▲
+//                            GetModel / ListModels / GetVersion ─┘
+//                            SearchByTag  (eventually consistent)
+//
+//   WHY CQRS HERE (interview framing):
+//     - Read:write ratio is enormous. Every inference request path may ask
+//       "what's the prod version of model X?" thousands of times per second;
+//       models are registered/promoted rarely. Separating the stores lets us
+//       scale and optimize each independently (Redis read replicas vs a single
+//       Postgres primary for writes).
+//     - The read model is shaped for the query ("latest production version")
+//       so we never compute it at read time — the projection precomputes it.
+//     - Tradeoff = EVENTUAL CONSISTENCY: after a write commits, there is a
+//       brief window before the Redis projection reflects it. We accept this
+//       and document it on every read RPC. Clients that need read-your-writes
+//       (e.g., a CI step that registers then immediately deploys) must either
+//       poll, or the orchestrator consumes the event directly rather than
+//       polling the read API. See the "consistency" note on each query RPC.
+//
+//   ALTERNATIVES CONSIDERED:
+//     - Single store (Postgres only), read and write from the same tables:
+//       simplest, strongly consistent, no projection lag. Rejected as the
+//       teaching vehicle (the whole point of this service is to demonstrate
+//       CQRS) AND because the hot read ("prod version of X") would hammer
+//       Postgres on the inference path.
+//     - Event Sourcing (store events, not state): more powerful (full audit,
+//       time-travel, rebuild any projection) but heavier. We reserve event
+//       sourcing for the Feature Store. Registry stores current state in
+//       Postgres and uses events only to feed the read projection — a lighter
+//       "CQRS without event sourcing" variant, which is the common production
+//       starting point (see Greg Young's guidance; also MLflow's registry is
+//       essentially a normalized SQL store with a query layer on top).
+//
+// REAL-WORLD COMPARISON:
+//   - MLflow Model Registry: models → versions → stages (None/Staging/
+//     Production/Archived). Our stage enum mirrors this so the mental model
+//     transfers directly. We add explicit events + a Redis read model.
+//   - SageMaker Model Registry: model package groups → versioned packages with
+//     approval status. Our PromoteVersion is the analog of approval transitions.
+//   - Docker/OCI registries: name + immutable versioned artifacts addressed by
+//     digest — same "named thing with immutable versions" core idea.
+//
+// SECURITY / MASS-ASSIGNMENT POSTURE (applies to every write RPC below):
+//   Server-authoritative fields are NEVER accepted on write requests. The
+//   caller does not get to set: id, owner_id, team (derived from the caller's
+//   auth claims), stage/status (only PromoteVersion may change stage),
+//   created_at/updated_at/archived_at, or artifact_path/digest (set by the
+//   storage layer on upload). Accepting any of these would let a caller forge
+//   ownership, backdate records, or jump a version straight to production —
+//   classic mass-assignment escalation. We model only the genuinely
+//   client-supplied fields on *Request messages and derive the rest server-side.
+//
+// VERSIONING: Package path includes v1 (Buf/Google convention). Breaking
+// changes require a new forgepoint.registry.v2 package; both coexist during
+// migration. buf breaking (FILE level) guards this file.
+// ============================================================================
+
+syntax = "proto3";
+
+package forgepoint.registry.v1;
+
+// go_package mirrors common.proto / auth.proto exactly:
+//   "github.com/abd-ulbasit/forgepoint/gen/go/{package};{shortname}"
+// The short name (registryv1) is the Go package identifier, keeping imports
+// unambiguous when several proto packages are pulled into one Go file.
+option go_package = "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/registry/v1;registryv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+import "forgepoint/common/v1/common.proto";
+
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+// ============================================================================
+// ModelStage — the lifecycle state of a *version*, not the model.
+// ============================================================================
+//
+// WHY stage lives on the VERSION, not the Model:
+//   "Production" is a property of a specific set of weights, not of the model
+//   name. Model "fraud-detector" always exists; what changes over time is
+//   WHICH version is serving production traffic. Putting the stage on
+//   ModelVersion lets exactly one version per model occupy PRODUCTION while
+//   older versions sit in ARCHIVED and newer candidates wait in STAGING.
+//
+// THE TRANSITION RULES (enforced server-side, documented for interviews):
+//   DEV ──► STAGING ──► PRODUCTION ──► ARCHIVED
+//    └──────────────────────────────────► ARCHIVED (abandon a candidate)
+//   Promoting a version to PRODUCTION auto-demotes the *current* production
+//   version of the same model to ARCHIVED (single-prod invariant). This is the
+//   atomic swap that PromoteVersion performs and emits as ModelPromoted.
+//
+// WHY an enum, not a free string:
+//   Closed set, validated at the wire boundary, prevents typos like "prod" vs
+//   "production" silently fragmenting the read projection's stage index.
+//   Buf STANDARD requires the _UNSPECIFIED zero value + ENUM_NAME prefix on
+//   every value (so the int 0 never accidentally means "DEV").
+// ============================================================================
+enum ModelStage {
+  // Default zero value. Means "stage not set / unknown". A freshly created
+  // version starts at MODEL_STAGE_DEV explicitly — the server never leaves a
+  // version in UNSPECIFIED. Required by Buf ENUM_ZERO_VALUE_SUFFIX.
+  MODEL_STAGE_UNSPECIFIED = 0;
+
+  // Newly created version. Artifact may still be uploading. Not eligible for
+  // serving. This is where every CreateVersion lands.
+  MODEL_STAGE_DEV = 1;
+
+  // Validated candidate undergoing pre-production checks (shadow traffic,
+  // canary eval). Promotable to PRODUCTION.
+  MODEL_STAGE_STAGING = 2;
+
+  // The version currently serving production traffic. INVARIANT: at most one
+  // PRODUCTION version per model at any time (enforced by PromoteVersion).
+  MODEL_STAGE_PRODUCTION = 3;
+
+  // Retired version. Kept for lineage/audit and rollback, but not served and
+  // hidden from default list views. Terminal state.
+  MODEL_STAGE_ARCHIVED = 4;
+}
+
+// ============================================================================
+// VersionStatus — readiness of a version's artifact, orthogonal to stage.
+// ============================================================================
+//
+// WHY separate from ModelStage:
+//   Stage answers "where in the lifecycle is this version?" (a human/policy
+//   decision). Status answers "is the artifact physically present and usable?"
+//   (a system fact). A version can be in STAGING (stage) yet PENDING_UPLOAD
+//   (status) because the weights haven't finished uploading to MinIO. Conflating
+//   them would mean we couldn't represent "promoted but artifact still arriving".
+//   Serving must check BOTH: stage == PRODUCTION AND status == READY.
+// ============================================================================
+enum VersionStatus {
+  // Required zero value. Unknown/unset status.
+  VERSION_STATUS_UNSPECIFIED = 0;
+
+  // Version row created; artifact upload not yet confirmed. CreateVersion
+  // returns a version in this state alongside a presigned upload URL.
+  VERSION_STATUS_PENDING_UPLOAD = 1;
+
+  // Artifact present in object storage and validated (checksum verified).
+  // Only READY versions are eligible to be promoted/served.
+  VERSION_STATUS_READY = 2;
+
+  // Upload failed, checksum mismatch, or validation error. Not promotable.
+  VERSION_STATUS_FAILED = 3;
+}
+
+// ============================================================================
+// DOMAIN MESSAGES
+// ============================================================================
+
+// ============================================================================
+// Model — the named, versioned thing. The aggregate root.
+// ============================================================================
+//
+// WHY a Model has no inline stage/version fields except a denormalized pointer:
+//   A Model is the stable identity ("fraud-detector"); its versions carry the
+//   mutable lifecycle. We DO denormalize one read-optimized pointer onto the
+//   read projection — latest_version / production_version — because the single
+//   most common query is "give me the prod version of model X" and we don't
+//   want clients to ListVersions and scan. That denormalization is a READ-MODEL
+//   concern (Redis), surfaced here so GetModelResponse can include it.
+//
+// SECURITY: id, owner_id, team, created_at, updated_at, archived_at are all
+// SERVER-AUTHORITATIVE — populated by the service, never accepted from clients.
+// owner_id and team come from the caller's validated TokenClaims, not the body.
+// ============================================================================
+message Model {
+  // UUID v4. Primary key, immutable. Server-generated on RegisterModel.
+  string id = 1;
+
+  // Unique, human-friendly model name within a team namespace, e.g.
+  // "fraud-detector". Used as the addressable handle by serving/gateway.
+  // Client-supplied at registration; immutable afterward (rename = new model).
+  string name = 2;
+
+  // Free-text description. Client-supplied; mutable via a future UpdateModel.
+  string description = 3;
+
+  // The user_id of the registrant. SERVER-AUTHORITATIVE: derived from the
+  // caller's auth claims, NOT from the request body. Identifies accountability
+  // and is used by billing/notification to attribute cost and route alerts.
+  string owner_id = 4;
+
+  // Team namespace (e.g., "ml-platform"). SERVER-AUTHORITATIVE: copied from the
+  // caller's TokenClaims.team. Scopes visibility and billing. Never client-set,
+  // so a caller cannot register a model into another team's namespace.
+  string team = 5;
+
+  // ML framework, e.g. "pytorch", "tensorflow", "sklearn", "onnx".
+  // Client-supplied descriptive metadata; influences how serving loads it.
+  string framework = 6;
+
+  // Task type, e.g. "classification", "regression", "embedding", "llm".
+  // Client-supplied descriptive metadata; used for UI grouping and routing.
+  string task_type = 7;
+
+  // Arbitrary key/value tags for search and organization, e.g.
+  // {"domain": "fraud", "pii": "false"}. Drives SearchByTag's Redis tag sets.
+  // Client-supplied (a map field is order-independent and dedupes keys, which
+  // is exactly the semantics we want for tags — unlike repeated ModelTag).
+  map<string, string> tags = 8;
+
+  // READ-MODEL CONVENIENCE (eventually consistent): the version string of this
+  // model's current PRODUCTION version, or "" if none is in production. Lets a
+  // client learn the serving version from a single GetModel without a second
+  // call. Populated only on the read path (Redis projection).
+  string production_version = 9;
+
+  // READ-MODEL CONVENIENCE (eventually consistent): the most recently created
+  // version string regardless of stage. "" if the model has no versions yet.
+  string latest_version = 10;
+
+  // When the model was first registered. SERVER-AUTHORITATIVE, immutable.
+  google.protobuf.Timestamp created_at = 11;
+
+  // Last time the model row (or its denormalized pointers) changed.
+  // SERVER-AUTHORITATIVE.
+  google.protobuf.Timestamp updated_at = 12;
+
+  // Set when the model is soft-deleted/archived; null/zero while active.
+  // SERVER-AUTHORITATIVE. DeleteModel sets this rather than hard-deleting, so
+  // lineage and audit survive (and the read projection can hide it from lists).
+  google.protobuf.Timestamp archived_at = 13;
+}
+
+// ============================================================================
+// ModelVersion — an immutable, point-in-time snapshot of a model's artifact.
+// ============================================================================
+//
+// WHY versions are immutable except for stage/status transitions:
+//   The artifact (weights) and metrics captured at training time must never
+//   change — that's the whole point of a registry (reproducibility, rollback).
+//   The ONLY mutable aspects are the lifecycle stage (DEV→STAGING→PROD→ARCHIVED,
+//   via PromoteVersion) and status (PENDING_UPLOAD→READY/FAILED, set when the
+//   upload completes). Everything else is write-once.
+//
+// SECURITY: id, model_id binding, stage, status, artifact_path, artifact_digest,
+// size_bytes, created_by, created_at are SERVER-AUTHORITATIVE. A client cannot
+// hand us a version that is already PRODUCTION or claim an arbitrary digest.
+// ============================================================================
+message ModelVersion {
+  // UUID v4. Primary key for the version row. Server-generated.
+  string id = 1;
+
+  // FK to the owning Model.id. SERVER-AUTHORITATIVE: bound from the path/request
+  // target, not a forgeable body field — you create a version *of a model*.
+  string model_id = 2;
+
+  // Human-facing version label, e.g. "1", "1.2.0", "2024-06-17-a". Unique per
+  // model. SERVER-AUTHORITATIVE by default: the service assigns a monotonic
+  // version unless the client explicitly requests one (see CreateVersionRequest).
+  string version = 3;
+
+  // Free-text changelog/notes for this version. Client-supplied at creation.
+  string description = 4;
+
+  // Object-storage location of the artifact (e.g. "s3://fp-models/<model>/<ver>/
+  // model.onnx"). SERVER-AUTHORITATIVE: computed by the storage layer from the
+  // presigned-upload flow. Clients never set where bytes land — preventing path
+  // traversal / overwriting another model's artifact.
+  string artifact_path = 5;
+
+  // Content digest (e.g. "sha256:..."), verified server-side after upload.
+  // SERVER-AUTHORITATIVE. Enables content-addressable integrity + dedupe and
+  // lets serving confirm it loaded exactly the registered bytes.
+  string artifact_digest = 6;
+
+  // Artifact size in bytes. SERVER-AUTHORITATIVE (measured on upload). Surfaced
+  // for UI and for Billing to meter storage. A client-supplied size would let a
+  // caller under-report storage usage — hence server-measured only.
+  int64 size_bytes = 7;
+
+  // Training/eval metrics as a free-form struct, e.g.
+  // {"accuracy": 0.97, "auc": 0.99, "loss": 0.03}. google.protobuf.Struct (not
+  // a fixed message) because metric sets vary per model/task and we don't want a
+  // schema change every time a new metric appears. Client-supplied at creation;
+  // stored in Postgres JSONB.
+  google.protobuf.Struct metrics = 8;
+
+  // Lifecycle stage. SERVER-AUTHORITATIVE: starts at MODEL_STAGE_DEV; only
+  // PromoteVersion may advance it. Never accepted on CreateVersion (else a
+  // caller could create straight into PRODUCTION, bypassing review).
+  ModelStage stage = 9;
+
+  // Artifact readiness. SERVER-AUTHORITATIVE: PENDING_UPLOAD on creation, flipped
+  // to READY/FAILED by the storage layer once the upload is confirmed.
+  VersionStatus status = 10;
+
+  // The user_id that created this version. SERVER-AUTHORITATIVE from auth claims.
+  string created_by = 11;
+
+  // When this version was created. SERVER-AUTHORITATIVE, immutable.
+  google.protobuf.Timestamp created_at = 12;
+}
+
+// ============================================================================
+// REQUEST / RESPONSE MESSAGES
+// ============================================================================
+//
+// House rule (matches auth.proto): every RPC gets a dedicated <Rpc>Request and
+// <Rpc>Response — never google.protobuf.Empty and never a bare domain message.
+// This satisfies Buf's RPC_REQUEST_RESPONSE_UNIQUE + RPC_RESPONSE_STANDARD_NAME
+// and, more importantly, lets us add fields later without breaking the RPC.
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// RegisterModel (COMMAND / write path)
+// ----------------------------------------------------------------------------
+
+// RegisterModelRequest carries ONLY client-owned fields. Note the deliberate
+// absence of id, owner_id, team, timestamps, production_version, latest_version
+// — all server-authoritative (see mass-assignment note in the header).
+message RegisterModelRequest {
+  // Desired unique model name within the caller's team. Validated for format
+  // and uniqueness server-side; collision → ALREADY_EXISTS.
+  string name = 1;
+
+  // Optional human description.
+  string description = 2;
+
+  // Framework descriptor ("pytorch", "onnx", ...).
+  string framework = 3;
+
+  // Task type descriptor ("classification", "llm", ...).
+  string task_type = 4;
+
+  // Initial tags. Optional; more can be added later.
+  map<string, string> tags = 5;
+
+  // IDEMPOTENCY KEY (write-safety). RegisterModel is a non-idempotent create:
+  // a retried request (network blip, client retry) must NOT create a second
+  // model. The server stores this client-generated UUID with the created row;
+  // a repeat with the same key returns the original Model instead of erroring.
+  // WHY surface it in the API rather than rely on name-uniqueness: name
+  // collision would surface as ALREADY_EXISTS (an error the client must
+  // special-case), whereas an idempotency key makes the retry a clean success
+  // returning the same resource — the Stripe-style contract. Empty = the server
+  // treats the call as one-shot (still protected by name uniqueness).
+  string idempotency_key = 6;
+}
+
+// RegisterModelResponse wraps the created Model (write path returns the truth
+// from Postgres, so it is immediately consistent for the registrant — the
+// eventual-consistency caveat applies only to the READ RPCs below).
+message RegisterModelResponse {
+  // The newly registered model. production_version/latest_version are empty
+  // (no versions yet); owner_id/team/timestamps are server-populated.
+  Model model = 1;
+}
+
+// ----------------------------------------------------------------------------
+// GetModel (QUERY / read path — Redis projection)
+// ----------------------------------------------------------------------------
+
+// GetModelRequest targets a model by id OR name (one of). We allow name lookup
+// because callers (serving, CLI) usually know the human name, not the UUID.
+message GetModelRequest {
+  // The model's UUID. Takes precedence if both are set.
+  string id = 1;
+
+  // The model's name within the caller's team. Used when id is empty.
+  string name = 2;
+}
+
+// GetModelResponse wraps the Model from the READ projection.
+// CONSISTENCY: served from Redis and therefore EVENTUALLY CONSISTENT — a model
+// registered milliseconds ago may briefly 404 here until the projection catches
+// up. Callers needing read-your-writes should react to the ModelRegistered
+// event instead of polling.
+message GetModelResponse {
+  Model model = 1;
+}
+
+// ----------------------------------------------------------------------------
+// ListModels (QUERY / read path — paginated)
+// ----------------------------------------------------------------------------
+
+// ListModelsRequest lists models in the caller's team (team scoping is applied
+// server-side from auth claims — there is intentionally no team field here, so
+// a caller cannot list another team's models).
+message ListModelsRequest {
+  // Optional filter: only models whose task_type equals this value. Empty = all.
+  string task_type_filter = 1;
+
+  // Optional filter: only models using this framework. Empty = all.
+  string framework_filter = 2;
+
+  // When true, ARCHIVED models are included. Default false hides them — the
+  // common case is "show me active models". Mirrors the projection's choice to
+  // drop archived models from the default models:list set.
+  bool include_archived = 3;
+
+  // Cursor-based pagination (reused from common.proto). page_size defaults to
+  // 20 and is CAPPED AT 100 server-side — a request for more is silently
+  // clamped to 100 to bound Redis ZRANGE work and response size (DoS guard).
+  forgepoint.common.v1.PaginationRequest pagination = 4;
+}
+
+message ListModelsResponse {
+  // The page of models, ordered newest-first by created_at (the projection's
+  // sorted-set score). EVENTUALLY CONSISTENT (Redis read model).
+  repeated Model models = 1;
+
+  // next_page_token + total_count. total_count may be -1 if computing the exact
+  // count is expensive (see common.proto PaginationResponse).
+  forgepoint.common.v1.PaginationResponse pagination = 2;
+}
+
+// ----------------------------------------------------------------------------
+// SearchByTag (QUERY / read path — paginated)
+// ----------------------------------------------------------------------------
+//
+// WHY a dedicated RPC rather than a tag filter on ListModels:
+//   Tag search hits a DIFFERENT Redis structure — the per-tag set
+//   models:tag:{key}:{value} — which the projection maintains specifically so
+//   tag lookups are O(members) set reads, not scans. A separate RPC makes that
+//   distinct read shape explicit and keeps ListModels' filter surface small.
+// ----------------------------------------------------------------------------
+message SearchByTagRequest {
+  // Tag key to match, e.g. "domain".
+  string key = 1;
+
+  // Tag value to match, e.g. "fraud". (key,value) together select the
+  // models:tag:{key}:{value} set in the projection.
+  string value = 2;
+
+  // Cursor-based pagination; same 100-item server-side cap as ListModels.
+  forgepoint.common.v1.PaginationRequest pagination = 3;
+}
+
+// SearchByTagResponse reuses the same paginated shape as ListModels for client
+// uniformity. (Each list RPC still has its OWN response type to satisfy Buf's
+// RPC_RESPONSE_STANDARD_NAME — we don't share ListModelsResponse.)
+message SearchByTagResponse {
+  repeated Model models = 1;
+  forgepoint.common.v1.PaginationResponse pagination = 2;
+}
+
+// ----------------------------------------------------------------------------
+// CreateVersion (COMMAND / write path)
+// ----------------------------------------------------------------------------
+
+// CreateVersionRequest creates a new version of an existing model. The artifact
+// itself is NOT in this message — bytes go to object storage via the presigned
+// URL returned in the response (see GetUploadURL note). This keeps large blobs
+// off the gRPC path (gRPC messages are capped ~4MB by default and models can be
+// gigabytes).
+message CreateVersionRequest {
+  // Target model. SERVER-AUTHORITATIVE binding for the version's model_id —
+  // validated to exist and belong to the caller's team.
+  string model_id = 1;
+
+  // OPTIONAL explicit version label. Empty = the server auto-assigns the next
+  // monotonic version (the safe default — prevents accidental clobbering and
+  // version races). When provided, it must be unique for the model. We allow it
+  // because some teams pin meaningful versions (e.g., a git SHA or semver from
+  // CI). stage/status are NOT settable here.
+  string version = 2;
+
+  // Changelog/notes for this version.
+  string description = 3;
+
+  // Training/eval metrics (free-form struct). Stored as JSONB.
+  google.protobuf.Struct metrics = 4;
+
+  // IDEMPOTENCY KEY: a retried CreateVersion must not mint a duplicate version
+  // (which would waste a version number and a storage slot). Same semantics as
+  // RegisterModel.idempotency_key — repeat with the same key returns the
+  // original version + its (still valid) upload URL.
+  string idempotency_key = 5;
+
+  // How long the returned presigned upload URL should remain valid, in seconds.
+  // Optional; server clamps to a sane max (e.g., 3600s) to limit the window an
+  // upload credential is usable. 0 = server default.
+  int64 upload_url_ttl_seconds = 6;
+}
+
+// CreateVersionResponse returns the new version (status=PENDING_UPLOAD,
+// stage=DEV) AND a presigned URL the client PUTs the artifact bytes to.
+// WHY bundle the URL here instead of a separate round-trip: the create-then-
+// upload flow is always paired, so returning both avoids a second RPC and a
+// race where the version exists but the client lost the URL.
+message CreateVersionResponse {
+  // The created version. status will be VERSION_STATUS_PENDING_UPLOAD until the
+  // upload is confirmed; stage is MODEL_STAGE_DEV.
+  ModelVersion version = 1;
+
+  // Presigned PUT URL for the artifact. Single-use, time-limited. The bytes
+  // never traverse this gRPC service — they go straight to MinIO/S3. After a
+  // successful upload the storage layer flips status to READY.
+  string upload_url = 2;
+
+  // When upload_url stops being valid. Client must complete the PUT before this.
+  google.protobuf.Timestamp upload_url_expires_at = 3;
+}
+
+// ----------------------------------------------------------------------------
+// GetVersion (QUERY / read path)
+// ----------------------------------------------------------------------------
+
+// GetVersionRequest fetches one version, either by its version id, or by the
+// (model_id, version-label) pair — whichever the caller has on hand.
+message GetVersionRequest {
+  // The version's UUID. Takes precedence if set.
+  string id = 1;
+
+  // Alternative lookup: the owning model id...
+  string model_id = 2;
+
+  // ...plus the version label (e.g. "1.2.0"). Used together when id is empty.
+  string version = 3;
+}
+
+// GetVersionResponse wraps the ModelVersion from the read projection.
+// CONSISTENCY: EVENTUALLY CONSISTENT (Redis).
+message GetVersionResponse {
+  ModelVersion version = 1;
+}
+
+// ----------------------------------------------------------------------------
+// ListVersions (QUERY / read path — paginated)
+// ----------------------------------------------------------------------------
+
+message ListVersionsRequest {
+  // The model whose versions to list. Required.
+  string model_id = 1;
+
+  // Optional filter: only versions in this stage (e.g., only PRODUCTION).
+  // MODEL_STAGE_UNSPECIFIED (the default/zero) means "any stage".
+  ModelStage stage_filter = 2;
+
+  // Cursor-based pagination; 100-item server-side cap.
+  forgepoint.common.v1.PaginationRequest pagination = 3;
+}
+
+message ListVersionsResponse {
+  // Versions ordered newest-first. EVENTUALLY CONSISTENT (Redis read model).
+  repeated ModelVersion versions = 1;
+  forgepoint.common.v1.PaginationResponse pagination = 2;
+}
+
+// ----------------------------------------------------------------------------
+// PromoteVersion (COMMAND / write path) — the stage state machine
+// ----------------------------------------------------------------------------
+//
+// WHY one PromoteVersion RPC instead of separate Promote/Demote/Archive RPCs:
+//   The lifecycle is a single state machine; modeling it as "set target stage,
+//   server validates the transition" keeps one authoritative transition
+//   validator rather than scattering rules across four RPCs. The server rejects
+//   illegal transitions (e.g., DEV→PRODUCTION skipping STAGING, or promoting a
+//   non-READY version) with FAILED_PRECONDITION.
+//
+// THE SINGLE-PRODUCTION INVARIANT (interview-critical):
+//   Promoting version B of model M to PRODUCTION must ATOMICALLY demote the
+//   current production version A of M to ARCHIVED — there is never a moment with
+//   two production versions. This happens in ONE Postgres transaction; the
+//   resulting ModelPromoted event carries BOTH the newly-promoted version and
+//   the demoted one so downstream consumers (serving must reload, billing must
+//   re-meter, monitor must re-baseline) see the swap atomically.
+// ----------------------------------------------------------------------------
+message PromoteVersionRequest {
+  // The version to transition. SERVER-AUTHORITATIVE binding to its model.
+  string version_id = 1;
+
+  // The desired target stage. The server validates the transition is legal from
+  // the version's current stage and that the version is READY when targeting
+  // STAGING/PRODUCTION. This is the ONLY place stage is client-influenced — and
+  // even here it's a *request* the server may reject, not a direct write.
+  ModelStage target_stage = 2;
+
+  // IDEMPOTENCY KEY: promotion triggers side effects (serving reload, billing
+  // re-meter). A duplicate promote with the same key is a no-op returning the
+  // current state, so a client retry can't re-fire those side effects or emit a
+  // second ModelPromoted event.
+  string idempotency_key = 3;
+}
+
+// PromoteVersionResponse returns the version in its new stage, plus the version
+// that was demoted (if any) so the caller sees the full atomic swap result.
+message PromoteVersionResponse {
+  // The promoted version reflecting its new stage.
+  ModelVersion version = 1;
+
+  // The previously-production version that was auto-demoted to ARCHIVED by this
+  // promotion, or unset if there was no prior production version. Lets the
+  // caller (and audit log) record the exact swap.
+  ModelVersion demoted_version = 2;
+}
+
+// ----------------------------------------------------------------------------
+// DeleteModel (COMMAND / write path) — soft delete / archive-all
+// ----------------------------------------------------------------------------
+//
+// WHY soft delete, not hard delete:
+//   Models have downstream lineage (experiments, billing records, served
+//   deployments). Hard-deleting would orphan those references and destroy audit
+//   history. DeleteModel sets the model's archived_at, archives all its
+//   versions, and removes it from active read lists — but the rows survive for
+//   compliance and potential restore. This is the same posture as "soft delete"
+//   in Stripe/most SaaS registries.
+// ----------------------------------------------------------------------------
+message DeleteModelRequest {
+  // The model to archive (soft-delete). Required.
+  string id = 1;
+
+  // IDEMPOTENCY KEY: deleting an already-deleted model is naturally idempotent,
+  // but the key also guards against a retry re-emitting the ModelArchived event
+  // (which would double-notify). Optional but recommended.
+  string idempotency_key = 2;
+}
+
+// DeleteModelResponse is a NAMED EMPTY message (not google.protobuf.Empty) to
+// satisfy Buf RPC_RESPONSE_STANDARD_NAME and stay forward-compatible: if we
+// later want to return archived_at or a count of archived versions, we add
+// fields here without changing the RPC signature. See auth.proto's
+// RevokeAPIKeyResponse for the same rationale.
+message DeleteModelResponse {}
+
+// ----------------------------------------------------------------------------
+// GetDownloadURL (QUERY-ish / storage) — fetch artifact bytes out of band
+// ----------------------------------------------------------------------------
+//
+// WHY a presigned DOWNLOAD URL rather than streaming bytes through gRPC:
+//   Symmetric with the upload flow — artifacts can be gigabytes; routing them
+//   through this control-plane service would blow the gRPC message limit and
+//   waste CPU/bandwidth. Serving and the CLI fetch the artifact directly from
+//   MinIO/S3 using a short-lived, scoped credential. This RPC does NOT mutate
+//   state, so it is safe to retry and needs no idempotency key.
+// ----------------------------------------------------------------------------
+message GetDownloadURLRequest {
+  // The version whose artifact to download. Must be READY.
+  string version_id = 1;
+
+  // Requested validity of the URL in seconds; server clamps to a max. 0 =
+  // server default. Short TTLs limit how long a leaked URL is usable.
+  int64 ttl_seconds = 2;
+}
+
+message GetDownloadURLResponse {
+  // Presigned GET URL for the artifact. Time-limited, scoped to this object.
+  string download_url = 1;
+
+  // When the URL expires.
+  google.protobuf.Timestamp expires_at = 2;
+
+  // Content digest of what will be downloaded, so the client can verify
+  // integrity after fetching (matches ModelVersion.artifact_digest).
+  string artifact_digest = 3;
+}
+
+// ============================================================================
+// EVENT PAYLOAD MESSAGES (published to NATS, carried in EventEnvelope.data)
+// ============================================================================
+//
+// WHY typed event payloads (not raw JSON):
+//   These messages are packed into common.v1.EventEnvelope.data (a
+//   google.protobuf.Any). Defining them as protos gives consumers — serving,
+//   monitor, billing, notification, experiment-tracker — a typed, versioned,
+//   backward-compatibility-checked contract. The Any's type_url tells a
+//   consumer exactly which message to unmarshal. This is the "typed payload in
+//   a generic envelope" pattern from common.proto's EventEnvelope docs.
+//
+// WHY duplicate some fields here instead of embedding the full Model/Version:
+//   Events should be SELF-CONTAINED and STABLE — a consumer must be able to act
+//   on the event WITHOUT calling back into the registry (which would also defeat
+//   the async decoupling and risk reading a not-yet-projected state). We embed
+//   the full domain object where the consumer genuinely needs it (registered/
+//   created), and only the identifying + changed fields where that's enough
+//   (promoted/archived). This is a deliberate "fat enough" event design — not so
+//   thin consumers must call back, not so fat it leaks unrelated churn.
+//
+// SUBJECT MAPPING (from the platform design's NATS hierarchy):
+//   ModelRegistered      → fp.models.registered
+//   ModelVersionCreated  → fp.models.version.created
+//   ModelPromoted        → fp.models.promoted   (drives serving reload + billing)
+//   ModelArchived        → fp.models.archived
+// ============================================================================
+
+// ModelRegistered — emitted after RegisterModel commits to Postgres.
+// CONSUMERS: Pipeline Orchestrator (a registered model can become a pipeline
+// input), Experiment Tracker (link runs to the model), Notification (announce).
+message ModelRegistered {
+  // The full model as committed (authoritative snapshot at registration time).
+  // Carrying the whole object lets consumers act without a callback.
+  Model model = 1;
+}
+
+// ModelVersionCreated — emitted after CreateVersion commits. Note: emitted at
+// version-row creation (status=PENDING_UPLOAD), so consumers that care about a
+// USABLE artifact must also watch for the READY transition (a future
+// ModelVersionReady event) rather than assuming the artifact is present.
+// CONSUMERS: Experiment Tracker (associate the training run), Billing (begin
+// metering storage once READY), Notification.
+message ModelVersionCreated {
+  // The owning model's id (denormalized so consumers needn't join).
+  string model_id = 1;
+
+  // The owning model's name (saves consumers a lookup for display/routing).
+  string model_name = 2;
+
+  // The full created version snapshot.
+  ModelVersion version = 3;
+}
+
+// ModelPromoted — emitted after PromoteVersion commits the atomic stage swap.
+// This is the highest-impact event in the service: it's how serving learns to
+// load new weights, how the gateway re-points traffic, how monitor re-baselines
+// drift, and how billing changes what it meters.
+// CONSUMERS: Model Serving (reload/route to the new production version),
+// Inference Gateway (update routing table), Model Monitor (reset drift baseline
+// to the new version's training distribution), Billing (re-meter), Notification.
+message ModelPromoted {
+  // The model whose production version changed.
+  string model_id = 1;
+
+  // The model's name (for routing/display without a lookup).
+  string model_name = 2;
+
+  // The version that was promoted (id + label).
+  string version_id = 3;
+  string version = 4;
+
+  // The stage it moved FROM and the stage it moved TO. Including both makes the
+  // event self-describing for audit and lets a consumer ignore transitions it
+  // doesn't care about (e.g., monitor only reacts when to_stage == PRODUCTION).
+  ModelStage from_stage = 5;
+  ModelStage to_stage = 6;
+
+  // If this promotion auto-demoted a previous production version (the
+  // single-production invariant), its id/label so consumers can tear down the
+  // old deployment. Empty when there was no prior production version.
+  string demoted_version_id = 7;
+  string demoted_version = 8;
+
+  // Who initiated the promotion (from auth claims) — for audit trails.
+  string promoted_by = 9;
+}
+
+// ModelArchived — emitted after DeleteModel soft-deletes the model.
+// CONSUMERS: Inference Gateway (stop routing to it), Model Serving (tear down
+// any running instances), Billing (stop metering), Notification.
+message ModelArchived {
+  // The archived model's id.
+  string model_id = 1;
+
+  // The archived model's name.
+  string model_name = 2;
+
+  // Who archived it (auth claims) — for audit.
+  string archived_by = 3;
+
+  // When the archive committed (matches Model.archived_at).
+  google.protobuf.Timestamp archived_at = 4;
+}
+
+// ============================================================================
+// REGISTRY SERVICE
+// ============================================================================
+//
+// WHY a single RegistryService spanning both command and query RPCs:
+//   CQRS separates the read/write MODELS and STORES, not necessarily the API
+//   surface. Exposing both through one gRPC service keeps the client experience
+//   simple (one stub) while the IMPLEMENTATION routes commands to the Postgres
+//   write repo and queries to the Redis read repo. If read and write needed
+//   independent scaling/deploys we could split them into two services later —
+//   the proto is structured (clear COMMAND vs QUERY grouping below) so that
+//   split would be mechanical. This is the pragmatic "logical CQRS, physical
+//   monolith-of-one-service" choice MLflow's registry also makes.
+//
+// STREAMING CHOICE — why everything here is UNARY:
+//   None of these operations is a long-lived stream. Registrations and
+//   promotions are discrete commands; lookups return a bounded object; lists are
+//   PAGINATED (cursor) rather than server-streamed because pagination gives the
+//   client backpressure, resumability (the page_token survives a disconnect),
+//   and cacheability that a server stream does not. Contrast with the Pipeline
+//   Orchestrator's WatchExecution, which IS server-streaming because execution
+//   progress is a genuine open-ended event feed. Picking unary+pagination here
+//   is the correct, defensible call (interviewers probe this: "why not stream
+//   ListModels?" → backpressure + resumable cursor + simpler caching).
+//
+// RPC GROUPS:
+//   COMMANDS (Postgres write, then publish NATS event):
+//     RegisterModel, CreateVersion, PromoteVersion, DeleteModel
+//   QUERIES (Redis read projection, eventually consistent):
+//     GetModel, ListModels, SearchByTag, GetVersion, ListVersions
+//   STORAGE (object store, presigned URLs — bytes bypass this service):
+//     GetDownloadURL  (upload URL is returned inline by CreateVersion)
+// ============================================================================
+service RegistryService {
+  // --- COMMANDS (write path → Postgres → NATS event) ---
+
+  // RegisterModel creates a new model (the identity, no versions yet). Writes to
+  // Postgres and publishes ModelRegistered. owner_id/team are taken from the
+  // caller's auth claims, never the request. Idempotent via idempotency_key.
+  rpc RegisterModel(RegisterModelRequest) returns (RegisterModelResponse);
+
+  // CreateVersion cuts a new immutable version of an existing model. Writes the
+  // version row (status=PENDING_UPLOAD, stage=DEV), returns a presigned upload
+  // URL for the artifact, and publishes ModelVersionCreated. The artifact bytes
+  // never flow through this RPC.
+  rpc CreateVersion(CreateVersionRequest) returns (CreateVersionResponse);
+
+  // PromoteVersion advances a version through the stage state machine
+  // (DEV→STAGING→PRODUCTION→ARCHIVED), enforcing legal transitions and the
+  // single-production invariant in ONE Postgres transaction, then publishes
+  // ModelPromoted. This is what drives serving/gateway/monitor/billing reactions.
+  rpc PromoteVersion(PromoteVersionRequest) returns (PromoteVersionResponse);
+
+  // DeleteModel soft-deletes (archives) a model and all its versions, removes it
+  // from active read lists, and publishes ModelArchived. Rows are retained for
+  // lineage/audit — this is not a hard delete.
+  rpc DeleteModel(DeleteModelRequest) returns (DeleteModelResponse);
+
+  // --- QUERIES (read path → Redis projection; EVENTUALLY CONSISTENT) ---
+
+  // GetModel returns a single model by id or name from the Redis read model.
+  // May briefly miss a just-registered model (projection lag).
+  rpc GetModel(GetModelRequest) returns (GetModelResponse);
+
+  // ListModels returns a paginated, team-scoped page of models from the read
+  // model, newest-first, with optional task_type/framework filters. page_size is
+  // capped at 100 server-side.
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+
+  // SearchByTag returns models matching a (key,value) tag, served from the
+  // projection's per-tag Redis set. Paginated, 100-item cap.
+  rpc SearchByTag(SearchByTagRequest) returns (SearchByTagResponse);
+
+  // GetVersion returns a single version by id, or by (model_id, version) label,
+  // from the read model.
+  rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
+
+  // ListVersions returns a paginated, newest-first list of a model's versions
+  // from the read model, optionally filtered by stage. 100-item cap.
+  rpc ListVersions(ListVersionsRequest) returns (ListVersionsResponse);
+
+  // --- STORAGE (object store; bytes bypass this control-plane service) ---
+
+  // GetDownloadURL returns a short-lived presigned URL to fetch a READY
+  // version's artifact directly from MinIO/S3, plus the expected digest for
+  // integrity verification. Read-only and safe to retry.
+  rpc GetDownloadURL(GetDownloadURLRequest) returns (GetDownloadURLResponse);
+}

@@ -1,0 +1,714 @@
+// ============================================================================
+// Forgepoint Feature Store Service Proto Definitions
+// ============================================================================
+//
+// WHY: The Feature Store is the system of record for the FEATURES that models
+// consume — both at training time (offline, historical, reproducible) and at
+// inference time (online, low-latency, "latest value now"). It decouples the
+// teams that PRODUCE features (data/ML engineers running pipelines) from the
+// teams/services that CONSUME them (training jobs, the inference gateway), so
+// neither has to re-implement feature computation or worry about train/serve
+// skew. Real-world parallels: Feast, Tecton, AWS SageMaker Feature Store,
+// Databricks Feature Store.
+//
+// PATTERN — EVENT SOURCING:
+//   This service is the platform's canonical Event Sourcing example. The core
+//   idea: we DO NOT store current state and mutate it in place. Instead, every
+//   change is recorded as an immutable, append-only EVENT in a log. The
+//   "current value" of any feature is a DERIVED PROJECTION — the result of
+//   folding (replaying) the events for an entity. State is a cache of the log,
+//   never the source of truth.
+//
+//     WRITE PATH (commands → events):
+//       WriteFeatures  ─► append FeaturesWritten event(s) to feature_events
+//                         (id, feature_view_id, entity_id, version, data, ts)
+//       DefineFeatureView ─► append FeatureViewDefined event
+//
+//     READ PATH (queries → projections, NEVER hit the raw log on the hot path):
+//       GetOnlineFeatures    ─► Redis hash  feature:{view}:{entity}  (latest)
+//       GetHistoricalFeatures─► Postgres "as-of" projection (point-in-time)
+//       ListFeatureViews     ─► feature_views metadata projection
+//
+//   ASCII — the log is the truth, views are caches built from it:
+//
+//      commands                 append-only EVENT LOG (truth)
+//     ┌──────────┐   write      ┌──────────────────────────────┐
+//     │WriteFeat.│ ───────────► │ v1 FeaturesWritten {e1,...}  │
+//     │DefineView│              │ v2 FeaturesWritten {e1,...}  │
+//     └──────────┘              │ v3 FeaturesWritten {e2,...}  │
+//                               └───────────────┬──────────────┘
+//                         project / fold        │  (also emits NATS events)
+//             ┌─────────────────────────────────┼───────────────────────┐
+//             ▼                                  ▼                        ▼
+//      Redis ONLINE view              Postgres OFFLINE view        NATS subscribers
+//   feature:{view}:{entity}      DISTINCT ON(entity) ... DESC   (Experiment Tracker,
+//   (GetOnlineFeatures)          (GetHistoricalFeatures)         Model Monitor, ...)
+//
+// WHY EVENT SOURCING HERE (not just an UPDATE table):
+//   1. REPRODUCIBILITY — ML's killer requirement. To retrain or debug a model,
+//      you must reconstruct EXACTLY the feature values that existed at training
+//      time. An UPDATE-in-place table loses history; an append-only log keeps
+//      every version, so GetHistoricalFeatures(as_of=T) is a pure query, not an
+//      archaeology project. This is the whole reason feature stores exist.
+//   2. TEMPORAL / POINT-IN-TIME queries fall out for free (event before T).
+//   3. REBUILDABLE VIEWS — if Redis is flushed or a projection bug is fixed, we
+//      replay the log to rebuild online+offline views. The cache can always be
+//      regenerated; the log cannot be regenerated.
+//   4. AUDIT — every feature value's full lineage is inspectable.
+//
+// TRADEOFFS / ALTERNATIVES (interview-critical — be ready to defend):
+//   - vs CRUD table (UPDATE in place): simplest, but destroys history →
+//     impossible point-in-time reads, no reproducibility. Disqualifying here.
+//   - vs CDC/temporal tables (Postgres system-versioned rows): you DO keep
+//     history, but state is still primary and events are a side-effect; harder
+//     to publish typed domain events and to rebuild arbitrary projections.
+//   - STORAGE COST: the log grows forever. Mitigation = snapshots (periodic
+//     materialized checkpoints so replay starts mid-log, not from genesis) and
+//     compaction/retention on very old event versions. Snapshots are an
+//     implementation detail of the read side, NOT part of this API contract.
+//   - EVENTUAL CONSISTENCY: the online (Redis) projection is updated just after
+//     the event is appended, so a GetOnlineFeatures immediately after a
+//     WriteFeatures MAY briefly miss it. We document this and expose
+//     `as_of_version` in reads so callers can detect staleness.
+//
+// VERSIONING: package path includes v1 (Buf/Google convention). Breaking
+// changes require a new forgepoint.featurestore.v2 package.
+//
+// NOTE ON NAMING vs the platform design doc:
+//   The design doc sketches CreateFeatureSet/IngestFeatures; this contract uses
+//   the clearer, consumer-facing names DefineFeatureView/WriteFeatures and the
+//   "FeatureView" entity (a named, versioned schema over an entity). The domain
+//   is identical — a FeatureView is the "feature set" of the design doc.
+// ============================================================================
+
+syntax = "proto3";
+
+package forgepoint.featurestore.v1;
+
+// go_package mirrors common.proto/auth.proto:
+//   "github.com/abd-ulbasit/forgepoint/gen/go/{package};{shortname}"
+// The short name (featurestorev1) is the Go package identifier, keeping imports
+// unambiguous when several generated proto packages are used together.
+option go_package = "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/featurestore/v1;featurestorev1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+import "forgepoint/common/v1/common.proto";
+
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+// ============================================================================
+// FeatureValueType
+// ============================================================================
+//
+// WHY an enum (not a free-form string): the FeatureView schema declares the
+// expected type of each feature. The server validates incoming WriteFeatures
+// payloads against these types — rejecting, e.g., a string where a DOUBLE is
+// declared. Catching type drift at the boundary prevents silently corrupt
+// features from poisoning training data, which is one of the worst, hardest-to-
+// debug failure modes in ML ("the model got worse and nobody knows why").
+//
+// WHY THESE TYPES: they cover the ML feature primitives. Embeddings/vectors are
+// represented as DOUBLE_LIST. Free-form/structured blobs fall back to STRUCT.
+// Buf STANDARD requires the zero value to be *_UNSPECIFIED and every value to be
+// prefixed with the enum name.
+// ============================================================================
+enum FeatureValueType {
+  // Default/unset — an invalid schema declaration. Server rejects on define.
+  FEATURE_VALUE_TYPE_UNSPECIFIED = 0;
+
+  // 64-bit signed integer (counts, IDs-as-features, ordinals).
+  FEATURE_VALUE_TYPE_INT64 = 1;
+
+  // IEEE-754 double (most numeric ML features: amounts, ratios, scores).
+  FEATURE_VALUE_TYPE_DOUBLE = 2;
+
+  // UTF-8 string (categoricals before encoding, raw text features).
+  FEATURE_VALUE_TYPE_STRING = 3;
+
+  // Boolean flag feature.
+  FEATURE_VALUE_TYPE_BOOL = 4;
+
+  // Wall-clock time feature (e.g., "last_login_at"). Encoded as Timestamp.
+  FEATURE_VALUE_TYPE_TIMESTAMP = 5;
+
+  // Vector of doubles — the canonical shape for embeddings. Validation may also
+  // assert a fixed dimensionality declared in FeatureSpec.dimension.
+  FEATURE_VALUE_TYPE_DOUBLE_LIST = 6;
+
+  // Arbitrary nested structure (google.protobuf.Struct). Escape hatch for
+  // structured features that don't fit the primitives. Use sparingly — typed
+  // features are validated and indexable; structs are opaque.
+  FEATURE_VALUE_TYPE_STRUCT = 7;
+}
+
+// ============================================================================
+// DOMAIN MESSAGES
+// ============================================================================
+
+// ============================================================================
+// Entity
+// ============================================================================
+//
+// WHY: An Entity is the THING features describe and the KEY features are looked
+// up by — e.g., a "user", a "merchant", a "device". Every FeatureView is keyed
+// by exactly one Entity, and every feature value belongs to a specific entity
+// instance (entity_id, e.g., user "u_123"). At inference the gateway says "give
+// me features for user u_123"; the entity tells the store how to interpret
+// "u_123".
+//
+// WHY MODEL IT EXPLICITLY (not just a string key): naming the join key is what
+// lets multiple FeatureViews compose at serving time — a model can pull the
+// "user_credit" view and the "user_activity" view and join them on the shared
+// `user` entity. This mirrors Feast's first-class Entity concept.
+//
+// SECURITY: `name` and `join_key` are caller-provided identifiers (safe). There
+// are no owner/credential fields here — ownership lives on FeatureView and is
+// SERVER-assigned (see below) to avoid mass-assignment.
+// ============================================================================
+message Entity {
+  // Stable, unique entity name within the team: "user", "merchant", "device".
+  // Referenced by FeatureView.entity. Immutable once a view uses it.
+  string name = 1;
+
+  // The logical join key column this entity is identified by, e.g., "user_id".
+  // Documents how an entity_id maps onto upstream data for offline joins.
+  string join_key = 2;
+
+  // Human-readable description for the catalog/UI.
+  string description = 3;
+}
+
+// ============================================================================
+// FeatureSpec
+// ============================================================================
+//
+// WHY: One feature's schema — its name, type, and optional shape constraints.
+// A FeatureView holds a list of these. The server uses FeatureSpecs to VALIDATE
+// every WriteFeatures payload, which is the contract that prevents train/serve
+// skew and silent data corruption.
+// ============================================================================
+message FeatureSpec {
+  // Feature name, unique within its FeatureView: "txn_count_7d", "embedding".
+  // Becomes a key in the FeatureValues map written/served for an entity.
+  string name = 1;
+
+  // Declared value type. Server validates written values against this.
+  FeatureValueType value_type = 2;
+
+  // Human-readable description (units, semantics) for the catalog/UI.
+  string description = 3;
+
+  // For DOUBLE_LIST features: required vector length (e.g., 768 for an
+  // embedding). 0 = unconstrained/not-applicable. Lets the server reject
+  // wrong-dimension vectors before they reach training.
+  int32 dimension = 4;
+}
+
+// ============================================================================
+// FeatureView
+// ============================================================================
+//
+// WHY: A FeatureView is the unit of definition and serving — a NAMED, VERSIONED
+// schema (a set of FeatureSpecs) over a single Entity. It is the design doc's
+// "feature set". Consumers request features by (feature_view, entity_id); the
+// view tells the store which features exist and how to validate/serve them.
+//
+// IMMUTABILITY + VERSIONING (event-sourcing tie-in): a FeatureView's schema is
+// itself defined by an event (FeatureViewDefined). `schema_version` increments
+// when the schema changes (a new FeatureViewDefined event), so historical reads
+// can be interpreted against the schema that was in effect at the time. We
+// favor additive schema evolution (add features) over breaking changes.
+//
+// SECURITY — SERVER-AUTHORITATIVE FIELDS (NOT accepted on define/write):
+//   id, owner_user_id, owner_team, schema_version, created_at, updated_at are
+//   all set by the SERVER from the authenticated principal / clock / sequence.
+//   The client never sends them on DefineFeatureViewRequest. This avoids
+//   mass-assignment (a caller forging owner_team to access another team's data
+//   or back-dating created_at). The auth interceptor's TokenClaims is the only
+//   trusted source of owner identity.
+// ============================================================================
+message FeatureView {
+  // UUID v4. SERVER-assigned. Stable handle used by all read/write RPCs.
+  string id = 1;
+
+  // Unique, human-readable view name within the team: "user_credit_features".
+  string name = 2;
+
+  // Human-readable description for the catalog/UI.
+  string description = 3;
+
+  // The Entity this view is keyed by. Every feature row belongs to one
+  // entity instance (entity_id) of this entity's type.
+  Entity entity = 4;
+
+  // The schema: the features this view contains. Server validates writes
+  // against these specs.
+  repeated FeatureSpec features = 5;
+
+  // Monotonic schema version. SERVER-assigned. Increments on each schema
+  // change (each FeatureViewDefined event for this name). Lets historical
+  // reads reason about which schema was in effect.
+  int64 schema_version = 6;
+
+  // Owning user (UUID). SERVER-assigned from the authenticated caller. Never
+  // accepted from the client (mass-assignment guard).
+  string owner_user_id = 7;
+
+  // Owning team label. SERVER-assigned from TokenClaims.team. Used for
+  // team-scoped authorization on reads/writes. Never client-supplied.
+  string owner_team = 8;
+
+  // When this view was first defined. SERVER-assigned. Immutable.
+  google.protobuf.Timestamp created_at = 9;
+
+  // When this view's schema was last changed. SERVER-assigned.
+  google.protobuf.Timestamp updated_at = 10;
+}
+
+// ============================================================================
+// FeatureValues
+// ============================================================================
+//
+// WHY a map<string, Value>: a single entity's feature row is a set of
+// name→value pairs. We use google.protobuf.Value (the well-known type) so any
+// declared FeatureValueType — number, string, bool, list (DOUBLE_LIST), or
+// nested struct — maps onto one wire representation, while the FeatureView's
+// FeatureSpecs carry the authoritative type. This keeps the message generic
+// over feature types without an enormous oneof per feature.
+//
+//   WHY NOT bytes: opaque bytes would lose the ability to inspect/validate/serve
+//   individual features and would force every consumer to agree on an encoding.
+//   WHY NOT a fixed message per view: views are user-defined at runtime; we
+//   can't generate a proto type per view.
+//
+// The Timestamp here is the EVENT TIME — when these feature values became true
+// (NOT when they were ingested). Point-in-time correctness depends on event
+// time, so it is a first-class field, not server wall-clock. (Ingest/append
+// time is recorded separately by the server in the event log.)
+// ============================================================================
+message FeatureValues {
+  // The entity instance these values describe, e.g., "u_123". Interpreted
+  // against the FeatureView's Entity.join_key.
+  string entity_id = 1;
+
+  // name → value for each feature in this row. Keys must match FeatureSpec
+  // names in the view; the server validates value kinds against declared types.
+  map<string, google.protobuf.Value> values = 2;
+
+  // EVENT TIME: when these values became valid in the real world. This is the
+  // timestamp point-in-time queries compare against (GetHistoricalFeatures
+  // as_of). Caller-supplied because only the producer knows the true event time
+  // (e.g., backfilling yesterday's features). If omitted on write, the server
+  // defaults it to ingest time and says so.
+  google.protobuf.Timestamp event_time = 3;
+}
+
+// ============================================================================
+// FeatureVector
+// ============================================================================
+//
+// WHY a distinct read-side type (vs reusing FeatureValues): a served feature
+// vector carries PROVENANCE the write side doesn't — which schema_version and
+// which event/log version produced it, and the projection's own timestamp.
+// Returning the version that served the value lets callers (and the Model
+// Monitor) detect staleness and reproduce reads. This separation (write command
+// shape vs read projection shape) is idiomatic CQRS, the natural companion to
+// event sourcing.
+// ============================================================================
+message FeatureVector {
+  // The entity instance this vector is for.
+  string entity_id = 1;
+
+  // name → value for the requested features. Missing requested features are
+  // simply absent here (see GetOnlineFeaturesResponse.missing_features).
+  map<string, google.protobuf.Value> values = 2;
+
+  // The event-log version that produced these values (the latest event applied
+  // for this entity, at or before as_of for historical reads). Lets the caller
+  // pin/repro a read and detect staleness against later writes.
+  int64 as_of_version = 3;
+
+  // Event time of the values served (the producing event's event_time).
+  google.protobuf.Timestamp event_time = 4;
+
+  // The FeatureView schema_version these values were validated against.
+  int64 schema_version = 5;
+}
+
+// ============================================================================
+// REQUEST / RESPONSE MESSAGES
+// ============================================================================
+
+// ============================================================================
+// DefineFeatureView
+// ============================================================================
+
+// DefineFeatureViewRequest declares (or evolves) a FeatureView schema.
+//
+// EVENT-SOURCING SEMANTICS: this is a COMMAND that, on success, appends a
+// FeatureViewDefined event. Calling it again for the same `name` with a changed
+// schema appends another FeatureViewDefined and bumps schema_version (additive
+// evolution preferred). The append, not an UPDATE, is the source of truth.
+//
+// SECURITY: only schema-shaping inputs are accepted. id, owner_user_id,
+// owner_team, schema_version, created_at, updated_at are SERVER-assigned (the
+// owner from TokenClaims) — deliberately NOT in this request to block
+// mass-assignment.
+message DefineFeatureViewRequest {
+  // Unique view name within the caller's team. First call creates it; a later
+  // call with the same name evolves the schema (new schema_version).
+  string name = 1;
+
+  // Human-readable description for the catalog.
+  string description = 2;
+
+  // The Entity this view is keyed by (name + join_key). Defining the entity
+  // inline keeps the view self-contained for M2; a first-class entity registry
+  // is a possible later refinement.
+  Entity entity = 3;
+
+  // The feature schema (specs). Server validates: non-empty, unique names,
+  // valid value_types, sane dimensions.
+  repeated FeatureSpec features = 4;
+
+  // IDEMPOTENCY KEY (interview-critical for "exactly-once intent"):
+  //   DefineFeatureView mutates state by appending an event. A network retry
+  //   after a server-side success (response lost) must NOT append a duplicate
+  //   FeatureViewDefined / spuriously bump schema_version. The server records
+  //   processed idempotency_keys; a repeat returns the SAME FeatureView. UUID
+  //   v4 generated by the client per logical attempt (not per retry).
+  string idempotency_key = 5;
+}
+
+// DefineFeatureViewResponse wraps the resulting FeatureView (with all
+// SERVER-assigned fields populated). Wrapped, not returned bare, per Buf
+// RPC_RESPONSE_STANDARD_NAME and for forward-compatibility (e.g., adding a
+// `created` bool to distinguish create vs evolve later).
+message DefineFeatureViewResponse {
+  // The defined/evolved view, including SERVER-assigned id, owner, version,
+  // timestamps.
+  FeatureView feature_view = 1;
+}
+
+// ============================================================================
+// ListFeatureViews
+// ============================================================================
+
+// ListFeatureViewsRequest pages the FeatureView catalog (a read projection over
+// FeatureViewDefined events). Reuses common.v1.PaginationRequest for a uniform
+// cursor-based shape across the platform (see common.proto for the WHY).
+message ListFeatureViewsRequest {
+  // Optional: case-insensitive substring filter on view name. Empty = no
+  // filter. Team scoping is applied SERVER-side from TokenClaims.team (NOT a
+  // client field) so a caller cannot enumerate another team's catalog.
+  string name_filter = 1;
+
+  // Cursor-based pagination. page_size defaults to 20; the server CAPS it at
+  // 100 (oversized requests are clamped, not rejected) to bound response size
+  // and prevent enumeration/DoS.
+  forgepoint.common.v1.PaginationRequest pagination = 2;
+}
+
+message ListFeatureViewsResponse {
+  // The page of feature views (catalog projection). Schemas are included so a
+  // UI/SDK can render the catalog without N follow-up calls.
+  repeated FeatureView feature_views = 1;
+
+  // next_page_token + total_count. total_count may be -1 when expensive.
+  forgepoint.common.v1.PaginationResponse pagination = 2;
+}
+
+// ============================================================================
+// WriteFeatures
+// ============================================================================
+
+// WriteFeaturesRequest appends new feature values — the primary EVENT-SOURCING
+// write. It records FeaturesWritten event(s) into the append-only log; it does
+// NOT update rows in place. Subsequent reads see these via the materialized
+// views the server updates from the new events.
+//
+// WHY BATCH (repeated FeatureValues): feature pipelines write thousands of rows
+// per run. One row per RPC would be chatty and lose write atomicity. A batch
+// appends as one logical, ordered set of events (one log version range),
+// matching how producers actually emit features.
+//
+// SECURITY: the caller may write only to views their team owns (enforced
+// server-side from TokenClaims). No owner/version/append-time fields are
+// accepted — those are SERVER-assigned. event_time inside FeatureValues IS
+// caller-supplied (it is domain data the producer owns, not a security field).
+message WriteFeaturesRequest {
+  // Target view (UUID, from FeatureView.id). The view's schema validates the
+  // payload. Using the immutable id (not name) avoids ambiguity if a view is
+  // later renamed.
+  string feature_view_id = 1;
+
+  // The feature rows to append. Each entry's `values` are validated against the
+  // view's FeatureSpecs (names + types + dimensions). A type mismatch fails the
+  // WHOLE batch (INVALID_ARGUMENT) so partial-corrupt writes can't slip in.
+  repeated FeatureValues features = 2;
+
+  // IDEMPOTENCY KEY: a retried WriteFeatures (lost response) must not append the
+  // same rows twice — duplicate feature events would corrupt counts and
+  // point-in-time history. The server deduplicates on this key (UUID v4 per
+  // logical batch) and returns the original result on replay. This is how an
+  // event-sourced write achieves at-least-once delivery with exactly-once
+  // EFFECT.
+  string idempotency_key = 3;
+}
+
+// WriteFeaturesResponse confirms the append and returns the assigned log
+// version range, so producers can correlate, audit, and (if needed) wait for
+// the online projection to catch up to written_through_version.
+message WriteFeaturesResponse {
+  // Number of feature rows (events) appended.
+  int32 written_count = 1;
+
+  // The highest event-log version assigned by this append. Reads observing an
+  // as_of_version >= this value are guaranteed to include this batch — useful
+  // for read-your-writes checks against the eventually-consistent online view.
+  int64 written_through_version = 2;
+}
+
+// ============================================================================
+// GetOnlineFeatures
+// ============================================================================
+
+// GetOnlineFeaturesRequest reads the LATEST feature values for entities from the
+// low-latency online projection (Redis hash feature:{view}:{entity}). This is
+// the inference hot path: the Inference Gateway calls it per prediction, so it
+// must be fast and is served from the cache projection, never by replaying the
+// log.
+//
+// PATTERN NOTE: this is the "read model" of CQRS over the event log. It is
+// eventually consistent with WriteFeatures (see eventual-consistency note in
+// the file header); as_of_version in the response lets callers detect lag.
+message GetOnlineFeaturesRequest {
+  // Target view (UUID).
+  string feature_view_id = 1;
+
+  // Entity instances to fetch (e.g., ["u_123","u_456"]). Batched to amortize
+  // round-trips for models that score many entities at once. Server CAPS the
+  // batch size (documented limit, e.g., 1000) to bound latency/payload.
+  repeated string entity_ids = 2;
+
+  // Optional projection: only return these feature names. Empty = all features
+  // in the view. Lets a model fetch just the columns it needs (smaller payload,
+  // less Redis work).
+  repeated string feature_names = 3;
+}
+
+message GetOnlineFeaturesResponse {
+  // One vector per found entity (order not guaranteed). Each carries its
+  // as_of_version/event_time/schema_version provenance.
+  repeated FeatureVector vectors = 1;
+
+  // Entity ids requested but absent in the online view (never written, or
+  // evicted). Returned explicitly (rather than silently dropped) so the caller
+  // can decide: use a default, fall back to GetHistoricalFeatures, or error.
+  repeated string missing_entity_ids = 2;
+}
+
+// ============================================================================
+// GetHistoricalFeatures
+// ============================================================================
+
+// GetHistoricalFeaturesRequest performs a POINT-IN-TIME ("as-of") read against
+// the offline projection of the event log: for each entity, the feature values
+// from the latest event with event_time <= as_of. This is the reproducibility
+// workhorse — training jobs use it to assemble the exact feature snapshot that
+// existed when labels were observed, eliminating LABEL LEAKAGE (using features
+// computed AFTER the prediction time).
+//
+// WHY UNARY (not server-streaming) for M2: training feature retrieval is
+// typically a bounded set of (entity, timestamp) lookups assembled into a
+// dataset, and the result is paginated. A large-scale "point-in-time JOIN"
+// producing millions of rows is a batch/offline job (write to object storage,
+// return a URI) rather than a synchronous stream — a deliberate later
+// refinement, called out here so the unary choice is defensible.
+message GetHistoricalFeaturesRequest {
+  // Target view (UUID).
+  string feature_view_id = 1;
+
+  // Entity instances to retrieve as-of the timestamp. Server CAPS batch size
+  // (documented) to bound the scan.
+  repeated string entity_ids = 2;
+
+  // POINT-IN-TIME cutoff. For each entity, return the values from the latest
+  // event with event_time <= as_of. REQUIRED — a missing as_of would make the
+  // query non-reproducible (it would mean "now", which changes over time).
+  google.protobuf.Timestamp as_of = 3;
+
+  // Optional feature-name projection. Empty = all features in the view.
+  repeated string feature_names = 4;
+
+  // Cursor-based pagination over the entity result set (large training pulls
+  // page through results). page_size capped at 100 server-side.
+  forgepoint.common.v1.PaginationRequest pagination = 5;
+}
+
+message GetHistoricalFeaturesResponse {
+  // One vector per entity that had at least one event at or before `as_of`.
+  // Each vector's as_of_version is the log version of the event that satisfied
+  // the point-in-time read (so the snapshot is exactly reproducible).
+  repeated FeatureVector vectors = 1;
+
+  // Requested entities with NO event at or before `as_of` (they did not exist
+  // yet at that time). Explicit, so training code can drop or default them.
+  repeated string missing_entity_ids = 2;
+
+  // next_page_token + total_count for the entity result set.
+  forgepoint.common.v1.PaginationResponse pagination = 3;
+}
+
+// ============================================================================
+// EVENT PAYLOADS (published to NATS, carried in common.v1.EventEnvelope.data)
+// ============================================================================
+//
+// WHY typed event payloads: the EventEnvelope's `data` is a google.protobuf.Any.
+// Defining concrete payload messages here lets producers pack a typed value and
+// consumers unpack it with compile-time safety (vs hand-parsing JSON). These
+// messages are the PUBLIC async contract of the Feature Store — they appear in
+// the catalog of events the platform emits.
+//
+// SUBJECT HIERARCHY (matches the design doc fp.features.>):
+//   fp.features.view.defined   → FeatureViewDefined
+//   fp.features.written        → FeaturesWritten
+//
+// WHY these events exist (consumers):
+//   - Experiment Tracker correlates which feature versions fed a training run.
+//   - Model Monitor watches FeaturesWritten to detect feature/data drift and,
+//     in the closed loop, can trigger retraining.
+//   - Notification/audit subscribers log schema changes.
+//
+// PAYLOAD DESIGN — "thin" events with keys + summary, not full row dumps:
+//   FeaturesWritten carries the version range and the affected entity ids, NOT
+//   every feature value. WHY: events are for NOTIFICATION and correlation, not
+//   bulk data transfer; consumers that need the actual values call
+//   GetOnlineFeatures/GetHistoricalFeatures (the read models). This keeps NATS
+//   messages small, avoids duplicating the (large) feature payloads onto the
+//   bus, and prevents the event bus from becoming a second source of truth.
+//   This is the standard "event-carried state transfer vs thin event" tradeoff;
+//   we choose thin events backed by query-able read models.
+// ============================================================================
+
+// FeatureViewDefined is published after a FeatureView is created or its schema
+// evolves (subject: fp.features.view.defined).
+message FeatureViewDefined {
+  // The view's stable id.
+  string feature_view_id = 1;
+
+  // The view name (human-friendly, for routing/filtering by subscribers).
+  string name = 2;
+
+  // The schema version this event represents (1 on create, +1 on each evolve).
+  int64 schema_version = 3;
+
+  // Owning team (for team-scoped consumers/audit). SERVER-assigned, as on the
+  // FeatureView itself.
+  string owner_team = 4;
+
+  // When the definition/evolution happened.
+  google.protobuf.Timestamp occurred_at = 5;
+}
+
+// FeaturesWritten is published after a WriteFeatures append commits
+// (subject: fp.features.written). THIN by design (see note above): it announces
+// "these entities in this view changed up to this version" so consumers can
+// react and, if needed, pull the actual values from the read models.
+message FeaturesWritten {
+  // The view that received the append.
+  string feature_view_id = 1;
+
+  // The view name (convenience for subscribers filtering by name).
+  string feature_view_name = 2;
+
+  // The entity ids whose features changed in this batch. Consumers (e.g., the
+  // Model Monitor) use these to scope drift checks / cache invalidation.
+  // For very large batches this MAY be truncated by the server; written_count
+  // remains the authoritative total.
+  repeated string entity_ids = 3;
+
+  // Total rows appended in this batch (authoritative even if entity_ids above
+  // is truncated for message-size reasons).
+  int32 written_count = 4;
+
+  // Highest event-log version assigned by this append. A consumer can request
+  // features as_of_version >= this to be sure it sees the new data.
+  int64 written_through_version = 5;
+
+  // When the append committed (server time).
+  google.protobuf.Timestamp occurred_at = 6;
+}
+
+// ============================================================================
+// FEATURE STORE SERVICE
+// ============================================================================
+//
+// WHY one FeatureStoreService (not split into Catalog/Write/Serve services):
+//   definition (schema), ingestion (append), and serving (project) all operate
+//   on the SAME event log and views and share the same team-ownership boundary.
+//   Splitting them would force inter-service calls and a shared event store
+//   across service boundaries — violating database-per-service. They live
+//   behind one boundary; CQRS happens INSIDE this service (write model = event
+//   log; read models = Redis online + Postgres offline), not across services.
+//
+// RPC CATEGORIES:
+//   DEFINITION (catalog):  DefineFeatureView, ListFeatureViews
+//   WRITE (commands):      WriteFeatures                 → appends events
+//   READ (projections):    GetOnlineFeatures (latest),
+//                          GetHistoricalFeatures (point-in-time)
+//
+// STREAMING CHOICE (interview-critical):
+//   ALL RPCs are UNARY. Justification:
+//     - WriteFeatures: producers emit in BATCHES (one RPC = one atomic append
+//       with one idempotency key). Client-streaming would blur the idempotency/
+//       atomicity boundary (when is the append "committed"?). Bounded batches +
+//       idempotency key is simpler and safer.
+//     - GetOnlineFeatures: a single fast key→value projection read; sub-ms
+//       budget on the inference hot path — streaming overhead is unwarranted.
+//     - GetHistoricalFeatures: bounded, PAGINATED point-in-time pulls. Truly
+//       huge training joins are an offline batch job (export to object storage),
+//       not a synchronous server stream — a deliberate later refinement.
+//   So no RPC here is server- or bidi-streaming, by design, and the reasons are
+//   documented so the choice is defensible.
+//
+// EVENT-SOURCING RECAP (what an interviewer will probe):
+//   * Source of truth = append-only feature_events log. Views are caches.
+//   * Reads never replay on the hot path; they read projections.
+//   * Reproducibility = GetHistoricalFeatures(as_of) over event_time.
+//   * Recovery = replay the log to rebuild Redis + Postgres views.
+//   * Exactly-once EFFECT under retries = idempotency_key on mutating RPCs.
+//   * Eventual consistency online = surfaced via as_of_version in reads.
+// ============================================================================
+service FeatureStoreService {
+  // DefineFeatureView creates a FeatureView or evolves its schema (append a
+  // FeatureViewDefined event; bump schema_version). Owner/team/timestamps are
+  // SERVER-assigned. Idempotent via idempotency_key. Requires "features:write".
+  rpc DefineFeatureView(DefineFeatureViewRequest) returns (DefineFeatureViewResponse);
+
+  // ListFeatureViews returns a paginated catalog of feature views (a projection
+  // over FeatureViewDefined events), scoped to the caller's team. page_size is
+  // capped at 100 server-side. Requires "features:read".
+  rpc ListFeatureViews(ListFeatureViewsRequest) returns (ListFeatureViewsResponse);
+
+  // WriteFeatures appends a batch of feature rows to the event log (the core
+  // event-sourcing write). Values are validated against the view schema; a type
+  // mismatch fails the whole batch. Idempotent via idempotency_key. Emits
+  // FeaturesWritten on commit. Requires "features:write".
+  rpc WriteFeatures(WriteFeaturesRequest) returns (WriteFeaturesResponse);
+
+  // GetOnlineFeatures returns the LATEST feature values for entities from the
+  // low-latency online projection (the inference hot path). Eventually
+  // consistent with writes; response carries as_of_version for staleness
+  // detection. Requires "features:read".
+  rpc GetOnlineFeatures(GetOnlineFeaturesRequest) returns (GetOnlineFeaturesResponse);
+
+  // GetHistoricalFeatures returns POINT-IN-TIME ("as-of") feature values from
+  // the offline projection — for each entity, the latest event with
+  // event_time <= as_of. Powers reproducible training and prevents label
+  // leakage. Paginated; page_size capped at 100. Requires "features:read".
+  rpc GetHistoricalFeatures(GetHistoricalFeaturesRequest) returns (GetHistoricalFeaturesResponse);
+}

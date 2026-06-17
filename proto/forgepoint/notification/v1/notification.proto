@@ -1,0 +1,700 @@
+// ============================================================================
+// Forgepoint Notification Service Proto Definitions
+// ============================================================================
+//
+// WHY: The Notification service is the platform's "town crier" — it turns
+// internal platform events (a pipeline failed, a model drifted, a quota was
+// exceeded) into human-facing alerts (webhook, Slack, email). Crucially, it
+// does this WITHOUT any other service knowing it exists.
+//
+// PATTERN — CHOREOGRAPHY (Pure Event Reactor):
+//   In a CHOREOGRAPHY architecture there is NO central coordinator telling
+//   services what to do next. Each service reacts to events it observes and
+//   independently decides how to respond. Contrast with ORCHESTRATION (see the
+//   Pipeline Orchestrator / saga), where one component issues explicit commands
+//   ("now run step 2, now compensate step 1") and owns the workflow state.
+//
+//   The Notification service is the purest expression of choreography in
+//   Forgepoint:
+//     - It SUBSCRIBES to the entire event firehose (`fp.>` on NATS JetStream).
+//     - For each event it matches the event's `type` against user-configured
+//       RULES (e.g. rule pattern `fp.pipelines.*` matches both
+//       `fp.pipelines.started` and `fp.pipelines.failed`).
+//     - For each matching rule it DELIVERS the event over the rule's channel.
+//   No producer ever calls this service. No producer knows a notification was
+//   sent. Adding a brand-new event type requires ZERO code changes here — a
+//   user just authors a rule whose pattern matches the new subject. THAT is the
+//   payoff of choreography: extreme decoupling and independent evolvability.
+//
+//   THE OTHER SIDE OF THE COIN (interview tradeoff): choreography's weakness is
+//   that no single place describes "the whole workflow". To answer "what
+//   happens when a pipeline fails?" you must inspect every subscriber. We accept
+//   that here because notification is a leaf reaction, not a multi-step business
+//   transaction — there is no distributed state to coordinate or compensate.
+//
+// WHY THE gRPC SURFACE IS DELIBERATELY TINY:
+//   The service's REAL work happens on the async (NATS) path — consuming events
+//   and delivering them. Almost nothing about that flow is a synchronous
+//   request/response, so it does not belong in gRPC. The gRPC API exists ONLY
+//   for the human-facing CONTROL PLANE:
+//     - reading the notifications I've been sent (inbox) — List/Get/MarkRead
+//     - configuring HOW and WHEN I want to be notified — Get/UpdatePreferences
+//   That is the entire RPC surface. We resisted adding "SendNotification" or
+//   "TriggerAlert" RPCs precisely because a producer calling us would VIOLATE
+//   choreography — it would make us an orchestrated dependency. Producers emit
+//   events; they never address us directly.
+//
+//   NOTE ON RULES: the implementation plan also mentions CreateRule/ListRules
+//   for the matching engine. In this v1 contract we fold a user's routing
+//   choices into NotificationPreferences (per-channel, per-event-category
+//   toggles) rather than a free-form rule CRUD API, because that is the shape an
+//   end user actually wants ("email me on failures, Slack me on drift"). A
+//   richer admin rule-builder can arrive as a v2 addition without breaking this
+//   surface. This tradeoff is called out so it is defensible in an interview.
+//
+// REAL-WORLD COMPARISON:
+//   - PagerDuty / Opsgenie: event intake → routing rules → notification
+//     channels. Their "event rules" are exactly our pattern-matched rules.
+//   - GitHub notifications: events (push, PR, mention) → per-user preferences →
+//     web inbox + email. Our List/MarkRead inbox mirrors GitHub's notifications
+//     center; UpdatePreferences mirrors GitHub's notification settings.
+//   - AWS EventBridge → SNS: rules match event patterns, fan out to targets.
+//   - Kafka consumer groups reacting to a topic with no producer awareness.
+//
+// DATA STORE: PostgreSQL (notifications inbox + delivery log + preferences).
+//
+// VERSIONING: Package path includes v1 following Buf/Google convention.
+// Breaking changes require a new forgepoint.notification.v2 package.
+// ============================================================================
+
+syntax = "proto3";
+
+package forgepoint.notification.v1;
+
+// go_package follows the pattern established in common.proto:
+//   "github.com/abd-ulbasit/forgepoint/gen/go/{package};{shortname}"
+// The semicolon-separated short name (notificationv1) is the Go package
+// identifier, keeping imports unambiguous when several proto packages coexist.
+option go_package = "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/notification/v1;notificationv1";
+
+import "google/protobuf/timestamp.proto";
+import "forgepoint/common/v1/common.proto";
+
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+// ============================================================================
+// NotificationChannel
+// ============================================================================
+//
+// WHY an enum (not a free string): the set of delivery transports is small,
+// closed, and security-sensitive (each channel has its own config + secret
+// handling). An enum gives us exhaustive switch handling in Go and prevents a
+// caller from inventing a channel the delivery layer can't service.
+//
+// CHANNELS:
+//   IN_APP  — the platform web inbox (List/Get/MarkRead). Always available, no
+//             external config, no secrets. This is the default "channel" for
+//             every Notification row even when a fan-out channel also fires.
+//   WEBHOOK — HTTP POST of the event payload to a user-configured URL. Delivery
+//             uses retries + a per-URL circuit breaker (see implementation plan
+//             Task 9.4) so a dead endpoint doesn't get hammered.
+//   SLACK   — POST to a Slack Incoming Webhook URL (a specialization of WEBHOOK
+//             with Slack's message JSON shape).
+//   EMAIL   — SMTP delivery. May be mocked in non-prod (per the plan).
+//
+// Buf STANDARD requires: zero value suffixed _UNSPECIFIED; every value prefixed
+// with the enum name (ENUM_VALUE_PREFIX + ENUM_ZERO_VALUE_SUFFIX).
+// ============================================================================
+enum NotificationChannel {
+  // Default/unknown. A well-formed preference never uses this; it exists so the
+  // wire's zero value is explicitly "not set" rather than a meaningful channel.
+  NOTIFICATION_CHANNEL_UNSPECIFIED = 0;
+
+  // Platform web inbox (the List/Get/MarkRead surface in this proto).
+  NOTIFICATION_CHANNEL_IN_APP = 1;
+
+  // Generic HTTP POST to a caller-supplied URL.
+  NOTIFICATION_CHANNEL_WEBHOOK = 2;
+
+  // Slack Incoming Webhook (Slack-shaped JSON over an HTTP POST).
+  NOTIFICATION_CHANNEL_SLACK = 3;
+
+  // Email via SMTP.
+  NOTIFICATION_CHANNEL_EMAIL = 4;
+}
+
+// ============================================================================
+// NotificationSeverity
+// ============================================================================
+//
+// WHY: A coarse priority lets the inbox UI sort/badge notifications and lets
+// preferences gate noise (e.g. "only EMAIL me for ERROR and above"). The
+// severity is derived SERVER-SIDE from the event type — a `*.failed` or
+// `*.drift.detected` event maps to ERROR/WARNING; informational lifecycle
+// events map to INFO. Clients never set this (it's not on any write request).
+//
+// We keep this intentionally small (INFO/WARNING/ERROR/CRITICAL) — the classic
+// syslog-lite ladder — because a finer scale invites bikeshedding and is hard
+// to map consistently from arbitrary event types.
+// ============================================================================
+enum NotificationSeverity {
+  NOTIFICATION_SEVERITY_UNSPECIFIED = 0;
+
+  // Routine lifecycle signal (e.g. pipeline started). Low attention.
+  NOTIFICATION_SEVERITY_INFO = 1;
+
+  // Something to look at soon (e.g. mild drift, approaching quota).
+  NOTIFICATION_SEVERITY_WARNING = 2;
+
+  // A failure occurred (pipeline failed, delivery failed, quota exceeded).
+  NOTIFICATION_SEVERITY_ERROR = 3;
+
+  // Page-someone-now class (e.g. production model drift past the hard threshold,
+  // canary failure during a promotion). Highest attention.
+  NOTIFICATION_SEVERITY_CRITICAL = 4;
+}
+
+// ============================================================================
+// DeliveryStatus
+// ============================================================================
+//
+// WHY a per-notification delivery status enum: a single logical notification can
+// fan out to several channels, each of which can independently succeed, fail, or
+// still be retrying. The inbox needs to surface "did my Slack alert actually go
+// out?" The status is owned entirely by the delivery layer (server-authoritative)
+// and reported back on Notification reads; it is never accepted on a write.
+// ============================================================================
+enum DeliveryStatus {
+  DELIVERY_STATUS_UNSPECIFIED = 0;
+
+  // Accepted into the system, not yet attempted on a fan-out channel.
+  DELIVERY_STATUS_PENDING = 1;
+
+  // Currently being retried (within the exponential-backoff window).
+  DELIVERY_STATUS_RETRYING = 2;
+
+  // Successfully delivered on the channel (e.g. webhook returned 2xx).
+  DELIVERY_STATUS_DELIVERED = 3;
+
+  // Permanently failed after exhausting retries / circuit-breaker open.
+  DELIVERY_STATUS_FAILED = 4;
+
+  // Suppressed by the user's preferences (e.g. severity below their threshold,
+  // or quiet hours). Recorded so the inbox can show "we chose not to page you".
+  DELIVERY_STATUS_SUPPRESSED = 5;
+}
+
+// ============================================================================
+// DOMAIN MESSAGES
+// ============================================================================
+
+// ============================================================================
+// Notification
+// ============================================================================
+//
+// WHY this is the central read model: a Notification is the materialized,
+// human-facing record produced when an inbound platform event matched a user's
+// preferences. It is what the inbox (List/Get) returns and what MarkRead
+// mutates. Think of it as one row in GitHub's notification center.
+//
+// PROVENANCE FIELDS (event_id, event_type, source_service): we deliberately keep
+// a back-pointer to the originating EventEnvelope. WHY: it makes notifications
+// debuggable and traceable end-to-end ("this Slack alert came from event
+// <uuid> of type fp.pipelines.failed produced by the pipeline service"). It also
+// powers idempotency on the consumer — see the consumer note in the service doc.
+//
+// SECURITY / AUTHORITY: every field here is SERVER-AUTHORITATIVE. The recipient,
+// severity, status, timestamps, and provenance are all derived from the event
+// and the matching engine — there is no client write path that sets them. The
+// inbox is read-mostly; the only mutation a client can perform is MarkRead.
+// ============================================================================
+message Notification {
+  // UUID v4. Stable identifier for this inbox entry. Used by GetNotification
+  // and MarkRead. NOT the same as the originating event_id (see below).
+  string id = 1;
+
+  // The user this notification was delivered to. Server-set from the matched
+  // preference's owner — NEVER taken from a request body. The List RPC scopes
+  // results to the authenticated caller (from TokenClaims), so one user can
+  // never read another user's inbox.
+  string recipient_user_id = 2;
+
+  // Short, human-readable headline for the inbox row.
+  // E.g. "Pipeline 'nightly-retrain' failed at step 'train'".
+  string title = 3;
+
+  // Longer human-readable body. Rendered server-side from the event payload so
+  // the inbox doesn't need per-event-type rendering logic on the client.
+  string body = 4;
+
+  // Server-derived severity (see NotificationSeverity). Drives sorting/badging
+  // and preference-based suppression. Client cannot set this.
+  NotificationSeverity severity = 5;
+
+  // The channels this notification was (or will be) delivered over. A single
+  // notification commonly includes IN_APP plus zero or more fan-out channels
+  // depending on the recipient's preferences. See DeliveryAttempt for the
+  // per-channel outcome.
+  repeated NotificationChannel channels = 6;
+
+  // Whether the user has read this notification in the inbox. Flipped by
+  // MarkRead. Server-owned; defaults false on creation.
+  bool read = 7;
+
+  // PROVENANCE — the EventEnvelope.id (common.proto) that triggered this.
+  // Doubles as the idempotency anchor: re-processing the same event_id for the
+  // same recipient must NOT create a duplicate inbox row (idempotent consumer).
+  string event_id = 8;
+
+  // PROVENANCE — the EventEnvelope.type, e.g. "fp.pipelines.failed". This is the
+  // exact value the matching engine pattern-matched against. Surfaced so the UI
+  // can group/filter ("show me all drift alerts").
+  string event_type = 9;
+
+  // PROVENANCE — the producing service ("pipeline", "billing", "model-monitor").
+  // From EventEnvelope.source. Useful for filtering and for support triage.
+  string source_service = 10;
+
+  // When the notification was created (i.e. when the matching event was
+  // processed). Server clock. Immutable.
+  google.protobuf.Timestamp created_at = 11;
+
+  // When the user marked it read (unset while unread). Server clock.
+  google.protobuf.Timestamp read_at = 12;
+}
+
+// ============================================================================
+// DeliveryAttempt
+// ============================================================================
+//
+// WHY a separate message from Notification: one Notification fans out to N
+// channels, and each channel can be retried K times. Flattening attempt detail
+// into Notification would lose that structure. DeliveryAttempt is the typed view
+// of one row in the `delivery_log` table — the audit trail of "did it actually
+// go out, and if not, why".
+//
+// This is what makes failures debuggable: a webhook that returned 503 three
+// times then opened the circuit breaker leaves three RETRYING/FAILED attempts
+// with the response codes recorded. (Returned by GetNotification, which includes
+// the per-channel attempt history.)
+//
+// SECURITY: response_code/error_message describe OUR delivery outcome, not the
+// downstream's secrets. We deliberately do NOT echo the target URL or any auth
+// header here — only enough to debug delivery health.
+// ============================================================================
+message DeliveryAttempt {
+  // Which transport this attempt used.
+  NotificationChannel channel = 1;
+
+  // Outcome of this attempt (see DeliveryStatus).
+  DeliveryStatus status = 2;
+
+  // 1-based attempt number within the retry budget (e.g. 1, 2, 3 for the
+  // 3-attempt exponential-backoff policy in the plan). 0 if not yet attempted.
+  int32 attempt = 3;
+
+  // For HTTP-based channels (WEBHOOK/SLACK): the response status code, e.g. 200,
+  // 503. 0 for non-HTTP channels or when no response was received (timeout).
+  int32 response_code = 4;
+
+  // Human-readable failure detail for logs/debugging (e.g. "connection refused",
+  // "circuit breaker open"). Empty on success. NOT for end-user display.
+  string error_message = 5;
+
+  // When this delivery attempt was made. Server clock.
+  google.protobuf.Timestamp attempted_at = 6;
+}
+
+// ============================================================================
+// ChannelPreference
+// ============================================================================
+//
+// WHY: A user's choice for ONE channel — is it enabled, what's the minimum
+// severity that should reach it, and the channel-specific config (the webhook
+// URL, the Slack URL, the email address). This is the per-channel building block
+// of NotificationPreferences.
+//
+// SECURITY — secrets/PII handling:
+//   The `target` here holds potentially sensitive routing data (a webhook URL
+//   may embed a token; an email is PII). The platform MAY return it on
+//   GetPreferences for the OWNING user (so they can see/edit their own settings)
+//   but it is scoped to that user only and must never appear in another user's
+//   responses or in any Notification/DeliveryAttempt. For high-secret deployments
+//   the server is free to return a masked target (e.g. "https://hooks.slack…/***")
+//   on reads while accepting the full value on UpdatePreferences. We document
+//   this rather than hard-code masking so the storage layer owns the policy.
+// ============================================================================
+message ChannelPreference {
+  // Which channel this preference configures.
+  NotificationChannel channel = 1;
+
+  // Master on/off for this channel. Disabled channels are skipped entirely
+  // (the corresponding DeliveryAttempt is recorded as SUPPRESSED, not FAILED).
+  bool enabled = 2;
+
+  // Minimum severity that should be delivered on this channel. An event below
+  // this threshold is SUPPRESSED for this channel. E.g. set EMAIL's threshold to
+  // ERROR to avoid being emailed about routine INFO events. UNSPECIFIED means
+  // "no floor" (deliver everything this channel is enabled for).
+  NotificationSeverity min_severity = 3;
+
+  // Channel-specific routing target. Semantics depend on `channel`:
+  //   WEBHOOK/SLACK → the HTTPS URL to POST to.
+  //   EMAIL         → the destination email address.
+  //   IN_APP        → ignored (the inbox target is the user themselves).
+  // See the SECURITY note above on masking-on-read.
+  string target = 4;
+}
+
+// ============================================================================
+// NotificationPreferences
+// ============================================================================
+//
+// WHY a single per-user preferences aggregate: a user configures their channels
+// together ("enable Slack for errors, email for criticals only"). Returning and
+// updating them as one document keeps the API and the UI simple (one settings
+// page = one GetPreferences + one UpdatePreferences), and makes the update
+// atomic — no partial half-saved state across separate per-channel RPCs.
+//
+// This aggregate is also WHERE THE CHOREOGRAPHY ROUTING LIVES from the user's
+// point of view: the matching engine, on each inbound event, looks up the
+// recipient's preferences to decide which channels fire and at what severity
+// floor. (The mapping from event type → recipient set is the platform's concern;
+// preferences answer "given that this user is a recipient, how do they want it?")
+// ============================================================================
+message NotificationPreferences {
+  // The user these preferences belong to. Server-set from the authenticated
+  // caller on read/write — NEVER taken from the request body (prevents one user
+  // from editing another's preferences via mass-assignment).
+  string user_id = 1;
+
+  // Per-channel settings. Typically one entry per NotificationChannel the user
+  // has configured. IN_APP is implicitly always-on even if absent here.
+  repeated ChannelPreference channels = 2;
+
+  // Optional event-type patterns the user wants to MUTE entirely, across all
+  // channels. Same wildcard grammar as the matching engine (e.g. "fp.inference.*"
+  // to silence all inference chatter). An empty list means "mute nothing".
+  // WHY here and not a separate RPC: muting is just another preference; keeping
+  // it in the aggregate preserves the atomic single-document update.
+  repeated string muted_event_patterns = 3;
+
+  // When these preferences were last updated. Server clock. Lets the UI show
+  // "last changed" and supports optimistic-concurrency checks if added later.
+  google.protobuf.Timestamp updated_at = 4;
+}
+
+// ============================================================================
+// EVENT PAYLOAD MESSAGES (published to NATS via the common EventEnvelope)
+// ============================================================================
+//
+// WHY THESE EXIST AS TYPED MESSAGES: the platform's EventEnvelope (common.proto)
+// carries the payload as a google.protobuf.Any. Defining concrete payload
+// messages here lets producers/consumers pack & unpack a TYPED value into that
+// Any (with a stable type_url) instead of slinging untyped JSON. Schema + wire
+// safety, with the Any keeping the envelope decoupled from any single service.
+//
+// SUBJECT MAPPING (this service is the PRODUCER of these):
+//   NotificationDeliveredEvent → fp.notifications.delivered
+//   NotificationFailedEvent    → fp.notifications.failed
+//
+// NOTE — this service CONSUMES events but does not need typed messages for what
+// it consumes. By design (choreography) it treats inbound events opaquely: it
+// pattern-matches on EventEnvelope.type and forwards EventEnvelope.data as the
+// notification payload WITHOUT decoding it. So there are no consumer-side payload
+// messages here — defining them would couple us to producers' schemas and defeat
+// the "zero knowledge of what events mean" principle. The two messages below are
+// only the events WE emit (so observability/Experiment Tracker can react to
+// delivery health), keeping us a good event-driven citizen even as a leaf.
+//
+// KEEP EVENTS SMALL & STABLE: include identifiers and outcome, not the full
+// rendered body. Consumers that want detail can correlate by notification_id.
+// ============================================================================
+
+// NotificationDeliveredEvent — emitted when a notification is successfully
+// delivered on a fan-out channel. Lets the platform observe delivery health
+// (e.g. Experiment Tracker recording alert volume, dashboards on success rates).
+message NotificationDeliveredEvent {
+  // The Notification.id that was delivered.
+  string notification_id = 1;
+
+  // Who it went to.
+  string recipient_user_id = 2;
+
+  // Which channel succeeded.
+  NotificationChannel channel = 3;
+
+  // The originating event's type (provenance), e.g. "fp.pipelines.failed".
+  string event_type = 4;
+
+  // When delivery succeeded. Server clock.
+  google.protobuf.Timestamp delivered_at = 5;
+}
+
+// NotificationFailedEvent — emitted when delivery permanently fails on a channel
+// after exhausting retries (or the circuit breaker is open). WHY publish a
+// failure event: it makes delivery failures observable platform-wide (alerting
+// on "we couldn't reach the user we were trying to alert" is itself important),
+// and it can feed a dead-letter / on-call escalation flow downstream.
+message NotificationFailedEvent {
+  // The Notification.id whose delivery failed.
+  string notification_id = 1;
+
+  // Who we were trying to reach.
+  string recipient_user_id = 2;
+
+  // Which channel failed.
+  NotificationChannel channel = 3;
+
+  // The originating event's type (provenance).
+  string event_type = 4;
+
+  // Number of attempts made before giving up (the exhausted retry budget).
+  int32 attempts = 5;
+
+  // Last failure detail (e.g. "503 from webhook", "circuit breaker open").
+  string error_message = 6;
+
+  // When we gave up. Server clock.
+  google.protobuf.Timestamp failed_at = 7;
+}
+
+// ============================================================================
+// REQUEST / RESPONSE MESSAGES
+// ============================================================================
+
+// ============================================================================
+// ListNotifications
+// ============================================================================
+
+// ListNotificationsRequest fetches the authenticated caller's inbox page.
+// WHY there is no `user_id` field: the inbox is ALWAYS scoped to the caller,
+// resolved from TokenClaims by the auth interceptor. Accepting a user_id here
+// would be a mass-assignment / IDOR hole (one user reading another's inbox), so
+// it is deliberately absent. Admin "read any inbox" tooling, if ever needed,
+// would be a separate explicitly-authorized RPC — not a field on this one.
+message ListNotificationsRequest {
+  // Optional: if true, return only unread notifications. Default false = all.
+  bool unread_only = 1;
+
+  // Optional: return only notifications at or above this severity. UNSPECIFIED
+  // = no severity floor.
+  NotificationSeverity min_severity = 2;
+
+  // Optional: restrict to a single event type (exact match, e.g.
+  // "fp.pipelines.failed"). Empty = all event types.
+  string event_type_filter = 3;
+
+  // Cursor-based pagination (shared shape, see common.proto).
+  // Server caps page_size at 100 and defaults it to 20 (documented in
+  // common.proto). The server enforces the cap regardless of what the client
+  // sends, so a client cannot demand an unbounded page.
+  forgepoint.common.v1.PaginationRequest pagination = 4;
+}
+
+// ListNotificationsResponse returns one page of the caller's inbox, newest first.
+message ListNotificationsResponse {
+  // The page of notifications. Ordered by created_at descending (newest first)
+  // so the most recent alerts are at the top of the inbox.
+  repeated Notification notifications = 1;
+
+  // Pagination metadata: next_page_token + total_count. See common.proto.
+  forgepoint.common.v1.PaginationResponse pagination = 2;
+
+  // Convenience: total UNREAD count across the whole inbox (not just this page),
+  // for the UI's badge. Cheap to compute with an indexed COUNT and saves the UI
+  // a second round-trip. -1 if not computed.
+  int32 unread_count = 3;
+}
+
+// ============================================================================
+// GetNotification
+// ============================================================================
+
+// GetNotificationRequest fetches one inbox entry in full, including its
+// per-channel delivery attempt history (see GetNotificationResponse).
+message GetNotificationRequest {
+  // The Notification.id to fetch. The server verifies the notification belongs
+  // to the authenticated caller before returning it (returns NOT_FOUND, not
+  // PERMISSION_DENIED, for someone else's id — avoids leaking existence).
+  string id = 1;
+}
+
+// GetNotificationResponse wraps the Notification plus its delivery audit trail.
+// WHY include delivery_attempts here but not on the list view: the attempt
+// history is the "detail view" payload — heavier, and only wanted when you open
+// a single notification to ask "did my Slack alert actually go out?". Keeping it
+// off the list keeps list responses small.
+message GetNotificationResponse {
+  // The requested notification.
+  Notification notification = 1;
+
+  // Per-channel delivery attempts for this notification (the delivery_log rows),
+  // ordered oldest attempt first. Empty for purely IN_APP notifications that
+  // required no external delivery.
+  repeated DeliveryAttempt delivery_attempts = 2;
+}
+
+// ============================================================================
+// MarkRead
+// ============================================================================
+
+// MarkReadRequest marks one or more of the caller's notifications as read.
+// WHY accept a repeated id (batch) rather than a single id: the UI almost always
+// marks read in bulk ("mark all on screen as read" / "mark this thread read"),
+// and a batch RPC avoids N round-trips. A single-id mark is just a list of one.
+message MarkReadRequest {
+  // The notification ids to mark read. All must belong to the caller; ids that
+  // don't (or don't exist) are ignored rather than failing the whole batch, so a
+  // partially-stale client list still makes progress. Max 1000 ids per call
+  // (server-enforced) to bound the write.
+  repeated string ids = 1;
+
+  // Optional escape hatch: if true, mark the caller's ENTIRE inbox read and
+  // ignore `ids`. WHY a flag rather than a separate MarkAllRead RPC: it's the
+  // same operation with a different selector; one RPC keeps the surface small.
+  bool mark_all = 2;
+}
+
+// MarkReadResponse reports how many notifications were actually flipped to read.
+// WHY return a count instead of an empty response: the UI uses it to update the
+// unread badge without a follow-up List call, and it confirms how many of a
+// batch were valid (since unknown/foreign ids are silently skipped).
+message MarkReadResponse {
+  // Number of notifications transitioned from unread → read by this call.
+  int32 marked_count = 1;
+
+  // The caller's remaining unread count after this operation (for the badge).
+  int32 unread_count = 2;
+}
+
+// ============================================================================
+// GetPreferences
+// ============================================================================
+
+// GetPreferencesRequest fetches the authenticated caller's notification
+// preferences. WHY no user_id field: same authority rule as the inbox — prefs
+// are always the caller's own, resolved from TokenClaims. No cross-user reads.
+message GetPreferencesRequest {}
+
+// GetPreferencesResponse wraps the caller's preferences.
+// WHY a wrapper around NotificationPreferences instead of returning it directly:
+// Buf STANDARD's RPC_RESPONSE_STANDARD_NAME requires "<Rpc>Response" naming, and
+// a wrapper lets us add response-level fields later (e.g. server-default hints,
+// or a "preferences have never been set" flag) without touching the shared
+// NotificationPreferences domain message.
+message GetPreferencesResponse {
+  // The caller's current preferences. If the user has never configured any, the
+  // server returns sensible defaults (IN_APP enabled, all else disabled) rather
+  // than an error, so the settings UI always has something to render.
+  NotificationPreferences preferences = 1;
+}
+
+// ============================================================================
+// UpdatePreferences
+// ============================================================================
+
+// UpdatePreferencesRequest replaces the caller's preferences.
+// WHY full-document replace (PUT semantics) rather than a partial patch: the
+// settings UI loads the whole preferences document, the user edits it, and saves
+// it back — sending the full desired state is the simplest correct model and
+// avoids ambiguous "is an absent channel a delete or untouched?" patch
+// semantics. If granular patching is ever needed, a field_mask can be added.
+//
+// SECURITY: the request carries the desired ChannelPreference set but NOT a
+// user_id — the target user is ALWAYS the authenticated caller (anti
+// mass-assignment). updated_at is also ignored if present; the server stamps it.
+message UpdatePreferencesRequest {
+  // The full desired per-channel preference set. Replaces the stored set
+  // wholesale. An omitted channel is treated as "not configured" (i.e. removed),
+  // matching PUT semantics. The server validates targets (e.g. webhook/slack
+  // URLs must be https, email must be well-formed) before persisting.
+  repeated ChannelPreference channels = 1;
+
+  // The full desired mute list (event-type patterns). Replaces the stored list.
+  // Empty = mute nothing.
+  repeated string muted_event_patterns = 2;
+
+  // Caller-supplied idempotency key (typically a UUID). WHY on a settings write:
+  // a flaky client that retries an UpdatePreferences after a timeout must not
+  // risk a confusing double-apply or clobber a concurrent edit. Same key →
+  // server returns the result of the first apply instead of re-applying. This is
+  // the Stripe idempotency-key pattern; here it mainly guards retry safety on a
+  // last-write-wins document. Optional but recommended for automated callers.
+  string idempotency_key = 3;
+}
+
+// UpdatePreferencesResponse returns the stored preferences after the update, so
+// the client can confirm exactly what was persisted (including the server's
+// fresh updated_at and any normalization the server applied to targets).
+message UpdatePreferencesResponse {
+  // The preferences as now stored. Reflects server normalization/defaults.
+  NotificationPreferences preferences = 1;
+}
+
+// ============================================================================
+// NOTIFICATION SERVICE
+// ============================================================================
+//
+// WHY a single small NotificationService: as explained at the top, this is the
+// CONTROL PLANE only. The real engine — subscribe to `fp.>`, match preferences,
+// deliver with retries + circuit breaker, write the delivery log — runs on the
+// NATS path and exposes NOTHING synchronous. There is intentionally no
+// "send"/"trigger" RPC: a producer calling us would break choreography.
+//
+// RPC CATEGORIES:
+//   INBOX (read model): ListNotifications, GetNotification, MarkRead
+//   PREFERENCES (config): GetPreferences, UpdatePreferences
+//
+// WHY NO STREAMING RPC HERE (a deliberate choice, interview-relevant):
+//   A live "watch my inbox" stream is tempting, but the natural realtime path
+//   for notifications is the very NATS stream this service already consumes and
+//   the fan-out channels (web push, Slack) it already delivers over. The web UI
+//   gets realtime via the BFF bridging `fp.notifications.>` to Server-Sent
+//   Events — NOT via a gRPC server-stream on this service. So the gRPC surface
+//   stays request/response (inbox + settings), and we avoid maintaining
+//   long-lived per-client streams on a service whose whole point is to be a
+//   stateless event reactor. Contrast: the Pipeline Orchestrator DOES expose a
+//   WatchExecution server-stream, because there the authoritative state lives in
+//   that service and a client genuinely needs to follow one execution's lifecycle.
+//
+// IDEMPOTENCY (interview-critical, on BOTH paths):
+//   - Async consumer: events can be redelivered (NATS at-least-once). The
+//     consumer dedupes on EventEnvelope.id (carried into Notification.event_id)
+//     per recipient, so a redelivered event never creates a duplicate inbox row
+//     or a duplicate delivery. This is the "idempotent consumer" platform rule.
+//   - Sync mutation: UpdatePreferences takes an idempotency_key so client retries
+//     are safe. MarkRead is naturally idempotent (read→read is a no-op), so it
+//     needs no key.
+// ============================================================================
+service NotificationService {
+  // ListNotifications returns a paginated page of the AUTHENTICATED caller's
+  // inbox (newest first), with optional unread/severity/event-type filters and
+  // an unread_count for the UI badge. Scoped to the caller — never another user.
+  rpc ListNotifications(ListNotificationsRequest) returns (ListNotificationsResponse);
+
+  // GetNotification fetches one of the caller's notifications in full, including
+  // its per-channel delivery attempt history (the delivery_log). Returns
+  // NOT_FOUND for ids that don't exist OR belong to another user (so existence
+  // of another user's notification isn't leaked).
+  rpc GetNotification(GetNotificationRequest) returns (GetNotificationResponse);
+
+  // MarkRead marks one, many, or all of the caller's notifications as read and
+  // returns the new unread count. Naturally idempotent (marking a read item read
+  // is a no-op), so no idempotency key is required. Foreign/unknown ids are
+  // skipped rather than failing the batch.
+  rpc MarkRead(MarkReadRequest) returns (MarkReadResponse);
+
+  // GetPreferences returns the caller's notification preferences (per-channel
+  // settings + mute patterns), falling back to sensible defaults if the user has
+  // never configured any. Always the caller's own preferences.
+  rpc GetPreferences(GetPreferencesRequest) returns (GetPreferencesResponse);
+
+  // UpdatePreferences replaces the caller's preferences wholesale (PUT
+  // semantics) and returns the stored result. Accepts an optional idempotency
+  // key so retries are safe. The target user is always the caller — the request
+  // body cannot reassign ownership.
+  rpc UpdatePreferences(UpdatePreferencesRequest) returns (UpdatePreferencesResponse);
+}

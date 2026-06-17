@@ -1,0 +1,850 @@
+// ============================================================================
+// Forgepoint Model Serving Service Proto Definitions
+// ============================================================================
+//
+// WHY: The Model Serving service is the "muscle" of the platform — it loads a
+// trained ML model (ONNX, CPU-only, tiny) into memory and answers prediction
+// requests. Everything upstream (registry, pipelines, gateway) exists so that a
+// model artifact lands here and gets served with low latency.
+//
+// WHAT'S HERE:
+//   - Tensor primitives: TensorData, DataType (the wire format for ML I/O)
+//   - Domain messages: ModelInfo, TensorSpec, ServingMetrics, ModelState
+//   - RPCs: Predict, StreamPredict (data plane) + LoadModel, UnloadModel,
+//     GetModelStatus, GetModelInfo, GetServingMetrics, HealthCheck (control plane)
+//   - Event payloads: ModelLoadedEvent, PredictionCompletedEvent, ModelUnloadedEvent
+//
+// PATTERN — Sidecar + Horizontal Autoscaling (HPA on custom metrics):
+//
+//   SIDECAR shape of THIS service: each model version runs as its OWN
+//   Deployment (one Deployment per model version in the fp-models namespace).
+//   The pod is "the model" — a thin gRPC server wrapping the ONNX runtime with
+//   the model weights loaded in memory. The Inference Gateway is the only thing
+//   allowed to call it (NetworkPolicy). This is the sidecar/per-pod-pattern
+//   philosophy: keep the serving runtime dumb, single-purpose, and replaceable;
+//   push routing, auth, rate-limiting, and circuit-breaking UP into the gateway.
+//
+//   HOW THE API SHAPE REALIZES THE PATTERN:
+//     1. Predict is deliberately MINIMAL and STATELESS — no auth fields, no
+//        billing fields, no routing fields. Those are the gateway's job. A
+//        serving pod just does math. This keeps the pod horizontally scalable:
+//        any replica can answer any request (no sticky state).
+//     2. GetServingMetrics exposes inflight_requests and latency so a custom
+//        metrics adapter (Prometheus Adapter / KEDA) can drive the HPA. The
+//        scaling signal is part of the CONTRACT, not an implementation detail.
+//     3. HealthCheck distinguishes liveness (process alive) from readiness
+//        (model actually loaded into memory) — the two K8s probes a per-model
+//        Deployment needs. Readiness = model loaded; liveness = recent
+//        inference latency under threshold.
+//
+//   WHY NOT one big multi-model server (à la NVIDIA Triton / TF Serving)?
+//     - A multi-model server is more resource-efficient but couples model
+//       lifecycles: redeploying model A risks model B; one model's memory leak
+//       OOM-kills the shared pod; you can't scale model A independently of B.
+//     - One-Deployment-per-version gives independent scaling, independent
+//       rollout/rollback, blast-radius isolation, and per-model HPA — which is
+//       exactly what the gateway's traffic-splitting (canary) needs.
+//     - Tradeoff: more pods, higher baseline cost, slower cold start. For a
+//       portfolio platform demonstrating K8s autoscaling patterns, the
+//       isolation story is worth more than the bin-packing efficiency. KEDA
+//       scale-to-zero (M6) recovers idle cost.
+//
+//   INTERVIEW NOTE: Expect "how does the HPA know to scale?" Answer: the pod
+//   publishes inflight_requests via GetServingMetrics + a /metrics Prometheus
+//   endpoint; Prometheus Adapter surfaces it as a custom metric; HPA targets an
+//   average inflight per pod. CPU alone is a poor signal for inference (latency
+//   is dominated by request queuing, not raw CPU), so a custom queue-depth
+//   metric is the correct scaling dimension. This is the whole point of the
+//   "HPA on custom metrics" pattern.
+//
+// REAL-WORLD COMPARISON:
+//   - KServe / Seldon Core: one InferenceService per model, scales per model
+//     (same isolation philosophy as ours).
+//   - NVIDIA Triton / TF Serving: multi-model single server (the alternative
+//     we rejected for isolation reasons).
+//   - SageMaker Endpoints: managed per-endpoint scaling — conceptually our
+//     "one Deployment per version".
+//
+// CALL FLOW (data plane):
+//   External Client ──HTTP──► Inference Gateway
+//        (gateway does: auth, rate-limit, circuit-breaker, traffic-split)
+//                          └──gRPC──► ModelServing.Predict()  [this service]
+//                                        └─ ONNX runtime in-memory inference
+//                          └──publishes──► fp.serving.prediction_completed
+//                                          (billing + monitor consume it)
+//
+// VERSIONING: Package path includes v1 (Buf/Google convention). Breaking
+// changes require a new forgepoint.serving.v2 package.
+// ============================================================================
+
+syntax = "proto3";
+
+package forgepoint.serving.v1;
+
+// go_package follows the pattern established in common.proto / auth.proto:
+//   "github.com/abd-ulbasit/forgepoint/gen/go/{package};{shortname}"
+// The semicolon short name (servingv1) is the Go package identifier, which
+// avoids collisions when several proto packages are imported together.
+option go_package = "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/serving/v1;servingv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+
+// ============================================================================
+// TENSOR PRIMITIVES
+// ============================================================================
+//
+// WHY a custom TensorData instead of google.protobuf.Struct or JSON:
+//   ML inputs/outputs are typed numeric N-dimensional arrays. JSON/Struct would
+//   force every float64 into a 8-byte double wrapped in a field — enormous
+//   overhead for a 1000-element feature vector, plus precision ambiguity
+//   (int vs float). A flat `bytes` buffer + shape + dtype is how every serious
+//   inference protocol does it (KServe v2 "Predict Protocol", Triton, ONNX,
+//   TF Serving). It's compact, zero-copy-friendly, and unambiguous.
+//
+// WIRE LAYOUT:
+//   - `shape` describes dimensions, e.g. [1, 4] = one row of four features.
+//   - `data` holds the raw little-endian bytes of a row-major (C-order) array.
+//     The number of elements is product(shape); each element is sizeof(dtype)
+//     bytes. The server validates len(data) == product(shape) * sizeof(dtype).
+//   - `dtype` tells the runtime how to reinterpret the bytes.
+//
+// WHY little-endian + row-major is fixed by contract:
+//   ONNX Runtime and virtually all x86/ARM hosts are little-endian, and ONNX
+//   tensors are row-major. Pinning it in the contract avoids a per-request
+//   "byte order" negotiation field. Documented here so an SDK author knows
+//   exactly how to serialize.
+//
+// ALTERNATIVES considered:
+//   - repeated float values: type-locked (no int/bool tensors), 3-5x larger on
+//     the wire than packed bytes for large vectors.
+//   - oneof per dtype (repeated float / repeated int64 / ...): type-safe but
+//     verbose and still larger than raw bytes; harder for SDKs to generalize.
+//   - We choose bytes+shape+dtype: the industry-standard "binary tensor".
+// ============================================================================
+
+// DataType is the element type of a tensor's raw byte buffer.
+// WHY an enum (not a free string like "float32"): an enum is validated at the
+// proto layer, gives generated constants, and prevents typos like "flaot32".
+// Suffix/prefix conventions satisfy Buf STANDARD (ENUM_ZERO_VALUE_SUFFIX +
+// ENUM_VALUE_PREFIX): zero value is *_UNSPECIFIED, every value is DATA_TYPE_*.
+enum DataType {
+  // Unset/unknown. A request with this dtype is rejected (INVALID_ARGUMENT) —
+  // forces clients to be explicit about element type.
+  DATA_TYPE_UNSPECIFIED = 0;
+
+  // 32-bit IEEE-754 float. The default for most CPU ONNX models (features and
+  // logits). 4 bytes/element.
+  DATA_TYPE_FLOAT32 = 1;
+
+  // 64-bit IEEE-754 float. Some sklearn-exported models use doubles. 8 bytes.
+  DATA_TYPE_FLOAT64 = 2;
+
+  // 32-bit signed integer. Categorical/index inputs. 4 bytes.
+  DATA_TYPE_INT32 = 3;
+
+  // 64-bit signed integer. Label outputs, token IDs. 8 bytes.
+  DATA_TYPE_INT64 = 4;
+
+  // 8-bit boolean (0/1). Mask inputs. 1 byte/element.
+  DATA_TYPE_BOOL = 5;
+
+  // UTF-8 string elements. WHY length-prefixed, not fixed-width: strings are
+  // variable length, so for STRING tensors `data` holds, per element, a
+  // 4-byte little-endian length followed by that many UTF-8 bytes. Used by
+  // NLP models that take raw text. Kept last so adding it didn't renumber.
+  DATA_TYPE_STRING = 6;
+}
+
+// TensorData is a single named tensor on the wire (input feature or output).
+// See the TENSOR PRIMITIVES block above for the full byte-layout contract.
+message TensorData {
+  // Dimensions, row-major. e.g. [1, 4] = batch of 1, four features.
+  // A leading batch dimension is conventional but not required by this service.
+  repeated int64 shape = 1;
+
+  // Raw little-endian, row-major element bytes. Length MUST equal
+  // product(shape) * sizeof(dtype) (or the length-prefixed encoding for STRING).
+  // The server rejects mismatches with INVALID_ARGUMENT.
+  bytes data = 2;
+
+  // How to interpret `data`. Must match the model's expected input dtype;
+  // the server validates against the loaded model's schema.
+  DataType dtype = 3;
+}
+
+// ============================================================================
+// DOMAIN MESSAGES
+// ============================================================================
+
+// ============================================================================
+// TensorSpec
+// ============================================================================
+//
+// WHY: A model's input/output schema is part of its public contract. Clients
+// (and the gateway) need to know "this model wants a tensor named 'input' of
+// shape [-1, 4] float32" to build valid requests and validate before sending.
+// This is the served-side mirror of the registry's model schema.
+//
+// DYNAMIC DIMENSIONS: a shape entry of -1 means "dynamic" (typically the batch
+// dimension). e.g. [-1, 4] = any number of 4-feature rows. This mirrors ONNX's
+// own dynamic-axis convention, so SDKs can map it 1:1.
+// ============================================================================
+message TensorSpec {
+  // The tensor's name as the ONNX graph expects it (e.g. "input", "float_input").
+  // Predict requests key their `inputs` map by this name.
+  string name = 1;
+
+  // Expected dimensions; -1 marks a dynamic axis (usually batch). Informational
+  // contract for clients; the runtime enforces the concrete shape at inference.
+  repeated int64 shape = 2;
+
+  // Expected element type for this tensor.
+  DataType dtype = 3;
+}
+
+// ============================================================================
+// ModelState
+// ============================================================================
+//
+// WHY an enum, not a bool "loaded": a model in a serving pod moves through a
+// lifecycle (downloading the artifact from MinIO → loading into ONNX → ready),
+// and can fail or be unloaded. A single bool can't express "currently
+// downloading" vs "load failed". The gateway's readiness routing and the
+// admin UI need the distinction.
+//
+// STATE MACHINE:
+//
+//   UNSPECIFIED
+//        │ LoadModel / startup
+//        ▼
+//   DOWNLOADING ──(MinIO fetch ok)──► LOADING ──(ONNX init ok)──► READY
+//        │                               │                          │
+//        │ (fetch err)                   │ (init err)               │ UnloadModel
+//        ▼                               ▼                          ▼
+//      FAILED ◄───────────────────────FAILED                    UNLOADED
+//
+// READY is the only state where Predict succeeds; all others return
+// FAILED_PRECONDITION so the gateway can route elsewhere.
+// ============================================================================
+enum ModelState {
+  // Unknown/unset.
+  MODEL_STATE_UNSPECIFIED = 0;
+
+  // Pulling the model artifact from object storage (MinIO/S3) to local disk.
+  MODEL_STATE_DOWNLOADING = 1;
+
+  // Artifact on disk; initializing the ONNX runtime session (allocating the
+  // in-memory inference graph). Brief but non-zero — this is "cold start".
+  MODEL_STATE_LOADING = 2;
+
+  // Model is loaded in memory and serving predictions. Readiness probe passes.
+  MODEL_STATE_READY = 3;
+
+  // Load failed (bad artifact, OOM, unsupported op). See ModelStatus.message
+  // for the reason. Pod stays unready; K8s/operator decides on restart.
+  MODEL_STATE_FAILED = 4;
+
+  // Model was deliberately unloaded (admin UnloadModel) to free memory.
+  // Distinct from FAILED so operators don't alert on an intentional unload.
+  MODEL_STATE_UNLOADED = 5;
+}
+
+// ============================================================================
+// ModelInfo
+// ============================================================================
+//
+// WHY: The static description of the model this pod serves — its identity and
+// I/O schema. Returned by GetModelInfo so clients/SDKs can introspect and
+// build correct requests without out-of-band documentation.
+//
+// SECURITY/AUTHORITY NOTE: every field here is SERVER-authoritative. It is
+// derived from the loaded artifact's metadata (set by the registry/training
+// pipeline), never accepted from a client. There is no "create model" RPC that
+// takes a ModelInfo — a serving pod serves exactly the model it was deployed
+// with. This prevents a caller from spoofing model identity.
+// ============================================================================
+message ModelInfo {
+  // Logical model name (matches the registry), e.g. "fraud-detector".
+  string name = 1;
+
+  // The exact version this pod serves, e.g. "v3" or a semver/sha. Because it's
+  // one-Deployment-per-version, a given pod's version is fixed for its lifetime.
+  string version = 2;
+
+  // Input tensors the model expects. Clients key Predict.inputs by these names.
+  repeated TensorSpec input_schema = 3;
+
+  // Output tensors the model produces. Predict.outputs is keyed by these names.
+  repeated TensorSpec output_schema = 4;
+
+  // When this model finished loading into memory on this pod (READY transition).
+  // Server-set; useful for cold-start observability and cache-warmth checks.
+  google.protobuf.Timestamp loaded_at = 5;
+
+  // Opaque digest (e.g. sha256) of the artifact bytes pulled from MinIO. Lets
+  // the gateway/registry confirm the pod is serving the exact artifact it
+  // expects (supply-chain integrity), without exposing the artifact itself.
+  string artifact_digest = 6;
+}
+
+// ============================================================================
+// ServingMetrics
+// ============================================================================
+//
+// WHY this is a first-class RPC response and not just /metrics scraping:
+//   The HPA-driving signal (inflight_requests) is part of the SERVICE CONTRACT
+//   in this pattern. Exposing it via gRPC lets the gateway make fast
+//   load-aware routing decisions (least-inflight) AND lets a metrics adapter
+//   read a stable, documented shape. The Prometheus /metrics endpoint is the
+//   transport for the HPA; this message is the canonical schema.
+//
+// INTERVIEW NOTE: "Why inflight requests and not CPU for autoscaling?"
+//   Inference latency is dominated by request queuing once the CPU is busy;
+//   inflight (concurrency/queue depth) crosses the danger threshold BEFORE CPU
+//   saturates, giving the HPA earlier, more stable scaling signals. This is the
+//   crux of "HPA on custom metrics".
+// ============================================================================
+message ServingMetrics {
+  // Requests currently being processed (the primary custom HPA metric). HPA
+  // targets an average inflight-per-pod; when actual exceeds target, scale out.
+  int32 inflight_requests = 1;
+
+  // Total predictions served since process start. Monotonic counter; used to
+  // derive predictions/sec (RED "Rate") at the scrape layer.
+  int64 total_requests = 2;
+
+  // Total failed predictions since start (RED "Errors"). Combined with
+  // total_requests gives an error rate for alerting.
+  int64 failed_requests = 3;
+
+  // Rolling p50 inference latency. WHY Duration not ms-int: Duration is the
+  // proto well-known type for elapsed time (nanosecond precision, self-
+  // describing) and matches our other time fields' style.
+  google.protobuf.Duration p50_latency = 4;
+
+  // Rolling p99 inference latency (RED "Duration", tail). Also the liveness
+  // signal: if p99 exceeds a configured threshold the liveness probe fails and
+  // K8s restarts the pod.
+  google.protobuf.Duration p99_latency = 5;
+
+  // Resident model memory estimate in bytes. Capacity-planning signal for the
+  // operator (how many model versions fit per node). Server-computed.
+  int64 model_memory_bytes = 6;
+}
+
+// ============================================================================
+// REQUEST / RESPONSE MESSAGES
+// ============================================================================
+
+// ============================================================================
+// Predict (the data plane — the hot path)
+// ============================================================================
+
+// PredictRequest carries the input tensors for one inference call.
+//
+// WHY model_name + version here even though it's one-model-per-pod:
+//   Defense in depth. The gateway routes to the right pod, but the pod
+//   re-validates that the request targets the model it actually serves —
+//   if they mismatch it returns FAILED_PRECONDITION. This catches gateway
+//   routing bugs and stale connections instead of silently serving the wrong
+//   model. version may be empty to mean "whatever this pod serves".
+//
+// SECURITY: no auth/owner/billing fields. Identity is established by the
+// gateway's auth interceptor and propagated as context, NOT trusted from the
+// request body (avoids a client spoofing user_id to dodge billing). The
+// serving pod is intentionally auth-agnostic — see the Sidecar rationale up top.
+message PredictRequest {
+  // Target model logical name. Validated against the pod's loaded model.
+  string model_name = 1;
+
+  // Target version. Empty = "this pod's version". If set and it doesn't match,
+  // the pod rejects rather than mis-serving.
+  string version = 2;
+
+  // Named input tensors, keyed by TensorSpec.name from the model's input_schema.
+  // WHY a map (not repeated): models name their inputs; a map makes the binding
+  // explicit and order-independent, matching ONNX's named-input API exactly.
+  map<string, TensorData> inputs = 3;
+
+  // Client-supplied idempotency key. WHY on a read-ish predict call:
+  //   Predict has a SIDE EFFECT — it emits a PredictionCompleted event that
+  //   bills the caller. On a network retry, a duplicate request must NOT
+  //   double-bill. The pod (or gateway) caches the result/event-emission keyed
+  //   by this id so a retry returns the prior result without re-emitting.
+  //   Optional: if empty, the request is treated as non-idempotent (billed each
+  //   time). Recommended for any client that retries.
+  string idempotency_key = 4;
+
+  // Optional correlation id propagated from the gateway for distributed
+  // tracing; echoed into the PredictionCompleted event's envelope so the async
+  // billing/monitor path links back to the original sync request.
+  string correlation_id = 5;
+}
+
+// PredictResponse returns the model's output tensors plus serving metadata.
+message PredictResponse {
+  // Named output tensors, keyed by TensorSpec.name from output_schema.
+  map<string, TensorData> outputs = 1;
+
+  // The model version that actually produced this result. Echoed so the caller
+  // (and the gateway, for canary attribution) records which version answered —
+  // critical when traffic is split across versions.
+  string model_version = 2;
+
+  // Server-measured inference wall time for THIS call (not including network).
+  // Lets the gateway record per-call latency and the client display it.
+  google.protobuf.Duration inference_latency = 3;
+
+  // Echo of the request id (mirrors EventEnvelope.correlation_id) for tracing.
+  string correlation_id = 4;
+
+  // True if this response was served from the idempotency cache (a retry) rather
+  // than freshly computed. Lets the caller/observer know no new billing event
+  // was emitted for this call.
+  bool from_cache = 5;
+}
+
+// ============================================================================
+// StreamPredict (optional streaming data plane)
+// ============================================================================
+//
+// WHY a bidirectional stream in addition to unary Predict:
+//   Two real use cases:
+//     1. HIGH-THROUGHPUT batch scoring: a client pushes a long sequence of rows
+//        and reads results as they complete, amortizing TCP/gRPC handshake and
+//        HTTP/2 framing over many predictions instead of one RPC per row.
+//     2. ONLINE/low-latency feeds: a long-lived connection (e.g. a feature
+//        stream) sends inputs continuously and receives predictions, avoiding
+//        per-request connection setup.
+//
+// WHY BIDIRECTIONAL (stream→stream) not server-streaming:
+//   The client decides when to send the next input (it may be reacting to prior
+//   outputs or rate-limiting itself), so inputs must be a stream too. Responses
+//   are NOT guaranteed 1:1-ordered with requests in general, which is why each
+//   carries its own idempotency_key/correlation_id to pair them.
+//
+// TRADEOFF: streaming complicates the HPA inflight accounting (a stream holds a
+// connection but may be idle) and load balancing (L7 gRPC LBs balance streams,
+// not messages). For that reason unary Predict remains the PRIMARY path the
+// gateway uses; StreamPredict is opt-in for batch/online clients. Documented so
+// an interviewer sees we know streaming isn't free.
+//
+// Buf note: streaming RPCs still require dedicated Request/Response messages
+// (RPC_REQUEST_RESPONSE_UNIQUE). We reuse the same tensor shapes but in
+// stream-specific wrappers so the unary and streaming contracts can evolve
+// independently.
+message StreamPredictRequest {
+  // One inference's inputs, same semantics as PredictRequest.inputs.
+  map<string, TensorData> inputs = 1;
+
+  // Per-message idempotency key — REQUIRED on streams because retried/duplicated
+  // stream messages must not double-bill, and because it pairs each response to
+  // its request (responses may be out of order).
+  string idempotency_key = 2;
+
+  // Optional per-message correlation id for tracing individual predictions
+  // within the stream.
+  string correlation_id = 3;
+}
+
+message StreamPredictResponse {
+  // The outputs for one inference.
+  map<string, TensorData> outputs = 1;
+
+  // The version that produced this result.
+  string model_version = 2;
+
+  // Inference wall time for this single prediction.
+  google.protobuf.Duration inference_latency = 3;
+
+  // Echoes the request message's idempotency_key so the client can pair this
+  // response with the request it answers (responses are not order-guaranteed).
+  string idempotency_key = 4;
+
+  // Echoes the request message's correlation id for tracing.
+  string correlation_id = 5;
+}
+
+// ============================================================================
+// GetModelInfo
+// ============================================================================
+
+// GetModelInfoRequest asks for the static schema/identity of the served model.
+// WHY it still takes a name/version even though the pod serves one model:
+//   Symmetry with the gateway's interface and forward-compat — keeps the
+//   request shape stable if a future multi-model variant ever appears. Empty
+//   fields mean "the model this pod serves".
+message GetModelInfoRequest {
+  // Optional logical name filter; empty = this pod's model.
+  string model_name = 1;
+
+  // Optional version filter; empty = this pod's version.
+  string version = 2;
+}
+
+// GetModelInfoResponse wraps ModelInfo.
+// WHY wrap (not return ModelInfo directly): Buf STANDARD RPC_RESPONSE_STANDARD_NAME
+// requires a <Rpc>Response message, and wrapping lets us add fields later (e.g.
+// warmup status) without mutating the shared ModelInfo domain type.
+message GetModelInfoResponse {
+  // The static description of the served model.
+  ModelInfo model_info = 1;
+}
+
+// ============================================================================
+// LoadModel (control plane — admin)
+// ============================================================================
+
+// LoadModelRequest tells the pod to fetch an artifact from object storage and
+// load it into the ONNX runtime. Used by the operator/controller that manages
+// per-version Deployments (and at startup the pod self-loads from env vars).
+//
+// WHY load-by-reference (URI/digest), not by uploading bytes here:
+//   The artifact lives in MinIO/S3 (the registry put it there). Streaming
+//   megabytes of weights through a control RPC would be wasteful and couple the
+//   control plane to artifact size. We pass a pointer; the pod pulls it. This
+//   mirrors KServe's storageUri model.
+//
+// SECURITY: the caller specifies WHERE to load from but the pod only accepts
+// URIs within its configured allowed bucket/prefix (validated server-side) —
+// a caller can't point a serving pod at an arbitrary attacker-controlled URL
+// (SSRF / supply-chain guard). expected_digest lets the pod verify integrity.
+message LoadModelRequest {
+  // Logical model name to register this artifact under on the pod.
+  string model_name = 1;
+
+  // Version label for the artifact (must match the Deployment's intended ver).
+  string version = 2;
+
+  // Object-storage URI of the ONNX artifact, e.g. "s3://fp-models/fraud/v3.onnx".
+  // Validated against the pod's allow-listed bucket/prefix before fetching.
+  string artifact_uri = 3;
+
+  // Optional expected sha256 digest. If set, the pod aborts the load (FAILED)
+  // when the fetched bytes don't match — integrity/supply-chain protection.
+  string expected_digest = 4;
+
+  // Idempotency key so a retried LoadModel (e.g. controller re-reconcile) does
+  // not re-download/re-init an already-loaded identical model. If the requested
+  // (name, version, digest) is already READY, the pod returns the current
+  // status without reloading.
+  string idempotency_key = 5;
+}
+
+// LoadModelResponse returns the resulting model status (which may still be
+// DOWNLOADING/LOADING — load is asynchronous; poll GetModelStatus for READY).
+// WHY return status, not empty: the caller wants to know whether the load was
+// accepted and the current state, without an immediate second RPC.
+message LoadModelResponse {
+  // Current lifecycle status after accepting the load request.
+  ModelStatus status = 1;
+}
+
+// ============================================================================
+// UnloadModel (control plane — admin)
+// ============================================================================
+
+// UnloadModelRequest frees a model from memory (e.g. before shutdown or to
+// reclaim RAM). After unload the pod reports MODEL_STATE_UNLOADED and Predict
+// returns FAILED_PRECONDITION until reloaded.
+message UnloadModelRequest {
+  // Model to unload. Empty fields = the pod's single loaded model.
+  string model_name = 1;
+
+  // Version to unload; empty = the pod's current version.
+  string version = 2;
+}
+
+// UnloadModelResponse is intentionally minimal but named (Buf RPC_RESPONSE_
+// STANDARD_NAME) and forward-compatible.
+message UnloadModelResponse {
+  // Status after unload (expected MODEL_STATE_UNLOADED).
+  ModelStatus status = 1;
+}
+
+// ============================================================================
+// GetModelStatus (control plane — readiness/lifecycle)
+// ============================================================================
+
+// ModelStatus is the live lifecycle view of the served model — used by probes,
+// the operator's reconcile loop, and admin tooling.
+message ModelStatus {
+  // The model's name (echoed for callers managing several pods).
+  string model_name = 1;
+
+  // The model's version.
+  string version = 2;
+
+  // Current lifecycle state (the state machine in ModelState's docs).
+  ModelState state = 3;
+
+  // Human-readable detail — especially the reason on FAILED ("digest mismatch",
+  // "unsupported ONNX op: X", "OOM loading 2.1GB model"). Empty when healthy.
+  string message = 4;
+
+  // When the pod last transitioned state. Lets the operator detect a stuck
+  // DOWNLOADING/LOADING (cold-start watchdog).
+  google.protobuf.Timestamp updated_at = 5;
+}
+
+// GetModelStatusRequest asks for the current lifecycle status.
+message GetModelStatusRequest {
+  // Model name; empty = this pod's model.
+  string model_name = 1;
+
+  // Version; empty = this pod's version.
+  string version = 2;
+}
+
+// GetModelStatusResponse wraps ModelStatus (Buf naming + forward-compat).
+message GetModelStatusResponse {
+  // Current lifecycle status.
+  ModelStatus status = 1;
+}
+
+// ============================================================================
+// GetServingMetrics (control plane — drives the HPA)
+// ============================================================================
+
+// GetServingMetricsRequest takes no selectors today (one model per pod) but is
+// a named message so the metric surface can grow (e.g. per-window stats).
+message GetServingMetricsRequest {}
+
+// GetServingMetricsResponse wraps the metrics snapshot used for autoscaling and
+// load-aware routing. WHY a snapshot RPC in addition to /metrics scraping: see
+// ServingMetrics docs — the gateway reads this for least-inflight routing.
+message GetServingMetricsResponse {
+  // Point-in-time serving metrics.
+  ServingMetrics metrics = 1;
+}
+
+// ============================================================================
+// HealthCheck (control plane — liveness vs readiness)
+// ============================================================================
+//
+// WHY a service-specific HealthCheck distinct from the platform /healthz:
+//   The standard pkg/health handler answers "is the process up?" (liveness).
+//   THIS RPC answers the serving-specific "is the MODEL ready to predict?"
+//   (readiness) and folds in the latency-based liveness signal. K8s wires:
+//     - readinessProbe → expects SERVING only when state == READY
+//     - livenessProbe  → fails if recent p99 latency exceeds threshold
+//   Splitting them lets K8s pull a slow pod out of rotation (not ready) WITHOUT
+//   killing it, and only restart it when it's truly wedged (not alive).
+// ============================================================================
+
+// HealthStatus expresses the serving-readiness verdict.
+enum HealthStatus {
+  // Unknown/unset.
+  HEALTH_STATUS_UNSPECIFIED = 0;
+
+  // Model loaded and inference latency within threshold — accept traffic.
+  HEALTH_STATUS_SERVING = 1;
+
+  // Process alive but not ready (model still loading, or latency degraded).
+  // K8s should keep the pod but route traffic away (readiness fail).
+  HEALTH_STATUS_NOT_SERVING = 2;
+}
+
+// HealthCheckRequest optionally scopes the check to a model (future multi-model).
+message HealthCheckRequest {
+  // Empty = check this pod's model. Mirrors gRPC's standard health protocol
+  // "service" selector so existing health tooling maps cleanly.
+  string model_name = 1;
+}
+
+// HealthCheckResponse reports serving status + the signals behind the verdict.
+message HealthCheckResponse {
+  // The readiness verdict K8s readinessProbe keys on.
+  HealthStatus status = 1;
+
+  // Current model lifecycle state (richer context behind `status`).
+  ModelState model_state = 2;
+
+  // Most recent inference latency observed; the livenessProbe compares this to
+  // its configured threshold to decide alive vs wedged.
+  google.protobuf.Duration last_inference_latency = 3;
+}
+
+// ============================================================================
+// EVENT PAYLOAD MESSAGES (async — carried inside common.EventEnvelope.data)
+// ============================================================================
+//
+// WHY typed event payloads live in the proto:
+//   The platform's EventEnvelope.data is a google.protobuf.Any. For consumers
+//   to deserialize typed payloads (not parse opaque JSON), the payload TYPES
+//   must be defined as proto messages here. The publisher packs one of these
+//   into Any; the consumer (billing, monitor) unpacks by type URL. This is the
+//   contract that makes the async path type-safe — same idea as the sync RPCs.
+//
+//   Subject hierarchy (see common.proto EventEnvelope): fp.serving.<event>.
+//   This service publishes: fp.serving.model_loaded,
+//   fp.serving.prediction_completed, fp.serving.model_unloaded.
+//
+// SECURITY: events carry only non-sensitive metadata (ids, counts, latency).
+// They do NOT embed raw input/output tensors (could contain PII) — only
+// digests/sizes. Consumers that need features (the Monitor) get them via the
+// dedicated, access-controlled feature path, not by snooping serving events.
+// ============================================================================
+
+// ModelLoadedEvent is published when a pod finishes loading a model (READY).
+// CONSUMERS: registry (mark version "serving"), monitor (start a drift window),
+// notification (optional "model live" alert). Subject: fp.serving.model_loaded.
+message ModelLoadedEvent {
+  // The model now serving.
+  string model_name = 1;
+
+  // The version now serving.
+  string version = 2;
+
+  // Artifact integrity digest of what was loaded (matches ModelInfo).
+  string artifact_digest = 3;
+
+  // The K8s pod identity serving it (e.g. "fraud-v3-7c9d-abcde"). Lets
+  // consumers attribute traffic/health to a specific replica.
+  string serving_instance = 4;
+
+  // When it became READY. Server-authoritative.
+  google.protobuf.Timestamp loaded_at = 5;
+}
+
+// PredictionCompletedEvent is published after each served prediction (or batch).
+// THIS IS THE LOAD-BEARING EVENT of the closed loop:
+//   - BILLING consumes it (outbox pattern) to record usage → invoice.
+//   - MONITOR consumes it to feed drift detection (prediction distribution).
+// Subject: fp.serving.prediction_completed.
+//
+// SECURITY/BILLING: amounts here are SERVER-authoritative (the pod counts what
+// it actually served). request_count cannot be inflated by a client to over- or
+// under-bill. No raw tensors are included (PII) — only the digest + sizes.
+message PredictionCompletedEvent {
+  // Model that produced the prediction(s).
+  string model_name = 1;
+
+  // Exact version that answered (for per-version billing and canary attribution).
+  string version = 2;
+
+  // Number of predictions in this event. 1 for a unary Predict; N for a batched
+  // StreamPredict flush. Billing multiplies this by the per-prediction price.
+  int64 request_count = 3;
+
+  // Server-measured aggregate inference time for these predictions. Billing may
+  // price on compute-time; monitor uses it for latency drift.
+  google.protobuf.Duration total_inference_latency = 4;
+
+  // The authenticated principal the gateway attributed this call to (user_id or
+  // api-key id), propagated from the gateway's auth context — NOT from the
+  // client request body. Billing keys usage off this. Server-authoritative.
+  string billed_principal = 5;
+
+  // Hash of the inputs (not the inputs themselves) so the monitor can dedup /
+  // correlate without ingesting raw, possibly-PII feature values.
+  string input_digest = 6;
+
+  // The serving pod that handled it (for per-replica observability).
+  string serving_instance = 7;
+
+  // When the prediction(s) completed. Server-authoritative; drives time-windowed
+  // drift aggregation and billing periods.
+  google.protobuf.Timestamp completed_at = 8;
+}
+
+// ModelUnloadedEvent is published when a model is unloaded (admin action or
+// graceful shutdown). CONSUMERS: registry/operator (a version left rotation),
+// monitor (close/flush its window). Subject: fp.serving.model_unloaded.
+message ModelUnloadedEvent {
+  // The model that was unloaded.
+  string model_name = 1;
+
+  // The version that was unloaded.
+  string version = 2;
+
+  // The pod that unloaded it.
+  string serving_instance = 3;
+
+  // Why it was unloaded ("admin_request", "shutdown", "evicted"). Lets
+  // consumers distinguish intentional unloads from failures for alerting.
+  string reason = 4;
+
+  // When the unload happened.
+  google.protobuf.Timestamp unloaded_at = 5;
+}
+
+// ============================================================================
+// MODEL SERVING SERVICE
+// ============================================================================
+//
+// WHY one ModelServingService split into a data plane and a control plane:
+//   - DATA PLANE (Predict, StreamPredict): the hot path, latency-critical,
+//     called only by the Inference Gateway, scaled by the HPA. Minimal,
+//     stateless, auth-agnostic — see the Sidecar rationale at the top.
+//   - CONTROL PLANE (LoadModel, UnloadModel, GetModelStatus, GetModelInfo,
+//     GetServingMetrics, HealthCheck): low-frequency lifecycle/observability
+//     calls made by the operator/controller, probes, and metric adapters.
+//
+//   They share one service (not two) because they target the SAME pod and the
+//   same in-memory model; a separate AdminService would just add a second
+//   listener for no isolation benefit on a single-model pod. Authorization is
+//   enforced by the interceptor chain (the gateway's identity may Predict;
+//   only the operator's identity may LoadModel/UnloadModel).
+//
+// RPC CATEGORIES:
+//   DATA PLANE:    Predict, StreamPredict
+//   INTROSPECTION: GetModelInfo
+//   LIFECYCLE:     LoadModel, UnloadModel, GetModelStatus
+//   AUTOSCALING:   GetServingMetrics
+//   PROBES:        HealthCheck
+//
+// ASCII — where each RPC sits:
+//
+//   ┌───────────────── Inference Gateway ─────────────────┐
+//   │  Predict / StreamPredict  ──────►  (data plane, HPA-scaled) │
+//   │  GetServingMetrics  ──────►  least-inflight routing         │
+//   └────────────────────────────────────────────────────┘
+//   ┌──────────── Operator / Controller ─────────────────┐
+//   │  LoadModel / UnloadModel / GetModelStatus  ────────►        │
+//   └────────────────────────────────────────────────────┘
+//   ┌──────────────────── Kubelet ───────────────────────┐
+//   │  HealthCheck (readiness=READY, liveness=latency<thr)────────►│
+//   └────────────────────────────────────────────────────┘
+// ============================================================================
+service ModelServingService {
+  // Predict runs a single synchronous inference. The hot path; called by the
+  // Inference Gateway after it has authed, rate-limited, and chosen a version.
+  // Side effect: emits fp.serving.prediction_completed (billing + monitor).
+  // Idempotent on idempotency_key to make gateway retries safe (no double-bill).
+  rpc Predict(PredictRequest) returns (PredictResponse);
+
+  // StreamPredict is a bidirectional stream for high-throughput batch scoring
+  // or long-lived online feeds. Opt-in (unary Predict is the primary path).
+  // Each request message carries its own idempotency_key; responses are not
+  // 1:1-ordered with requests, so clients pair them via that key.
+  rpc StreamPredict(stream StreamPredictRequest) returns (stream StreamPredictResponse);
+
+  // GetModelInfo returns the served model's identity + I/O schema so clients
+  // can build valid Predict requests. All fields server-authoritative.
+  rpc GetModelInfo(GetModelInfoRequest) returns (GetModelInfoResponse);
+
+  // LoadModel pulls an artifact from object storage and loads it into the ONNX
+  // runtime. Admin/operator-only. Load is async — poll GetModelStatus for READY.
+  // Idempotent: re-loading an already-READY identical (name,version,digest) is
+  // a no-op returning current status.
+  rpc LoadModel(LoadModelRequest) returns (LoadModelResponse);
+
+  // UnloadModel frees the model from memory. Admin/operator-only. After unload
+  // Predict returns FAILED_PRECONDITION; emits fp.serving.model_unloaded.
+  rpc UnloadModel(UnloadModelRequest) returns (UnloadModelResponse);
+
+  // GetModelStatus returns the live lifecycle state (DOWNLOADING/LOADING/READY/
+  // FAILED/UNLOADED). Used by the operator's reconcile loop and admin tooling.
+  rpc GetModelStatus(GetModelStatusRequest) returns (GetModelStatusResponse);
+
+  // GetServingMetrics returns the inflight/latency snapshot that drives the HPA
+  // (custom-metrics autoscaling) and the gateway's least-inflight routing.
+  rpc GetServingMetrics(GetServingMetricsRequest) returns (GetServingMetricsResponse);
+
+  // HealthCheck reports serving readiness (model loaded) + the latency signal
+  // behind liveness. Wired to K8s readiness/liveness probes for this per-model
+  // Deployment.
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
