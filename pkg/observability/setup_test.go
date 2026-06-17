@@ -29,6 +29,7 @@ import (
 // ============================================================================
 
 func TestSetup_ReturnsShutdownFunction(t *testing.T) {
+	observability.ResetForTest() // each test gets a clean init state
 	// Arrange
 	cfg := observability.Config{
 		ServiceName:    "test-service",
@@ -55,6 +56,7 @@ func TestSetup_ReturnsShutdownFunction(t *testing.T) {
 }
 
 func TestSetup_SetsGlobalTracerProvider(t *testing.T) {
+	observability.ResetForTest()
 	// Arrange
 	cfg := observability.Config{
 		ServiceName:    "test-service",
@@ -81,6 +83,7 @@ func TestSetup_SetsGlobalTracerProvider(t *testing.T) {
 }
 
 func TestSetup_TracerProducesValidTraceID(t *testing.T) {
+	observability.ResetForTest()
 	cfg := observability.Config{
 		ServiceName:    "test-service",
 		ServiceVersion: "v0.0.1",

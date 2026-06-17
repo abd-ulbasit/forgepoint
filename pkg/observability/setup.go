@@ -69,6 +69,7 @@ package observability
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
@@ -80,6 +81,26 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
+)
+
+// setupOnce guards Setup() so it can only be called once per process.
+// A second call returns errAlreadySetup without replacing the existing providers.
+//
+// WHY: OTel's global providers (otel.SetTracerProvider, otel.SetMeterProvider)
+// are package-level singletons. Calling Setup() a second time would:
+//   1. Replace the existing providers, orphaning their exporters/batchers.
+//      Those goroutines keep running (leaked) and may continue flushing
+//      to a now-redundant connection.
+//   2. Lose any spans/metrics created after the first Setup but before the
+//      second (the old provider's buffer is abandoned).
+//
+// TESTS: call ResetForTest() before each test that calls Setup(), so tests
+// are independent of each other regardless of execution order.
+var (
+	setupOnce    sync.Once
+	errSetupDone = errors.New("observability: Setup already called; call ResetForTest() in tests")
+	setupCalled  bool
+	setupMu      sync.Mutex // protects setupCalled for ResetForTest
 )
 
 // Config holds the configuration for observability setup.
@@ -100,6 +121,23 @@ type Config struct {
 	// If empty, falls back to stdout exporters (useful for testing/dev).
 	// Production: "otel-collector.fp-infra.svc.cluster.local:4317"
 	OTLPEndpoint string
+
+	// OTLPInsecure disables TLS on the OTLP gRPC exporter connection.
+	//
+	// When false (zero value / production default): the exporter uses TLS.
+	//   - Inside an Istio service mesh: TLS is terminated at the sidecar proxy,
+	//     so the local connection (pod → sidecar → mesh) may be plaintext, but
+	//     the mesh enforces mTLS between pods. Set to true for local-to-sidecar.
+	//   - Outside a mesh with a real collector cert: leave false, the exporter
+	//     negotiates TLS automatically via transport credentials.
+	//
+	// When true (local dev): the OTel Collector in docker-compose has no TLS
+	// certificate, so we must skip TLS. Set OTLPInsecure: true in your local
+	// config or via an env variable that maps to this field.
+	//
+	// ZERO VALUE IS SECURE: Go's zero value is false, so omitting this field
+	// in a config struct defaults to TLS — fail-safe.
+	OTLPInsecure bool
 }
 
 // Setup initializes OpenTelemetry trace and metric providers.
@@ -129,7 +167,28 @@ type Config struct {
 //     dropped when buffer fills. Service continues running — observability
 //     is never a hard dependency (you don't want monitoring to cause outages).
 //   - Invalid config: Returns error immediately (fail fast).
+// ResetForTest resets the single-init guard so Setup() can be called again.
+// MUST only be called from test code — it is a test-only escape hatch.
+// Normal application code should never call this.
+func ResetForTest() {
+	setupMu.Lock()
+	defer setupMu.Unlock()
+	setupOnce = sync.Once{} // replace the used Once with a fresh one
+	setupCalled = false
+}
+
 func Setup(ctx context.Context, cfg Config) (shutdown func(ctx context.Context) error, err error) {
+	// Single-init guard: return an error if Setup() has already been called.
+	// This prevents accidental double-init (e.g., two packages both calling Setup)
+	// from silently orphaning the first set of OTel providers and their goroutines.
+	setupMu.Lock()
+	if setupCalled {
+		setupMu.Unlock()
+		return nil, errSetupDone
+	}
+	setupCalled = true
+	setupMu.Unlock()
+
 	var shutdownFuncs []func(context.Context) error
 
 	// shutdown combines all cleanup functions into one.
@@ -283,9 +342,12 @@ func newMeterProvider(ctx context.Context, cfg Config, res *resource.Resource) (
 // newSpanExporter builds the trace exporter based on config: OTLP gRPC to the
 // collector when an endpoint is set, otherwise stdout for local dev.
 //
-// WHY WithInsecure: inside the cluster, traffic to the collector is on the pod
-// network and (with Istio) already mTLS-encrypted at the mesh layer, so the
-// OTLP client itself doesn't terminate TLS. Outside a mesh you'd add real TLS.
+// TLS BEHAVIOR:
+//   - OTLPInsecure=false (default): TLS is enabled on the OTLP connection.
+//     The exporter uses the system certificate pool by default. In production,
+//     either the collector has a signed cert or Istio mTLS handles it.
+//   - OTLPInsecure=true: plaintext. Use for local docker-compose where the
+//     collector has no TLS certificate.
 //
 // WHY no WithPrettyPrint on stdout: the container's stdout is scraped line-by-
 // line into Loki, which expects ONE JSON object per line. Pretty-printed,
@@ -293,10 +355,12 @@ func newMeterProvider(ctx context.Context, cfg Config, res *resource.Resource) (
 // choice for a log-shipped pipeline.
 func newSpanExporter(ctx context.Context, cfg Config) (trace.SpanExporter, error) {
 	if cfg.OTLPEndpoint != "" {
-		return otlptracegrpc.New(ctx,
-			otlptracegrpc.WithEndpoint(cfg.OTLPEndpoint),
-			otlptracegrpc.WithInsecure(),
-		)
+		opts := []otlptracegrpc.Option{otlptracegrpc.WithEndpoint(cfg.OTLPEndpoint)}
+		if cfg.OTLPInsecure {
+			// Opt-in plaintext for local dev; production should NOT set this.
+			opts = append(opts, otlptracegrpc.WithInsecure())
+		}
+		return otlptracegrpc.New(ctx, opts...)
 	}
 	return stdouttrace.New()
 }
@@ -305,10 +369,11 @@ func newSpanExporter(ctx context.Context, cfg Config) (trace.SpanExporter, error
 // collector when an endpoint is set, otherwise stdout for local dev.
 func newMetricExporter(ctx context.Context, cfg Config) (metric.Exporter, error) {
 	if cfg.OTLPEndpoint != "" {
-		return otlpmetricgrpc.New(ctx,
-			otlpmetricgrpc.WithEndpoint(cfg.OTLPEndpoint),
-			otlpmetricgrpc.WithInsecure(),
-		)
+		opts := []otlpmetricgrpc.Option{otlpmetricgrpc.WithEndpoint(cfg.OTLPEndpoint)}
+		if cfg.OTLPInsecure {
+			opts = append(opts, otlpmetricgrpc.WithInsecure())
+		}
+		return otlpmetricgrpc.New(ctx, opts...)
 	}
 	return stdoutmetric.New()
 }
