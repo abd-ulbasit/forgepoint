@@ -1,0 +1,158 @@
+# ============================================================================
+# REDIS — Caching layer (registry read-model/CQRS, rate limiting, sessions)
+# ============================================================================
+#
+# WHY a StatefulSet at 1 replica: Redis here backs the Model Registry CQRS read
+# model and the Inference Gateway rate limiter. We enable AOF persistence so a
+# pod restart doesn't cold-start an empty cache (and so rate-limit counters
+# survive a bounce). Persistence ⇒ a PVC ⇒ stable identity ⇒ StatefulSet, same
+# reasoning as NATS/Postgres. If we treated Redis as a pure ephemeral cache a
+# Deployment would do; we choose durability for the rate-limiter correctness.
+#
+# REAL-WORLD COMPARISON: this maps to AWS ElastiCache in prod (M5 plan). The app
+# code path is identical — connect to redis.fp-infra.svc.cluster.local:6379.
+# ============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/part-of: forgepoint
+data:
+  redis.conf: |
+    # NOTE: redis.conf does NOT support inline (end-of-line) comments — a `#` after
+    # a directive value is parsed as extra arguments and FATALs at startup. Every
+    # comment here is therefore on its own line.
+
+    # Bind on all interfaces inside the pod's netns; the NetworkPolicy + ClusterIP
+    # are the real access boundary (no LAN exposure).
+    bind 0.0.0.0
+    port 6379
+    # protected-mode off is safe: traffic is restricted by NetworkPolicy + ClusterIP.
+    protected-mode no
+
+    # MEMORY POLICY (task requirement): cap memory and evict least-recently-used
+    # keys when full. allkeys-lru suits a cache where any key is fair game to drop.
+    # WHY 256mb: comfortably under the 512Mi container limit, leaving headroom for
+    # Redis's own overhead/COW during persistence so we don't trip the OOM killer.
+    maxmemory 256mb
+    maxmemory-policy allkeys-lru
+
+    # PERSISTENCE: AOF (append-only file) for durability of the rate-limiter state.
+    # everysec fsync = good durability/throughput balance (<=1s data loss window).
+    appendonly yes
+    appendfsync everysec
+    dir /data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  serviceName: redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis
+        app.kubernetes.io/component: cache
+        app.kubernetes.io/part-of: forgepoint
+    spec:
+      # Redis never calls the K8s API. The auto-mounted SA token is unused dead
+      # weight and a lateral-movement risk if the container is compromised.
+      automountServiceAccountToken: false
+      # The redis:7 image runs as uid 999 (redis). Pin nonroot + fsGroup so the
+      # AOF/RDB files on the PVC are writable.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: redis:7
+          args: ["redis-server", "/etc/redis/redis.conf"]
+          ports:
+            - name: redis
+              containerPort: 6379
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true   # only /data (PVC) needs writing
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          # redis-cli PING is the idiomatic health signal. We use it for both
+          # liveness and readiness — a Redis that answers PONG is serving.
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          volumeMounts:
+            - name: config
+              mountPath: /etc/redis
+              readOnly: true
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: config
+          configMap:
+            name: redis-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: redis
+          app.kubernetes.io/part-of: forgepoint
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 1Gi

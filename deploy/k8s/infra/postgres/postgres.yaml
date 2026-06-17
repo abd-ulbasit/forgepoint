@@ -1,0 +1,209 @@
+# ============================================================================
+# POSTGRESQL — Primary data store, DATABASE-PER-SERVICE
+# ============================================================================
+#
+# CLAUDE.md standard: "Each service owns its Postgres database and migrations.
+# No cross-service DB access." We run ONE Postgres server (homelab economy) but
+# carve out an isolated database per service. In production these could be
+# separate RDS instances; the connection-string boundary is the same either way.
+#
+# WHY a StatefulSet: Postgres is stateful — its data dir MUST survive reschedule
+# and bind to a stable identity (postgres-0). volumeClaimTemplates ties the PVC to
+# that identity. A Deployment would risk two pods racing on one RWO volume.
+#
+# INIT pattern: the official postgres image runs every *.sh / *.sql in
+# /docker-entrypoint-initdb.d/ ON FIRST START (empty data dir only). We mount
+# init-postgres.sh there from a ConfigMap — the same logic as the docker-compose
+# stack and scripts/init-postgres.sh, so local and cluster behave identically.
+# Idempotent re-init across pod restarts is NOT needed: once the DBs exist on the
+# PVC, the init dir is skipped (PG only runs it when PGDATA is empty).
+# ============================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-credentials
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: forgepoint
+type: Opaque
+stringData:
+  # ⚠️ PLACEHOLDER CREDENTIALS — NOT a real secret.
+  # In production these come from External Secrets Operator (pulling from AWS
+  # Secrets Manager / Vault) or Sealed Secrets — the encrypted value is what gets
+  # committed, never the plaintext. This file documents the SHAPE of the secret;
+  # the value is a well-known dev default ("fp") matching docker-compose so local
+  # tooling/connection strings line up. DO NOT reuse this anywhere real.
+  POSTGRES_USER: fp
+  POSTGRES_PASSWORD: fp
+  POSTGRES_DB: fp
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: forgepoint
+data:
+  # Ported from scripts/init-postgres.sh, extended to the full 8-service set from
+  # the task (auth, registry, pipeline, featurestore, experiment, billing,
+  # notification, monitor). Kept the fp_ prefix so DB names match the compose
+  # stack's connection strings (e.g. postgres://fp:fp@.../fp_auth).
+  init-postgres.sh: |
+    #!/bin/bash
+    # DATABASE-PER-SERVICE bootstrap. Runs once, on first PG start (empty PGDATA).
+    set -e
+    echo "Creating per-service databases..."
+    for db in fp_auth fp_registry fp_pipeline fp_featurestore fp_experiment fp_billing fp_notification fp_monitor; do
+        echo "  Creating database: $db"
+        # ON_ERROR_STOP=1 makes psql fail the whole init on any error (so a bad
+        # state surfaces loudly in pod logs rather than silently half-initializing).
+        psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+            CREATE DATABASE $db;
+            GRANT ALL PRIVILEGES ON DATABASE $db TO $POSTGRES_USER;
+    EOSQL
+    done
+    echo "All databases created successfully."
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/component: database
+        app.kubernetes.io/part-of: forgepoint
+    spec:
+      # Postgres never calls the K8s API — it talks only to its clients over TCP 5432.
+      # Disabling the auto-mounted SA token eliminates an unused credential that
+      # could be extracted from a compromised container to query or manipulate the
+      # cluster (MITRE ATT&CK: T1552.007 — Container API credentials).
+      automountServiceAccountToken: false
+      # The official postgres image's entrypoint runs as uid 999 (postgres) after
+      # an initial root step that chowns PGDATA. fsGroup=999 makes the PVC writable
+      # by that group. We pin runAsNonRoot + uid 999 so even the entrypoint runs
+      # unprivileged (the image supports this when PGDATA is already group-writable).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: postgres:17
+          envFrom:
+            - secretRef:
+                name: postgres-credentials
+          env:
+            # PGDATA points at a SUBDIRECTORY of the mount. WHY: local-path mounts
+            # the volume root; postgres refuses to init into a dir containing
+            # lost+found or non-empty content. A dedicated subdir ("pgdata") keeps
+            # PGDATA pristine and lets the entrypoint own it cleanly.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          securityContext:
+            allowPrivilegeEscalation: false
+            # readOnlyRootFilesystem is NOT set: the postgres entrypoint writes to
+            # /var/run/postgresql (socket) and a few transient paths. We give it a
+            # writable emptyDir for the socket dir instead of a fully-read-only FS,
+            # which the image doesn't cleanly support. Data still lives on the PVC.
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            # Postgres gets a bit more than the others (it's the platform's data
+            # backbone). Still modest for a homelab.
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          # pg_isready is the canonical health check. Liveness uses a short window;
+          # readiness gates traffic until the server accepts connections (and, on
+          # first boot, until init scripts finish — PG only opens the real 5432
+          # listener after init completes).
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "fp", "-d", "fp"]
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 5
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "fp", "-d", "fp"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+            - name: run
+              mountPath: /var/run/postgresql
+      volumes:
+        - name: init
+          configMap:
+            name: postgres-init
+            defaultMode: 0555     # executable: the entrypoint runs *.sh directly
+            # WHY 0555 not 0o555: YAML 1.1 (used by most K8s parsers including
+            # kubectl and kustomize) treats leading-zero integers as octal, making
+            # `0555` universally portable. `0o555` is Python/YAML-1.2 notation and
+            # triggers parse errors in strict YAML-1.1 tooling (e.g. some linters).
+        - name: run
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: postgres
+          app.kubernetes.io/part-of: forgepoint
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 5Gi

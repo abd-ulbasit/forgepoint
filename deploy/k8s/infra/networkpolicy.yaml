@@ -1,0 +1,166 @@
+# ============================================================================
+# NETWORK POLICIES — restrict who may reach the data infra
+# ============================================================================
+#
+# WHY: by default Kubernetes networking is wide open — any pod can dial any other
+# pod's IP. These policies implement DEFAULT-DENY ingress for fp-infra, then poke
+# explicit holes so ONLY the Forgepoint workload namespaces (fp-system, fp-models,
+# fp-jobs) can reach the data stores. Nothing else on the cluster (or a stray pod)
+# can touch Postgres/NATS/Redis/MinIO.
+#
+# HOW namespace selection works: NetworkPolicy peers select by LABEL, not name.
+# Every namespace auto-gets `kubernetes.io/metadata.name=<ns>` (kube-managed), so
+# we match on that — robust regardless of pod labels (Job pods, etc.).
+#
+# IMPORTANT k3s/CNI note: NetworkPolicy is only ENFORCED if the CNI supports it.
+# k3s default (flannel) does NOT enforce NetworkPolicy. These objects are still
+# correct and portable (Calico/Cilium enforce them); on plain flannel they are
+# declarative intent. We apply them so the security posture is codified and ready
+# the moment a policy-enforcing CNI is in place. (Documented as a known concern.)
+#
+# Pattern: one "default-deny-ingress" policy for the whole namespace, plus one
+# allow policy per component scoped to its port. Allow policies are ADDITIVE —
+# the union of all matching policies' allowed traffic is permitted.
+# ============================================================================
+
+# ---- Default deny all ingress into fp-infra -------------------------------
+# An empty podSelector selects every pod in the namespace; an empty ingress list
+# means "allow nothing". This is the floor; the allow-policies below add back the
+# specific flows we want.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress"]
+  ingress: []
+---
+# ---- NATS: allow 4222 (client) + 8222 (monitor) from workload namespaces ----
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-nats-from-workloads
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: nats
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: nats
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fp-system
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fp-models
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fp-jobs
+      ports:
+        - protocol: TCP
+          port: 4222
+        - protocol: TCP
+          port: 8222
+---
+# ---- Postgres: allow 5432 from workload namespaces ------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-postgres-from-workloads
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fp-system
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fp-models
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fp-jobs
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+# ---- Redis: allow 6379 from workload namespaces ---------------------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-redis-from-workloads
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fp-system
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fp-models
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fp-jobs
+      ports:
+        - protocol: TCP
+          port: 6379
+---
+# ---- MinIO: allow 9000 (S3 API) + 9001 (console) from workload namespaces --
+# The bucket-init Job runs INSIDE fp-infra, so we also allow same-namespace
+# ingress to MinIO (otherwise the mc Job couldn't reach the server under a
+# default-deny CNI).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-minio-from-workloads
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: minio
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: minio
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fp-system
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fp-models
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fp-jobs
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fp-infra   # the mc bootstrap Job
+      ports:
+        - protocol: TCP
+          port: 9000
+        - protocol: TCP
+          port: 9001

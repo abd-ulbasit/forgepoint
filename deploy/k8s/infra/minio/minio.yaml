@@ -1,0 +1,228 @@
+# ============================================================================
+# MINIO — S3-compatible object storage (model artifacts)
+# ============================================================================
+#
+# WHY: services use the S3 API for model artifacts so the SAME code path works
+# locally (MinIO) and in prod (AWS S3 — see M5 Terraform plan). No "local file"
+# storage adapter needed. Endpoint: minio.fp-infra.svc.cluster.local:9000.
+#
+# WHY a StatefulSet: object data must persist on a PVC bound to a stable identity.
+# Single-node, single-drive MinIO (no erasure coding) — appropriate for a homelab
+# portfolio; prod would use a distributed MinIO StatefulSet or real S3.
+#
+# The bucket is created by a separate Kubernetes Job (mc) — the cluster analogue
+# of the docker-compose `minio-init` service. A Job (not an initContainer) keeps
+# bootstrap decoupled from MinIO's own lifecycle and is naturally run-once.
+# ============================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-credentials
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: minio
+    app.kubernetes.io/component: object-storage
+    app.kubernetes.io/part-of: forgepoint
+type: Opaque
+stringData:
+  # ⚠️ PLACEHOLDER CREDENTIALS — NOT a real secret. Same policy as Postgres:
+  # production root creds come from External Secrets / Sealed Secrets, never
+  # committed in plaintext. Values match docker-compose defaults for parity.
+  MINIO_ROOT_USER: minioadmin
+  MINIO_ROOT_PASSWORD: minioadmin
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: minio
+    app.kubernetes.io/component: object-storage
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: minio
+  ports:
+    - name: api          # S3 API — used by services
+      port: 9000
+      targetPort: api
+    - name: console      # Web console (reached via kubectl port-forward; no Ingress)
+      port: 9001
+      targetPort: console
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: minio
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: minio
+    app.kubernetes.io/component: object-storage
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  serviceName: minio
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minio
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minio
+        app.kubernetes.io/component: object-storage
+        app.kubernetes.io/part-of: forgepoint
+    spec:
+      # The minio image runs as uid 1000. fsGroup makes the /data PVC writable.
+      # automountServiceAccountToken: MinIO never calls the K8s API, so the
+      # default-mounted SA token is unused attack surface — disable it.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: minio
+          image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+          args: ["server", "/data", "--console-address", ":9001"]
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+          ports:
+            - name: api
+              containerPort: 9000
+            - name: console
+              containerPort: 9001
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true   # MinIO only writes under /data
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          # MinIO exposes dedicated health endpoints. /minio/health/live = liveness;
+          # /minio/health/ready = readiness (drive + cluster ready to serve).
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: api
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: api
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: minio
+          app.kubernetes.io/part-of: forgepoint
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 5Gi
+---
+# ============================================================================
+# BUCKET BOOTSTRAP — run-once Job using the mc client
+# ============================================================================
+# Creates the `model-artifacts` bucket. Idempotent: `mc mb --ignore-existing`
+# is a no-op if the bucket already exists, so a re-apply / Job re-run is safe.
+# backoffLimit retries handle the race where MinIO isn't accepting connections
+# yet (we also poll `mc ready` first).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-bucket-init
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: minio
+    app.kubernetes.io/component: bucket-init
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 3600   # auto-clean the finished Job after 1h
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minio
+        app.kubernetes.io/component: bucket-init
+        app.kubernetes.io/part-of: forgepoint
+    spec:
+      restartPolicy: OnFailure
+      # This Job only runs mc commands against MinIO — it never calls the K8s
+      # API. Disabling the auto-mounted SA token removes a lateral-movement
+      # vector: a compromised mc container can't use the token to query the
+      # API server or escalate within the cluster.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mc
+          # Pinned to the same release era as the minio server image above
+          # (RELEASE.2025-04-22T22-12-26Z). Using an explicit tag rather than
+          # :latest prevents a surprise image pull pulling a version that is
+          # incompatible with the server or has an unvetted CVE.
+          # To update: bump both tags together and re-run `make docker-build-all`.
+          image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              # mc writes its config under $HOME; the read-only root FS forces us
+              # to point config at the writable /tmp (emptyDir).
+              export MC_CONFIG_DIR=/tmp/.mc
+              echo "Configuring mc alias for in-cluster MinIO..."
+              mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"
+              echo "Waiting for MinIO to be ready..."
+              mc ready local
+              echo "Creating bucket model-artifacts (idempotent)..."
+              mc mb local/model-artifacts --ignore-existing
+              echo "Buckets present:"
+              mc ls local
+              echo "Bucket bootstrap complete."
+          volumeMounts:
+            - name: mc-config
+              mountPath: /tmp
+      volumes:
+        - name: mc-config
+          emptyDir: {}

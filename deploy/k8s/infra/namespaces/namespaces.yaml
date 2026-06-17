@@ -1,0 +1,49 @@
+# ============================================================================
+# FORGEPOINT NAMESPACES
+# ============================================================================
+#
+# WHY this file exists here (and first in kustomization.yaml resources):
+#   kubectl apply -k deploy/k8s/infra/ on a fresh cluster will fail with
+#   "namespaces fp-infra not found" unless the Namespace objects are created
+#   before any namespaced resources. Kustomize applies resources in the order
+#   they appear in the resources list, so this file must come first.
+#
+# WHY four namespaces:
+#   fp-infra   — stateful data plane (NATS, Postgres, Redis, MinIO)
+#   fp-system  — platform services (auth, registry, inference-gateway, etc.)
+#   fp-models  — model serving workloads (dynamically created per model version)
+#   fp-jobs    — training and batch jobs (K8s Jobs)
+#
+# LABEL strategy:
+#   app.kubernetes.io/part-of=forgepoint  — applied here for resource grouping
+#   kubernetes.io/metadata.name           — auto-set by kube on every namespace;
+#     used in NetworkPolicy namespaceSelectors (see networkpolicy.yaml) so we
+#     never need to manually label namespaces for network isolation.
+# ============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fp-infra
+  labels:
+    app.kubernetes.io/part-of: forgepoint
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fp-system
+  labels:
+    app.kubernetes.io/part-of: forgepoint
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fp-models
+  labels:
+    app.kubernetes.io/part-of: forgepoint
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fp-jobs
+  labels:
+    app.kubernetes.io/part-of: forgepoint

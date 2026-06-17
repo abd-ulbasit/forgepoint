@@ -1,0 +1,19 @@
+# ============================================================================
+# Namespaces sub-kustomization
+# ============================================================================
+# Intentionally a separate kustomization (not inlined in the root) because
+# the root kustomization sets `namespace: fp-infra` which would be applied
+# as a namespace transformation to every resource — including Namespace objects.
+# Kustomize's namespace transformer uses the overridden value when building
+# resource IDs for conflict detection, causing a spurious ID collision when
+# multiple Namespace objects are present alongside `namespace: fp-infra`.
+#
+# Keeping the Namespace manifests in a child kustomization that has NO
+# `namespace:` transformer set avoids the collision and is the idiomatic
+# kustomize pattern for cluster-scoped resources that live alongside
+# namespace-scoped ones.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - namespaces.yaml

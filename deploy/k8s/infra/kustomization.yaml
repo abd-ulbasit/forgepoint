@@ -1,0 +1,46 @@
+# ============================================================================
+# FORGEPOINT DATA INFRASTRUCTURE — kustomization
+# ============================================================================
+# Aggregates every fp-infra data component into one apply unit:
+#   kubectl apply -k deploy/k8s/infra/
+#
+# Each resource declares `namespace: fp-infra` explicitly in its own file.
+# We intentionally do NOT set `namespace:` here at the root level because
+# kustomize v5's namespace transformer produces an ID-conflict error when
+# cluster-scoped Namespace objects and namespaced objects coexist in the same
+# build output. The per-resource namespace declarations are the source of truth.
+#
+# COMPONENTS (matches docker-compose.yaml local stack):
+#   namespaces — fp-infra, fp-system, fp-models, fp-jobs (must apply first)
+#   nats       — JetStream event bus
+#   postgres   — database-per-service (8 DBs)
+#   redis      — cache / CQRS read model / rate limiter
+#   minio      — S3-compatible object storage (model-artifacts bucket)
+#   network    — default-deny + per-component allow NetworkPolicies
+#
+# NOTE: observability (Prometheus/Grafana/Tempo/Loki) from docker-compose is NOT
+# part of this DATA-infra bundle — that's M3 (Observability + Istio) and lives
+# separately. This bundle is the stateful data plane only.
+# ============================================================================
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# `labels` with includeSelectors:false adds the common label to every resource's
+# metadata WITHOUT injecting it into pod/StatefulSet selectors (which are
+# immutable). The older `commonLabels` injects into selectors too — undesirable.
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: forgepoint
+    includeSelectors: false
+
+resources:
+  # namespaces/ MUST be first: creates fp-infra (and workload ns) before the
+  # namespaced objects below. It is a sub-kustomization so that kustomize's
+  # namespace transformer (absent here but present if a parent overlays this)
+  # does not corrupt the cluster-scoped Namespace resources.
+  - namespaces/
+  - nats/nats.yaml
+  - postgres/postgres.yaml
+  - redis/redis.yaml
+  - minio/minio.yaml
+  - networkpolicy.yaml
