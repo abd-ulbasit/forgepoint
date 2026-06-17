@@ -1,0 +1,201 @@
+# ============================================================================
+# TEMPO — distributed tracing backend (single-binary, local storage)
+# ============================================================================
+#
+# WHY Tempo: object-storage-backed trace store that speaks OTLP natively and is
+#   queried by Grafana. Adapted from the local deploy/tempo/tempo.yaml — same
+#   single-binary, filesystem-backed config, just K8s-ified onto a PVC.
+#
+# TRACE FLOW (who sends what):
+#   service → OTel SDK → otel-collector (otlp/tempo exporter) → Tempo :4317
+#   Grafana → Tempo HTTP API :3200 → renders trace waterfalls.
+#   NOTE: services do NOT push to Tempo directly — ONLY the collector does. The
+#   NetworkPolicy enforces exactly that (tempo:4317 reachable only from the
+#   collector pod).
+#
+# WHY a StatefulSet: Tempo persists trace blocks + WAL to a filesystem path. That
+#   data must survive reschedule and bind to a stable identity (tempo-0) via
+#   volumeClaimTemplates — identical reasoning to NATS/Postgres/Redis in infra/.
+#   A Deployment's interchangeable pods would race on one RWO PVC.
+#
+# SINGLE-BINARY MODE: all Tempo components (distributor, ingester, querier,
+#   compactor) run in ONE process. Appropriate for a homelab/portfolio; prod
+#   would split components into a microservices deployment behind a gateway and
+#   back storage with S3/GCS (see M5 Terraform plan).
+# ============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tempo-config
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: tempo
+    app.kubernetes.io/component: tracing
+    app.kubernetes.io/part-of: forgepoint
+data:
+  # tempo.yaml — adapted from deploy/tempo/tempo.yaml. Storage paths point under
+  # /var/tempo (the PVC mount) instead of /tmp so blocks/WAL survive restarts.
+  tempo.yaml: |
+    # Allow Grafana to stream search results over HTTP (TraceQL streaming).
+    stream_over_http_enabled: true
+
+    server:
+      http_listen_port: 3200
+      grpc_listen_port: 9095
+
+    # distributor.receivers — Tempo's OWN OTLP ingest. The collector's otlp/tempo
+    # exporter targets grpc :4317 here. http :4318 is available for completeness.
+    distributor:
+      receivers:
+        otlp:
+          protocols:
+            grpc:
+              endpoint: 0.0.0.0:4317
+            http:
+              endpoint: 0.0.0.0:4318
+
+    # ingester flush tuning kept conservative for a small single node.
+    ingester:
+      max_block_duration: 5m
+
+    compactor:
+      compaction:
+        # Trace retention: drop blocks older than 7d (matches Prometheus
+        # retention below — keep the three pillars' windows aligned).
+        block_retention: 168h
+
+    storage:
+      trace:
+        backend: local
+        local:
+          path: /var/tempo/blocks
+        wal:
+          path: /var/tempo/wal
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tempo
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: tempo
+    app.kubernetes.io/component: tracing
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: tempo
+  ports:
+    - name: http-query    # Grafana queries the Tempo API here (datasource url)
+      port: 3200
+      targetPort: http-query
+    - name: otlp-grpc     # OTLP gRPC ingest — the collector pushes traces here
+      port: 4317
+      targetPort: otlp-grpc
+    - name: otlp-http     # OTLP HTTP ingest (parity with the local stack)
+      port: 4318
+      targetPort: otlp-http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: tempo
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: tempo
+    app.kubernetes.io/component: tracing
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  serviceName: tempo
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: tempo
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: tempo
+        app.kubernetes.io/component: tracing
+        app.kubernetes.io/part-of: forgepoint
+    spec:
+      # Tempo never calls the K8s API — disable the unused SA token (same
+      # lateral-movement hardening as the infra/ stores).
+      automountServiceAccountToken: false
+      # The grafana/tempo image runs as uid 10001. fsGroup makes the /var/tempo
+      # PVC group-writable so block/WAL writes don't EACCES.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: tempo
+          # Pinned tag (the local stack uses :latest; we pin in-cluster for
+          # reproducibility and CVE control, matching the infra/ image policy).
+          # VERIFY before first deploy: confirm this tag exists on Docker Hub
+          # (hub.docker.com/r/grafana/tempo/tags) and check the changelog for
+          # storage-format or config breaking changes before bumping.
+          image: grafana/tempo:2.7.1
+          args: ["-config.file=/etc/tempo/tempo.yaml"]
+          ports:
+            - name: http-query
+              containerPort: 3200
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true   # only /var/tempo (PVC) is written
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          # /ready is Tempo's readiness endpoint; /status/services confirms the
+          # single-binary's subservices are Running. We use /ready for both —
+          # a Tempo that reports ready is ingesting + queryable.
+          livenessProbe:
+            httpGet:
+              path: /ready
+              port: http-query
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http-query
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: config
+              mountPath: /etc/tempo
+              readOnly: true
+            - name: data
+              mountPath: /var/tempo
+      volumes:
+        - name: config
+          configMap:
+            name: tempo-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: tempo
+          app.kubernetes.io/part-of: forgepoint
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 5Gi

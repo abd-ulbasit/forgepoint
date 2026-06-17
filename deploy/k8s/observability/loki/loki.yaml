@@ -1,0 +1,210 @@
+# ============================================================================
+# LOKI — log aggregation backend (single-binary, filesystem storage)
+# ============================================================================
+#
+# WHY Loki: "Prometheus, but for logs" — it indexes only labels (not full text),
+#   so it's cheap to run and pairs naturally with Grafana. CLAUDE.md names Loki
+#   as the log sink for the platform's structured JSON logs.
+#
+# LOG FLOW (who sends what):
+#   service → structured JSON to stdout (slog) → [log collector / OTel log bridge]
+#   → otel-collector (otlphttp/loki exporter) → Loki :3100 /otlp endpoint
+#   Grafana → Loki query API :3100 → renders log streams + derived TraceID links.
+#   The local docker-compose runs Loki with no explicit config (image defaults).
+#   In-cluster we supply an explicit single-binary config so storage lands on the
+#   PVC and the OTLP-ingest endpoint is enabled deterministically.
+#
+# WHY a StatefulSet: Loki persists chunks + the BoltDB-shipper index to a
+#   filesystem path that must survive reschedule on a stable identity (loki-0).
+#   Same PVC/identity reasoning as the other stateful backends.
+#
+# SINGLE-BINARY ("monolithic") MODE: distributor/ingester/querier/compactor all
+#   in one process with the filesystem object store. Right-sized for a homelab;
+#   prod would run the scalable/microservices mode backed by S3.
+# ============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-config
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/component: logging
+    app.kubernetes.io/part-of: forgepoint
+data:
+  loki.yaml: |
+    # auth_enabled:false — single-tenant. Loki's multi-tenancy keys off an
+    # X-Scope-OrgID header; we don't need tenant isolation in a single-platform
+    # homelab, and the NetworkPolicy already restricts who can reach Loki.
+    auth_enabled: false
+
+    server:
+      http_listen_port: 3100
+      grpc_listen_port: 9096
+      # Keep server logs quiet-ish; the collector + Grafana surface real signal.
+      log_level: info
+
+    common:
+      # All paths live under /var/loki (the PVC mount).
+      path_prefix: /var/loki
+      replication_factor: 1
+      ring:
+        kvstore:
+          store: inmemory          # single node — no external ring KV needed
+      storage:
+        filesystem:
+          chunks_directory: /var/loki/chunks
+          rules_directory: /var/loki/rules
+
+    # schema_config — TSDB index (the current Loki default; supersedes the older
+    # boltdb-shipper). One period from a fixed start date; bump the `from` date +
+    # add a new entry when changing schema (never edit a past period).
+    schema_config:
+      configs:
+        - from: 2024-01-01
+          store: tsdb
+          object_store: filesystem
+          schema: v13
+          index:
+            prefix: index_
+            period: 24h
+
+    # Retention: drop logs older than 7d to bound PVC growth (aligned with the
+    # Prometheus + Tempo 7d windows so the three pillars expire together).
+    limits_config:
+      retention_period: 168h
+      # Allow OTLP-shipped logs whose timestamps may lag slightly behind wall
+      # clock (batching in the collector) without being rejected as too old.
+      reject_old_samples: true
+      reject_old_samples_max_age: 168h
+
+    compactor:
+      working_directory: /var/loki/compactor
+      # delete_request_store + retention_enabled are required for the compactor
+      # to actually ENFORCE the retention_period above (otherwise it only
+      # compacts, never deletes).
+      retention_enabled: true
+      delete_request_store: filesystem
+
+    # ruler is optional; pointing it at local storage avoids startup warnings.
+    ruler:
+      storage:
+        type: local
+        local:
+          directory: /var/loki/rules
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/component: logging
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: loki
+  ports:
+    - name: http       # query API (Grafana) + OTLP log ingest (/otlp) + push
+      port: 3100
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: loki
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/component: logging
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  serviceName: loki
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: loki
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: loki
+        app.kubernetes.io/component: logging
+        app.kubernetes.io/part-of: forgepoint
+    spec:
+      # Loki never calls the K8s API — disable the unused SA token.
+      automountServiceAccountToken: false
+      # The grafana/loki image runs as uid 10001. fsGroup makes /var/loki
+      # group-writable for chunk/index writes.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: loki
+          # Pinned tag — reproducible builds + CVE control (no :latest).
+          # VERIFY before first deploy: confirm this tag on Docker Hub
+          # (hub.docker.com/r/grafana/loki/tags) and check the changelog for
+          # schema or config breaking changes before bumping (schema migrations
+          # are one-way — see schema_config above).
+          image: grafana/loki:3.4.2
+          args: ["-config.file=/etc/loki/loki.yaml"]
+          ports:
+            - name: http
+              containerPort: 3100
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true   # only /var/loki (PVC) is written
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          # /ready gates traffic until Loki's subservices are Running; /metrics is
+          # also exposed but /ready is the right readiness signal.
+          livenessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: config
+              mountPath: /etc/loki
+              readOnly: true
+            - name: data
+              mountPath: /var/loki
+      volumes:
+        - name: config
+          configMap:
+            name: loki-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: loki
+          app.kubernetes.io/part-of: forgepoint
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 5Gi

@@ -1,0 +1,294 @@
+# ============================================================================
+# OTEL COLLECTOR — the SINGLE telemetry ingest point for Forgepoint
+# ============================================================================
+#
+# WHY a collector at all (vs services talking to Tempo/Prometheus/Loki direct):
+#   CLAUDE.md observability contract + pkg/observability/setup.go both make ONE
+#   decision explicit: every service PUSHES OTLP (traces + metrics) to a single
+#   endpoint — otel-collector.fp-infra:4317. The collector is the fan-out hub:
+#
+#       services (fp-system/fp-models/fp-jobs)
+#                 │  OTLP gRPC :4317  /  OTLP HTTP :4318
+#                 ▼
+#        ┌──────────────────────┐
+#        │    OTEL COLLECTOR     │   receivers → processors → exporters
+#        └───────┬──────┬───────┘
+#         traces │      │ metrics          logs
+#          (otlp)│      │(prometheus       (loki via
+#                ▼      ▼ exporter,         otlphttp)
+#             Tempo   scraped by Prom)    Loki
+#                       ▲
+#                       └── Prometheus scrapes the collector's :8889/metrics
+#
+#   Benefits (all interview-relevant):
+#     - ONE instrumentation path, ONE config to swap backends — services never
+#       learn a backend's address. Tempo→Jaeger or Prometheus→Mimir is a
+#       collector edit, not a redeploy of 10 services.
+#     - Keeps the Prometheus PULL model intact: the collector re-exposes pushed
+#       OTLP metrics on a /metrics endpoint that Prometheus scrapes — so the
+#       Prometheus/Alertmanager ecosystem (ServiceMonitors, recording rules)
+#       still works while services only speak OTLP push.
+#     - Central place for batch/memory_limiter/resource processors — back-pressure
+#       and enrichment live in ONE pod, not smeared across every service SDK.
+#
+# REAL-WORLD COMPARISON: this is the OTel "gateway collector" deployment pattern
+#   (as opposed to per-node agent collectors). Datadog Agent / Grafana Alloy /
+#   AWS ADOT play the same role. We run the upstream contrib distro.
+#
+# WHY a Deployment (not StatefulSet): the collector is STATELESS — it buffers
+#   in-memory only (memory_limiter caps it) and persists nothing. Pods are
+#   interchangeable, so a Deployment (easy rolling updates, no PVC) is correct.
+#   Contrast with the backends below (Tempo/Loki/Prometheus) which are stateful.
+# ============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: telemetry-gateway
+    app.kubernetes.io/part-of: forgepoint
+data:
+  # config.yaml — the collector pipeline. Mounted read-only; the collector reads
+  # it via --config. Keeping it in a ConfigMap makes the pipeline reviewable and
+  # version-controlled (same philosophy as nats.conf / redis.conf in infra/).
+  config.yaml: |
+    # ---- RECEIVERS: how telemetry ENTERS the collector ----------------------
+    # OTLP is the only receiver — every service pushes OTLP here (matches
+    # pkg/observability/setup.go which exports otlptracegrpc + otlpmetricgrpc).
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            # 0.0.0.0 so the Service can route pod-external traffic in. The
+            # NetworkPolicy (networkpolicy.yaml) is the real access boundary —
+            # only fp-system/fp-models/fp-jobs may dial this port.
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+    # ---- PROCESSORS: transform/protect telemetry in the pipeline ------------
+    processors:
+      # memory_limiter MUST be first in every pipeline. WHY: it enforces a hard
+      # memory ceiling and applies back-pressure (refusing new data) before the
+      # collector OOMs. Without it a traffic spike kills the pod and you lose ALL
+      # telemetry. limit_mib is set below the container memory limit (512Mi) so
+      # the limiter trips before the kernel OOM-killer does.
+      memory_limiter:
+        check_interval: 1s
+        limit_mib: 400
+        spike_limit_mib: 100
+
+      # resourcedetection enriches every span/metric/log with environment
+      # attributes (k8s/host/process) so Grafana can filter by node/pod without
+      # services having to set those attributes themselves. `env` detector reads
+      # OTEL_RESOURCE_ATTRIBUTES; `system` adds host.name/os. override:false means
+      # we never clobber an attribute a service already set (service.name stays).
+      resourcedetection:
+        detectors: [env, system]
+        timeout: 5s
+        override: false
+
+      # batch is the throughput workhorse: it groups telemetry into bigger
+      # payloads before export — far fewer network round-trips to the backends.
+      # It is the LAST processor so batching happens after limiting/enrichment.
+      batch:
+        timeout: 5s
+        send_batch_size: 1024
+        send_batch_max_size: 2048
+
+    # ---- EXPORTERS: where telemetry LEAVES the collector --------------------
+    exporters:
+      # TRACES → Tempo over OTLP gRPC. tls.insecure=true because in-cluster
+      # traffic to tempo:4317 is plaintext (no mesh mTLS here; the homelab CNI +
+      # NetworkPolicy are the boundary). In a mesh, Istio would mTLS this hop.
+      otlp/tempo:
+        endpoint: tempo.fp-infra.svc.cluster.local:4317
+        tls:
+          insecure: true
+
+      # METRICS → Prometheus PULL. The `prometheus` exporter does NOT push; it
+      # re-exposes all received OTLP metrics on an HTTP /metrics endpoint
+      # (:8889) that Prometheus then SCRAPES (see prometheus.yaml scrape job).
+      # WHY this over prometheusremotewrite (push): keeps the canonical pull
+      # model + staleness handling Prometheus is built around, and matches the
+      # rationale documented in pkg/observability/setup.go (newMeterProvider).
+      prometheus:
+        endpoint: 0.0.0.0:8889
+        # Emit OTel resource attributes (service.name, etc.) as Prometheus
+        # labels so dashboards can group by service. Without this they'd be
+        # collapsed into a single target_info metric.
+        resource_to_telemetry_conversion:
+          enabled: true
+
+      # LOGS → Loki via OTLP HTTP. Loki ≥3 natively accepts OTLP on
+      # /otlp/v1/logs, so the generic otlphttp exporter (not a Loki-specific
+      # one) is the current idiomatic path. Services log structured JSON to
+      # stdout today; once an OTel log bridge is wired, this path carries them.
+      otlphttp/loki:
+        endpoint: http://loki.fp-infra.svc.cluster.local:3100/otlp
+        tls:
+          insecure: true
+
+    # ---- SERVICE: wire receivers→processors→exporters into 3 pipelines ------
+    # One pipeline per pillar. The processor ORDER is identical and intentional:
+    # memory_limiter (protect) → resourcedetection (enrich) → batch (throughput).
+    service:
+      telemetry:
+        # The collector's OWN logs to stdout (scraped into Loki like any pod).
+        logs:
+          level: info
+        # The collector's OWN internal metrics, exposed for Prometheus to scrape
+        # (self-observability — is the collector dropping data?).
+        metrics:
+          address: 0.0.0.0:8888
+      extensions: [health_check]
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, resourcedetection, batch]
+          exporters: [otlp/tempo]
+        metrics:
+          receivers: [otlp]
+          processors: [memory_limiter, resourcedetection, batch]
+          exporters: [prometheus]
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, resourcedetection, batch]
+          exporters: [otlphttp/loki]
+
+    # health_check extension powers the k8s liveness/readiness probes below
+    # (HTTP 200 on :13133 when the collector pipeline is healthy).
+    extensions:
+      health_check:
+        endpoint: 0.0.0.0:13133
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: telemetry-gateway
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  # ClusterIP — services reach it in-cluster as:
+  #   otel-collector.fp-infra.svc.cluster.local:4317
+  # which is exactly the OTLPEndpoint pkg/observability/setup.go documents.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: otel-collector
+  ports:
+    - name: otlp-grpc       # OTLP gRPC ingest (primary path for the SDK)
+      port: 4317
+      targetPort: otlp-grpc
+    - name: otlp-http       # OTLP HTTP ingest (browsers / non-gRPC clients)
+      port: 4318
+      targetPort: otlp-http
+    - name: prom-metrics    # re-exposed OTLP metrics — Prometheus scrapes this
+      port: 8889
+      targetPort: prom-metrics
+    - name: self-metrics    # the collector's own internal metrics
+      port: 8888
+      targetPort: self-metrics
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/component: telemetry-gateway
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: otel-collector
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: otel-collector
+        app.kubernetes.io/component: telemetry-gateway
+        app.kubernetes.io/part-of: forgepoint
+    spec:
+      # The collector forwards telemetry over the network; it never calls the K8s
+      # API (no k8s_attributes processor configured). Disabling the auto-mounted
+      # SA token removes an unused credential a compromised collector could use to
+      # pivot. (If we later add the k8sattributes processor for pod-metadata
+      # enrichment, it would need RBAC + the token — documented tradeoff.)
+      automountServiceAccountToken: false
+      # The upstream collector image runs as uid 10001 (nonroot). Pin it
+      # explicitly so the pod is rejected if the image ever ships as root.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: otel-collector
+          # Pinned tag (NOT :latest) — reproducible builds + no surprise CVEs.
+          # contrib distro carries the prometheus + otlphttp/loki exporters the
+          # core distro lacks. Bump deliberately and re-test the pipeline.
+          # VERIFY before first deploy: confirm this tag exists on Docker Hub
+          # (hub.docker.com/r/otel/opentelemetry-collector-contrib/tags) and
+          # check the release notes for breaking pipeline config changes.
+          image: otel/opentelemetry-collector-contrib:0.119.0
+          args: ["--config=/etc/otel/config.yaml"]
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+            - name: prom-metrics
+              containerPort: 8889
+            - name: self-metrics
+              containerPort: 8888
+            - name: health
+              containerPort: 13133
+          securityContext:
+            allowPrivilegeEscalation: false
+            # Collector writes nothing to disk (in-memory buffering only), so a
+            # fully read-only root FS is safe — defense in depth.
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              # 512Mi limit sits above memory_limiter's 400+100Mi so the limiter
+              # applies back-pressure BEFORE the kernel OOM-kills the pod.
+              memory: 512Mi
+          # Probes hit the health_check extension. Readiness gates the Service so
+          # services aren't routed to a collector whose pipeline isn't up yet.
+          livenessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otel
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector-config

@@ -1,0 +1,56 @@
+# ============================================================================
+# FORGEPOINT OBSERVABILITY STACK — kustomization (Phase 10 / M3)
+# ============================================================================
+# The three pillars (metrics/logs/traces) + their single ingest gateway, K8s-ified
+# from the docker-compose local stack. Apply unit:
+#   kubectl apply -k deploy/k8s/observability/
+#
+# PREREQ: the fp-infra namespace must already exist (created by
+# deploy/k8s/infra/namespaces/). This bundle is the OBSERVABILITY plane and is
+# intentionally SEPARATE from the data-infra bundle (deploy/k8s/infra/), exactly
+# as that bundle's header anticipated ("observability ... is M3 and lives
+# separately"). It does NOT re-create namespaces — apply infra first (or just its
+# namespaces/ sub-kustomization).
+#
+# TELEMETRY PIPELINE (who sends what where):
+#   services (fp-system/fp-models/fp-jobs)
+#     --OTLP gRPC/HTTP 4317/4318-->  otel-collector  (the single ingest point)
+#                                        |  traces  --otlp-->  Tempo  :4317
+#                                        |  metrics --re-expose :8889--> scraped by Prometheus
+#                                        |  logs    --otlphttp--> Loki   :3100/otlp
+#   Prometheus --scrape--> otel-collector:8889 (+ :8888 self, + NATS :8222)
+#   Grafana --query--> Prometheus:9090 / Tempo:3200 / Loki:3100  (single pane)
+#
+# Each resource declares `namespace: fp-infra` in its own file (source of truth).
+# We do NOT set a root-level `namespace:` — same kustomize-v5 rationale as the
+# infra bundle (the namespace transformer conflicts with cluster-scoped objects;
+# this bundle ships a cluster-scoped ClusterRole/Binding for Prometheus SD).
+# ============================================================================
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# `labels` with includeSelectors:false stamps the common part-of label onto every
+# resource's metadata WITHOUT mutating immutable pod/StatefulSet selectors. (Same
+# pattern as deploy/k8s/infra/kustomization.yaml — commonLabels would corrupt the
+# selectors.)
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: forgepoint
+    includeSelectors: false
+
+resources:
+  # otel-collector FIRST conceptually (it's the hub), though kustomize apply order
+  # within a bundle does not enforce readiness — the probes + retries handle
+  # startup races (e.g. collector buffering until Tempo/Loki are up).
+  - otel-collector/otel-collector.yaml
+  - tempo/tempo.yaml
+  - loki/loki.yaml
+  - prometheus/prometheus.yaml
+  - grafana/grafana.yaml
+  # NetworkPolicies last — a scoped default-deny for the five observability pods
+  # (making this bundle self-contained) plus additive allow-rules for the
+  # telemetry flows. When the infra bundle is also applied its namespace-wide
+  # default-deny-ingress coexists harmlessly (different name, same effect).
+  # NOTE: enforcement requires a policy-capable CNI (Calico/Cilium); on the
+  # current k3s/flannel setup these objects are declarative intent only.
+  - networkpolicy.yaml

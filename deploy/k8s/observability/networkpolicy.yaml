@@ -1,0 +1,259 @@
+# ============================================================================
+# NETWORK POLICIES — lock down the observability ingest + backends
+# ============================================================================
+#
+# THREAT MODEL & INTENT (same philosophy as deploy/k8s/infra/networkpolicy.yaml):
+#   K8s networking is wide-open by default. This file ships a DEFAULT-DENY for
+#   the four observability pods (collector/tempo/loki/prometheus/grafana) so the
+#   observability bundle is SELF-CONTAINED and apply-able on its own without
+#   relying on deploy/k8s/infra/networkpolicy.yaml's namespace-wide floor. When
+#   both bundles are applied together the two default-deny objects coexist
+#   harmlessly — they have distinct names and K8s merges NetworkPolicy ingress
+#   rules additively (only allow-rules from both apply; two deny floors = one
+#   deny floor in practice).
+#
+#   After establishing the deny floor this file pokes EXACTLY the holes the
+#   telemetry pipeline needs:
+#
+#     1. The COLLECTOR is the intended front door for app telemetry. On a
+#        policy-capable CNI (Calico/Cilium) it would accept OTLP (4317/4318)
+#        ONLY from the workload namespaces (fp-system/fp-models/fp-jobs). This
+#        is the "single ingest point" contract — declared at L3/L4 for
+#        enforcement by a CNI that supports NetworkPolicy.
+#
+#     2. The BACKENDS (Tempo/Loki) are intended to accept telemetry ONLY from
+#        the collector. On a policy-capable CNI, services pushing directly to
+#        Tempo/Loki would be blocked; on flannel they can reach them and this
+#        is documented defence-in-depth intent only (see CNI caveat below).
+#
+#     3. Prometheus PULLS, so the flow is inverted: Prometheus must be allowed
+#        to reach the collector's :8889/:8888 + NATS :8222. That's egress from
+#        Prometheus, which is permitted by default (we only restrict INGRESS
+#        here). We DO restrict ingress TO Prometheus/Grafana: only Grafana may
+#        query Prometheus/Tempo/Loki, and Grafana's UI is reachable only via
+#        port-forward (same-namespace), so we allow same-namespace ingress.
+#
+#   CNI CAVEAT — IMPORTANT: NetworkPolicy objects are DECLARATIVE INTENT. They
+#   are only ENFORCED when the cluster CNI supports them (Calico, Cilium, etc.).
+#   The default k3s CNI (flannel) does NOT enforce NetworkPolicy — on a flannel
+#   cluster these objects are applied and stored by the API server but have NO
+#   effect on actual packet routing. They represent the intended security posture
+#   and are ready the moment a policy-capable CNI is installed. Do NOT rely on
+#   these policies for actual traffic isolation on the current k3s/flannel
+#   cluster. (Documented known concern; swap CNI before treating these as
+#   enforced.)
+#
+#   HOW peers are selected: by LABEL, never name. Namespaces auto-get
+#   `kubernetes.io/metadata.name=<ns>`; collector/grafana pods carry
+#   `app.kubernetes.io/name`. We match on those.
+#
+#   OWNERSHIP NOTE: deploy/k8s/infra/networkpolicy.yaml also ships a
+#   `default-deny-ingress` policy in fp-infra (namespace-wide, empty
+#   podSelector). This file's deny policy is named distinctly
+#   (`default-deny-ingress-observability`) and scopes to the observability pods
+#   by label — no name collision, no drift risk, two consistent deny floors.
+# ============================================================================
+
+# ---- Default-deny ingress for the observability pods in fp-infra -----------
+# WHY scoped rather than namespace-wide: deploy/k8s/infra/networkpolicy.yaml
+# already owns the namespace-wide default-deny-ingress for fp-infra. Re-declaring
+# an identically-named namespace-wide deny here would risk name collision and
+# ownership confusion across bundles. Instead we declare a DISTINCTLY NAMED deny
+# scoped to the five observability components (by their app.kubernetes.io/name
+# labels). Combined with the infra bundle's namespace-wide deny this is
+# redundant — but it makes this bundle genuinely self-contained: applying ONLY
+# the observability bundle (e.g. in a CI smoke-test namespace) still establishes
+# a deny floor for these pods without needing the infra bundle applied first.
+#
+# ENFORCEMENT REMINDER: on flannel this object is stored but NOT enforced.
+# On Calico/Cilium it blocks all unlisted ingress to these pods.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress-observability
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  # matchExpressions selects the five observability pods by their
+  # app.kubernetes.io/name label — does NOT catch infra pods (nats/postgres/
+  # redis/minio) which use different name values, so this deny is scoped
+  # precisely to the observability surface.
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        values:
+          - otel-collector
+          - tempo
+          - loki
+          - prometheus
+          - grafana
+  policyTypes: ["Ingress"]
+  ingress: []
+---
+
+# ---- Collector: OTLP ingest ONLY from workload namespaces (on policy CNI) --
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-otel-collector-from-workloads
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: otel-collector
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: otel-collector
+  policyTypes: ["Ingress"]
+  ingress:
+    # OTLP push from the three workload namespaces (the services).
+    # On a policy-capable CNI (Calico/Cilium) this is enforced at L3/L4.
+    # On flannel (k3s default) this rule is stored but NOT enforced —
+    # pods in other namespaces can still reach :4317/:4318 in practice.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fp-system
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fp-models
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fp-jobs
+      ports:
+        - protocol: TCP
+          port: 4317   # OTLP gRPC
+        - protocol: TCP
+          port: 4318   # OTLP HTTP
+    # Prometheus (same namespace) scrapes the collector's re-exposed metrics.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 8889   # re-exposed OTLP app metrics
+        - protocol: TCP
+          port: 8888   # collector's own internal metrics
+---
+# ---- Tempo: trace ingest + queries ONLY from collector & grafana ----------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-tempo-from-collector-and-grafana
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: tempo
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: tempo
+  policyTypes: ["Ingress"]
+  ingress:
+    # Collector pushes traces to Tempo's OTLP ingest. On a policy-capable CNI
+    # only the collector pod matches this peer selector, realising the
+    # single-ingest contract. On flannel this rule is stored but not enforced —
+    # services can reach Tempo:4317 directly in practice on that CNI.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 4318
+    # Grafana queries the Tempo HTTP API to render trace waterfalls.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: grafana
+      ports:
+        - protocol: TCP
+          port: 3200
+---
+# ---- Loki: log ingest + queries ONLY from collector & grafana -------------
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-loki-from-collector-and-grafana
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: loki
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: loki
+  policyTypes: ["Ingress"]
+  ingress:
+    # Loki's single :3100 carries BOTH the collector's OTLP log push AND
+    # Grafana's query API — so both peers are allowed to that one port.
+    # On a policy-capable CNI only these two pods can reach Loki. On flannel
+    # the rule is declarative-only and any pod can reach :3100 in practice.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: grafana
+      ports:
+        - protocol: TCP
+          port: 3100
+---
+# ---- Prometheus: query API reachable ONLY from Grafana --------------------
+# Prometheus's EGRESS (scraping the collector/NATS) is unrestricted (we only
+# gate ingress). Its INGRESS (who can query the TSDB) is locked to Grafana.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus-from-grafana
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: prometheus
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: grafana
+      ports:
+        - protocol: TCP
+          port: 9090
+---
+# ---- Grafana: UI reachable only same-namespace (port-forward target) ------
+# No Ingress/LoadBalancer in the homelab — Grafana is reached via
+# `kubectl port-forward`, which originates from the API server / kubelet and is
+# NOT subject to pod NetworkPolicy. We additionally allow same-namespace ingress
+# so an in-cluster reverse-proxy/BFF (M4) could front it later without a policy
+# edit. Nothing in other namespaces may reach Grafana directly.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-grafana-same-namespace
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: grafana
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: grafana
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: fp-infra
+      ports:
+        - protocol: TCP
+          port: 3000

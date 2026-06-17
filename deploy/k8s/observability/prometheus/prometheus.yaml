@@ -1,0 +1,290 @@
+# ============================================================================
+# PROMETHEUS — metrics store (pull/scrape model)
+# ============================================================================
+#
+# WHY Prometheus: the K8s-native metrics standard. PULL model — Prometheus
+#   scrapes /metrics endpoints rather than receiving pushes. Adapted from
+#   deploy/prometheus/prometheus.yml; the static docker-compose targets are
+#   replaced with Kubernetes service discovery (the cluster-correct way).
+#
+# METRICS FLOW (who sends what):
+#   service → OTel SDK (OTLP push) → otel-collector (prometheus exporter :8889)
+#   Prometheus → SCRAPES otel-collector:8889/metrics → stores time-series
+#   Prometheus → ALSO scrapes its own :9090 + the collector's self-metrics :8888
+#   Grafana → queries Prometheus :9090 → RED dashboards.
+#   KEY POINT: services NEVER expose /metrics themselves. The collector is the
+#   single scrape target for app metrics — matches pkg/observability/setup.go
+#   (services push OTLP; the collector re-exposes pull). This is why the old
+#   per-service "fp-services" static job is gone.
+#
+# WHY a StatefulSet: the TSDB on /prometheus must persist across reschedule on a
+#   stable identity (prometheus-0). Same PVC/identity reasoning as infra stores.
+#
+# RBAC: Kubernetes service discovery (kubernetes_sd_configs) requires the
+#   Prometheus ServiceAccount to LIST/WATCH pods/endpoints/services. We grant a
+#   minimal read-only ClusterRole — Prometheus is the one component here that
+#   legitimately needs an SA token (so we do NOT disable automount for it).
+# ============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/component: metrics
+    app.kubernetes.io/part-of: forgepoint
+---
+# ClusterRole: read-only discovery permissions. Prometheus needs to enumerate
+# endpoints/pods/services across namespaces to know what to scrape. This is the
+# MINIMUM set the kubernetes_sd_configs roles below require — nothing writable.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: forgepoint-prometheus
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/component: metrics
+    app.kubernetes.io/part-of: forgepoint
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/metrics", "services", "endpoints", "pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  # Allow scraping endpoints protected by Kubernetes RBAC (non-resource /metrics).
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: forgepoint-prometheus
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/component: metrics
+    app.kubernetes.io/part-of: forgepoint
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: forgepoint-prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: fp-infra
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/component: metrics
+    app.kubernetes.io/part-of: forgepoint
+data:
+  # prometheus.yml — adapted from deploy/prometheus/prometheus.yml. The global
+  # block is unchanged; scrape_configs swap docker static_configs for K8s SD.
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+      scrape_timeout: 10s
+      external_labels:
+        cluster: forgepoint
+        environment: homelab
+
+    scrape_configs:
+      # ---- Prometheus self-monitoring -----------------------------------
+      - job_name: prometheus
+        static_configs:
+          - targets: ["localhost:9090"]
+
+      # ---- OTel Collector: the re-exposed APP metrics (the main signal) --
+      # The collector's `prometheus` exporter republishes every OTLP metric the
+      # services pushed, on :8889/metrics. Scraping this ONE target gives us all
+      # service RED metrics — this is the cluster equivalent of the old
+      # "fp-services" static job, now sourced through the collector.
+      - job_name: otel-collector-app-metrics
+        static_configs:
+          - targets: ["otel-collector.fp-infra.svc.cluster.local:8889"]
+            labels:
+              source: otel-collector
+
+      # ---- OTel Collector: the collector's OWN internal metrics ----------
+      # Self-observability: is the collector dropping spans, refusing data
+      # (memory_limiter), failing to export? :8888 answers that.
+      - job_name: otel-collector-internal
+        static_configs:
+          - targets: ["otel-collector.fp-infra.svc.cluster.local:8888"]
+            labels:
+              source: otel-collector-internal
+
+      # ---- NATS server metrics ------------------------------------------
+      # NATS exposes Prometheus metrics on its monitoring port (8222). DNS to the
+      # infra-namespace Service. (Parity with the docker-compose "nats" job.)
+      - job_name: nats
+        metrics_path: /metrics
+        static_configs:
+          - targets: ["nats.fp-infra.svc.cluster.local:8222"]
+
+      # ---- Kubernetes service discovery: opt-in pod scraping ------------
+      # ServiceMonitor-style discovery without the Prometheus Operator: any pod
+      # annotated `prometheus.io/scrape: "true"` is scraped. This is the escape
+      # hatch for components that DO expose their own /metrics (e.g. a sidecar)
+      # rather than pushing OTLP. Most fp services rely on the collector path
+      # above and need NO annotation.
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          # Keep only pods that opted in via annotation.
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          # Honor a custom metrics path annotation (default /metrics).
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          # Honor a custom port annotation: rewrite the scrape address to the
+          # pod IP + annotated port.
+          - source_labels:
+              [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          # Surface useful k8s metadata as labels (namespace, pod, node).
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/component: metrics
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: prometheus
+  ports:
+    - name: http        # UI + query API (Grafana datasource url: prometheus:9090)
+      port: 9090
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: prometheus
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/component: metrics
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  serviceName: prometheus
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: prometheus
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: prometheus
+        app.kubernetes.io/component: metrics
+        app.kubernetes.io/part-of: forgepoint
+    spec:
+      # Prometheus IS the exception to the automount=false rule: it genuinely
+      # calls the K8s API (kubernetes_sd_configs) to discover scrape targets, so
+      # it needs its SA token. We scope the blast radius with a read-only
+      # ClusterRole (above) instead — least privilege, not zero privilege.
+      serviceAccountName: prometheus
+      automountServiceAccountToken: true
+      # The prom/prometheus image runs as uid 65534 (nobody). fsGroup makes the
+      # TSDB PVC group-writable.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: prometheus
+          # Pinned tag — reproducible builds + CVE control (no :latest).
+          # VERIFY before first deploy: confirm this tag on Docker Hub
+          # (hub.docker.com/r/prom/prometheus/tags) and review the CHANGELOG for
+          # scrape config or TSDB breaking changes before bumping.
+          image: prom/prometheus:v3.1.0
+          args:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.path=/prometheus"
+            - "--storage.tsdb.retention.time=7d"
+            # Enable the lifecycle API so config can be hot-reloaded via a POST
+            # to /-/reload (no pod restart) after a ConfigMap change.
+            - "--web.enable-lifecycle"
+          ports:
+            - name: http
+              containerPort: 9090
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true   # only /prometheus (PVC) is written
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 150m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          # Prometheus ships purpose-built probe endpoints: /-/healthy (liveness)
+          # and /-/ready (readiness — TSDB loaded + web up).
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+              readOnly: true
+            - name: data
+              mountPath: /prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: prometheus
+          app.kubernetes.io/part-of: forgepoint
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 5Gi
