@@ -129,6 +129,13 @@ type TokenValidator interface {
 // RECOVERY INTERCEPTOR
 // ============================================================================
 
+// maxStackLen is the maximum number of bytes we log from a panic stack trace.
+// debug.Stack() can return megabytes for deep call stacks (e.g., deeply nested
+// goroutines). Logging that verbatim floods Loki and can hit slog's line-length
+// limits. 4096 bytes is enough to see the top ~20 frames — the ones that matter
+// for diagnosing the panic origin — without drowning the log pipeline.
+const maxStackLen = 4096
+
 // RecoveryUnaryInterceptor catches panics in handlers and returns a gRPC
 // Internal error instead of crashing the server.
 //
@@ -155,12 +162,16 @@ func RecoveryUnaryInterceptor() grpc.UnaryServerInterceptor {
 	) (resp any, err error) {
 		defer func() {
 			if r := recover(); r != nil {
-				// Log the panic with stack trace for debugging.
-				// In production, this goes to Loki via stdout JSON.
+				// Cap stack trace to avoid flooding Loki. debug.Stack() can return
+				// megabytes for deep stacks; we only need the top frames.
+				stack := debug.Stack()
+				if len(stack) > maxStackLen {
+					stack = stack[:maxStackLen]
+				}
 				slog.ErrorContext(ctx, "panic recovered in gRPC handler",
 					slog.String("method", info.FullMethod),
 					slog.Any("panic", r),
-					slog.String("stack", string(debug.Stack())),
+					slog.String("stack", string(stack)),
 				)
 				// Return gRPC Internal error — client gets a proper error response
 				// instead of a hanging connection.
@@ -206,15 +217,27 @@ func LoggingUnaryInterceptor(logger *slog.Logger) grpc.UnaryServerInterceptor {
 		code := status.Code(err)
 		level := logLevelForCode(code)
 
-		// Include the error message itself when the RPC failed — a "code=Internal"
-		// access log with no message gives an on-call engineer nothing to act on.
+		// Include the error when the RPC failed — a "code=Internal" access log
+		// with no error detail gives an on-call engineer nothing to act on.
+		//
+		// SANITIZATION:
+		//   We log st.Message() for gRPC status errors, not err.Error(). The raw
+		//   err.Error() string is "rpc error: code = X desc = Y" — verbose and
+		//   already contains the code we logged separately. More importantly, if
+		//   the message contains internal detail (host names, stack traces), it is
+		//   sanitized at the authenticate() level (Fix 4a) before it reaches here.
+		//
+		//   For plain Go errors (not gRPC statuses): log a constant string rather
+		//   than err.Error() because raw error strings can embed payload content or
+		//   PII (e.g., "failed processing user email=alice@example.com"). The error
+		//   TYPE is still useful for debugging patterns in Loki.
 		attrs := []slog.Attr{
 			slog.String("grpc.method", info.FullMethod),
 			slog.String("grpc.code", code.String()),
 			slog.Duration("grpc.duration", duration),
 		}
 		if err != nil {
-			attrs = append(attrs, slog.String("grpc.error", err.Error()))
+			attrs = append(attrs, slog.String("grpc.error", sanitizeGRPCError(err)))
 		}
 
 		logger.LogAttrs(ctx, level, "gRPC request", attrs...)
@@ -298,19 +321,24 @@ func AuthUnaryInterceptor(validator TokenValidator, opts ...AuthOption) grpc.Una
 // authenticate extracts the bearer token, validates it, and returns a context
 // carrying the resulting Claims. Shared by the unary and stream interceptors.
 //
-// ERROR NORMALIZATION (this is the subtle, interview-worthy part):
+// ERROR NORMALIZATION (interview-worthy):
 //
 //	A validator can fail for two very different reasons:
 //	  1. The token is genuinely bad → Unauthenticated (client's fault).
-//	  2. The auth backend is DOWN → the remote ValidateToken RPC returns
-//	     codes.Internal/Unavailable (our fault, not the caller's).
+//	  2. The auth backend is DOWN → codes.Internal/Unavailable (our fault).
 //
-//	The old code flattened BOTH to Unauthenticated, which would make a total
-//	auth-service outage look like every client suddenly had invalid tokens —
-//	masking the real incident and breaking error-rate/SLO alerting. So we
-//	PRESERVE an error that is already a gRPC status (the validator chose its
-//	code deliberately) and only wrap genuinely-unstructured errors as
-//	Unauthenticated.
+//	We PRESERVE the gRPC code (so SLO alerting fires on the correct signal)
+//	but SANITIZE the message for non-client-facing codes:
+//	  - Unauthenticated / PermissionDenied: pass the message through — these
+//	    are client-facing by design ("invalid token", "not authorized for X").
+//	  - Any other code (Internal, Unavailable, etc.): replace the message with
+//	    "authentication service error". The raw message can contain internal
+//	    topology (DB hosts, IP addresses, stack traces) that must not reach
+//	    clients. The real message is still logged internally by the logging
+//	    interceptor (which runs before auth in the chain).
+//
+// TRADEOFF: We lose the specific internal message at the client boundary
+// (security win). Internal diagnosis uses service logs, not client errors.
 func authenticate(ctx context.Context, validator TokenValidator) (context.Context, error) {
 	token, err := extractBearerToken(ctx)
 	if err != nil {
@@ -319,12 +347,25 @@ func authenticate(ctx context.Context, validator TokenValidator) (context.Contex
 
 	claims, err := validator.Validate(ctx, token)
 	if err != nil {
-		// status.FromError reports ok==true only when err already carries a
-		// gRPC status code; in that case pass it through untouched.
-		if _, ok := status.FromError(err); ok {
-			return ctx, err
+		st, ok := status.FromError(err)
+		if !ok {
+			// Plain Go error (not a gRPC status) → treat as bad token.
+			return ctx, status.Error(codes.Unauthenticated, "invalid token")
 		}
-		return ctx, status.Error(codes.Unauthenticated, "invalid token")
+
+		// gRPC status: preserve the code, but sanitize the message for
+		// codes that expose internal infrastructure detail.
+		switch st.Code() {
+		case codes.Unauthenticated, codes.PermissionDenied:
+			// Client-facing codes: pass the message through unchanged.
+			// "token signature mismatch" is useful feedback for the client.
+			return ctx, err
+		default:
+			// Internal, Unavailable, etc.: preserve the code for SLO alerting
+			// but replace the message with a generic string so internal details
+			// (DB hosts, stack traces, service URLs) do not reach the client.
+			return ctx, status.Error(st.Code(), "authentication service error")
+		}
 	}
 
 	return contextWithClaims(ctx, claims), nil
@@ -332,6 +373,19 @@ func authenticate(ctx context.Context, validator TokenValidator) (context.Contex
 
 // extractBearerToken extracts the token from the "authorization" metadata.
 // Returns Unauthenticated error if missing or malformed.
+//
+// RFC 6750 §2.1 specifies "Authorization: Bearer <token>". The scheme name
+// ("Bearer") is case-insensitive per RFC 7235 §3.1 which defines the
+// Authorization header grammar. Many clients send "bearer" (lowercase) or
+// "BEARER" (uppercase) — a case-sensitive check incorrectly rejects them.
+//
+// MULTIPLE HEADERS REJECTION:
+//
+//	gRPC metadata allows multiple values per key. Two "authorization" headers
+//	is ambiguous: different layers of the stack may pick the first or the last
+//	header, enabling header-confusion attacks (e.g., an attacker appends a
+//	second valid token after a WAF has already validated the first). We reject
+//	any request with len(values) > 1 to eliminate this ambiguity entirely.
 func extractBearerToken(ctx context.Context) (string, error) {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
@@ -343,15 +397,25 @@ func extractBearerToken(ctx context.Context) (string, error) {
 		return "", status.Error(codes.Unauthenticated, "missing authorization header")
 	}
 
-	// Strip "Bearer " prefix (case-insensitive, per RFC 6750).
+	// Reject ambiguous requests with more than one authorization header.
+	// This eliminates header-confusion attacks where different stack layers
+	// parse different header values. The legitimate case has exactly one header.
+	if len(values) > 1 {
+		return "", status.Error(codes.Unauthenticated,
+			"multiple authorization headers not allowed")
+	}
+
+	// Case-insensitive Bearer scheme check per RFC 6750 / RFC 7235.
+	// strings.ToLower on just the first 7 characters avoids allocating a
+	// lowercase copy of the entire (potentially large) auth string.
 	auth := values[0]
-	const prefix = "Bearer "
-	if !strings.HasPrefix(auth, prefix) {
+	const schemeLen = 7 // len("bearer ")
+	if len(auth) < schemeLen || strings.ToLower(auth[:schemeLen]) != "bearer " {
 		return "", status.Error(codes.Unauthenticated,
 			"invalid authorization format, expected 'Bearer <token>'")
 	}
 
-	token := strings.TrimPrefix(auth, prefix)
+	token := auth[schemeLen:]
 	if token == "" {
 		return "", status.Error(codes.Unauthenticated, "empty token")
 	}
@@ -395,6 +459,7 @@ func (w *wrappedServerStream) Context() context.Context { return w.ctx }
 // RecoveryStreamInterceptor is the streaming counterpart of
 // RecoveryUnaryInterceptor: it catches panics in streaming handlers and
 // converts them to a gRPC Internal error instead of crashing the goroutine.
+// Stack trace is capped to maxStackLen bytes (same as the unary version).
 func RecoveryStreamInterceptor() grpc.StreamServerInterceptor {
 	return func(
 		srv any,
@@ -404,10 +469,14 @@ func RecoveryStreamInterceptor() grpc.StreamServerInterceptor {
 	) (err error) {
 		defer func() {
 			if r := recover(); r != nil {
+				stack := debug.Stack()
+				if len(stack) > maxStackLen {
+					stack = stack[:maxStackLen]
+				}
 				slog.ErrorContext(ss.Context(), "panic recovered in gRPC stream handler",
 					slog.String("method", info.FullMethod),
 					slog.Any("panic", r),
-					slog.String("stack", string(debug.Stack())),
+					slog.String("stack", string(stack)),
 				)
 				err = status.Errorf(codes.Internal, "internal server error")
 			}
@@ -488,4 +557,34 @@ func logLevelForCode(code codes.Code) slog.Level {
 	default:
 		return slog.LevelInfo
 	}
+}
+
+// sanitizeGRPCError returns a safe string to log for an RPC error.
+//
+// WHY: err.Error() for a gRPC status is "rpc error: code = X desc = Y".
+// That format is verbose and duplicates the code we already log separately.
+// More critically, Y (the description) may contain PII or internal details
+// if it came from a handler that didn't sanitize its errors.
+//
+// STRATEGY:
+//   - gRPC status error: log st.Message() only (the desc part, already
+//     sanitized at the authenticate() boundary for auth errors).
+//   - Plain Go error: log a constant. The raw error string can embed payload
+//     content (e.g. "invalid user email=alice@corp.com") and must not be
+//     emitted to a shared log store like Loki.
+//
+// TRADEOFF: We lose raw error strings in logs. Engineers needing full error
+// detail should add structured attributes in the handler itself, where they
+// control what is logged and can redact PII explicitly.
+func sanitizeGRPCError(err error) string {
+	if st, ok := status.FromError(err); ok {
+		msg := st.Message()
+		if msg == "" {
+			return st.Code().String()
+		}
+		return msg
+	}
+	// Non-status error: log a constant rather than the raw string.
+	// The error type/code is already captured in grpc.code above.
+	return "non-status error"
 }

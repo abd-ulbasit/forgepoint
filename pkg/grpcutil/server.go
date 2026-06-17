@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"sync/atomic"
+	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
@@ -48,6 +50,12 @@ import (
 // Used by gRPC itself, OTel, and most Go libraries.
 // ============================================================================
 
+// defaultDrainTimeout is the maximum time GracefulStop is allowed to run before
+// we hard-stop the server. 25s is chosen to be comfortably within a K8s
+// terminationGracePeriodSeconds of 30s, leaving 5s for the container runtime
+// to clean up after us.
+const defaultDrainTimeout = 25 * time.Second
+
 // ServerOption configures a gRPC server.
 type ServerOption func(*serverConfig)
 
@@ -56,6 +64,7 @@ type serverConfig struct {
 	validator      TokenValidator
 	skipMethods    []string
 	enableReflect  bool
+	drainTimeout   time.Duration
 	extraUnaryInt  []grpc.UnaryServerInterceptor
 	extraStreamInt []grpc.StreamServerInterceptor
 }
@@ -114,6 +123,35 @@ func WithStreamInterceptors(interceptors ...grpc.StreamServerInterceptor) Server
 	}
 }
 
+// WithDrainTimeout sets the maximum duration for GracefulStop to drain active
+// RPCs before a hard Stop() is issued. The zero value uses defaultDrainTimeout
+// (25 seconds).
+//
+// WHY THIS MATTERS FOR K8S ROLLING DEPLOYS:
+//   When K8s sends SIGTERM, it gives the pod terminationGracePeriodSeconds (30s
+//   by default) to finish up. Our Serve() catches ctx.Done(), marks the server
+//   NOT_SERVING (so probes fail → pod leaves Service endpoints), then calls
+//   GracefulStop. GracefulStop blocks until ALL in-flight RPCs finish — but a
+//   single slow streaming RPC (e.g., a long-running WatchExecution with no
+//   client deadline) can hold GracefulStop open indefinitely, causing the pod to
+//   be SIGKILL'd mid-stream anyway (ugly) AND blocking the rolling update.
+//
+//   The bounded drain: GracefulStop races against the timeout. If the timeout
+//   fires first, we hard-Stop (clients get UNAVAILABLE — reconnect-able) and
+//   return. This ensures pods finish within terminationGracePeriodSeconds even
+//   under pathological streaming clients.
+//
+//   TRADEOFF: A client that holds a stream open longer than the drain timeout
+//   sees a hard disconnect. The alternative — no timeout — risks blocking the
+//   entire rolling update. Setting the client's RPC deadline < drainTimeout
+//   eliminates this entirely (well-behaved clients), so the timeout is only
+//   a safety net for misbehaving or stuck clients.
+func WithDrainTimeout(d time.Duration) ServerOption {
+	return func(cfg *serverConfig) {
+		cfg.drainTimeout = d
+	}
+}
+
 // Server bundles the gRPC server with its health server and provides graceful
 // shutdown. Register your service handlers on the embedded GRPC field.
 //
@@ -129,8 +167,15 @@ type Server struct {
 	//   authpb.RegisterAuthServiceServer(srv.GRPC, handler)
 	GRPC *grpc.Server
 
-	health *health.Server
-	logger *slog.Logger
+	health       *health.Server
+	logger       *slog.Logger
+	drainTimeout time.Duration
+
+	// serving is an atomic flag preventing a second Serve() call from running
+	// concurrently with an already-serving instance. 0 = idle, 1 = serving.
+	// WHY atomic: we need a lockless check at the top of Serve() without
+	// introducing a mutex that would complicate the select loop below.
+	serving atomic.Int32
 }
 
 // NewServer creates a Server with the standard interceptor chains, tracing,
@@ -199,10 +244,16 @@ func NewServer(opts ...ServerOption) *Server {
 		reflection.Register(grpcServer)
 	}
 
+	drainTimeout := cfg.drainTimeout
+	if drainTimeout == 0 {
+		drainTimeout = defaultDrainTimeout
+	}
+
 	return &Server{
-		GRPC:   grpcServer,
-		health: healthServer,
-		logger: cfg.logger,
+		GRPC:         grpcServer,
+		health:       healthServer,
+		logger:       cfg.logger,
+		drainTimeout: drainTimeout,
 	}
 }
 
@@ -221,14 +272,31 @@ func (s *Server) SetServing(serving bool) {
 // Serve starts the server on lis and blocks until the server stops or ctx is
 // cancelled. On cancellation (typically SIGTERM in K8s) it marks the server
 // NOT_SERVING — so in-flight readiness probes fail fast and the pod is pulled
-// from the Service endpoints — then GracefulStop drains in-flight RPCs before
-// returning.
+// from the Service endpoints — then attempts GracefulStop with a bounded drain
+// timeout (default 25s), falling back to hard Stop() if streams don't finish.
 //
 // WHY GracefulStop over Stop: Stop hard-kills in-flight RPCs (clients see
 // broken connections mid-call). GracefulStop stops accepting new RPCs and waits
 // for active ones to finish — the correct behavior for a K8s rolling update,
 // which gives a 30s termination grace period for exactly this.
+//
+// WHY a drain TIMEOUT on GracefulStop: a streaming RPC held open by a client
+// (with no deadline) would block GracefulStop forever, causing the pod to be
+// SIGKILL'd mid-stream anyway AND blocking the rolling update. The bounded drain
+// ensures we always return within the K8s grace period. See WithDrainTimeout.
+//
+// DOUBLE-SERVE GUARD: Calling Serve() twice on the same Server instance would
+// start two goroutines listening on the same listener (likely a panic or accept
+// error inside grpc-go). The atomic guard returns a clear error instead.
 func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
+	// Guard against calling Serve() twice on the same server instance.
+	// CompareAndSwap from 0→1 atomically; if it returns false, another
+	// goroutine is already in Serve().
+	if !s.serving.CompareAndSwap(0, 1) {
+		return grpc.ErrServerStopped // reuse the sentinel; caller gets a clear error
+	}
+	defer s.serving.Store(0)
+
 	serveErr := make(chan error, 1)
 	go func() {
 		serveErr <- s.GRPC.Serve(lis)
@@ -236,13 +304,61 @@ func (s *Server) Serve(ctx context.Context, lis net.Listener) error {
 
 	select {
 	case err := <-serveErr:
-		// Server stopped on its own (listener error, etc.).
+		// Server stopped on its own (listener error, Stop(), GracefulStop(), etc.).
+		// grpc.ErrServerStopped is returned when Stop/GracefulStop was called
+		// externally; that is a clean shutdown, not an error. Map it to nil so
+		// main() doesn't log a spurious error on normal shutdown.
+		if err == grpc.ErrServerStopped {
+			return nil
+		}
 		return err
+
 	case <-ctx.Done():
-		s.logger.Info("shutting down gRPC server", slog.String("reason", ctx.Err().Error()))
+		s.logger.Info("shutting down gRPC server",
+			slog.String("reason", ctx.Err().Error()),
+			slog.Duration("drain_timeout", s.drainTimeout),
+		)
+		// Mark NOT_SERVING immediately: K8s readiness probes start failing now,
+		// which causes the load balancer to stop routing new traffic to this pod
+		// before we've fully stopped. This is the "connection draining" equivalent
+		// for gRPC — the pod leaves the Service endpoints gracefully.
 		s.SetServing(false)
-		s.GRPC.GracefulStop()
-		// GracefulStop unblocks Serve, which returns nil after a clean drain.
-		return <-serveErr
+
+		// Bounded graceful drain:
+		//   1. Run GracefulStop in a goroutine (it can block indefinitely).
+		//   2. Race it against a timer.
+		//   3. If the timer wins, hard-Stop and return.
+		gracefulDone := make(chan struct{})
+		go func() {
+			s.GRPC.GracefulStop()
+			close(gracefulDone)
+		}()
+
+		select {
+		case <-gracefulDone:
+			// Clean drain — all in-flight RPCs finished within the timeout.
+			// GracefulStop already called Serve() to return; drain the channel.
+			err := <-serveErr
+			if err == grpc.ErrServerStopped {
+				return nil
+			}
+			return err
+
+		case <-time.After(s.drainTimeout):
+			// Timeout: some RPCs are still open. Hard-stop now so the pod
+			// exits within K8s terminationGracePeriodSeconds. Clients with
+			// open streams see UNAVAILABLE and should reconnect.
+			s.logger.Warn("graceful drain timed out — forcing hard stop",
+				slog.Duration("drain_timeout", s.drainTimeout),
+			)
+			s.GRPC.Stop()
+			// Wait for both GracefulStop and Serve goroutines to finish.
+			<-gracefulDone
+			err := <-serveErr
+			if err == grpc.ErrServerStopped {
+				return nil
+			}
+			return err
+		}
 	}
 }
