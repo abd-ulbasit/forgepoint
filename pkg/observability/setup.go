@@ -83,8 +83,8 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
 )
 
-// setupOnce guards Setup() so it can only be called once per process.
-// A second call returns errAlreadySetup without replacing the existing providers.
+// setupCalled (guarded by setupMu) ensures Setup() runs at most once per process.
+// A second call returns errSetupDone without replacing the existing providers.
 //
 // WHY: OTel's global providers (otel.SetTracerProvider, otel.SetMeterProvider)
 // are package-level singletons. Calling Setup() a second time would:
@@ -97,7 +97,6 @@ import (
 // TESTS: call ResetForTest() before each test that calls Setup(), so tests
 // are independent of each other regardless of execution order.
 var (
-	setupOnce    sync.Once
 	errSetupDone = errors.New("observability: Setup already called; call ResetForTest() in tests")
 	setupCalled  bool
 	setupMu      sync.Mutex // protects setupCalled for ResetForTest
@@ -173,7 +172,6 @@ type Config struct {
 func ResetForTest() {
 	setupMu.Lock()
 	defer setupMu.Unlock()
-	setupOnce = sync.Once{} // replace the used Once with a fresh one
 	setupCalled = false
 }
 
