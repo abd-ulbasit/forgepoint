@@ -41,16 +41,22 @@ A **Backend‑for‑Frontend (BFF)** + web UI and an `fp` **CLI** sit in front o
 
 ## Status
 
-This is an actively‑built project. The **shared foundation (`pkg/`) is complete and tested**; the services are being built one at a time (depth over breadth).
+All 10 services are **code‑complete across every layer** — built test‑first with adversarial bug/security verification, and validated with the race detector against real Postgres/Redis/NATS (testcontainers).
 
 | Area | State |
 |---|---|
 | `pkg/` shared libraries | ✅ Built & tested (build · vet · `-race`) |
-| Local infra (docker‑compose) | ✅ NATS, Postgres, Redis, MinIO, Prometheus, Tempo, Grafana, Loki |
-| Proto tooling (Buf) | ✅ Lint + codegen wired |
-| Services (auth → …) | 🚧 In progress, per the implementation plan |
+| Proto contracts + `events/v1` event schema | ✅ All 10 services, `buf` lint/breaking |
+| Service **domains** (one pattern each) | ✅ All 10 — TDD + adversarial review |
+| Service **handlers** (gRPC, proto↔domain) | ✅ All 10 — bufconn component tests |
+| **Persistence** (Postgres/Redis adapters + migrations) | ✅ All 10 — testcontainers `-race` |
+| **Events** (NATS pub/sub, idempotent, DLQ) + `main.go` wiring | ✅ All 10 — testcontainers `-race` |
+| Helm charts + ArgoCD app‑of‑apps | ✅ All 10 |
+| k8s data infra (NATS/Postgres/Redis/MinIO) | ✅ Deployed to k3s `fp-infra` |
+| Observability stack · CI/CD + supply‑chain · M6 (Kyverno/GitOps/secrets) · Terraform (AWS) | ✅ Authored |
+| Deploy smoke (image → k3s → Helm) · E2E · Web UI (BFF) · `fp` CLI | 🚧 In progress |
 
-See the [implementation plan](docs/plans/forgepoint-implementation-plan.md) for the phased roadmap (Core vs Stretch).
+See the [implementation plan](docs/plans/forgepoint-implementation-plan.md) for the full phased roadmap and the [ADRs](docs/adr/) for the key decisions.
 
 ### Shared libraries (`pkg/`)
 
