@@ -280,19 +280,41 @@ func main() {
 		}
 	}()
 
-	// NOTIFICATION CREATES NO DOMAIN STREAM. It is a pure CONSUMER that binds ONE
-	// durable consumer per subject (events.ConsumedSubjects) to the EXISTING per-domain
-	// stream that owns each subject — MODELS (fp.models.>), PIPELINES (fp.pipelines.>),
+	// NOTIFICATION CONSUMES from the EXISTING per-domain streams it does NOT own. It
+	// binds ONE durable consumer per subject (events.ConsumedSubjects) to the stream
+	// that owns each subject — MODELS (fp.models.>), PIPELINES (fp.pipelines.>),
 	// INFERENCE (fp.inference.>), BILLING (fp.billing.>), EXPERIMENTS (fp.experiments.>)
 	// — each provisioned by its OWN producing service at boot. The reactor resolves the
 	// owning stream for each subject via js.StreamNameBySubject (events.Reactor.Start).
+	// It does NOT create those consumed streams.
 	//
 	// WHY NOT a single EVENTS stream over fp.>: a stream's subjects must not OVERLAP
 	// another stream's, and fp.> overlaps every per-domain stream → JetStream err 10065
 	// ("subjects overlap with an existing stream") → CrashLoop. That is the exact bug
-	// this deploy surfaced. We removed the fp.> stream creation entirely; the only
-	// stream this service owns is its private DLQ below.
+	// this deploy surfaced. We removed the fp.> stream creation entirely.
 	//
+	// ENSURE THE NOTIFICATIONS DOMAIN STREAM EXISTS (producer owns its stream).
+	// Notification is the OWNER and sole producer of the fp.notifications.* delivery-
+	// health feed (fp.notifications.delivered / .failed). JetStream REJECTS a publish
+	// whose subject no stream captures (10073); without this stream every delivery-health
+	// event was dropped AND experiment-tracker's wide lineage sink (which binds a durable
+	// to the NOTIFICATIONS stream) had no stream to bind. We ensure it here, before the
+	// publisher is wired, exactly as registry/experiment-tracker/billing do for their
+	// trees. CreateOrUpdateStream is idempotent + convergent; we FAIL FAST on error so an
+	// unprovisionable stream CrashLoops with the cause in logs rather than silently
+	// dropping events. fp.notifications.> overlaps no other stream.
+	domainStreamCtx, cancelDomainStream := context.WithTimeout(ctx, 10*time.Second)
+	if streamErr := events.EnsureStream(domainStreamCtx, js); streamErr != nil {
+		cancelDomainStream()
+		logger.Error("failed to ensure NOTIFICATIONS stream", slog.String("error", streamErr.Error()))
+		os.Exit(1)
+	}
+	cancelDomainStream()
+	logger.Info("NOTIFICATIONS domain stream ensured",
+		slog.String("stream", events.StreamName),
+		slog.String("subjects", events.StreamSubjects),
+	)
+
 	// ENSURE THE DEDICATED DLQ STREAM EXISTS. A JetStream subject is bound to exactly
 	// ONE stream, so the DLQ subject (events.SubjectDLQ = "fp_dlq.notification", a token
 	// OUTSIDE every fp.<domain>.> tree, so it overlaps nothing) needs its own stream to

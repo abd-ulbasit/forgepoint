@@ -106,9 +106,11 @@
 package events
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 
+	"github.com/nats-io/nats.go/jetstream"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
@@ -218,28 +220,74 @@ const Source = "notification"
 //
 // In JetStream a SUBJECT is bound to a STREAM (the durable log). A subscriber
 // creates a CONSUMER on a stream filtered to a subject, so the stream must exist
-// before Subscribe is called. The per-domain streams notification consumes from
+// before Subscribe is called. The per-domain streams notification CONSUMES from
 // (MODELS, PIPELINES, INFERENCE, BILLING, EXPERIMENTS) are OWNED and provisioned by
-// the producing services (registry, pipeline-orchestrator, …) at their boot — and,
-// at platform scale, by a stream-bootstrap job / the infra Helm chart. Notification
-// does NOT create any of them; it RESOLVES the owning stream for each consumed
-// subject at boot via js.StreamNameBySubject (subscriber.go Start) and binds a
-// durable consumer there. Creating an fp.> stream of its own would OVERLAP every
-// per-domain stream (JetStream err 10065) — the exact CrashLoop this design fixes.
+// THEIR producing services (registry, pipeline-orchestrator, …, experiment-tracker)
+// at their boot — and, at platform scale, by a stream-bootstrap job / the infra Helm
+// chart. Notification does NOT create the streams it consumes; it RESOLVES the owning
+// stream for each consumed subject at boot via js.StreamNameBySubject (subscriber.go
+// Start) and binds a durable consumer there. Creating an fp.> stream of its own would
+// OVERLAP every per-domain stream (JetStream err 10065) — the exact CrashLoop this
+// design fixes.
 //
-// The ONE stream notification owns is its private DLQ: a SINK rooted at "fp_dlq.*"
-// (outside every fp.<domain>.> tree, so it overlaps nothing). Ops drain/replay from
-// it out-of-band; no reactor consumer reads it.
+// Notification owns TWO streams (the rule is "the producer owns the stream for the
+// subject tree it produces"):
+//
+//   1. NOTIFICATIONS (fp.notifications.>) — its DOMAIN stream. Notification is the
+//      OWNER and sole producer of fp.notifications.delivered / fp.notifications.failed
+//      (the delivery-health feed). JetStream REJECTS a publish whose subject no stream
+//      captures (10073), so without this stream every delivery-health event was dropped
+//      AND experiment-tracker's wide lineage sink (which binds a consumer to the
+//      NOTIFICATIONS stream) had no stream to bind. We ensure it at boot, like every
+//      other domain-stream producer.
+//
+//   2. NOTIFICATION_DLQ (fp_dlq.notification) — its private DLQ SINK, rooted at
+//      "fp_dlq.*" (outside every fp.<domain>.> tree, so it overlaps nothing). Ops
+//      drain/replay from it out-of-band; no reactor consumer reads it.
 const (
+	// StreamName is the JetStream stream notification OWNS for the subject tree it
+	// PRODUCES: the durable home of the fp.notifications.* delivery-health feed.
+	// Exported so main.go, the tests, and the consumer (experiment-tracker binds a
+	// durable here) share one canonical value.
+	StreamName = "NOTIFICATIONS"
+
+	// StreamSubjects is the wildcard the NOTIFICATIONS stream binds. fp.notifications.>
+	// captures both produced subjects (delivered / failed) plus any future
+	// fp.notifications.* subject, and overlaps no other stream (no other stream owns
+	// fp.notifications.*), satisfying JetStream's no-overlap rule.
+	StreamSubjects = "fp.notifications.>"
+
 	// StreamDLQ is the DEDICATED dead-letter stream that owns SubjectDLQ
 	// ("fp_dlq.notification" — outside every fp.<domain>.> tree). Because a JetStream
 	// subject is bound to exactly ONE stream, keeping the DLQ subject in its own
 	// stream (and out of the domain streams the reactor's consumers read) is precisely
 	// what stops a parked poison message from being re-delivered to a reactor consumer.
-	// notification provisions ONLY this stream at boot (main.go); the domain streams it
+	// notification provisions this stream at boot (main.go); the domain streams it
 	// consumes from are provisioned by their producers.
 	StreamDLQ = "NOTIFICATION_DLQ"
 )
+
+// EnsureStream creates (or reconciles) the NOTIFICATIONS domain stream this service
+// PRODUCES into (fp.notifications.delivered / fp.notifications.failed). It is
+// idempotent and convergent (CreateOrUpdateStream behaves like `kubectl apply`):
+// safe to call on every boot and safe to race against a peer notification pod / a
+// GitOps job declaring the same stream during a rolling deploy.
+//
+// The caller passes the jetstream.JetStream from natsutil.Connect and a BOUNDED
+// context — a hung NATS server must not wedge boot forever (main.go uses 10s, like
+// the DLQ ensure). On error the caller fails fast (os.Exit), because a notification
+// pod that cannot guarantee its delivery-health stream would otherwise drop every
+// delivered/failed event at runtime with only a log line — and starve
+// experiment-tracker's delivery-health dashboards of input.
+func EnsureStream(ctx context.Context, js jetstream.JetStream) error {
+	if _, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:     StreamName,
+		Subjects: []string{StreamSubjects},
+	}); err != nil {
+		return fmt.Errorf("notification/events: ensure stream %s (%s): %w", StreamName, StreamSubjects, err)
+	}
+	return nil
+}
 
 // ============================================================================
 // CANONICAL MARSHALING (produced payloads only — see the package doc's rationale)

@@ -27,12 +27,14 @@ import (
 // broker cannot faithfully reproduce. testutil.StartNATS spins a nats:2.11 with
 // JetStream; SkipIfNoDocker skips cleanly when Docker is unavailable.
 
-// streamNotifications is a TEST-ONLY stream over fp.notifications.> so the publisher
-// tests (drainOne) can read this service's OWN delivery-health output. In production
-// the notification output is captured by whatever stream the platform provisions for
-// fp.notifications.> (e.g. experiment-tracker's NOTIFICATIONS stream); the reactor
-// never reads it, so the service itself does not create it.
-const streamNotifications = "NOTIFICATIONS"
+// streamNotifications is the NOTIFICATIONS stream over fp.notifications.> so the
+// publisher tests (drainOne) can read this service's OWN delivery-health output. In
+// PRODUCTION notification now OWNS and provisions this stream at boot (it is the sole
+// producer of fp.notifications.* — see events.EnsureStream / streams_test.go); these
+// helpers create it directly to stand in for that boot-time provisioning. The reactor
+// never CONSUMES it — it is the publisher's output, read here only to assert the wire.
+// It MUST equal events.StreamName so producer and test agree on one name.
+const streamNotifications = events.StreamName
 
 // newJS spins up a real NATS and provisions the per-domain streams the reactor's
 // per-subject consumers BIND to — exactly the production topology, where each owning

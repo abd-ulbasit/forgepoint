@@ -237,6 +237,31 @@ func main() {
 	}()
 	logger.Info("NATS connected", slog.String("url", cfg.NATSUrl))
 
+	// --- ENSURE THE EXPERIMENTS STREAM EXISTS (producer owns its stream) ---
+	// experiment-tracker is the OWNER and sole producer of the fp.experiments.* tree
+	// (run.created / run.finished). JetStream REJECTS a publish whose subject no stream
+	// captures ("no stream matches subject", 10073). Before this, NO service provisioned
+	// EXPERIMENTS, so every run-lifecycle event was dropped at runtime AND notification's
+	// reactor degrade-skipped fp.experiments.run.* (no stream to bind). We GUARANTEE our
+	// own stream here, before wiring the publisher, exactly as registry/auth/feature-store
+	// do for their trees. EnsureStream uses CreateOrUpdateStream (idempotent + convergent
+	// — safe on every boot and under rolling deploys). We FAIL FAST: an unprovisionable
+	// stream aborts boot (K8s CrashLoops with the cause in logs) rather than letting the
+	// pod serve and silently drop every event. The context is bounded (10s, like the dep
+	// pings) so a hung NATS server can't wedge boot. NOTE: we ensure ONLY the stream we
+	// PRODUCE — the NOTIFICATIONS stream we CONSUME is owned by the notification service.
+	streamCtx, streamCancel := context.WithTimeout(ctx, 10*time.Second)
+	if streamErr := events.EnsureStream(streamCtx, js); streamErr != nil {
+		streamCancel()
+		logger.Error("failed to ensure EXPERIMENTS stream", slog.String("error", streamErr.Error()))
+		os.Exit(1)
+	}
+	streamCancel()
+	logger.Info("EXPERIMENTS stream ensured",
+		slog.String("stream", events.StreamName),
+		slog.String("subjects", events.StreamSubjects),
+	)
+
 	// ================================================================
 	// 5. CONSTRUCT REPO ADAPTERS → PUBLISHER → DOMAIN SERVICE → HANDLER
 	// ================================================================
