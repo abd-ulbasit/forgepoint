@@ -2,57 +2,69 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Build a full ML lifecycle platform as 9 microservices in Go — covering saga, CQRS, event sourcing, choreography, outbox, circuit breakers, and more — deployed on Kubernetes. Deliver it as a polished, working product with good UX, including a web UI as a first-class interface alongside the CLI and gRPC/HTTP APIs.
+**Goal:** Build a full ML lifecycle platform as 10 microservices in Go — covering saga, CQRS, event sourcing, choreography, outbox, circuit breakers, streaming drift detection, and more — deployed on Kubernetes. The lifecycle is a **closed loop** (train → register → deploy → serve → monitor → retrain), delivered as a polished, working product with good UX: a web UI and a `fp` CLI alongside the gRPC/HTTP APIs, secured and shipped via GitOps.
 
-**Architecture:** Go monorepo with workspaces. 9 services communicating via gRPC (sync) and NATS JetStream (async). Each service owns its PostgreSQL database. Clean Architecture (handler → domain → repository). Deployed on Kind locally, EKS for production.
+**Architecture:** Go monorepo with workspaces. 10 services communicating via gRPC (sync) and NATS JetStream (async). Each service owns its PostgreSQL database. Clean Architecture (handler → domain → repository). Deployed on Kind locally, EKS for production, delivered via ArgoCD (GitOps).
 
-**Tech Stack:** Go, gRPC, Buf, NATS JetStream, PostgreSQL, Redis, MinIO, Docker, Kubernetes, Helm, Skaffold, OpenTelemetry, Prometheus, Grafana, Loki, Tempo, Istio, Terraform, GitHub Actions, k6, Testcontainers
+**Tech Stack:** Go, gRPC, Buf, NATS JetStream, PostgreSQL, Redis, MinIO, Docker, Kubernetes, Helm, Skaffold, OpenTelemetry, Prometheus, Grafana, Loki, Tempo, Istio, Terraform, GitHub Actions, k6, Testcontainers — plus **ArgoCD** (GitOps), **Argo Rollouts/Flagger** (progressive delivery), **KEDA** (event-driven autoscaling), **Kyverno** (policy-as-code), **External Secrets Operator** (secrets), **Trivy + Syft + cosign + govulncheck** (supply chain), and **CloudNativePG/Velero** (backup & DR).
 
 **Design Doc:** `docs/plans/forgepoint-platform-design.md`
 
 ---
 
-## Scope Tiers
+## Milestones
 
-This plan is intentionally larger than what should be built first. Depth on a focused
-core interviews better than breadth across a half-finished 9-service repo. Phases are
-tagged:
+This is the **complete platform as designed** — every phase is first-class. The 27 phases
+are grouped into seven delivery milestones. Build them top to bottom; within a milestone,
+follow the phase order. New phases keep new IDs (16+) so the original phase numbers are
+stable; milestone grouping defines the build order.
 
-- **Core** — build to polish. Every distinct distributed-systems pattern, the BFF + web
-  UI, full local Kubernetes, observability *with real alerts/SLOs + a runbook*, and CI.
-  This alone covers every interview talking point (saga, CQRS, circuit breaker, BFF,
-  observability, K8s, IaC-lite) with enough depth to defend on a shared screen.
-- **Stretch** — build only if the Core is genuinely polished. Services 6-9 are mostly
-  event-consumer *repeats* with diminishing learning return; pick 1-2 for pattern variety
-  (Outbox and Event Sourcing are the most interview-worth). EKS/Terraform is high-effort,
-  low-novel-learning, and invisible in a portfolio — make it last.
-
-> **Rule:** a recorded demo of a polished local Kind deployment demonstrates the same
-> competency as a torn-down EKS cluster nobody can see. Don't let EKS gate the project.
+| Milestone | Theme | Phases | Outcome |
+|-----------|-------|--------|---------|
+| **M0 — Foundation** | Scaffolding & shared libs | 0 | Repo, `pkg/` libraries, proto tooling, local infra |
+| **M1 — Core platform** | The five flagship patterns | 1–5 | Auth → Registry → Serving → Gateway → Orchestrator, end to end |
+| **M2 — Complete the platform & close the loop** | All services + lifecycle loop | 6–9, 16 | Feature Store, Experiment Tracker, Billing, Notification, **Model Monitor (monitor → retrain)** |
+| **M3 — Production hardening** | Make it operable & trustworthy | 10, 11, 13 | Observability + service mesh, CI/CD, E2E + load testing |
+| **M4 — Product, DX & operability** | Make it usable & on-call ready | 14, 15, 23, 26 | Web UI, SLOs/alerts/runbooks, **`fp` CLI**, **DX & docs** |
+| **M5 — Cloud deployment** | Run it on real infra | 12, 24 | Terraform on AWS (EKS, RDS, ElastiCache, S3), **backup & DR** |
+| **M6 — Platform security, GitOps & autoscaling** | Make it production-trustworthy & self-driving | 17–22, 25 | Secrets, supply chain, policy, audit, GitOps, progressive delivery, KEDA |
 
 ## Phase Overview
 
-| Phase | Tier | Focus | Services/Components | Key Pattern | Depends On |
-|-------|------|-------|--------------------|----|------------|
-| **0** | Core | Foundation | Repo scaffold, shared libs, local infra | — | Nothing |
-| **1** | Core | Auth/IAM | `services/auth` | Centralized Auth, JWT | Phase 0 |
-| **2** | Core | Model Registry | `services/registry` | CQRS | Phase 1 |
-| **3** | Core | Model Serving | `services/model-serving` | Sidecar, HPA | Phase 2 |
-| **4** | Core | Inference Gateway | `services/inference-gateway` | Circuit Breaker, Rate Limiting | Phase 3 |
-| **5** | Core | Pipeline Orchestrator | `services/pipeline-orchestrator` | Saga, DAG Execution | Phase 2, 3 |
-| **6** | Stretch | Feature Store | `services/feature-store` | Event Sourcing | Phase 1 |
-| **7** | Stretch | Experiment Tracker | `services/experiment-tracker` | Event-Driven, Batch Consumer | Phase 1 |
-| **8** | Stretch | Billing/Usage | `services/billing` | Outbox Pattern | Phase 1 |
-| **9** | Stretch | Notification | `services/notification` | Choreography | Phase 1 |
-| **10** | Core | Observability & Mesh | Grafana dashboards, Istio | Three Pillars, mTLS | Phase 1-5 |
-| **11** | Core | CI/CD | GitHub Actions | Path-filtered pipelines | Phase 0-5 |
-| **12** | Stretch | AWS Deployment | Terraform EKS, RDS, S3 | IaC | Phase 0-11 |
-| **13** | Core | E2E & Load Testing | Cross-service tests, k6 | Full lifecycle validation | Phase 1-5 |
-| **14** | Core | Web UI (BFF + frontend) | `services/bff`, `web/` dashboard | Backend-for-Frontend, gRPC→SSE | Phase 1-5 |
-| **15** | Core | Operability & SRE | SLOs, alert rules, runbook | SLO/error-budget, on-call signal | Phase 10 |
+| Phase | Milestone | Focus | Services/Components | Key Pattern | Depends On |
+|-------|-----------|-------|--------------------|----|------------|
+| **0** | M0 | Foundation | Repo scaffold, shared libs, local infra | — | Nothing |
+| **1** | M1 | Auth/IAM | `services/auth` | Centralized Auth, JWT | Phase 0 |
+| **2** | M1 | Model Registry | `services/registry` | CQRS | Phase 1 |
+| **3** | M1 | Model Serving | `services/model-serving` | Sidecar, HPA | Phase 2 |
+| **4** | M1 | Inference Gateway | `services/inference-gateway` | Circuit Breaker, Rate Limiting | Phase 3 |
+| **5** | M1 | Pipeline Orchestrator | `services/pipeline-orchestrator` | Saga, DAG Execution | Phase 2, 3 |
+| **6** | M2 | Feature Store | `services/feature-store` | Event Sourcing | Phase 1 |
+| **7** | M2 | Experiment Tracker | `services/experiment-tracker` | Event-Driven, Batch Consumer | Phase 1 |
+| **8** | M2 | Billing/Usage | `services/billing` | Outbox Pattern | Phase 1 |
+| **9** | M2 | Notification | `services/notification` | Choreography | Phase 1 |
+| **16** | M2 | Model Monitor & Auto-Retrain | `services/model-monitor` | Streaming drift detection, closed-loop trigger | Phase 4, 5, 7 |
+| **10** | M3 | Observability & Mesh | Grafana dashboards, Istio | Three Pillars, mTLS | Phase 1-9, 16 |
+| **11** | M3 | CI/CD | GitHub Actions | Path-filtered pipelines | Phase 0-9 |
+| **13** | M3 | E2E & Load Testing | Cross-service tests, k6 | Full lifecycle validation | Phase 1-9, 16 |
+| **14** | M4 | Web UI (BFF + frontend) | `services/bff`, `web/` dashboard | Backend-for-Frontend, gRPC→SSE | Phase 1-9, 16 |
+| **15** | M4 | Operability & SRE | SLOs, alert rules, runbook | SLO/error-budget, on-call signal | Phase 10 |
+| **23** | M4 | `fp` CLI | `tools/fp-cli` | Cobra CLI over gRPC, scriptable UX | Phase 1-9 |
+| **26** | M4 | Developer Experience & Docs | Python SDK, API docs, C4, fuzz, PR previews | DX, generated artifacts | Phase 11, 14 |
+| **12** | M5 | AWS Deployment | Terraform EKS, RDS, S3 | IaC | Phase 0-11 |
+| **24** | M5 | Backup & Disaster Recovery | CloudNativePG/Velero, restore drills | DR, RPO/RTO | Phase 12 |
+| **17** | M6 | Secrets Management | External Secrets Operator, Sealed Secrets | Externalized secrets, rotation | Phase 0 |
+| **18** | M6 | Supply-Chain Security & CI Hardening | govulncheck, Trivy, Syft SBOM, cosign | Signed, scanned, attested builds | Phase 11 |
+| **19** | M6 | Policy-as-Code & Admission Control | Kyverno, NetworkPolicies | Cluster guardrails | Phase 10 |
+| **25** | M6 | Audit Logging & Compliance | `pkg/audit`, audit log store | Tamper-evident audit trail | Phase 1 |
+| **20** | M6 | GitOps with ArgoCD | `deploy/argocd/` app-of-apps | Declarative, pull-based, self-healing | Phase 11, 12 |
+| **21** | M6 | Progressive Delivery | Argo Rollouts / Flagger | Automated metric-based canary | Phase 10, 20 |
+| **22** | M6 | Event-Driven Autoscaling | KEDA on NATS lag | Scale-to-zero, queue-depth scaling | Phase 10 |
 
-> Recommended Core sequence: **0 → 1 → 2 → 3 → 4 → 5 → 10 → 11 → 13 → 14 → 15**, then
-> Stretch (pick 1-2 of 6-9, then 12) only if time allows.
+> Full build sequence: **0 → 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 16 → 10 → 11 → 13 → 14 → 15 → 23 → 26 → 12 → 24 → 17 → 18 → 19 → 25 → 20 → 21 → 22.**
+> Phases 6–9 depend only on Auth (Phase 1) + NATS, so they can be built in any order or in
+> parallel. M6 (security/GitOps/autoscaling) can begin earlier and run alongside M3–M5 — it's
+> listed last because each piece is most valuable once there's a running platform to apply it to.
 
 ---
 
@@ -1803,38 +1815,334 @@ Verify the platform degrades instead of cascading:
 
 ---
 
+## Phase 16: Model Monitor & Auto-Retrain (M2)
+
+> **This closes the ML lifecycle loop.** The platform claims `train → register → deploy →
+> serve → monitor → retrain`, but nothing currently *monitors* models or *triggers* retrain
+> — Notification even subscribes to a `ModelDriftDetected` event that no one publishes. This
+> service is the missing producer and the loop-closer.
+>
+> **Pattern:** streaming aggregation + windowed statistics over an event stream, feeding a
+> policy that fires a control-plane action (retraining). It's the most "alive" part of the
+> platform — models that degrade heal themselves.
+
+---
+
+### Task 16.1: Model Monitor Proto + Scaffold
+
+Proto RPCs: `GetModelHealth`, `ListDriftReports`, `ConfigureMonitor` (thresholds per model),
+`SubmitGroundTruth` (delayed labels for accuracy). Standard service scaffold (`services/model-monitor`).
+
+### Task 16.2: Streaming Drift Detection
+
+Subscribe to `fp.inference.completed`. Maintain per-model **sliding windows** of:
+- **Data drift** — feature distribution shift vs the training baseline (PSI / KL-divergence / KS-test).
+- **Prediction drift** — output distribution shift over time.
+- **Performance decay** — when ground-truth labels arrive (`SubmitGroundTruth`), compute rolling accuracy/F1 vs the registered baseline.
+
+Baselines come from the Model Registry / Experiment Tracker (the training-time distribution).
+Tables: `monitors` (config + baseline), `drift_windows`, `drift_reports`.
+
+### Task 16.3: Drift Policy + Closed-Loop Trigger
+
+When a window breaches a configured threshold:
+1. Persist a `drift_report` (idempotent on window id).
+2. Publish `fp.models.drift.detected` (envelope) → **Notification** alerts, **Experiment Tracker** records.
+3. If auto-retrain is enabled for the model, call the **Pipeline Orchestrator** `TriggerExecution`
+   on the model's training pipeline (with the drift report as input). The resulting saga
+   retrains → evaluates → registers a new version → canary → promote — and the loop closes.
+
+ASCII the loop in code comments:
+```
+serve → InferenceCompleted ─→ Model Monitor (windows) ─→ drift? ─yes─→ ModelDriftDetected
+   ↑                                                                        │
+   └────── promote new version ←── canary ←── retrain DAG ←── Orchestrator ←─┘
+```
+
+### Task 16.4: Monitor Handler, Events, Dockerfile, Helm, Deploy
+
+TDD on the drift math (table-driven: known distributions → expected PSI/KS), handler, NATS
+publisher/consumer, migrations, Dockerfile, Helm, deploy to Kind. Add a `model_drift_detected_total`
+metric and wire the report into the Web UI (Phase 14) and alerts/runbook (Phase 15).
+
+---
+
+## Phase 23: `fp` CLI (M4)
+
+> The design has always listed `tools/fp-cli`; this makes it real. A CLI is the best live-demo
+> artifact in an interview ("watch me deploy a model from my terminal") and forces clean,
+> scriptable API ergonomics.
+
+---
+
+### Task 23.1: CLI Scaffold (Cobra)
+
+`tools/fp-cli` module. Cobra command tree, config via `~/.forgepoint/config.yaml` + env
+(`FP_ENDPOINT`, `FP_TOKEN`). Reuse the generated gRPC clients. Global flags: `--output
+json|table`, `--context`.
+
+### Task 23.2: Core Commands
+
+- `fp auth login` / `fp auth whoami`
+- `fp model register|list|get|versions`
+- `fp pipeline create|trigger|status|watch` (server-streaming `WatchExecution` → live terminal output)
+- `fp deploy <model>@<version>` (triggers the deployment saga)
+- `fp predict <model> --input ...`
+- `fp usage` / `fp monitor <model>` (drift health from Phase 16)
+
+### Task 23.3: Polish + Release
+
+Shell completions, `fp version` (build info), table/JSON rendering, a `--watch` TUI for
+pipeline execution. Goreleaser config to publish cross-platform binaries on tag. Integration
+test against the in-process gRPC server (`pkg/testutil`).
+
+---
+
+## Phase 26: Developer Experience & Documentation (M4)
+
+> The cheap, high-signal polish that makes the repo read as *finished*.
+
+---
+
+### Task 26.1: Generated API Docs
+
+Add a `buf` plugin (`protoc-gen-doc` or `protoc-gen-openapiv2`) to `buf.gen.yaml` → generate
+REST/gRPC API docs into `docs/api/`. Publish via GitHub Pages.
+
+### Task 26.2: Python Client SDK
+
+ML users live in Python. Generate a `forgepoint` Python gRPC client (`grpcio-tools`) into
+`sdks/python/`, with a thin ergonomic wrapper and a `README` quickstart. (Optional: publish to PyPI on tag.)
+
+### Task 26.3: Fuzz Tests
+
+Go-native fuzzing for the parsers most exposed to untrusted input: `pkg/natsutil` envelope
+unmarshalling and `pkg/config` value parsing. `go test -fuzz` targets, seed corpus, wired into
+a scheduled CI job (not the per-PR job).
+
+### Task 26.4: Architecture Docs
+
+A C4 (context + container) diagram in the README (`structurizr` or mermaid), an architecture
+overview, and an onboarding guide (`docs/onboarding.md`). Cross-link the ADRs.
+
+### Task 26.5: PR Preview Environments
+
+CI spins an ephemeral namespace per PR (Kind in CI or a shared dev cluster), deploys the
+changed services via Helm, posts the preview URL as a PR comment, and tears down on merge/close.
+
+---
+
+## Phase 24: Backup & Disaster Recovery (M5)
+
+> "What happens when the database dies?" is a standard platform interview question. Have a real answer.
+
+---
+
+### Task 24.1: Postgres Backups
+
+Adopt **CloudNativePG** (operator-managed Postgres) or scheduled `pg_dump`/WAL archiving to
+S3/MinIO. Per-service backup schedule, retention policy, and encryption at rest.
+
+### Task 24.2: Cluster-Resource Backup (Velero)
+
+Install **Velero** backing up to S3/MinIO: namespaces, PVCs, and CRDs. Scheduled backups + on-demand.
+
+### Task 24.3: Restore Drill + Runbook
+
+Actually restore into a fresh namespace/cluster and verify the platform comes up. Document
+**RPO/RTO**, the restore procedure, and link it from the operability runbooks (Phase 15).
+
+---
+
+## Phase 17: Secrets Management (M6)
+
+> Plain Kubernetes Secrets are base64, not encrypted, and shouldn't live in Git. Fix both.
+
+---
+
+### Task 17.1: External Secrets Operator
+
+Install **External Secrets Operator**; back it with AWS Secrets Manager (prod) and a local
+provider (dev). Services reference `ExternalSecret` resources; no raw secret values in manifests/Helm.
+
+### Task 17.2: Sealed Secrets (GitOps-safe)
+
+For secrets that must live in Git (so ArgoCD can manage them), use **Sealed Secrets** —
+encrypted manifests only the in-cluster controller can decrypt.
+
+### Task 17.3: Rotation + Wiring
+
+Document rotation (DB creds, JWT signing keys) and confirm services pick up rotated secrets
+(restart or reload). Remove every plaintext secret from `deploy/` and docker-compose notes.
+
+---
+
+## Phase 18: Supply-Chain Security & CI Hardening (M6)
+
+> Your standards claim "hermetic builds, pinned deps, distroless." This phase makes the CI
+> actually enforce and *prove* it.
+
+---
+
+### Task 18.1: Dependency & Code Scanning
+
+Add `govulncheck` (Go-native CVE scan) and `golangci-lint` security linters to CI; enable
+Dependabot/Renovate for deps + Actions. Fail the build on known-exploitable vulns.
+
+### Task 18.2: Image Scanning + SBOM
+
+Scan every built image with **Trivy** (fail on HIGH/CRITICAL); generate an **SBOM** with
+**Syft** and attach it as a build artifact / OCI attestation.
+
+### Task 18.3: Image Signing + Provenance
+
+Sign images with **cosign** (keyless/OIDC) and emit SLSA provenance. Enforce signature
+verification at admission time via the Kyverno policy from Phase 19.
+
+---
+
+## Phase 19: Policy-as-Code & Admission Control (M6)
+
+> Cluster guardrails that catch mistakes before they run — the governance half of platform engineering.
+
+---
+
+### Task 19.1: Kyverno Policies
+
+Install **Kyverno**; author policies in `deploy/policies/`: require resource requests/limits,
+disallow `:latest` tags, require standard labels, enforce read-only root FS / non-root user,
+and **verify cosign image signatures** (ties to Phase 18).
+
+### Task 19.2: NetworkPolicy Hardening
+
+Default-deny per namespace; explicit allow-lists (e.g., only `inference-gateway` → `model-serving`,
+only services → their own Postgres). Validate with a connectivity test.
+
+### Task 19.3: Policy Tests in CI
+
+`kyverno test` / `conftest` over the Helm-rendered manifests in CI so policy violations fail the PR.
+
+---
+
+## Phase 25: Audit Logging & Compliance (M6)
+
+> A tamper-evident record of *who did what* — model promotions, quota changes, role grants.
+
+---
+
+### Task 25.1: `pkg/audit` + Interceptor
+
+A shared audit helper + gRPC interceptor that records mutating RPCs: actor (from Claims),
+action, resource, before/after, correlation id, timestamp. Append-only.
+
+### Task 25.2: Audit Store + Query
+
+Append-only `audit_log` table (hash-chained rows for tamper-evidence), exposed via an
+`AuditService` query API and surfaced in the Web UI. Auth/registry/orchestrator emit audit
+entries for sensitive actions.
+
+---
+
+## Phase 20: GitOps with ArgoCD (M6)
+
+> Replace push-based `helm upgrade` from CI with declarative, pull-based, self-healing delivery
+> — the single highest-signal platform-engineering capability in the project.
+
+---
+
+### Task 20.1: ArgoCD Install + App-of-Apps
+
+Install **ArgoCD**; adopt the **app-of-apps** pattern in `deploy/argocd/`. Each service is an
+ArgoCD `Application` tracking `deploy/helm/<svc>` with automated sync, self-heal, and prune.
+
+### Task 20.2: Environments + Image Automation
+
+`dev` (auto-sync) and `prod` (manual sync / PR-gated) overlays. CI's job ends at *build + sign
++ push + bump the image tag in Git* — ArgoCD does the deploy. Optionally ArgoCD Image Updater.
+
+### Task 20.3: Migrate CI off Push-Deploy
+
+Remove the `helm upgrade` step from Phase 11 CI; the Git repo is now the single source of
+truth. Document the rollback-by-revert flow.
+
+---
+
+## Phase 21: Progressive Delivery (M6)
+
+> Automated, metric-driven canary at the infra layer — complements the saga's app-level canary.
+
+---
+
+### Task 21.1: Argo Rollouts (or Flagger)
+
+Convert `inference-gateway` and `model-serving` Deployments to **Argo Rollouts** (or Flagger).
+Define a canary strategy: step weights (10→25→50→100), pause/analysis gates.
+
+### Task 21.2: Metric Analysis + Auto-Rollback
+
+`AnalysisTemplate` queries Prometheus (error rate, p99 latency, the drift signal from Phase 16);
+promote on healthy metrics, **auto-rollback** on breach. Demo a bad version rolling itself back.
+
+---
+
+## Phase 22: Event-Driven Autoscaling (KEDA) (M6)
+
+> HPA scales on CPU/inflight requests; **KEDA** scales on the thing that actually matters here —
+> NATS work backlog — and can scale to zero.
+
+---
+
+### Task 22.1: KEDA Install + NATS Scaler
+
+Install **KEDA**; add `ScaledObject`s for the event consumers (Experiment Tracker, Billing,
+Notification, Model Monitor) scaling on **NATS JetStream consumer lag**.
+
+### Task 22.2: Scale-to-Zero + Tuning
+
+Scale idle consumers to zero; tune activation thresholds and cooldown. Load-test (k6, Phase 13)
+to show consumers scaling up under a backlog and back to zero when drained.
+
+---
+
 ## Execution Notes
 
 ### Service Build Order (Dependency Chain)
 
 ```
-Phase 0 (Foundation)
-    ↓
-Phase 1 (Auth) ← everything depends on this
-    ↓
-Phase 2 (Registry) ← models must exist before serving/deploying
-    ↓
-Phase 3 (Model Serving) ← must exist before gateway can route to it
-    ↓
-Phase 4 (Inference Gateway) ← routes to model serving
-    ↓
-Phase 5 (Pipeline Orchestrator) ← orchestrates registry + serving + gateway
-    ↓
-Phase 10, 11, 13 (Observability, CI/CD, E2E) ← cross-cutting over the Core services
-    ↓
-Phase 14 (BFF + Web UI) ← composes Core services into screens
-    ↓
-Phase 15 (Operability) ← SLOs/alerts/runbook over the running platform
-    · · · · · · · · · · · · · · · · · · · · · · · · ·  CORE complete
-    ↓
-Phase 6-9 (Feature Store, Experiment, Billing, Notification) ← STRETCH, pick 1-2
-    ↓
-Phase 12 (Terraform EKS) ← STRETCH, last (high effort, low novel learning)
+M0  Phase 0 (Foundation)
+        ↓
+M1  Phase 1 (Auth) ← everything depends on this
+        ↓
+    Phase 2 (Registry) ← models must exist before serving/deploying
+        ↓
+    Phase 3 (Model Serving) ← must exist before gateway can route to it
+        ↓
+    Phase 4 (Inference Gateway) ← routes to model serving
+        ↓
+    Phase 5 (Pipeline Orchestrator) ← orchestrates registry + serving + gateway
+        ↓
+M2  Phase 6-9 (Feature Store, Experiment Tracker, Billing, Notification)
+        ↓     ← independent of each other; need only Auth + NATS
+    Phase 16 (Model Monitor) ← CLOSES THE LOOP: serve→monitor→retrain
+        ↓                       needs gateway (4), orchestrator (5), experiment tracker (7)
+M3  Phase 10, 11, 13 (Observability + Mesh, CI/CD, E2E + Load) ← cross-cutting over all 10 services
+        ↓
+M4  Phase 14 (BFF + Web UI) ← composes all services into screens
+        ↓
+    Phase 15 (Operability) → Phase 23 (fp CLI) → Phase 26 (DX & docs)
+        ↓
+M5  Phase 12 (Terraform AWS) → Phase 24 (Backup & DR)
+        ↓
+M6  Phase 17 (Secrets) → 18 (Supply chain) → 19 (Policy) → 25 (Audit)
+        ↓                → 20 (GitOps/ArgoCD) → 21 (Progressive delivery) → 22 (KEDA)
 ```
 
 Phases 6-9 can be built in parallel or any order — they only depend on Phase 1 (auth) and
-NATS events. When you build a Stretch service, fold it into the BFF dashboard and add its
-alerts/runbook entries so the Core artifacts stay consistent.
+NATS events. As each service lands, fold it into the BFF dashboard (Phase 14) and add its
+alerts/runbook entries (Phase 15) so the platform stays coherent. **M6 is intentionally last
+in the listing but not gated to the end** — secrets (17), supply-chain (18), and policy (19)
+are cheap to start early and pay off the moment there's something to deploy; GitOps (20) is
+most valuable once CI (11) and a cloud target (12) exist.
 
 ### Per-Service Checklist
 
@@ -1851,6 +2159,11 @@ Every service MUST have before moving to the next:
 - [ ] Health checks working (/healthz, /readyz)
 - [ ] Prometheus metrics exposed
 - [ ] OpenTelemetry traces propagated
+- [ ] Secrets via ExternalSecret/Sealed Secrets — no plaintext in Git (Phase 17)
+- [ ] Image scanned (Trivy) + SBOM + cosign-signed in CI (Phase 18)
+- [ ] Manifests pass Kyverno policies + default-deny NetworkPolicy (Phase 19)
+- [ ] Mutating RPCs emit audit entries via `pkg/audit` (Phase 25)
+- [ ] Managed by an ArgoCD Application; no push-deploy from CI (Phase 20)
 
 ### Key Dependencies (Go modules)
 
