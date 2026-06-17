@@ -191,6 +191,15 @@ COPY --from=builder /out/service /service-bin
 ### PER-SERVICE: this service's migrations
 COPY services/model-serving/migrations /migrations
 
+# PLACEHOLDER artifact — a tiny, read-only file at /artifacts/placeholder.onnx so a
+# DEFAULT deploy (FP_ARTIFACT_URI=file:///artifacts/placeholder.onnx) has something the
+# FileFetcher can fetch+hash, letting the placeholder engine reach StateReady and /readyz
+# go GREEN without external object storage. It is NOT a real model — a per-model
+# Deployment overrides FP_ARTIFACT_URI with a presigned https:// URL or a CSI mount. The
+# fetcher copies this into the pod's writable /tmp scratch at load time, so the artifact
+# source staying on the read-only rootfs is fine (readOnlyRootFilesystem: true holds).
+COPY services/model-serving/artifacts /artifacts
+
 # Run as the unprivileged nonroot user baked into the distroless image (UID
 # 65532). Defense in depth: even if the process is compromised it has no shell,
 # no root, and a read-only-friendly filesystem.

@@ -84,8 +84,14 @@ config:
   env: "local"
   logLevel: "info"
   # In-cluster service DNS. fp-infra is the namespace hosting shared infra
-  # (OTel collector, MinIO) per CLAUDE.md K8s namespaces.
+  # (NATS, OTel collector, MinIO) per CLAUDE.md K8s namespaces.
   otelEndpoint: "otel-collector.fp-infra.svc.cluster.local:4317"
+  # FP_NATS_URL — the lifecycle event bus. main.go DOES connect to NATS (it
+  # subscribes to fp.models.* / fp.pipelines.* deploy/promote/archive events to
+  # reconcile this pod's loaded model) and /readyz check #2 fails when the NATS
+  # connection is down. So natsUrl is REQUIRED, not optional — omitting it (the prior
+  # bug) left main.go dialing the localhost default and CrashLooping on the NATS ping.
+  natsUrl: "nats://nats.fp-infra.svc.cluster.local:4222"
 
   # --- Object storage (MinIO/S3) — where this pod fetches its ONNX artifact ---
   # The S3-compatible endpoint the storage adapter dials. In-cluster MinIO lives
@@ -100,14 +106,25 @@ config:
   modelVersion: "v0"
   # ArtifactURI MUST sit under artifactBucketURI (the SSRF allow-list root) or the
   # domain rejects the load (fail-closed). Keep them consistent.
-  artifactURI: "s3://fp-models/placeholder-model/v0/model.onnx"
+  #
+  # WHY file:// (not s3://) by default: the ModelFetcher dispatcher supports ONLY
+  # file:// and http(s):// today — the native MinIO/S3 client is a flagged follow-up
+  # (see artifactstore/fetcher.go). An s3:// default makes the self-load fail with
+  # "unsupported scheme" → StateFailed → /readyz red FOREVER (the prior bug). The image
+  # bakes a tiny placeholder artifact at /artifacts/placeholder.onnx (see the service
+  # Dockerfile), so this file:// default lets the FileFetcher fetch+hash it, the
+  # placeholder engine loads it, and /readyz goes GREEN out of the box. A real per-model
+  # Deployment overrides ARTIFACT_URI with a presigned https:// URL (registry-minted) or
+  # a CSI-mounted file path; flip artifactBucketURI to match the real source root then.
+  artifactURI: "file:///artifacts/placeholder.onnx"
   # Optional expected sha256 of the artifact for supply-chain integrity. Empty in
   # dev (no integrity check); set to "sha256:..." in prod so the pod refuses to
   # serve weights whose digest does not match.
   artifactDigest: ""
   # The allow-listed bucket/prefix the pod may load from (the SSRF allow-list
-  # root). The domain rejects any ArtifactURI outside it.
-  artifactBucketURI: "s3://fp-models/"
+  # root). The domain rejects any ArtifactURI outside it. Matches the file:// default
+  # above so the placeholder load passes the allow-list; override for the real source.
+  artifactBucketURI: "file:///artifacts/"
   # Inference-latency threshold (ms) above which the liveness signal degrades and
   # the pod is pulled from rotation. Inference latency — not CPU — is the health
   # signal for an inference pod (see the HPA rationale below + the proto).
@@ -399,11 +416,17 @@ networkPolicy:
     - fp-system
     - fp-models
   # Egress allow-list. dns is special-cased to the kube-system resolver.
-  # NOTE vs fp-auth: postgres and nats are OMITTED (this service uses neither);
-  # minio is ADDED (artifact fetch). otlp stays (telemetry push).
+  # NOTE vs fp-auth: postgres is OMITTED (this service has no DB); minio is ADDED
+  # (artifact fetch over presigned http/CSI mount). nats IS used — main.go subscribes
+  # to model lifecycle events and /readyz check #2 pings the NATS connection, so its
+  # egress MUST be open (omitting it was the prior bug). otlp stays (telemetry push).
   egress:
     dns:
       enabled: true
+    nats:
+      enabled: true
+      namespace: fp-infra
+      port: 4222
     otlp:
       enabled: true
       namespace: fp-infra

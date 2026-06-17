@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
@@ -18,7 +19,7 @@ import (
 // The Reactor is the INBOUND adapter that drives the domain's primary port. It is
 // the "imperative shell" wrapped around the domain's "functional core":
 //
-//	NATS fp.>  ──►  Reactor.handle (THIS)  ──►  domain.ReactToEvent (pure)
+//	NATS (per-domain streams)  ──►  Reactor.handle (THIS)  ──►  domain.ReactToEvent (pure)
 //	                     │                            │ returns RoutingDecision
 //	                     │  loads prefs (PreferenceLoader port)
 //	                     │  executes decision (DecisionExecutor port):
@@ -181,22 +182,26 @@ type ReactorDeps struct {
 	Health DeliveryHealthPublisher
 }
 
-// ReactorConfig tunes the resilience knobs of the firehose subscription. Defaults
+// ReactorConfig tunes the resilience knobs of the per-subject subscriptions. Defaults
 // (applied by Start when zero) match the platform conventions: a durable consumer
-// group named after the service, a small retry budget, and a service-scoped DLQ.
+// group PREFIX named after the service (each subject's durable is "<prefix>-<subject>"),
+// a small retry budget, and a service-scoped DLQ.
 type ReactorConfig struct {
-	// ConsumerGroup is the durable name. All replicas sharing it form a consumer
-	// group (each event handled by exactly one replica). Default: Source.
+	// ConsumerGroup is the durable-name PREFIX. The full durable per subject is
+	// "<ConsumerGroup>-<subject>" (see durableName), so each subject gets its own
+	// durable while all replicas sharing the prefix form one consumer group per
+	// subject (each event handled by exactly one replica). Default: Source.
 	ConsumerGroup string
 	// MaxRetries is redeliveries before DLQ (total attempts = MaxRetries+1). Default: 4.
 	MaxRetries int
 	// DLQSubject is where poison messages are parked. Default: SubjectDLQ
-	// ("fp_dlq.notification"). CRITICAL: this subject MUST NOT match the reactor's own
-	// consumer filter (SubjectAllEvents = "fp.>") and MUST live in a stream OTHER than
-	// the one the reactor consumes (StreamEvents). Otherwise a parked poison message
-	// is fed straight back to the reactor's fp.> consumer and re-processed (the DLQ
-	// re-consumption / amplification bug). The "fp_dlq." root token (underscore) keeps
-	// it outside fp.>; main.go binds it to StreamDLQ. See SubjectDLQ for the full rationale.
+	// ("fp_dlq.notification"). CRITICAL: this subject MUST NOT fall under any of the
+	// per-domain trees the reactor's consumers read (fp.models.>, fp.pipelines.>,
+	// fp.inference.>, fp.billing.>, fp.experiments.>) and MUST live in a stream OTHER
+	// than those. Otherwise a parked poison message is fed straight back to one of the
+	// reactor's consumers and re-processed (the DLQ re-consumption / amplification bug).
+	// The "fp_dlq." root token (underscore) keeps it outside every fp.<domain> tree;
+	// main.go binds it to StreamDLQ. See SubjectDLQ for the full rationale.
 	DLQSubject string
 	// MessageTimeout bounds a single reaction (load prefs → react → execute →
 	// publish). Default: 15s — generous, because the execute step does external
@@ -214,11 +219,11 @@ func (c *ReactorConfig) withDefaults() {
 		c.MaxRetries = 4
 	}
 	if c.DLQSubject == "" {
-		// Default to the dedicated DLQ subject that is OUTSIDE the fp.> firehose the
+		// Default to the dedicated DLQ subject that is OUTSIDE every per-domain tree the
 		// reactor consumes (SubjectDLQ = "fp_dlq.notification"). Using "fp.dlq."+Source
-		// here was the amplification bug: "fp.dlq.notification" matches fp.> and lands
-		// in the same EVENTS stream, so the parked poison message was fed back to the
-		// reactor and re-processed. See SubjectDLQ / StreamDLQ.
+		// here was the amplification bug: "fp.dlq.notification" is under fp.> and could
+		// land in a domain stream a reactor consumer reads, so the parked poison message
+		// was fed back to the reactor and re-processed. See SubjectDLQ / StreamDLQ.
 		c.DLQSubject = SubjectDLQ
 	}
 	if c.MessageTimeout == 0 {
@@ -226,67 +231,162 @@ func (c *ReactorConfig) withDefaults() {
 	}
 }
 
-// Reactor owns the single fp.> subscription and its lifecycle.
+// Reactor owns the per-subject choreography consumers and their lifecycle.
+//
+// TOPOLOGY: one durable consumer PER subject in ConsumedSubjects, each BOUND to the
+// EXISTING per-domain stream that owns the subject (resolved at Start via
+// js.StreamNameBySubject). The reactor CREATES NO domain stream — a single fp.>
+// stream would overlap every per-domain stream (JetStream err 10065). This mirrors
+// model-monitor's consumer adapter. See events.go's package doc for the full why.
 type Reactor struct {
 	deps   ReactorDeps
 	cfg    ReactorConfig
 	store  natsutil.ProcessedStore
-	sub    *natsutil.Subscriber
+	js     jetstream.JetStream
 	logger *slog.Logger
+
+	// subs holds the per-subject natsutil.Subscribers Start created, so Close can
+	// stop every consume loop. Guarded because Start and Close may race on shutdown.
+	subsMu sync.Mutex
+	subs   []*natsutil.Subscriber
 }
 
 // NewReactor builds the reactor. store is the idempotency ProcessedStore (a shared
-// Redis/Postgres-backed store in prod; a memory store in tests). The caller
-// (main.go, next stage) provides the JetStream context, the domain service, the
-// prefs loader, the executor, the health publisher, and the store.
-func NewReactor(sub *natsutil.Subscriber, deps ReactorDeps, store natsutil.ProcessedStore, cfg ReactorConfig, logger *slog.Logger) *Reactor {
+// Redis/Postgres-backed store in prod; a memory store in tests). js is the JetStream
+// context the per-subject consumers attach to. The caller (main.go) provides the
+// domain service, the prefs loader, the executor, the health publisher, and the store.
+func NewReactor(js jetstream.JetStream, deps ReactorDeps, store natsutil.ProcessedStore, cfg ReactorConfig, logger *slog.Logger) *Reactor {
 	cfg.withDefaults()
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Reactor{deps: deps, cfg: cfg, store: store, sub: sub, logger: logger}
+	return &Reactor{deps: deps, cfg: cfg, store: store, js: js, logger: logger}
 }
 
-// Start begins consuming the fp.> firehose. The natsutil.Subscriber passed in must
-// already be configured with the consumer group + idempotency store + retries + DLQ
-// that match cfg (NewReactorSubscriber builds exactly that). ctx governs the
-// consume loop's lifetime alongside the subscriber's Close().
+// Start binds ONE durable consumer per subject in ConsumedSubjects. For each subject
+// it RESOLVES the owning stream (the per-domain stream a producer already created)
+// via js.StreamNameBySubject and attaches a consumer there — it never creates a
+// stream. ctx governs every consume loop's lifetime alongside Close().
 //
-// WHY a single Subscribe to StreamEvents/fp.>: the choreography reactor sees the
-// WHOLE platform through ONE durable consumer — it does not enumerate subjects (see
-// the package doc). That is what makes a new event type a zero-code change here.
+// WHY per-subject (not one fp.> consumer): a JetStream durable consumer binds to ONE
+// stream, and the subjects the reactor reacts to live in DIFFERENT per-domain streams
+// (MODELS, PIPELINES, INFERENCE, BILLING, EXPERIMENTS). There is no single stream that
+// spans them without overlapping their subjects. So we fan out: one consumer per
+// subject, each on the subject's owning stream. The handler is identical for all of
+// them — it stays fully OPAQUE (choreography); only the SUBSCRIPTION fans out.
+//
+// DEGRADE (don't crash) on a MISSING owning stream: a subject whose producer hasn't
+// provisioned its stream yet is SKIPPED with a WARN, and Start continues binding the
+// rest. This mirrors experiment-tracker's "lineage sink is degraded" policy and the
+// platform convention: streams are provisioned by their owning producers (and, at
+// scale, an infra bootstrap), and consumer startup must not be coupled to that
+// ordering. A reactor that hard-failed here would CrashLoop forever if even one
+// domain's stream were absent (e.g. EXPERIMENTS, created by no service today) —
+// taking down ALL notifications, including the domains whose streams DO exist. We
+// surface the gap loudly (WARN per skipped subject + a count) and stay up serving the
+// streams that are present; a later restart picks up newly-created streams.
+//
+// CRITICALLY, we STILL never create an overlapping stream — skipping is the safe
+// failure mode, creating an fp.> stream (the original bug) is not.
 func (r *Reactor) Start(ctx context.Context) error {
-	if err := r.sub.Subscribe(ctx, StreamEvents, SubjectAllEvents, r.handle); err != nil {
-		return fmt.Errorf("events: subscribe %s on %s: %w", SubjectAllEvents, StreamEvents, err)
+	var bound, skipped int
+	for _, subject := range ConsumedSubjects {
+		stream, err := r.streamForSubject(ctx, subject)
+		if err != nil {
+			// No stream owns this subject yet (producer hasn't booted / infra hasn't
+			// provisioned it). Skip + warn rather than fail the whole reactor.
+			r.logger.WarnContext(ctx, "no stream owns subject yet — skipping (notification degraded for it until its producer provisions the stream)",
+				slog.String("subject", subject), slog.String("error", err.Error()))
+			skipped++
+			continue
+		}
+		if err := r.subscribeOne(ctx, stream, subject); err != nil {
+			// A bind failure (e.g. a stream that vanished between resolve and consume)
+			// is likewise non-fatal: log and move on, same degrade policy.
+			r.logger.WarnContext(ctx, "failed to bind consumer — skipping subject (degraded)",
+				slog.String("subject", subject), slog.String("stream", stream), slog.String("error", err.Error()))
+			skipped++
+			continue
+		}
+		bound++
 	}
+	r.logger.InfoContext(ctx, "notification reactor consumers bound",
+		slog.Int("bound", bound), slog.Int("skipped", skipped), slog.Int("total", len(ConsumedSubjects)))
 	return nil
 }
 
-// Close stops the consume loop. Safe to call multiple times (natsutil Subscriber.Close
-// is idempotent).
-func (r *Reactor) Close() {
-	if r.sub != nil {
-		r.sub.Close()
+// streamForSubject resolves the JetStream stream that owns subject. We ask the broker
+// (js.StreamNameBySubject) rather than hard-coding a subject→stream map so a rename of
+// a producer's stream never silently breaks our binding — the broker is the source of
+// truth for which stream captures a subject. A short bounded ctx keeps a slow/broken
+// broker from wedging Start. A 404 (no stream owns the subject) surfaces as an error
+// the caller treats as "skip this subject" (see Start's degrade policy).
+func (r *Reactor) streamForSubject(ctx context.Context, subject string) (string, error) {
+	lookupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	name, err := r.js.StreamNameBySubject(lookupCtx, subject)
+	if err != nil {
+		return "", err
 	}
+	return name, nil
 }
 
-// NewReactorSubscriber builds a natsutil.Subscriber wired with the reactor's
-// resilience config: durable consumer group + idempotency store + bounded retries +
-// DLQ + message timeout. Exposed so main.go (next stage) and the tests construct the
-// subscriber the same way, and so the natsutil-level options live in ONE place.
-func NewReactorSubscriber(js jetstream.JetStream, store natsutil.ProcessedStore, cfg ReactorConfig) *natsutil.Subscriber {
-	cfg.withDefaults()
+// subscribeOne builds a per-subject natsutil.Subscriber (the reactor's shared
+// resilience options + a per-subject DURABLE name) and starts its consume loop on the
+// subject, bound to its owning stream. A per-subject durable is REQUIRED: a JetStream
+// durable consumer binds to exactly one filter subject, so a single shared durable
+// cannot span the subjects we consume. All replicas share the per-subject durable, so
+// for a given subject they form one consumer group (JetStream load-balances that
+// subject's events across them) — Kafka-consumer-group semantics, idempotency makes a
+// cross-replica redelivery safe.
+func (r *Reactor) subscribeOne(ctx context.Context, stream, subject string) error {
 	opts := []natsutil.SubOption{
-		natsutil.WithConsumerGroup(cfg.ConsumerGroup),
-		natsutil.WithMaxRetries(cfg.MaxRetries),
-		natsutil.WithDLQSubject(cfg.DLQSubject),
-		natsutil.WithIdempotencyStore(store),
-		natsutil.WithMessageTimeout(cfg.MessageTimeout),
+		natsutil.WithConsumerGroup(r.durableName(subject)),
+		natsutil.WithMaxRetries(r.cfg.MaxRetries),
+		natsutil.WithDLQSubject(r.cfg.DLQSubject),
+		natsutil.WithIdempotencyStore(r.store),
+		natsutil.WithMessageTimeout(r.cfg.MessageTimeout),
 	}
-	if cfg.AckWait > 0 {
-		opts = append(opts, natsutil.WithAckWait(cfg.AckWait))
+	if r.cfg.AckWait > 0 {
+		opts = append(opts, natsutil.WithAckWait(r.cfg.AckWait))
 	}
-	return natsutil.NewSubscriber(js, opts...)
+	sub := natsutil.NewSubscriber(r.js, opts...)
+
+	r.subsMu.Lock()
+	r.subs = append(r.subs, sub)
+	r.subsMu.Unlock()
+
+	return sub.Subscribe(ctx, stream, subject, r.handle)
+}
+
+// durableName turns a subject into a JetStream-legal durable consumer name:
+// "<ConsumerGroup>-<subject>" with '.', '*', '>' (forbidden in durable names)
+// replaced by '-'. e.g. "fp.pipelines.failed" → "notification-fp-pipelines-failed".
+// The ConsumerGroup is the per-service prefix; the subject suffix makes each
+// consumer's durable unique (a durable binds to one filter subject).
+func (r *Reactor) durableName(subject string) string {
+	out := make([]byte, 0, len(r.cfg.ConsumerGroup)+1+len(subject))
+	out = append(out, r.cfg.ConsumerGroup...)
+	out = append(out, '-')
+	for i := 0; i < len(subject); i++ {
+		c := subject[i]
+		if c == '.' || c == '*' || c == '>' {
+			c = '-'
+		}
+		out = append(out, c)
+	}
+	return string(out)
+}
+
+// Close stops every per-subject consume loop. Safe to call multiple times (natsutil
+// Subscriber.Close is idempotent).
+func (r *Reactor) Close() {
+	r.subsMu.Lock()
+	defer r.subsMu.Unlock()
+	for _, sub := range r.subs {
+		sub.Close()
+	}
+	r.subs = nil
 }
 
 // ============================================================================

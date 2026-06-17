@@ -14,11 +14,13 @@
 #             hardcoded here. Nothing outside that list can even open a
 #             connection to a model pod.
 #   EGRESS  → default-deny, allow only: DNS (resolve service names), the OTel
-#             collector (telemetry push), and MinIO (object storage — the artifact
-#             fetch). NOTE vs fp-auth: NO Postgres and NO NATS egress — this
-#             service uses NEITHER (no DB; main.go never opens a NATS connection).
-#             Closing egress it doesn't need shrinks the exfiltration surface if a
-#             serving pod (which loads third-party model weights) is compromised.
+#             collector (telemetry push), MinIO (object storage — the artifact
+#             fetch), and NATS (the lifecycle event bus — main.go SUBSCRIBES to
+#             model deploy/promote/archive events to reconcile this pod's loaded
+#             model, and /readyz check #2 pings the NATS connection). NOTE vs
+#             fp-auth: NO Postgres egress — this service has no DB. Closing egress it
+#             doesn't need shrinks the exfiltration surface if a serving pod (which
+#             loads third-party model weights) is compromised.
 #
 # ENFORCEMENT CAVEAT (interview-critical): a NetworkPolicy is only enforced if
 # the cluster's CNI supports it (Calico, Cilium, etc.). On a CNI without policy
@@ -73,6 +75,20 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.nats.enabled }}
+    # NATS JetStream (the model-lifecycle event bus). main.go subscribes to
+    # fp.models.* / fp.pipelines.* deploy/promote/archive events to reconcile the
+    # pod's loaded model; /readyz check #2 fails when the NATS connection is down. So
+    # this egress is REQUIRED — without it (under an enforcing CNI) the pod connects to
+    # NATS at boot only if allowed, and readiness flaps to NotReady on the conn check.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.nats.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.nats.port }}
     {{- end }}
     {{- if .Values.networkPolicy.egress.otlp.enabled }}
     # OTLP/gRPC to the OpenTelemetry Collector (traces + metrics push).

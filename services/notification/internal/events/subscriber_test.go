@@ -25,9 +25,11 @@ import (
 //   • a poison message (executor permanently fails) lands on the DLQ after the cap;
 //   • an event with no recipient is ACKed and skipped (no execution).
 
-// newReactor wires a Reactor with a real natsutil.Subscriber pointed at the test
-// NATS, the SAME options main.go uses (durable group + idempotency store + bounded
-// retries + DLQ), plus a short AckWait so redelivery-driven tests run fast.
+// newReactor wires a Reactor against the test NATS with the SAME config main.go uses
+// (durable-prefix + idempotency store + bounded retries + DLQ), plus a short AckWait so
+// redelivery-driven tests run fast. The reactor builds one durable consumer per subject
+// in events.ConsumedSubjects internally, each bound to its owning per-domain stream
+// (all provisioned by newJS).
 func newReactor(t *testing.T, js jetstream.JetStream, deps events.ReactorDeps, store natsutil.ProcessedStore, dlq string) *events.Reactor {
 	t.Helper()
 	cfg := events.ReactorConfig{
@@ -37,9 +39,8 @@ func newReactor(t *testing.T, js jetstream.JetStream, deps events.ReactorDeps, s
 		MessageTimeout: 5 * time.Second,
 		AckWait:        2 * time.Second, // short so the redelivery/DLQ tests are quick
 	}
-	sub := events.NewReactorSubscriber(js, store, cfg)
-	t.Cleanup(sub.Close)
-	r := events.NewReactor(sub, deps, store, cfg, nil)
+	r := events.NewReactor(js, deps, store, cfg, nil)
+	t.Cleanup(r.Close)
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("start reactor: %v", err)
 	}
@@ -262,18 +263,17 @@ func TestReactor_PoisonMessage_ExecutorBoundedByCap(t *testing.T) {
 	cfg := events.ReactorConfig{
 		ConsumerGroup:  "notification-bound-test",
 		MaxRetries:     maxRetries,
-		DLQSubject:     events.SubjectDLQ, // OUTSIDE fp.> → parked copy is never re-consumed
+		DLQSubject:     events.SubjectDLQ, // OUTSIDE every domain tree → parked copy is never re-consumed
 		MessageTimeout: 5 * time.Second,
 		AckWait:        1 * time.Second, // short so retries + any re-loop happen fast
 	}
-	sub := events.NewReactorSubscriber(js, natsutil.NewMemoryProcessedStore(), cfg)
-	t.Cleanup(sub.Close)
-	r := events.NewReactor(sub, events.ReactorDeps{
+	r := events.NewReactor(js, events.ReactorDeps{
 		Service:  realService(),
 		Router:   &fakeRouter{recipient: "user-poison", fullType: "fp.pipelines.failed"},
 		Prefs:    &fakePrefs{prefs: fullPrefs("user-poison")},
 		Executor: exec,
 	}, natsutil.NewMemoryProcessedStore(), cfg, nil)
+	t.Cleanup(r.Close)
 	if err := r.Start(context.Background()); err != nil {
 		t.Fatalf("start reactor: %v", err)
 	}
@@ -296,19 +296,33 @@ func TestReactor_PoisonMessage_ExecutorBoundedByCap(t *testing.T) {
 	}
 }
 
-// REGRESSION (structural): the reactor's DLQ subject must NOT be matched by its own
-// consumer filter (SubjectAllEvents = "fp.>"). This is the root-cause invariant of
-// the DLQ re-consumption bug, asserted directly and without a broker: if a future
-// edit moves the DLQ back under fp.* (e.g. "fp.dlq.notification"), this fails
-// immediately — a cheap canary in front of the slower broker test above.
-func TestSubjectDLQ_NotUnderFirehose(t *testing.T) {
-	if !subjectMatches(events.SubjectAllEvents, "fp.notifications.delivered") {
-		t.Fatalf("sanity: %q should match a real fp.* subject", events.SubjectAllEvents)
+// REGRESSION (structural): the reactor's DLQ subject must NOT be matched by ANY of the
+// per-subject consumer filters (events.ConsumedSubjects) — exact subjects here, but the
+// invariant generalizes to "the DLQ is outside every consumed domain tree". This is the
+// root-cause invariant of the DLQ re-consumption bug, asserted directly and without a
+// broker: if a future edit moves the DLQ under a consumed fp.<domain> tree (e.g.
+// "fp.pipelines.dlq.notification"), this fails immediately — a cheap canary in front of
+// the slower broker test above. We test containment against each consumed domain's
+// wildcard (fp.<domain>.>), which is exactly what the owning stream's consumer covers.
+func TestSubjectDLQ_NotUnderConsumedTrees(t *testing.T) {
+	// Sanity: a real consumed subject IS matched by its own domain wildcard.
+	if !subjectMatches("fp.pipelines.>", "fp.pipelines.failed") {
+		t.Fatal("sanity: fp.pipelines.> should match fp.pipelines.failed")
 	}
-	if subjectMatches(events.SubjectAllEvents, events.SubjectDLQ) {
-		t.Fatalf("DLQ subject %q matches the reactor's own consumer filter %q — "+
-			"it would be re-consumed (DLQ poison re-consumption). The DLQ must be rooted "+
-			"outside fp.> (e.g. the fp_dlq.* token).", events.SubjectDLQ, events.SubjectAllEvents)
+	// The DLQ must be outside EVERY consumed domain's wildcard. Derive the domain
+	// wildcard from each consumed subject (fp.<domain>.>) and assert the DLQ escapes it.
+	for _, subject := range events.ConsumedSubjects {
+		parts := strings.SplitN(subject, ".", 3) // ["fp", "<domain>", "..."]
+		if len(parts) < 2 {
+			t.Fatalf("unexpected consumed subject shape %q", subject)
+		}
+		domainWildcard := parts[0] + "." + parts[1] + ".>" // e.g. "fp.pipelines.>"
+		if subjectMatches(domainWildcard, events.SubjectDLQ) {
+			t.Fatalf("DLQ subject %q falls under a consumed domain tree %q — "+
+				"it could land in that domain's stream and be re-consumed (DLQ poison "+
+				"re-consumption). The DLQ must be rooted outside every fp.<domain> tree "+
+				"(e.g. the fp_dlq.* token).", events.SubjectDLQ, domainWildcard)
+		}
 	}
 }
 
@@ -336,23 +350,64 @@ func subjectMatches(filter, subject string) bool {
 	return len(f) == len(s)
 }
 
+// DEGRADE (missing owning stream): when a consumed subject's owning stream does NOT
+// exist yet (a partial/fresh cluster where some producers haven't booted), Start must
+// SKIP that subject WITHOUT failing — and the consumers whose streams DO exist must
+// still work. This is the platform "degrade, don't crash" policy (mirrors
+// experiment-tracker's degraded lineage sink) and the direct guard against the original
+// CrashLoop: notification must come up even when EXPERIMENTS/MODELS/etc. are absent, and
+// it must NEVER create an overlapping fp.> stream to compensate.
+func TestReactor_MissingStream_DegradesNotCrashes(t *testing.T) {
+	js := newJSPartial(t) // only PIPELINES + DLQ exist; MODELS/INFERENCE/BILLING/EXPERIMENTS absent
+
+	exec := &fakeExecutor{result: events.ExecutionResult{NotificationID: "notif-degrade"}}
+	deps := events.ReactorDeps{
+		Service:  realService(),
+		Router:   &fakeRouter{recipient: "user-degrade", fullType: "fp.pipelines.failed"},
+		Prefs:    &fakePrefs{prefs: fullPrefs("user-degrade")},
+		Executor: exec,
+	}
+	// Start MUST NOT error even though most owning streams are missing.
+	newReactor(t, js, deps, natsutil.NewMemoryProcessedStore(), events.SubjectDLQ)
+
+	// A pipeline event (whose stream EXISTS) is still consumed + executed — the reactor
+	// degraded for the absent domains but stayed live for the present one.
+	publishCanonical(t, js, "fp.pipelines.failed", "pipeline-orchestrator", sampleEvent())
+	waitFor(t, func() bool { return exec.count() == 1 }, 15*time.Second,
+		"pipeline event executed despite other domains' streams being absent")
+
+	// And the reactor did NOT create any overlapping domain stream: only PIPELINES,
+	// NOTIFICATION_DLQ should exist (the reactor creates NO domain stream). We assert it
+	// did not conjure an EVENTS/fp.> firehose stream by checking a models event has no
+	// stream to land in (publishing it would be dropped — no stream owns fp.models.>).
+	_, err := js.StreamNameBySubject(context.Background(), "fp.models.drift.detected")
+	if err == nil {
+		t.Fatal("reactor must NOT have created a stream owning fp.models.* — it should bind only to existing streams")
+	}
+}
+
 // NO RECIPIENT: an event the router declines is ACKed and skipped — no Execute call,
-// no NAK-loop, no DLQ. This is the normal case for platform events with no per-user
-// target (e.g. fp.pipelines.step.completed).
+// no NAK-loop, no DLQ. This is the normal case for a consumed subject that, for THIS
+// envelope, has no per-user target (the router declines it). We use a CONSUMED subject
+// (fp.pipelines.step.failed) so the reactor actually receives it (the reactor binds a
+// consumer per ConsumedSubjects entry); the router declining it is what exercises the
+// skip path.
 func TestReactor_NoRecipient_Skips(t *testing.T) {
 	js := newJS(t)
 	exec := &fakeExecutor{result: events.ExecutionResult{}}
 	deps := events.ReactorDeps{
-		Service:  realService(),
-		Router:   &fakeRouter{recipient: "user-5", fullType: "fp.pipelines.step.completed", declineType: "step.completed"},
+		Service: realService(),
+		// Declines step.failed (the prefix-stripped type of fp.pipelines.step.failed),
+		// accepts everything else (e.g. fp.pipelines.failed → type "failed").
+		Router:   &fakeRouter{recipient: "user-5", fullType: "fp.pipelines.failed", declineType: "step.failed"},
 		Prefs:    &fakePrefs{prefs: fullPrefs("user-5")},
 		Executor: exec,
 	}
 	newReactor(t, js, deps, natsutil.NewMemoryProcessedStore(), events.SubjectDLQ)
 
-	// fp.pipelines.step.completed → natsutil derives type "step.completed", which the
-	// router declines.
-	publishCanonical(t, js, "fp.pipelines.step.completed", "pipeline-orchestrator", sampleEvent())
+	// fp.pipelines.step.failed → natsutil derives type "step.failed", which the router
+	// declines → the reactor ACKs and skips (no Execute).
+	publishCanonical(t, js, "fp.pipelines.step.failed", "pipeline-orchestrator", sampleEvent())
 
 	// Publish a SECOND event the router DOES accept, to prove the consumer is alive
 	// and progressing (so the absence of an Execute for the first is a SKIP, not a stall).
@@ -364,7 +419,7 @@ func TestReactor_NoRecipient_Skips(t *testing.T) {
 		t.Fatalf("Execute called %d times; the declined event must be skipped (only the accepted one runs)", exec.count())
 	}
 	ev, _ := exec.lastEvent()
-	if ev.Type != "fp.pipelines.step.completed" && ev.Type != "fp.pipelines.failed" {
-		t.Errorf("unexpected executed event type %q", ev.Type)
+	if ev.Type != "fp.pipelines.failed" {
+		t.Errorf("unexpected executed event type %q, want fp.pipelines.failed", ev.Type)
 	}
 }

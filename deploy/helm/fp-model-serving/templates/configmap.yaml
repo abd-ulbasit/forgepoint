@@ -9,8 +9,10 @@
 # object-storage CREDENTIALS (S3 access/secret key) live in the Secret.
 #
 # WHAT'S DIFFERENT vs fp-auth's ConfigMap:
-#   * NO FP_NATS_URL — main.go never opens a NATS connection (serving data plane
-#     is event-bus-agnostic).
+#   * FP_NATS_URL IS present — main.go opens a NATS connection to consume model
+#     lifecycle events (deploy/promote/archive) and /readyz pings it. (An earlier
+#     version wrongly claimed serving was bus-agnostic and omitted this, leaving the
+#     pod on the localhost default → CrashLoop on the NATS ping.)
 #   * + FP_S3_ENDPOINT and the per-pod MODEL IDENTITY block (the Sidecar "the pod
 #     IS the model" contract): FP_MODEL_NAME / FP_MODEL_VERSION / FP_ARTIFACT_URI
 #     / FP_ARTIFACT_DIGEST / FP_ARTIFACT_BUCKET_URI / FP_LIVENESS_LATENCY_MS.
@@ -29,9 +31,13 @@ data:
   # Ports — stringified because ConfigMap values are always strings.
   FP_PORT: {{ .Values.ports.health | quote }}
   FP_GRPC_PORT: {{ .Values.ports.grpc | quote }}
-  # Observability endpoint (in-cluster service DNS). No NATS — unused here.
+  # Observability + lifecycle-bus endpoints (in-cluster service DNS).
   FP_LOG_LEVEL: {{ .Values.config.logLevel | quote }}
   FP_OTEL_ENDPOINT: {{ .Values.config.otelEndpoint | quote }}
+  # FP_NATS_URL — the model-lifecycle event bus main.go subscribes to (and /readyz
+  # pings). Required: an absent value leaves main.go on its localhost default → the
+  # NATS connect/readiness fails in-cluster.
+  FP_NATS_URL: {{ .Values.config.natsUrl | quote }}
   # FP_ENV labels logs/traces with the deployment environment.
   FP_ENV: {{ .Values.config.env | quote }}
   # Object storage (MinIO/S3) endpoint the storage adapter dials for the artifact.

@@ -1,0 +1,12 @@
+# Forgepoint model-serving PLACEHOLDER artifact.
+#
+# This is NOT a real ONNX model. It exists so a freshly-deployed model-serving pod
+# has a fetchable artifact at file:///artifacts/placeholder.onnx, letting the
+# FileFetcher fetch+hash it and the PLACEHOLDER inference engine (see main.go's
+# newPlaceholderEngine — the real ONNX adapter is a flagged follow-up) report
+# StateReady so /readyz goes green out of the box on a default deploy.
+#
+# A real per-model Deployment overrides FP_ARTIFACT_URI with a presigned https:// URL
+# (registry-minted) or a CSI-mounted file path and ships the real ONNX bytes; this
+# placeholder is only the default so the chart runs without external object storage.
+PLACEHOLDER-ONNX-DO-NOT-USE-FOR-INFERENCE

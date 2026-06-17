@@ -27,20 +27,37 @@ import (
 // broker cannot faithfully reproduce. testutil.StartNATS spins a nats:2.11 with
 // JetStream; SkipIfNoDocker skips cleanly when Docker is unavailable.
 
-// newJS spins up a real NATS, creates the EVENTS firehose stream (the consumed fp.>
-// firehose + this service's own fp.notifications.> output) AND the dedicated
-// NOTIFICATION_DLQ stream that owns the dead-letter subject (events.SubjectDLQ,
-// "fp_dlq.notification" — OUTSIDE fp.>), then returns a JetStream handle. Torn down
+// streamNotifications is a TEST-ONLY stream over fp.notifications.> so the publisher
+// tests (drainOne) can read this service's OWN delivery-health output. In production
+// the notification output is captured by whatever stream the platform provisions for
+// fp.notifications.> (e.g. experiment-tracker's NOTIFICATIONS stream); the reactor
+// never reads it, so the service itself does not create it.
+const streamNotifications = "NOTIFICATIONS"
+
+// newJS spins up a real NATS and provisions the per-domain streams the reactor's
+// per-subject consumers BIND to — exactly the production topology, where each owning
+// service creates its own narrow stream (MODELS=fp.models.>, PIPELINES=fp.pipelines.>,
+// INFERENCE=fp.inference.>, BILLING=fp.billing.>, EXPERIMENTS=fp.experiments.>). It
+// ALSO creates the dedicated NOTIFICATION_DLQ stream (events.SubjectDLQ,
+// "fp_dlq.notification" — OUTSIDE every fp.<domain>.> tree) and the test-only
+// NOTIFICATIONS stream for the publisher tests. Returns a JetStream handle; torn down
 // with the container by t.Cleanup inside StartNATS.
 //
-// WHY one EVENTS stream over fp.>: the choreography reactor needs a single consumer
-// that sees the whole platform, so the firehose lives in one stream whose subjects
-// include fp.>. That same fp.> capture also covers the delivery-health output.
+// WHY per-domain streams (NOT one fp.> firehose): a JetStream stream's subjects must
+// not OVERLAP another stream's, so a single fp.> stream cannot coexist with the narrow
+// per-domain streams the rest of the platform creates (it would fail with err 10065).
+// The reactor therefore binds ONE durable consumer per subject to the EXISTING owning
+// stream — these CreateStream calls stand in for the producers' boot-time provisioning.
+//
+// IMPORTANT: ALL of ConsumedSubjects' owning streams must exist, because Reactor.Start
+// resolves every subject via StreamNameBySubject and fails if any is missing. We create
+// the full per-domain set up front so a test that only publishes to one subject still
+// lets the reactor start all its consumers.
 //
 // WHY a SEPARATE DLQ stream: a JetStream subject is bound to exactly ONE stream, and
-// the DLQ subject is deliberately rooted OUTSIDE fp.> so it never matches the
-// reactor's fp.> consumer (the DLQ poison re-consumption fix). It therefore needs its
-// own stream to land in — mirroring main.go, which provisions both.
+// the DLQ subject is deliberately rooted OUTSIDE every fp.<domain>.> tree so it never
+// lands in a stream a reactor consumer reads (the DLQ poison re-consumption fix). It
+// therefore needs its own stream — mirroring main.go, which provisions it.
 func newJS(t *testing.T) jetstream.JetStream {
 	t.Helper()
 	testutil.SkipIfNoDocker(t)
@@ -53,17 +70,58 @@ func newJS(t *testing.T) jetstream.JetStream {
 	t.Cleanup(conn.Close)
 
 	ctx := context.Background()
-	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{
-		Name:     events.StreamEvents,
-		Subjects: []string{"fp.>"}, // firehose: every event + fp.notifications.>
-	}); err != nil {
-		t.Fatalf("create EVENTS stream: %v", err)
+	// The narrow per-domain streams that own the subjects in events.ConsumedSubjects.
+	// One stream per top-level domain tree, exactly as each producing service creates.
+	perDomain := []jetstream.StreamConfig{
+		{Name: "MODELS", Subjects: []string{"fp.models.>"}},
+		{Name: "PIPELINES", Subjects: []string{"fp.pipelines.>"}},
+		{Name: "INFERENCE", Subjects: []string{"fp.inference.>"}},
+		{Name: "BILLING", Subjects: []string{"fp.billing.>"}},
+		{Name: "EXPERIMENTS", Subjects: []string{"fp.experiments.>"}},
+		{Name: streamNotifications, Subjects: []string{"fp.notifications.>"}},
 	}
-	// The dead-letter stream owns the fp_dlq.* subject (outside fp.>), so parked
-	// poison messages have a home that the reactor's fp.> consumer can never see.
+	for _, sc := range perDomain {
+		if _, err := js.CreateStream(ctx, sc); err != nil {
+			t.Fatalf("create %s stream: %v", sc.Name, err)
+		}
+	}
+	// The dead-letter stream owns the fp_dlq.* subject (outside every fp.<domain>.>
+	// tree), so parked poison messages have a home no reactor consumer can re-read.
 	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{
 		Name:     events.StreamDLQ,
 		Subjects: []string{events.SubjectDLQ},
+	}); err != nil {
+		t.Fatalf("create NOTIFICATION_DLQ stream: %v", err)
+	}
+	return js
+}
+
+// newJSPartial spins up a real NATS but provisions ONLY the PIPELINES stream (plus the
+// DLQ stream). It models a fresh/partial cluster where some producers have created their
+// streams and others (MODELS, INFERENCE, BILLING, EXPERIMENTS) have NOT yet. It exists
+// to exercise the reactor's DEGRADE policy: Start must SKIP the subjects whose owning
+// stream is absent (with a warning) and still bind the ones that exist — never crash and
+// never create an overlapping stream.
+func newJSPartial(t *testing.T) jetstream.JetStream {
+	t.Helper()
+	testutil.SkipIfNoDocker(t)
+	url := testutil.StartNATS(t)
+
+	conn, js, err := natsutil.Connect(url)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(conn.Close)
+
+	ctx := context.Background()
+	// ONLY pipelines exists — the other domains' streams are deliberately absent.
+	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{
+		Name: "PIPELINES", Subjects: []string{"fp.pipelines.>"},
+	}); err != nil {
+		t.Fatalf("create PIPELINES stream: %v", err)
+	}
+	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{
+		Name: events.StreamDLQ, Subjects: []string{events.SubjectDLQ},
 	}); err != nil {
 		t.Fatalf("create NOTIFICATION_DLQ stream: %v", err)
 	}
@@ -77,7 +135,7 @@ func drainOne(t *testing.T, js jetstream.JetStream, subject string) natsutil.Eve
 	got := make(chan natsutil.EventEnvelope, 1)
 	sub := natsutil.NewSubscriber(js)
 	t.Cleanup(sub.Close)
-	if err := sub.Subscribe(context.Background(), events.StreamEvents, subject,
+	if err := sub.Subscribe(context.Background(), streamNotifications, subject,
 		func(_ context.Context, env natsutil.EventEnvelope) error {
 			select {
 			case got <- env:

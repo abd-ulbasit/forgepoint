@@ -83,9 +83,17 @@ config:
   env: "local"
   logLevel: "info"
   # In-cluster service DNS. fp-infra is the namespace hosting shared infra
-  # (NATS, Postgres, OTel collector) per CLAUDE.md K8s namespaces.
+  # (NATS, Postgres, Redis, OTel collector) per CLAUDE.md K8s namespaces.
   otelEndpoint: "otel-collector.fp-infra.svc.cluster.local:4317"
   natsUrl: "nats://nats.fp-infra.svc.cluster.local:4222"
+  # FP_REDIS_URL — the consumer-side idempotency ProcessedStore (fast dedup so a
+  # redelivered inference event is never double-metered). CRITICAL FORMAT: billing's
+  # main.go uses go-redis NewClient(&Options{Addr: cfg.RedisURL}), which takes a BARE
+  # "host:port" — NOT a "redis://" URL. A redis:// scheme here would be passed verbatim
+  # as the dial address and fail. (Contrast: inference-gateway/feature-store/notification
+  # use go-redis ParseURL and DO take a redis:// URL.) Move to the Secret in prod if
+  # Redis grows credentials (then switch main.go to ParseURL).
+  redisUrl: "redis.fp-infra.svc.cluster.local:6379"
   # FP_DEFAULT_CURRENCY — billing-specific. The deployment's settlement currency
   # (ISO-4217). Fallback currency for server-built artifacts when no plan
   # currency applies (BillingConfig.DefaultCurrency, default "USD").
@@ -383,9 +391,10 @@ networkPolicy:
     - fp-system
   # Egress allow-list. dns is special-cased to the kube-system resolver.
   # Billing's real egress surface: Postgres (business writes + the outbox table),
-  # NATS (the relay PUBLISHES outbox events and a consumer SUBSCRIBES to inference
-  # events for metering), and OTLP. No Redis/MinIO — those keys are intentionally
-  # absent so the policy never opens a path billing doesn't use.
+  # Redis (the consumer-side idempotency ProcessedStore — main.go pings it at boot and
+  # readiness depends on it), NATS (the relay PUBLISHES outbox events and a consumer
+  # SUBSCRIBES to inference events for metering), and OTLP. No MinIO — billing stores
+  # no artifacts.
   egress:
     dns:
       enabled: true
@@ -393,6 +402,10 @@ networkPolicy:
       enabled: true
       namespace: fp-infra
       port: 5432
+    redis:
+      enabled: true
+      namespace: fp-infra
+      port: 6379
     nats:
       enabled: true
       namespace: fp-infra

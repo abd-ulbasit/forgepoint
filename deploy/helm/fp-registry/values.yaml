@@ -87,8 +87,13 @@ config:
   natsUrl: "nats://nats.fp-infra.svc.cluster.local:4222"
   # FP_REDIS_URL — the CQRS READ projection store. Distinct from DATABASE_URL
   # (the Postgres WRITE store): in CQRS the two sides are SEPARATE stores, made
-  # explicit here as one connection string per side.
-  redisUrl: "redis://redis.fp-infra.svc.cluster.local:6379"
+  # explicit here as one connection string per side. CRITICAL FORMAT: registry's
+  # main.go uses go-redis NewClient(&Options{Addr: cfg.RedisURL}), which takes a BARE
+  # "host:port" — NOT a "redis://" URL. A redis:// scheme here is passed verbatim as the
+  # dial address and fails to connect. (Contrast: inference-gateway/feature-store/
+  # notification use go-redis ParseURL and DO take a redis:// URL.) Move to the Secret
+  # in prod if Redis grows credentials (then switch main.go to ParseURL).
+  redisUrl: "redis.fp-infra.svc.cluster.local:6379"
   # FP_OTEL_INSECURE — plaintext OTLP (no TLS). true locally (the collector has
   # no cert); set false in prod where the collector terminates mTLS. The registry
   # reads this from config (12-factor), unlike auth which hard-coded it.

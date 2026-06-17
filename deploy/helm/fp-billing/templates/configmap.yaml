@@ -25,6 +25,10 @@ data:
   FP_LOG_LEVEL: {{ .Values.config.logLevel | quote }}
   FP_OTEL_ENDPOINT: {{ .Values.config.otelEndpoint | quote }}
   FP_NATS_URL: {{ .Values.config.natsUrl | quote }}
+  # FP_REDIS_URL — the consumer-side idempotency ProcessedStore. BARE host:port
+  # (go-redis NewClient{Addr}); see the note in values.yaml. No embedded credential
+  # in dev (in-cluster Redis), so it is non-secret and lives here.
+  FP_REDIS_URL: {{ .Values.config.redisUrl | quote }}
   # FP_ENV labels logs/traces with the deployment environment.
   FP_ENV: {{ .Values.config.env | quote }}
   # FP_DEFAULT_CURRENCY — billing-specific settlement currency (ISO-4217).

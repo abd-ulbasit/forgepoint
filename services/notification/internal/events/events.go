@@ -27,38 +27,62 @@
 //	  fp.notifications.delivered  (NotificationDelivered) — a channel succeeded
 //	  fp.notifications.failed     (NotificationFailed)    — a channel exhausted retries
 //
-//	CONSUMES (the CHOREOGRAPHY firehose — a single wildcard subscription):
-//	  fp.>  → every platform event. Notable members per the contract:
-//	          fp.models.drift.detected, fp.pipelines.failed, fp.pipelines.step.failed,
-//	          fp.pipelines.compensation.triggered, fp.pipelines.completed,
-//	          fp.billing.quota.exceeded, fp.billing.invoice.generated,
-//	          fp.experiments.run.created, fp.experiments.run.finished,
-//	          fp.models.archived, fp.inference.failed, fp.auth.user.created,
-//	          fp.auth.apikey.rotated, …
+//	CONSUMES (the CHOREOGRAPHY set — one durable consumer PER subject, each bound
+//	to the EXISTING per-domain stream that owns the subject; see ConsumedSubjects):
+//	  fp.models.drift.detected, fp.models.archived            (stream MODELS)
+//	  fp.pipelines.failed, fp.pipelines.step.failed,
+//	  fp.pipelines.compensation.triggered, fp.pipelines.completed (stream PIPELINES)
+//	  fp.inference.failed                                     (stream INFERENCE)
+//	  fp.billing.quota.exceeded, fp.billing.invoice.generated (stream BILLING)
+//	  fp.experiments.run.created, fp.experiments.run.finished (stream EXPERIMENTS)
 //
 // ============================================================================
-// WHY A SINGLE fp.> SUBSCRIPTION, NOT ONE CONSUMER PER EVENT TYPE
+// WHY A CURATED SUBJECT SET BOUND TO PER-DOMAIN STREAMS (NOT ONE fp.> CONSUMER)
 // ============================================================================
 //
-// This is the defining property of CHOREOGRAPHY (vs ORCHESTRATION) and the single
-// most interview-relevant decision in this package. Every other consumer on the
-// platform (gateway, monitor, orchestrator) subscribes to the SPECIFIC few
-// subjects it understands and decodes each payload into a typed events.v1 message.
-// Notification does the opposite: it subscribes to the WHOLE firehose and treats
-// every event OPAQUELY — it pattern-matches on EventEnvelope.type and forwards the
-// payload bytes verbatim. It NEVER decodes what a `fp.pipelines.failed` MEANS.
+// Notification is still a CHOREOGRAPHY leaf — it treats every inbound event
+// OPAQUELY (it pattern-matches on EventEnvelope.type via the recipient router and
+// forwards the payload bytes verbatim; it NEVER decodes what a `fp.pipelines.failed`
+// MEANS). What changed is the TOPOLOGY of HOW it subscribes, forced by a hard
+// JetStream constraint we hit in the k3s deploy:
 //
-//	consequence: a brand-new event type the team ships next quarter needs ZERO
-//	code change here. The producer has no awareness of us; a user just writes a
-//	preference/mute pattern whose wildcard matches the new Type, and the reactor
-//	already routes it. That is choreography in one sentence — "react to facts on
-//	the bus, with no central coordinator and no per-event-type coupling".
+//	A JetStream STREAM owns a SUBJECT TREE, and a stream's subjects MUST NOT
+//	OVERLAP another stream's. The platform already provisions NARROW per-domain
+//	streams — MODELS=fp.models.>, PIPELINES=fp.pipelines.>, BILLING=fp.billing.>,
+//	INFERENCE=fp.inference.>, EXPERIMENTS=fp.experiments.>, … (each owning service
+//	creates its own at boot). A single firehose stream over "fp.>" would OVERLAP
+//	all of them, so CreateStream/CreateOrUpdateStream fails with JetStream err
+//	10065 ("subjects overlap with an existing stream") and notification CrashLoops.
 //
-// The events.proto NOTIFICATION block says exactly this: "The Notification service
-// is a CHOREOGRAPHY leaf — it consumes the firehose but treats inbound events
-// OPAQUELY (it never decodes their payloads; it pattern-matches on
-// EventEnvelope.type). So there are no consumer-side payload types for it." We
-// honor that: the Reactor decodes ONLY the envelope, never env.Data.
+// And a JetStream CONSUMER binds to exactly ONE stream — so there is no single
+// consumer that can span fp.models.>, fp.pipelines.>, fp.billing.>, … living in
+// DIFFERENT streams. The "one fp.> consumer on a self-owned EVENTS stream" design
+// is therefore structurally impossible alongside the per-domain-stream topology
+// the rest of the platform uses.
+//
+// THE FIX (the mature, idiomatic shape — what model-monitor already does): run ONE
+// durable consumer PER consumed subject, and BIND each to the EXISTING stream that
+// owns that subject (resolved at boot via js.StreamNameBySubject — see
+// subscriber.go's Start). Notification CREATES NO domain stream of its own; it is a
+// pure CONSUMER that attaches to streams the producers provision. The only stream
+// it owns is its private DLQ (StreamDLQ on fp_dlq.*, outside every fp.<domain>.>
+// tree, so it overlaps nothing).
+//
+// WHAT WE GIVE UP vs a true fp.> firehose: a brand-new event DOMAIN (a new
+// fp.<newdomain>.> tree) is no longer auto-consumed — it must be added to
+// ConsumedSubjects. That is the deliberate, contract-anchored tradeoff: the
+// subjects notification reacts to are exactly the ones the event-contract lists
+// with notification as a consumer, so they are an enumerable, reviewable set, not
+// an open firehose. Within an already-consumed domain a new event subject just
+// needs its narrow subject added here (still no payload decode — choreography
+// intact). The reactor body is UNCHANGED: it still decodes ONLY the envelope.
+//
+// INTERVIEW FRAMING: "How does a choreography consumer span many domains when each
+// domain is a separate JetStream stream and consumers bind to one stream?" Answer:
+// you DON'T use one wildcard consumer (that needs one stream whose subjects overlap
+// every domain stream — forbidden). You run one durable consumer per subject, each
+// bound to its owning stream, and resolve the owning stream by subject at boot. The
+// opacity (no payload decode) is orthogonal to the subscription topology.
 //
 // ============================================================================
 // CANONICAL ENCODING — protojson, not encoding/json, for the PRODUCED payloads
@@ -101,47 +125,86 @@ const (
 	SubjectNotificationDelivered = "fp.notifications.delivered"
 	SubjectNotificationFailed    = "fp.notifications.failed"
 
-	// Consumed by this service — the CHOREOGRAPHY firehose. One wildcard filter
-	// over the whole platform namespace. The reactor matches on EventEnvelope.type
-	// and the recipient's preference patterns; it does not enumerate subjects.
-	SubjectAllEvents = "fp.>"
+	// ---- CONSUMED subjects (the curated choreography set) -------------------
+	//
+	// These are the EXACT subjects the canonical event-contract (docs/design/
+	// event-contract.md) lists with `notification` as a consumer. Each is a NARROW
+	// subject (no wildcard) so a durable consumer for it binds to the one EXISTING
+	// per-domain stream that owns its tree (MODELS / PIPELINES / INFERENCE /
+	// BILLING / EXPERIMENTS) — never a self-created fp.> stream that would overlap.
+	// The reactor still treats every payload OPAQUELY; these names only decide WHICH
+	// streams' events reach the (opaque) handler.
+
+	// fp.models.* — owned by stream MODELS (producer: registry; drift by model-monitor).
+	SubjectModelDriftDetected = "fp.models.drift.detected"
+	SubjectModelArchived      = "fp.models.archived"
+
+	// fp.pipelines.* — owned by stream PIPELINES (producer: pipeline-orchestrator).
+	SubjectPipelineFailed        = "fp.pipelines.failed"
+	SubjectPipelineStepFailed    = "fp.pipelines.step.failed"
+	SubjectPipelineCompensation  = "fp.pipelines.compensation.triggered"
+	SubjectPipelineCompleted     = "fp.pipelines.completed"
+
+	// fp.inference.* — owned by stream INFERENCE (producer: inference-gateway).
+	SubjectInferenceFailed = "fp.inference.failed"
+
+	// fp.billing.* — owned by stream BILLING (producer: billing).
+	SubjectBillingQuotaExceeded     = "fp.billing.quota.exceeded"
+	SubjectBillingInvoiceGenerated  = "fp.billing.invoice.generated"
+
+	// fp.experiments.* — owned by stream EXPERIMENTS (producer: experiment-tracker).
+	SubjectExperimentRunCreated  = "fp.experiments.run.created"
+	SubjectExperimentRunFinished = "fp.experiments.run.finished"
 
 	// SubjectDLQ is where the reactor parks POISON messages (a message that fails
 	// processing past the retry cap). It is DELIBERATELY rooted at "fp_dlq." (an
-	// UNDERSCORE, a distinct token) — NOT "fp.dlq." — so it does NOT match the
-	// SubjectAllEvents "fp.>" wildcard the reactor's own consumer filters on. That
-	// one-character difference is the whole fix:
+	// UNDERSCORE, a distinct token) — NOT "fp.dlq." and NOT under any consumed
+	// fp.<domain>.> tree — so it lands ONLY in its own dedicated StreamDLQ and is
+	// never re-consumed by one of the reactor's per-subject consumers:
 	//
-	//   "fp.dlq.notification"  matches  "fp.>"   ← the DLQ re-feeds the reactor (BUG)
-	//   "fp_dlq.notification"  does NOT match "fp.>" ← the reactor never re-consumes it
+	//   "fp.dlq.notification"  is under fp.>  → could land in a domain stream (BUG)
+	//   "fp_dlq.notification"  is under NO fp.<domain> tree → its own stream only
 	//
 	// THE BUG THIS PREVENTS (DLQ poison re-consumption / amplification):
-	// The reactor's single consumer filters on fp.> and shares ONE stream (EVENTS)
-	// with the subject it parks poison on. If the DLQ subject is "fp.dlq.notification"
-	// it ALSO matches fp.> and lands in the SAME stream — so the moment natsutil
-	// publishes the DLQ copy, JetStream hands it right back to the reactor's fp.>
-	// consumer. The reactor re-decodes the SAME envelope (same Type, same content),
-	// re-fails, and re-DLQs. A single forever-poison message therefore drives the
-	// executor through ~2x its retry budget (one extra full retry-round), and once a
-	// real DecisionExecutor fires actual webhook/Slack sends a poison-classified
-	// notification is DELIVERED TWICE before being parked. It is only bounded today by
-	// natsutil giving the DLQ copy Nats-Msg-Id = envelope.ID+"-dlq", so the SECOND DLQ
-	// publish is dropped by JetStream's ~2-minute publish-dedup window — a time-window
-	// bound, not a structural one.
+	// If the DLQ subject lived under a tree a reactor consumer reads (e.g.
+	// "fp.pipelines.dlq.notification" under fp.pipelines.>), the moment natsutil
+	// publishes the DLQ copy JetStream would hand it back to that domain consumer.
+	// The reactor would re-decode the SAME envelope, re-fail, and re-DLQ — driving the
+	// executor through extra retry rounds and, once a real DecisionExecutor fires
+	// actual webhook/Slack sends, DELIVERING a poison-classified notification twice
+	// before parking it. Rooting the DLQ at its own "fp_dlq." token in its own stream
+	// makes the dead-letter a pure SINK, structurally un-re-consumable.
 	//
-	// THE FIX (option a — the DLQ must never be re-consumed by the producer's own
-	// firehose consumer): route the DLQ to a subject OUTSIDE fp.> and give it its OWN
-	// stream (StreamDLQ). A poison message then leaves the firehose for good; ops
-	// inspect/replay it from the dedicated DLQ stream out-of-band. This is how mature
-	// buses model dead-letter (Kafka's separate dead-letter TOPIC, SQS's separate
-	// dead-letter QUEUE) — the DLQ is a SINK, never an input to the same consumer.
-	//
-	// WHY a token boundary, not a deny-filter on the consumer: JetStream subject
-	// matching is token-wise on ".", and a consumer FilterSubject is a single allow
-	// pattern with no built-in deny — so the robust, self-documenting way to keep the
-	// DLQ out of fp.> is to give it a root token ("fp_dlq") that simply isn't under fp.
+	// This is how mature buses model dead-letter (Kafka's separate dead-letter TOPIC,
+	// SQS's separate dead-letter QUEUE) — the DLQ is a SINK, never an input to the
+	// same consumer. WHY a token boundary, not a deny-filter on the consumer:
+	// JetStream subject matching is token-wise on "." and a consumer FilterSubject is
+	// a single allow pattern with no built-in deny, so the robust, self-documenting
+	// way to keep the DLQ out of every domain tree is a root token ("fp_dlq") that
+	// simply isn't under fp.<domain>.
 	SubjectDLQ = "fp_dlq.notification"
 )
+
+// ConsumedSubjects is the curated, contract-anchored set of subjects the reactor
+// reacts to — one durable consumer is created PER entry (see subscriber.go Start).
+// It is the single source of truth for the subscription set: subscriber.go iterates
+// it and the tests assert against it, so adding a subject is a one-line edit here.
+//
+// Ordering is not significant (each subject gets an independent durable consumer);
+// duplicates would create duplicate consumers, so keep it a set.
+var ConsumedSubjects = []string{
+	SubjectModelDriftDetected,
+	SubjectModelArchived,
+	SubjectPipelineFailed,
+	SubjectPipelineStepFailed,
+	SubjectPipelineCompensation,
+	SubjectPipelineCompleted,
+	SubjectInferenceFailed,
+	SubjectBillingQuotaExceeded,
+	SubjectBillingInvoiceGenerated,
+	SubjectExperimentRunCreated,
+	SubjectExperimentRunFinished,
+}
 
 // Source is the value stamped into EventEnvelope.source for every event THIS
 // service publishes. The subject says WHICH RESOURCE the event is about; source
@@ -154,33 +217,27 @@ const Source = "notification"
 // ============================================================================
 //
 // In JetStream a SUBJECT is bound to a STREAM (the durable log). A subscriber
-// creates a consumer ON a stream filtered to a subject, so the stream must exist
-// before Subscribe is called. In production these streams are provisioned once at
-// platform bootstrap (a stream-bootstrap job / the infra Helm chart), NOT by each
-// service — multiple services share the streams, so letting any one service own
-// their config invites conflicting definitions.
+// creates a CONSUMER on a stream filtered to a subject, so the stream must exist
+// before Subscribe is called. The per-domain streams notification consumes from
+// (MODELS, PIPELINES, INFERENCE, BILLING, EXPERIMENTS) are OWNED and provisioned by
+// the producing services (registry, pipeline-orchestrator, …) at their boot — and,
+// at platform scale, by a stream-bootstrap job / the infra Helm chart. Notification
+// does NOT create any of them; it RESOLVES the owning stream for each consumed
+// subject at boot via js.StreamNameBySubject (subscriber.go Start) and binds a
+// durable consumer there. Creating an fp.> stream of its own would OVERLAP every
+// per-domain stream (JetStream err 10065) — the exact CrashLoop this design fixes.
 //
-// The CHOREOGRAPHY twist: a JetStream consumer filters WITHIN a single stream, but
-// Notification must see fp.> (every domain). The platform therefore provisions a
-// dedicated firehose stream — EVENTS — whose Subjects include fp.> (or, in a
-// per-domain-stream topology, Notification runs one consumer per stream). We name
-// the firehose stream here; main.go (next stage) and the tests provision exactly
-// this so the reactor's single fp.> consumer has a stream to bind to.
+// The ONE stream notification owns is its private DLQ: a SINK rooted at "fp_dlq.*"
+// (outside every fp.<domain>.> tree, so it overlaps nothing). Ops drain/replay from
+// it out-of-band; no reactor consumer reads it.
 const (
-	// StreamEvents is the firehose: every fp.> subject lands here so the
-	// choreography reactor's single consumer can see the whole platform. It also
-	// carries this service's own fp.notifications.> output. It DELIBERATELY does NOT
-	// carry the DLQ — see StreamDLQ and SubjectDLQ for why the dead-letter must live
-	// in a SEPARATE stream outside the fp.> firehose.
-	StreamEvents = "EVENTS"
-
 	// StreamDLQ is the DEDICATED dead-letter stream that owns SubjectDLQ
-	// ("fp_dlq.notification" — outside fp.>). It MUST be a different stream from
-	// EVENTS, because a JetStream subject is bound to exactly ONE stream and the
-	// reactor's fp.> consumer lives on EVENTS: keeping the DLQ subject out of EVENTS
-	// is precisely what stops a parked poison message from being re-delivered to the
-	// reactor. Ops drain/replay from this stream out-of-band; the reactor never
-	// consumes it. main.go provisions both streams at boot.
+	// ("fp_dlq.notification" — outside every fp.<domain>.> tree). Because a JetStream
+	// subject is bound to exactly ONE stream, keeping the DLQ subject in its own
+	// stream (and out of the domain streams the reactor's consumers read) is precisely
+	// what stops a parked poison message from being re-delivered to a reactor consumer.
+	// notification provisions ONLY this stream at boot (main.go); the domain streams it
+	// consumes from are provisioned by their producers.
 	StreamDLQ = "NOTIFICATION_DLQ"
 )
 

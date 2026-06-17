@@ -280,35 +280,24 @@ func main() {
 		}
 	}()
 
-	// ENSURE THE EVENTS FIREHOSE STREAM EXISTS. The choreography reactor binds a
-	// single consumer to fp.> on the EVENTS stream, so that stream MUST exist before
-	// Subscribe. In production the platform bootstrap provisions it (multiple services
-	// share it); here we CreateOrUpdate it idempotently so a fresh local stack works
-	// and an existing stream is reconciled rather than failing. This service ALSO
-	// publishes fp.notifications.{delivered,failed}, which the fp.> subjects capture,
-	// so one stream serves both directions.
+	// NOTIFICATION CREATES NO DOMAIN STREAM. It is a pure CONSUMER that binds ONE
+	// durable consumer per subject (events.ConsumedSubjects) to the EXISTING per-domain
+	// stream that owns each subject — MODELS (fp.models.>), PIPELINES (fp.pipelines.>),
+	// INFERENCE (fp.inference.>), BILLING (fp.billing.>), EXPERIMENTS (fp.experiments.>)
+	// — each provisioned by its OWN producing service at boot. The reactor resolves the
+	// owning stream for each subject via js.StreamNameBySubject (events.Reactor.Start).
 	//
-	// NOTE the EVENTS stream's Subjects are fp.> ONLY — they DELIBERATELY exclude the
-	// DLQ subject (events.SubjectDLQ = "fp_dlq.notification", a token outside fp.>),
-	// which gets its OWN stream below. That separation is the fix for the DLQ poison
-	// re-consumption bug: if the DLQ subject lived in EVENTS it would match the
-	// reactor's fp.> consumer and a parked poison message would be re-delivered to the
-	// reactor, re-failed, and re-parked. See events.SubjectDLQ for the full rationale.
-	streamCtx, cancelStream := context.WithTimeout(ctx, 10*time.Second)
-	if _, streamErr := js.CreateOrUpdateStream(streamCtx, jetstream.StreamConfig{
-		Name:     events.StreamEvents,
-		Subjects: []string{events.SubjectAllEvents},
-	}); streamErr != nil {
-		cancelStream()
-		logger.Error("failed to ensure EVENTS stream", slog.String("error", streamErr.Error()))
-		os.Exit(1)
-	}
-	cancelStream()
-
+	// WHY NOT a single EVENTS stream over fp.>: a stream's subjects must not OVERLAP
+	// another stream's, and fp.> overlaps every per-domain stream → JetStream err 10065
+	// ("subjects overlap with an existing stream") → CrashLoop. That is the exact bug
+	// this deploy surfaced. We removed the fp.> stream creation entirely; the only
+	// stream this service owns is its private DLQ below.
+	//
 	// ENSURE THE DEDICATED DLQ STREAM EXISTS. A JetStream subject is bound to exactly
-	// ONE stream, so the DLQ subject (outside fp.>) needs its own stream to land in.
-	// The reactor NEVER consumes this stream — it is a SINK that ops drain/replay from
-	// out-of-band (mirrors Kafka's separate dead-letter topic / SQS's dead-letter
+	// ONE stream, so the DLQ subject (events.SubjectDLQ = "fp_dlq.notification", a token
+	// OUTSIDE every fp.<domain>.> tree, so it overlaps nothing) needs its own stream to
+	// land in. The reactor NEVER consumes this stream — it is a SINK that ops drain/replay
+	// from out-of-band (mirrors Kafka's separate dead-letter topic / SQS's dead-letter
 	// queue). Provisioning it here keeps the local stack self-contained; in production
 	// the platform bootstrap owns it, and CreateOrUpdate reconciles either way.
 	dlqStreamCtx, cancelDLQStream := context.WithTimeout(ctx, 10*time.Second)
@@ -322,9 +311,7 @@ func main() {
 	}
 	cancelDLQStream()
 
-	logger.Info("nats connected; EVENTS + DLQ streams ensured",
-		slog.String("stream", events.StreamEvents),
-		slog.String("subjects", events.SubjectAllEvents),
+	logger.Info("nats connected; DLQ stream ensured (no domain stream created — binds to existing per-domain streams)",
 		slog.String("dlq_stream", events.StreamDLQ),
 		slog.String("dlq_subject", events.SubjectDLQ),
 	)
@@ -421,9 +408,13 @@ func main() {
 	// this small edge adapter — same pattern as the inference-gateway.
 	processedStore := newRedisProcessedStore(rdb)
 
-	reactorSub := events.NewReactorSubscriber(js, processedStore, events.ReactorConfig{})
+	// The reactor builds ONE durable consumer per subject in events.ConsumedSubjects,
+	// each bound to the EXISTING per-domain stream that owns the subject (resolved at
+	// Start via js.StreamNameBySubject). It takes the JetStream context directly and
+	// owns the per-subject natsutil.Subscribers internally (the per-subject durable
+	// requirement lives in the events package, not here).
 	reactor := events.NewReactor(
-		reactorSub,
+		js,
 		events.ReactorDeps{
 			Service:  svc,
 			Router:   noRecipientRouter{},
@@ -439,15 +430,15 @@ func main() {
 		logger.Error("failed to start notification reactor", slog.String("error", startErr.Error()))
 		os.Exit(1)
 	}
-	// Stop the consume loop on shutdown. Registered AFTER the NATS-drain defer so it
+	// Stop the consume loops on shutdown. Registered AFTER the NATS-drain defer so it
 	// runs BEFORE it (LIFO): stop consuming new events, THEN drain the connection.
 	defer func() {
 		logger.Info("stopping notification reactor")
 		reactor.Close()
 	}()
-	logger.Info("notification reactor started (consuming fp.> firehose)",
-		slog.String("stream", events.StreamEvents),
-		slog.String("subject", events.SubjectAllEvents),
+	logger.Info("notification reactor started (per-subject consumers bound to existing per-domain streams)",
+		slog.Int("subjects", len(events.ConsumedSubjects)),
+		slog.String("dlq_subject", events.SubjectDLQ),
 	)
 
 	// ================================================================
