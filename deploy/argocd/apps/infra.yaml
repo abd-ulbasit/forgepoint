@@ -1,0 +1,88 @@
+# ============================================================================
+# CHILD APPLICATION — infra (Kustomize)
+# ============================================================================
+# Managed BY the root app-of-apps (do not apply this by hand). It deploys the
+# stateful data plane (NATS, Postgres, Redis, MinIO, namespaces, NetworkPolicies)
+# from the Kustomize base at deploy/k8s/infra — the exact same directory you'd
+# run `kubectl apply -k` against locally. ArgoCD has native Kustomize support:
+# point `path` at a kustomization dir and it runs `kustomize build` for you.
+#
+# WHY infra is its own Application (separate from services):
+#   * Different lifecycle. Data infra changes rarely and is risky to prune; the
+#     services change constantly. Splitting them lets infra use a CONSERVATIVE
+#     sync policy (no auto-prune) while services iterate fast.
+#   * Ordering. Infra owns the Namespace objects every service needs. As its own
+#     app it can be synced first; sync-waves (annotation below) make this explicit.
+#
+# DEV vs PROD — this file is the DEV variant (auto-sync). For prod you copy this
+# to a prod overlay/branch and flip syncPolicy to manual + no prune (see README
+# "values-per-env"). The README documents both; here we keep one readable file.
+# ============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: fp-infra
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+  labels:
+    app.kubernetes.io/part-of: forgepoint
+    forgepoint.dev/layer: infra
+  annotations:
+    # sync-wave orders sync WITHIN a single ArgoCD sync operation. Lower numbers
+    # go first. Infra is wave "-1" so its Namespaces + data stores are applied
+    # and (ideally) healthy before the services (wave 0+) that depend on them.
+    # Without this, a service could try to land in fp-system before the infra app
+    # created it. NOTE: waves order the APPLY; ArgoCD also waits for health
+    # between waves, which is why the data plane gets a head start.
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  project: forgepoint
+
+  source:
+    # REPO_URL — same mono-repo as the root (must be in the project allow-list).
+    repoURL: https://github.com/abd-ulbasit/forgepoint.git
+    targetRevision: main
+    # Kustomize root. The presence of kustomization.yaml here tells ArgoCD to use
+    # its Kustomize plugin (vs. plain-directory or Helm). No extra config needed.
+    path: deploy/k8s/infra
+
+  destination:
+    server: https://kubernetes.default.svc
+    # The infra kustomize sets `namespace: fp-infra` per-resource AND creates the
+    # Namespace objects themselves. We still name a destination namespace because
+    # the Application object requires one; cluster-scoped resources (the
+    # Namespaces) ignore it, and the namespaced ones already pin fp-infra.
+    namespace: fp-infra
+
+  # --------------------------------------------------------------------------
+  # syncPolicy — DEV profile: automated reconciliation with self-heal.
+  #
+  # DELIBERATE CHOICE: auto-sync + selfHeal but NO `prune` for infra, even in dev.
+  # Pruning a StatefulSet's PVC because a manifest was momentarily mis-rendered
+  # would delete a database's data. For STATEFUL infra the cost of an accidental
+  # prune is catastrophic and irreversible, so we never auto-prune it. If you
+  # intentionally remove an infra component, you prune it manually/with intent.
+  # (Contrast the stateless services, which auto-prune freely — see fp-auth.yaml.)
+  # --------------------------------------------------------------------------
+  syncPolicy:
+    automated:
+      prune: false      # never auto-delete stateful resources (data-loss guard)
+      selfHeal: true    # revert manual drift (someone edits the Deployment live)
+    syncOptions:
+      # Belt-and-suspenders: ensure the target namespace exists. The kustomize
+      # already ships Namespace objects, but this covers a destination ns that
+      # the manifests don't themselves create.
+      - CreateNamespace=true
+      # ServerSideApply avoids the "metadata.annotations too long" failure that
+      # large CRDs/StatefulSets hit with client-side apply's last-applied
+      # annotation. Recommended default for ArgoCD on modern clusters.
+      - ServerSideApply=true
+    retry:
+      # Bounded exponential backoff on a failed sync (e.g. Postgres not ready yet
+      # when a dependent resource applies). Prevents a tight failing-sync loop.
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

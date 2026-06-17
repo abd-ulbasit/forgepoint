@@ -1,0 +1,271 @@
+# =============================================================================
+# WORKLOAD SHAPE & HOST-ISOLATION POLICIES
+# =============================================================================
+
+---
+# -----------------------------------------------------------------------------
+# require-part-of-label — every workload must declare it belongs to forgepoint
+# -----------------------------------------------------------------------------
+# We require app.kubernetes.io/part-of=forgepoint on workload pod templates. WHY:
+#   1. Consistent inventory/selection — `kubectl get pods -l
+#      app.kubernetes.io/part-of=forgepoint` finds everything we own across all
+#      namespaces (dashboards, NetworkPolicies, cost allocation key off this).
+#   2. It's the hook several of our OTHER controls use (e.g. the readonly-rootfs
+#      exception selects on app.kubernetes.io/name; the recommended-labels
+#      convention from the Helm _helpers and infra manifests already sets
+#      part-of=forgepoint).
+# This is a recommended Kubernetes label (kubernetes.io/docs → "Recommended
+# Labels"). We enforce just part-of to avoid over-fitting; name/component are
+# convention but not blocked.
+#
+# We match the WORKLOAD kinds directly (Deployment/StatefulSet/DaemonSet/Job/
+# CronJob...) rather than Pod, because we want the label asserted on the pod
+# TEMPLATE that the controller stamps onto every pod — a bare Pod created by a
+# controller inherits it; requiring it on the controller template is the right
+# altitude and avoids flagging system-spawned mirror pods.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-part-of-label
+  annotations:
+    policies.kyverno.io/title: Require part-of Label
+    policies.kyverno.io/category: Conventions
+    policies.kyverno.io/severity: low
+    policies.kyverno.io/subject: Workload
+    policies.kyverno.io/description: >-
+      Workload pod templates must carry app.kubernetes.io/part-of=forgepoint for
+      consistent inventory, selection, and policy targeting.
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: require-part-of-on-templates
+      match:
+        any:
+          - resources:
+              kinds:
+                - Deployment
+                - StatefulSet
+                - DaemonSet
+                - ReplicaSet
+                - Job
+              namespaces:
+                - fp-system
+                - fp-models
+                - fp-jobs
+                - fp-infra
+          # CronJob nests the pod template one level deeper
+          # (spec.jobTemplate.spec.template) so it needs its own pattern below;
+          # we handle it as a separate rule for a clean, readable path.
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-node-lease
+                - kube-public
+      validate:
+        message: >-
+          Pod template must set the label
+          app.kubernetes.io/part-of=forgepoint.
+        pattern:
+          spec:
+            template:
+              metadata:
+                labels:
+                  app.kubernetes.io/part-of: forgepoint
+    - name: require-part-of-on-cronjob
+      match:
+        any:
+          - resources:
+              kinds:
+                - CronJob
+              namespaces:
+                - fp-system
+                - fp-models
+                - fp-jobs
+                - fp-infra
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-node-lease
+                - kube-public
+      validate:
+        message: >-
+          CronJob pod template must set the label
+          app.kubernetes.io/part-of=forgepoint.
+        pattern:
+          spec:
+            jobTemplate:
+              spec:
+                template:
+                  metadata:
+                    labels:
+                      app.kubernetes.io/part-of: forgepoint
+
+---
+# -----------------------------------------------------------------------------
+# disallow-host-namespaces — no sharing the host's PID/IPC/network namespaces
+# -----------------------------------------------------------------------------
+# hostPID/hostIPC/hostNetwork let a container see and interact with host
+# processes, SysV IPC, and the node's network stack (including localhost-bound
+# services and the kubelet). Any of these collapses the container/host boundary
+# and is a textbook escape/lateral-movement vector. No fp service needs them.
+# (Default for these fields is false, but we forbid an EXPLICIT true so a copied
+# DaemonSet spec can't sneak one in.)
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-host-namespaces
+  annotations:
+    policies.kyverno.io/title: Disallow Host Namespaces
+    policies.kyverno.io/category: Pod Security Standards (Baseline)
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Pods must not share the host PID, IPC, or network namespaces
+      (hostPID/hostIPC/hostNetwork must be false or unset).
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: host-namespaces
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - fp-system
+                - fp-models
+                - fp-jobs
+                - fp-infra
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-node-lease
+                - kube-public
+      validate:
+        message: >-
+          Sharing host namespaces is not allowed. hostNetwork, hostIPC, and
+          hostPID must be false or unset.
+        pattern:
+          spec:
+            # `=(field): "false"` → field is optional, but if set it must be
+            # false. Unset (the safe default) also passes.
+            =(hostPID): "false"
+            =(hostIPC): "false"
+            =(hostNetwork): "false"
+
+---
+# -----------------------------------------------------------------------------
+# disallow-host-path — no mounting node-local directories
+# -----------------------------------------------------------------------------
+# A hostPath volume mounts a directory FROM THE NODE into the pod. Mount
+# /var/run/docker.sock, /etc, or / and a compromised pod owns the node. Stateful
+# data in fp uses PVCs (volumeClaimTemplates → local-path/EBS), never hostPath,
+# so forbidding hostPath has zero cost for us and removes a top escape vector.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-host-path
+  annotations:
+    policies.kyverno.io/title: Disallow hostPath Volumes
+    policies.kyverno.io/category: Pod Security Standards (Baseline)
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Pods must not use hostPath volumes (mounting node-local directories is a
+      container-escape vector). Use PVCs/emptyDir instead.
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: host-path
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - fp-system
+                - fp-models
+                - fp-jobs
+                - fp-infra
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-node-lease
+                - kube-public
+      validate:
+        message: "hostPath volumes are not allowed. Use a PVC or emptyDir."
+        pattern:
+          spec:
+            # For every volume that EXISTS, the hostPath key must be absent.
+            # `X(hostPath): "null"` asserts the field is null/unset.
+            =(volumes):
+              - X(hostPath): "null"
+
+---
+# -----------------------------------------------------------------------------
+# disallow-host-ports — no binding container ports to the node's interfaces
+# -----------------------------------------------------------------------------
+# A hostPort maps a container port onto the NODE's IP, bypassing Service/
+# NetworkPolicy mediation, exposing the workload on the node's network, and
+# limiting scheduling (one pod per node per host port). fp services are reached
+# via ClusterIP Services + NetworkPolicies only — no pod declares a hostPort.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-host-ports
+  annotations:
+    policies.kyverno.io/title: Disallow hostPort
+    policies.kyverno.io/category: Pod Security Standards (Baseline)
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Containers must not declare hostPort (bypasses Service/NetworkPolicy
+      mediation and constrains scheduling). Use a Service instead.
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: host-ports
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - fp-system
+                - fp-models
+                - fp-jobs
+                - fp-infra
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-node-lease
+                - kube-public
+      validate:
+        message: "hostPort is not allowed. Expose the workload via a Service."
+        pattern:
+          spec:
+            # For every container, for every port it declares, hostPort must be
+            # unset. The nested `=(ports)` makes the ports array optional.
+            =(ephemeralContainers):
+              - =(ports):
+                  - X(hostPort): "null"
+            =(initContainers):
+              - =(ports):
+                  - X(hostPort): "null"
+            containers:
+              - =(ports):
+                  - X(hostPort): "null"

@@ -1,0 +1,515 @@
+# =============================================================================
+# POD SECURITY HARDENING — Kyverno ClusterPolicies (the "restricted" baseline)
+# =============================================================================
+#
+# WHAT THIS FILE IS
+# -----------------
+# A set of Kyverno *validate* ClusterPolicies that ENFORCE the same pod-level
+# and container-level hardening we already hand-wrote into:
+#   - deploy/helm/fp-auth/templates/deployment.yaml   (platform services)
+#   - deploy/k8s/infra/{postgres,redis,nats,minio}/*  (stateful infra)
+#
+# WHY POLICY-AS-CODE AT ALL (the pattern)
+# ---------------------------------------
+# Admission control is the *last line of defense* before an object is persisted
+# in etcd. Without an admission policy, the security context in our YAML is only
+# a CONVENTION — any future manifest, Helm chart, `kubectl run`, or operator can
+# create a privileged, root, write-everywhere pod and nothing stops it. Kyverno
+# runs as a ValidatingAdmissionWebhook: the API server calls it on every
+# create/update, and Kyverno can `validate` (allow/deny), `mutate` (default
+# fields), or `generate` (spawn related objects). Here we only `validate` — we
+# reject non-conforming pods so the hardening can never silently regress.
+#
+#   client ──create Pod──▶ kube-apiserver ──webhook──▶ Kyverno ──Audit/Enforce──▶ etcd
+#                                                          │
+#                                                          └─ deny if it violates a rule
+#
+# REAL-WORLD COMPARISON
+# ---------------------
+# This is the OPA Gatekeeper / Kyverno space. Kyverno is "Kubernetes-native"
+# (policies are CRDs written in YAML, no Rego), which is why we use it. These
+# policies mirror the Pod Security Standards "restricted" profile — see the
+# README for how this *complements* (not duplicates) the built-in PodSecurity
+# admission controller.
+#
+# AUDIT vs ENFORCE (rollout safety)
+# ---------------------------------
+# Every policy here ships with `validationFailureAction: Audit` in this base.
+# Audit = log a PolicyReport violation but ALLOW the object. That lets us deploy
+# platform-wide and watch what *would* break before we block anything. The
+# `overlays/enforce` kustomize overlay flips this single field to `Enforce`
+# (deny). See deploy/policies/README.md for the rollout runbook.
+#
+# SCOPING (fp-* only, never kube-system)
+# --------------------------------------
+# Every rule matches Pods (and the Pod controllers — Deployment/StatefulSet/etc.
+# Kyverno's "Pod controller" auto-gen handles those) ONLY in our four namespaces
+# and explicitly EXCLUDES kube-system and kube-node-lease. WHY: system pods (CNI,
+# kube-proxy, CSI drivers) legitimately need privilege/hostPath/root; blocking
+# them would break the cluster. We constrain blast radius to what we own.
+#
+# AUTOGEN NOTE (important to understand for interviews)
+# -----------------------------------------------------
+# We `match` on `Pod` only. Kyverno AUTOMATICALLY generates equivalent rules for
+# Deployment/StatefulSet/DaemonSet/Job/CronJob/ReplicaSet/ReplicationController
+# (the "pod-controllers" autogen). So one Pod rule transparently guards the
+# controller's pod template too — we don't have to list every workload kind.
+# =============================================================================
+
+---
+# -----------------------------------------------------------------------------
+# require-run-as-nonroot
+# -----------------------------------------------------------------------------
+# Containers must run as a non-root UID. Root in a container is root on the host
+# kernel (same uid 0) the moment a container-escape CVE lands — so "don't run as
+# root" is the single highest-leverage container control. Our fp-auth pod sets
+# runAsNonRoot at the POD securityContext; infra pins explicit non-zero UIDs.
+#
+# TWO RULES IN THIS POLICY (belt-and-suspenders):
+#
+#   1. run-as-non-root  (positive gate)
+#      runAsNonRoot=true must be SET at either the pod level OR on every
+#      container — same evaluation the Pod Security "restricted" profile uses.
+#
+#   2. deny-run-as-root-override  (negative gate — the security gap this fixes)
+#      A container CAN explicitly set securityContext.runAsNonRoot=false even
+#      when the pod-level runAsNonRoot=true. That override WINS at container
+#      start and silently re-enables root, defeating rule 1. This second rule
+#      catches and denies the explicit false value so there is no escape hatch.
+#
+# WHY A SEPARATE RULE, NOT AN EXTRA anyPattern BRANCH:
+#   anyPattern is satisfied when ANY branch matches — it cannot express "all
+#   branches must pass". The override check requires iterating every container
+#   and asserting NONE has runAsNonRoot=false, which is naturally expressed as
+#   a foreach+deny. Adding it as a second rule keeps concerns separated and
+#   makes the policy easier to read and test independently.
+#
+# INTERVIEW NOTE: "pod-level securityContext is inherited but container-level
+# overrides it" is a common gotcha. The correct fix is a deny-on-explicit-false
+# rule, not trying to write a single pattern that covers both. Kyverno's
+# anyPattern cannot guard against a container actively disabling a setting.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-run-as-nonroot
+  annotations:
+    policies.kyverno.io/title: Require runAsNonRoot
+    policies.kyverno.io/category: Pod Security Standards (Restricted)
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Containers must not run as the root user. runAsNonRoot=true must be set at
+      the pod level or on every container/initContainer/ephemeralContainer, AND
+      no container may explicitly override it back to false.
+spec:
+  # Audit in the base; the enforce overlay flips this to Enforce.
+  validationFailureAction: Audit
+  # background=true also scans EXISTING resources (not just admission) so the
+  # PolicyReport reflects the whole cluster, not only newly created pods.
+  background: true
+  rules:
+    - name: run-as-non-root
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - fp-system
+                - fp-models
+                - fp-jobs
+                - fp-infra
+      # Belt-and-suspenders: even if someone widens the match later, never touch
+      # the system namespaces.
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-node-lease
+                - kube-public
+      validate:
+        message: >-
+          Running as root is not allowed. Set
+          spec.securityContext.runAsNonRoot=true (pod level) or
+          runAsNonRoot=true on every container.
+        # anyPattern = ANY of these alternatives satisfies the rule. Either the
+        # pod-level field is true, OR every container sets it. `=null` permits
+        # the pod-level toggle to be unset PROVIDED each container opts in.
+        anyPattern:
+          - spec:
+              securityContext:
+                runAsNonRoot: "true"
+          - spec:
+              # `=(...)` makes the parent optional but, when present, the child
+              # must match. The wildcard container name + foreach-style array
+              # pattern asserts EVERY container sets runAsNonRoot=true.
+              =(ephemeralContainers):
+                - =(securityContext):
+                    runAsNonRoot: "true"
+              =(initContainers):
+                - =(securityContext):
+                    runAsNonRoot: "true"
+              containers:
+                - securityContext:
+                    runAsNonRoot: "true"
+
+    # -------------------------------------------------------------------------
+    # deny-run-as-root-override — block containers from nullifying the pod-level
+    # nonroot guarantee by explicitly setting runAsNonRoot=false.
+    # -------------------------------------------------------------------------
+    # SECURITY GAP CLOSED: Pod spec.securityContext.runAsNonRoot=true sets a
+    # default, but Kubernetes lets a container's own securityContext OVERRIDE it.
+    # A manifest with pod-level runAsNonRoot=true AND a container-level
+    # runAsNonRoot=false will admit under rule 1 above (pod-level satisfies
+    # anyPattern branch 1), then run the container as root — the policy is
+    # bypassed. This rule closes that gap with an explicit deny.
+    #
+    # USING foreach+deny (not anyPattern/pattern):
+    #   - We iterate each container collection and deny on runAsNonRoot==false.
+    #   - `|| false` coerces a missing field to false so that containers that
+    #     OMIT runAsNonRoot (the safe default) are NOT denied — only the ones
+    #     that affirmatively set it to false are caught.
+    - name: deny-run-as-root-override
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - fp-system
+                - fp-models
+                - fp-jobs
+                - fp-infra
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-node-lease
+                - kube-public
+      validate:
+        message: >-
+          A container/initContainer/ephemeralContainer has securityContext.runAsNonRoot=false,
+          which overrides the pod-level nonroot guarantee. Remove the explicit false
+          or set it to true.
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                all:
+                  # element.securityContext.runAsNonRoot is a boolean field.
+                  # We default to false via `|| false` so a missing field (safe)
+                  # never triggers the deny — only an explicit `false` value does.
+                  - key: "{{ element.securityContext.runAsNonRoot || false }}"
+                    operator: Equals
+                    value: false
+                  # Guard: only deny if securityContext itself is present. Without
+                  # this guard the `|| false` above would also catch containers
+                  # that omit securityContext entirely (which is safe — they inherit
+                  # the pod-level setting). So we additionally require that
+                  # securityContext exists AND explicitly sets the field.
+                  - key: "{{ element.securityContext.runAsNonRoot != null }}"
+                    operator: Equals
+                    value: true
+          - list: "request.object.spec.initContainers || `[]`"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ element.securityContext.runAsNonRoot || false }}"
+                    operator: Equals
+                    value: false
+                  - key: "{{ element.securityContext.runAsNonRoot != null }}"
+                    operator: Equals
+                    value: true
+          - list: "request.object.spec.ephemeralContainers || `[]`"
+            deny:
+              conditions:
+                all:
+                  - key: "{{ element.securityContext.runAsNonRoot || false }}"
+                    operator: Equals
+                    value: false
+                  - key: "{{ element.securityContext.runAsNonRoot != null }}"
+                    operator: Equals
+                    value: true
+
+---
+# -----------------------------------------------------------------------------
+# disallow-privilege-escalation
+# -----------------------------------------------------------------------------
+# allowPrivilegeEscalation=false sets the no_new_privs bit, which prevents a
+# process from gaining MORE privileges than its parent via setuid binaries or
+# file capabilities (e.g. a setuid `ping` can't be used to escalate). Every one
+# of our containers already sets this; the policy makes it mandatory.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-privilege-escalation
+  annotations:
+    policies.kyverno.io/title: Disallow Privilege Escalation
+    policies.kyverno.io/category: Pod Security Standards (Restricted)
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Every container must set securityContext.allowPrivilegeEscalation=false
+      (sets the no_new_privs bit, blocking setuid-based escalation).
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: deny-privilege-escalation
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - fp-system
+                - fp-models
+                - fp-jobs
+                - fp-infra
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-node-lease
+                - kube-public
+      validate:
+        message: >-
+          allowPrivilegeEscalation must be false on every container. Set
+          securityContext.allowPrivilegeEscalation=false.
+        pattern:
+          spec:
+            # `=(...)` = optional parent; if init/ephemeral containers exist they
+            # must comply too. The bare `containers` (no `=()`) is required.
+            =(ephemeralContainers):
+              - securityContext:
+                  allowPrivilegeEscalation: "false"
+            =(initContainers):
+              - securityContext:
+                  allowPrivilegeEscalation: "false"
+            containers:
+              - securityContext:
+                  allowPrivilegeEscalation: "false"
+
+---
+# -----------------------------------------------------------------------------
+# drop-all-capabilities
+# -----------------------------------------------------------------------------
+# Linux capabilities split root's power into units (NET_ADMIN, SYS_ADMIN, ...).
+# A container starts with a default set; dropping ALL and adding back only what
+# is needed is least-privilege. None of our services need any capability, so we
+# require capabilities.drop to include "ALL". (We do NOT police `add` here — the
+# restricted profile permits re-adding only NET_BIND_SERVICE; we have no service
+# that needs it, but leaving `add` unconstrained keeps the rule focused on the
+# high-value "drop ALL" assertion and avoids false positives on future need.)
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: drop-all-capabilities
+  annotations:
+    policies.kyverno.io/title: Drop All Capabilities
+    policies.kyverno.io/category: Pod Security Standards (Restricted)
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Every container must drop ALL Linux capabilities
+      (securityContext.capabilities.drop must contain "ALL").
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: require-drop-all
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - fp-system
+                - fp-models
+                - fp-jobs
+                - fp-infra
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-node-lease
+                - kube-public
+      validate:
+        message: >-
+          Containers must drop ALL capabilities. Set
+          securityContext.capabilities.drop to ["ALL"].
+        # foreach lets us iterate each container and assert the drop list
+        # CONTAINS "ALL" (order-independent, tolerant of extra entries). The
+        # JMESPath `contains(... , 'ALL')` is more robust than a positional
+        # array pattern when manifests list multiple dropped caps.
+        foreach:
+          - list: request.object.spec.containers
+            deny:
+              conditions:
+                all:
+                  - key: '{{ contains(element.securityContext.capabilities.drop[] || `[]`, ''ALL'') }}'
+                    operator: Equals
+                    value: false
+          - list: request.object.spec.initContainers || `[]`
+            deny:
+              conditions:
+                all:
+                  - key: '{{ contains(element.securityContext.capabilities.drop[] || `[]`, ''ALL'') }}'
+                    operator: Equals
+                    value: false
+          - list: request.object.spec.ephemeralContainers || `[]`
+            deny:
+              conditions:
+                all:
+                  - key: '{{ contains(element.securityContext.capabilities.drop[] || `[]`, ''ALL'') }}'
+                    operator: Equals
+                    value: false
+
+---
+# -----------------------------------------------------------------------------
+# require-readonly-rootfs  (WITH a documented exception for stateful infra)
+# -----------------------------------------------------------------------------
+# readOnlyRootFilesystem=true means the container can't write to its own image
+# layers — it must mount an emptyDir/PVC for any writable path. This neuters a
+# whole class of attacks (dropping a binary, tampering with config) and is set
+# on fp-auth, redis, nats, and minio.
+#
+# THE EXCEPTION (read the postgres manifest): the official postgres image's
+# entrypoint writes to a few transient paths and does not cleanly support a
+# fully read-only root FS, so postgres deliberately omits readOnlyRootFilesystem
+# and instead confines writes to a PVC + an emptyDir socket dir. We encode that
+# as a precondition-based exclusion keyed on the well-known label
+# app.kubernetes.io/name=postgres, so the exception is NARROW, named, and
+# auditable — not a blanket hole. If we add another image that genuinely can't
+# run read-only, we extend this allowlist explicitly (and document why).
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-readonly-rootfs
+  annotations:
+    policies.kyverno.io/title: Require Read-Only Root Filesystem
+    policies.kyverno.io/category: Pod Security Standards (Restricted)
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Containers must set securityContext.readOnlyRootFilesystem=true. A narrow,
+      documented exception applies to stateful infra whose image cannot run with
+      a read-only root FS (currently: postgres), selected by the
+      app.kubernetes.io/name label.
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: require-readonly-rootfs
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - fp-system
+                - fp-models
+                - fp-jobs
+                - fp-infra
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-node-lease
+                - kube-public
+          # DOCUMENTED EXCEPTION: postgres cannot run read-only (see
+          # deploy/k8s/infra/postgres/postgres.yaml comments). Exclude by its
+          # platform label so the carve-out is explicit and greppable.
+          - resources:
+              selector:
+                matchLabels:
+                  app.kubernetes.io/name: postgres
+      validate:
+        message: >-
+          readOnlyRootFilesystem must be true on every container. Mount an
+          emptyDir/PVC for any writable path (e.g. /tmp). Documented exception:
+          stateful infra labeled app.kubernetes.io/name=postgres.
+        pattern:
+          spec:
+            =(ephemeralContainers):
+              - securityContext:
+                  readOnlyRootFilesystem: "true"
+            =(initContainers):
+              - securityContext:
+                  readOnlyRootFilesystem: "true"
+            containers:
+              - securityContext:
+                  readOnlyRootFilesystem: "true"
+
+---
+# -----------------------------------------------------------------------------
+# require-seccomp-runtimedefault
+# -----------------------------------------------------------------------------
+# seccomp ("secure computing mode") filters which syscalls a process may make.
+# RuntimeDefault uses the container runtime's curated allowlist, blocking exotic
+# syscalls used in many exploits (keyctl, ptrace tricks, etc.) at near-zero cost.
+# Every fp pod sets seccompProfile.type=RuntimeDefault at the POD level; the
+# restricted profile also accepts it set on each container. We accept either.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-seccomp-runtimedefault
+  annotations:
+    policies.kyverno.io/title: Require seccomp RuntimeDefault
+    policies.kyverno.io/category: Pod Security Standards (Restricted)
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      The seccomp profile must be RuntimeDefault (or Localhost), set at the pod
+      level or on every container. Unconfined is rejected.
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: seccomp-runtime-default
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - fp-system
+                - fp-models
+                - fp-jobs
+                - fp-infra
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-node-lease
+                - kube-public
+      validate:
+        message: >-
+          seccompProfile.type must be RuntimeDefault or Localhost, set at the
+          pod level or on every container. Unconfined / unset is not allowed.
+        anyPattern:
+          # Option A: set once at the pod level (how all fp pods do it today).
+          - spec:
+              securityContext:
+                seccompProfile:
+                  type: "RuntimeDefault | Localhost"
+          # Option B: set on every container individually.
+          - spec:
+              =(ephemeralContainers):
+                - securityContext:
+                    seccompProfile:
+                      type: "RuntimeDefault | Localhost"
+              =(initContainers):
+                - securityContext:
+                    seccompProfile:
+                      type: "RuntimeDefault | Localhost"
+              containers:
+                - securityContext:
+                    seccompProfile:
+                      type: "RuntimeDefault | Localhost"

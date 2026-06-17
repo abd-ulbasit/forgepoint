@@ -1,0 +1,238 @@
+# =============================================================================
+# IMAGE SUPPLY-CHAIN POLICIES — pin tags, restrict registries
+# =============================================================================
+#
+# These two policies constrain WHAT images can run and HOW they're referenced.
+# They complement the M6 supply-chain controls (govulncheck/Trivy/Syft/cosign):
+# those scan/sign images in CI; these enforce, at admission time, that only
+# pinned images from trusted registries ever reach the cluster.
+# =============================================================================
+
+---
+# -----------------------------------------------------------------------------
+# disallow-latest-tag — images must be pinned
+# -----------------------------------------------------------------------------
+# `:latest` (or NO tag, which defaults to `:latest`) is a moving target: two
+# nodes pulling "the same" image can run different bits, rollbacks become
+# impossible, and a poisoned upstream tag silently lands in prod. Pinned tags
+# (and ideally digests) make deployments reproducible and auditable — this is a
+# 12-Factor "build, release, run" separation and a CLAUDE.md "hermetic builds"
+# requirement. Our infra images are already pinned (postgres:17, redis:7,
+# nats:2.11, minio/...:RELEASE.<date>); fp-auth uses appVersion as the tag.
+#
+# We assert TWO things: (1) a tag is present at all, and (2) it isn't `latest`.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-latest-tag
+  annotations:
+    policies.kyverno.io/title: Disallow Latest Tag
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Container images must use an explicit, non-"latest" tag (ideally a digest)
+      so deployments are reproducible and rollbacks are possible.
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: require-image-tag
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - fp-system
+                - fp-models
+                - fp-jobs
+                - fp-infra
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-node-lease
+                - kube-public
+      validate:
+        message: "An image tag is required (untagged defaults to :latest)."
+        pattern:
+          spec:
+            # `*:*` requires a colon in every image ref → a tag (or digest) is
+            # present. Applies to all three container collections.
+            =(ephemeralContainers):
+              - image: "*:*"
+            =(initContainers):
+              - image: "*:*"
+            containers:
+              - image: "*:*"
+    - name: forbid-latest-tag
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - fp-system
+                - fp-models
+                - fp-jobs
+                - fp-infra
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-node-lease
+                - kube-public
+      validate:
+        message: "Using a mutable ':latest' tag is not allowed; pin a version."
+        pattern:
+          spec:
+            =(ephemeralContainers):
+              - image: "!*:latest"   # ! = negation: the ref must NOT end in :latest
+            =(initContainers):
+              - image: "!*:latest"
+            containers:
+              - image: "!*:latest"
+
+---
+# -----------------------------------------------------------------------------
+# restrict-image-registries — allowlist trusted registries (PARAMETERIZED)
+# -----------------------------------------------------------------------------
+# Only images from registries we trust may run. This blocks typo-squatting,
+# random Docker Hub images, and exfil-via-sidecar. The allowlist is PARAMETERIZED
+# in a single JMESPath variable (`allowedRegistries`) so it's edited in ONE place
+# and the per-collection rules below reference it — no duplication, no drift.
+#
+# The allowlist below covers, intentionally:
+#   - <account>.dkr.ecr.<region>.amazonaws.com/*  → our prod ECR (M5 AWS plan).
+#     Wildcarded on account+region so we don't hard-code one account here.
+#   - ghcr.io/abd-ulbasit/forgepoint/*            → where fp-auth's chart points
+#     TODAY (values.yaml). Keeping it prevents the current platform from
+#     regressing the moment we flip to Enforce.
+#   - gcr.io/distroless/*                          → distroless runtime base
+#     (CLAUDE.md hermetic-builds requirement).
+#   - the PINNED infra images: docker.io/library/{postgres,redis,nats} and
+#     docker.io/minio/{minio,mc}. We pin the FULL repo path (not a bare
+#     "docker.io/*") so only these specific, reviewed infra images are allowed —
+#     not all of Docker Hub.
+#
+# HOW THE CHECK WORKS: for each container we test whether its image matches ANY
+# entry in `allowedRegistries`. JMESPath has no "matches any glob" builtin, so we
+# build a filtered projection and assert its length is > 0. We implement the glob
+# test with Kyverno's `pattern_match(pattern, string)` inside a `deny.conditions`
+# block per container collection. Note: `wildcard()` does NOT exist in Kyverno's
+# JMESPath implementation — using it causes an admission-time evaluation error.
+#
+# NOTE ON DOCKER HUB NORMALIZATION: `postgres:17` in a manifest is the short form
+# of `docker.io/library/postgres:17`. Kyverno's image variable parsing exposes
+# the registry/normalized form, but to be robust against BOTH the short and fully
+# qualified spellings we include short-form globs (`postgres:*`,
+# `library/postgres:*`) alongside the docker.io-qualified ones.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-image-registries
+  annotations:
+    policies.kyverno.io/title: Restrict Image Registries
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Container images may only come from an allowlisted set of registries: the
+      platform ECR (prod), ghcr.io/abd-ulbasit/forgepoint (current), the
+      distroless base, and the specific pinned infra images.
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: validate-registries
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - fp-system
+                - fp-models
+                - fp-jobs
+                - fp-infra
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-node-lease
+                - kube-public
+      # PARAMETERIZED ALLOWLIST — edit here only. Each entry is a glob matched
+      # with pattern_match() below. Add a new trusted registry by appending one line.
+      context:
+        - name: allowedRegistries
+          # A static context variable: `value` literally IS the allowlist. This
+          # is the single source of truth the rules below reference as
+          # `allowedRegistries`. Edit this list to add/remove a trusted registry.
+          variable:
+            value:
+              - "*.dkr.ecr.*.amazonaws.com/*"           # prod ECR (any account/region)
+              - "ghcr.io/abd-ulbasit/forgepoint/*"        # current GHCR images
+              - "gcr.io/distroless/*"                     # distroless runtime base
+              # Pinned infra images (full repo path, both spellings). We include
+              # BOTH the docker.io-qualified form (what Kyverno normalizes to) AND
+              # the bare short-form (what manifests often spell) so the check is
+              # robust against Kyverno version differences in normalization:
+              - "postgres:*"
+              - "docker.io/library/postgres:*"
+              - "redis:*"
+              - "docker.io/library/redis:*"
+              - "nats:*"
+              - "docker.io/library/nats:*"
+              - "minio/minio:*"
+              - "docker.io/minio/minio:*"
+              - "minio/mc:*"
+              - "docker.io/minio/mc:*"
+      validate:
+        message: >-
+          Image registry is not allowlisted. Allowed: ECR
+          (*.dkr.ecr.*.amazonaws.com), ghcr.io/abd-ulbasit/forgepoint,
+          gcr.io/distroless, and the pinned infra images (postgres, redis, nats,
+          minio/minio, minio/mc). Edit restrict-image-registries to add one.
+        # foreach + deny: for each container, count how many allowlist globs the
+        # image matches; deny when ZERO match.
+        #
+        # FUNCTION USED: pattern_match(pattern, string) — Kyverno's real JMESPath
+        # glob function. `wildcard()` does NOT exist in Kyverno and causes an
+        # admission-time evaluation error.
+        #
+        # ARG ORDER: pattern_match(pattern, string).
+        #   @ = current allowedRegistries element = the glob pattern (e.g. "gcr.io/distroless/*")
+        #   element.image = the container image being admitted (the string to test)
+        # So pattern_match(@, element.image) asks "does this image match this glob?"
+        #
+        # The filtered projection [?pattern_match(@, element.image)] keeps only
+        # entries where the glob matches; length(...) == 0 means no match → deny.
+        foreach:
+          - list: "request.object.spec.containers"
+            deny:
+              conditions:
+                all:
+                  - key: >-
+                      {{ length(allowedRegistries[?pattern_match(@, element.image)]) }}
+                    operator: Equals
+                    value: 0
+          - list: "request.object.spec.initContainers || `[]`"
+            deny:
+              conditions:
+                all:
+                  - key: >-
+                      {{ length(allowedRegistries[?pattern_match(@, element.image)]) }}
+                    operator: Equals
+                    value: 0
+          - list: "request.object.spec.ephemeralContainers || `[]`"
+            deny:
+              conditions:
+                all:
+                  - key: >-
+                      {{ length(allowedRegistries[?pattern_match(@, element.image)]) }}
+                    operator: Equals
+                    value: 0

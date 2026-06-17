@@ -1,0 +1,37 @@
+# =============================================================================
+# ENFORCE overlay — flip every policy from Audit to Enforce (BLOCKING).
+# =============================================================================
+# This overlay reuses the exact same policies from the base and changes ONE
+# field on each — validationFailureAction: Audit → Enforce — so non-conforming
+# pods are now DENIED at admission rather than merely reported.
+#
+# WHY A PATCH (not a separate copy of the policies): there is one source of
+# truth for the policy logic (the base). The audit↔enforce difference is a
+# single field, so we express it as a kustomize patch. Editing a rule means
+# editing it once in the base; both overlays inherit the change. This is the
+# whole point of the base/overlay split.
+#
+# HOW THE PATCH TARGETS EVERY POLICY: the `target` selects by group+version+kind
+# with NO name, so it applies to ALL ClusterPolicy objects rendered by the base.
+# The JSON6902 `replace` op rewrites spec.validationFailureAction in place.
+#
+# ROLLOUT STEP 2 (only after the audit step is clean):
+#   kubectl apply -k deploy/policies/overlays/enforce
+#   # new violating pods are now rejected by the API server at admission.
+# To roll back instantly, re-apply the audit overlay (it sets the field back to
+# Audit) — no policy deletion needed.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+patches:
+  - target:
+      group: kyverno.io
+      version: v1
+      kind: ClusterPolicy
+    patch: |-
+      - op: replace
+        path: /spec/validationFailureAction
+        value: Enforce

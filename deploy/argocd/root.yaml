@@ -1,0 +1,101 @@
+# ============================================================================
+# ROOT APPLICATION — the "app-of-apps"
+# ============================================================================
+# This single Application is the ONLY object an operator applies by hand
+# (bootstrap):
+#
+#   kubectl apply -n argocd -f deploy/argocd/project.yaml
+#   kubectl apply -n argocd -f deploy/argocd/root.yaml
+#
+# From there everything is GitOps. The root app doesn't deploy any workloads
+# itself — its job is to watch deploy/argocd/apps/ and create/update/delete the
+# CHILD Applications it finds there. Each child then deploys an actual component
+# (infra, fp-auth, ... the other 9 services as they land).
+#
+# APP-OF-APPS PATTERN — why this shape:
+#   * One bootstrap, N managed apps. Adding a service = drop one YAML file in
+#     apps/, commit, push. The root app notices the new Application manifest and
+#     creates it. No `kubectl apply` per service, no CI deploy step.
+#   * Recursive GitOps: the set OF applications is itself declared in Git and
+#     reconciled, so "which apps exist" is also drift-checked, not just "what's
+#     inside each app".
+#   * Clean teardown: delete the root app (with the cascade finalizer) and
+#     ArgoCD removes every child and their workloads in dependency order.
+#
+#   Compare to alternatives: an ApplicationSet generator could template these
+#   children from a list, which scales to dozens of near-identical apps. We use
+#   plain app-of-apps here because the children are still few and individually
+#   commented for learning; ApplicationSet is the natural next step once the
+#   per-service apps are truly uniform (noted in README).
+#
+#                          ┌─────────────────────────┐
+#         apply by hand →  │   root (app-of-apps)     │
+#                          │   path: deploy/argocd/apps│
+#                          └────────────┬─────────────┘
+#                 watches apps/ dir, renders child Applications
+#                          ┌────────────┴─────────────┐
+#                  ┌───────▼───────┐          ┌────────▼────────┐
+#                  │ infra (kustom)│          │ fp-auth (Helm)  │   ... +9 later
+#                  │ → fp-infra ns │          │ → fp-system ns  │
+#                  └───────────────┘          └─────────────────┘
+# ============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: forgepoint-root
+  namespace: argocd
+  finalizers:
+    # Cascade finalizer: deleting this Application also deletes the resources it
+    # manages (here, the child Applications), instead of orphaning them.
+    - resources-finalizer.argocd.argoproj.io
+  labels:
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  # Bind to the guardrail project from project.yaml. The root only manages
+  # Application CRs in the `argocd` namespace, which the project permits.
+  project: forgepoint
+
+  source:
+    # REPO_URL — the one forgepoint mono-repo (must match an entry in the
+    # AppProject sourceRepos allow-list, or sync is refused). Swap for your fork.
+    repoURL: https://github.com/abd-ulbasit/forgepoint.git
+    # targetRevision pins WHAT git ref ArgoCD tracks. `main` = always-latest dev
+    # convenience. For prod stability you'd pin a tag/branch (e.g. `release-1.4`)
+    # so prod only moves when you cut a release. Kept as main here for the demo.
+    targetRevision: main
+    # The directory of child Application manifests. ArgoCD treats a plain
+    # directory source as "apply every manifest in it".
+    path: deploy/argocd/apps
+    directory:
+      # recurse:false — apps/ is flat (one file per child). Set true only if you
+      # nest child manifests in subfolders.
+      recurse: false
+
+  destination:
+    server: https://kubernetes.default.svc
+    # Child Application objects are created in the argocd namespace (that's where
+    # the ArgoCD controller looks for Applications by default).
+    namespace: argocd
+
+  # --------------------------------------------------------------------------
+  # syncPolicy for the ROOT — automated, so newly committed child apps appear
+  # without manual intervention. This is the "set of apps" reconciliation loop.
+  #
+  # IMPORTANT: the root being auto-sync does NOT force the CHILDREN to auto-sync.
+  # Each child carries its OWN syncPolicy (see apps/*.yaml). So we get:
+  #   root: auto-create child apps   +   prod child: still manual to deploy.
+  # The root only manages the EXISTENCE of child Applications, not their rollout.
+  # --------------------------------------------------------------------------
+  syncPolicy:
+    automated:
+      # prune:true — if a child app's YAML is deleted from apps/, ArgoCD deletes
+      # the corresponding Application (and, via its finalizer, its workloads).
+      # Safe here because the managed objects are just Application CRs.
+      prune: true
+      # selfHeal:true — if someone `kubectl delete application fp-auth` out of
+      # band, the root recreates it from Git on the next reconcile. Git wins.
+      selfHeal: true
+    syncOptions:
+      # CreateNamespace is irrelevant for the root (argocd ns already exists) but
+      # harmless; left off intentionally — see infra app for namespace creation.
+      - ApplyOutOfSyncOnly=true

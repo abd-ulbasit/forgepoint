@@ -1,0 +1,19 @@
+# =============================================================================
+# BASE kustomization — all Kyverno ClusterPolicies, in AUDIT mode.
+# =============================================================================
+# This base is itself a valid, deployable layer: every policy here ships with
+# validationFailureAction: Audit, so `kubectl apply -k deploy/policies/base`
+# (or the audit overlay, which is identical) installs the policies in
+# observe-only mode. The enforce overlay reuses this base and flips the action.
+#
+# ClusterPolicies are CLUSTER-SCOPED (no namespace), so there is intentionally
+# no `namespace:` field here — the policies themselves scope to the fp-*
+# namespaces via each rule's match/exclude.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - 00-pod-security.yaml
+  - 10-require-resources.yaml
+  - 20-image-policies.yaml
+  - 30-workload-policies.yaml

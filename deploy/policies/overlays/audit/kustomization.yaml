@@ -1,0 +1,19 @@
+# =============================================================================
+# AUDIT overlay — observe-only rollout (the SAFE first step).
+# =============================================================================
+# This overlay is deliberately a thin pass-through over the base: the base
+# already sets validationFailureAction: Audit on every policy, so there is
+# nothing to patch. Audit mode means Kyverno records a PolicyReport /
+# ClusterPolicyReport violation for any non-conforming resource but ALLOWS it.
+#
+# ROLLOUT STEP 1: apply this overlay, then watch what WOULD be blocked:
+#   kubectl apply -k deploy/policies/overlays/audit
+#   kubectl get clusterpolicyreport -A
+#   kubectl get policyreport -A -o wide
+# Fix every reported violation (or add a documented exception) BEFORE switching
+# to the enforce overlay. See deploy/policies/README.md for the full runbook.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
