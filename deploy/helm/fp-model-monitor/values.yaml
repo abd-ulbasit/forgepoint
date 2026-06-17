@@ -137,6 +137,48 @@ secrets:
   redisUrl: "redis://redis.fp-infra.svc.cluster.local:6379"
 
 # ----------------------------------------------------------------------------
+# Migrations — self-contained schema migrations via a migrate initContainer.
+# ----------------------------------------------------------------------------
+# WHY this block exists: the service's distroless runtime image bakes /migrations
+# but has no shell and no migrate binary, so it cannot apply migrations itself.
+# When `migrations.enabled` is true, the Deployment runs a golang-migrate
+# initContainer BEFORE the app container starts. That initContainer mounts the
+# migrations-configmap.yaml (the chart's migrations/*.sql) at /migrations and runs
+# `migrate up`, so a fresh database is schema-ready before any traffic. The step
+# is IDEMPOTENT: golang-migrate records the highest applied version in a
+# schema_migrations table, so on a re-deploy with no new files it prints
+# "no change" and exits 0 (no-op). Set enabled=false for services with no Postgres
+# (inference-gateway, model-serving), or when you run migrations out-of-band (a
+# separate Job / GitOps migration step).
+#
+# DSN SOURCE: the initContainer reads the SAME Postgres DSN the app uses — the
+# FP_DATABASE_URL key from the service Secret, surfaced as the DATABASE_URL env var
+# the migrate CLI expects. No second copy of the credential; one Secret feeds both
+# the app and the migrator.
+migrations:
+  # Default true for Postgres-backed services. The initContainer ALSO self-gates
+  # on a DSN being available (secrets.databaseUrl set, or an existingSecret), so
+  # enabling this without a database can't render a broken initContainer.
+  enabled: true
+  image:
+    # golang-migrate official image. Alpine-based, so it has /bin/sh (needed to
+    # expand the DSN from env without baking it into the pod spec) and the
+    # `migrate` binary on PATH. Pinned to an immutable tag for reproducible
+    # rollouts — bump deliberately, never track a moving tag.
+    repository: migrate/migrate
+    tag: v4.18.3
+    pullPolicy: IfNotPresent
+  # Modest resources: the migrate step is short-lived and IO-light. Requests are
+  # tiny so it never blocks scheduling; limits cap a pathological migration.
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+
+# ----------------------------------------------------------------------------
 # Resources — requests AND limits both set (a "Guaranteed" QoS-friendly shape).
 #   requests = what the scheduler reserves; sets the floor and drives HPA math.
 #   limits   = the ceiling; CPU is throttled, memory OOM-kills above it.

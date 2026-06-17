@@ -1,0 +1,46 @@
+{{- if .Values.migrations.enabled -}}
+# ============================================================================
+# Migrations ConfigMap — ships the service's SQL into the cluster.
+# ============================================================================
+# WHY this exists: the service's runtime image is gcr.io/distroless — it bakes
+# /migrations into the image but has NO shell and NO migrate binary, so the pod
+# itself cannot apply migrations. We solve that with a dedicated migrate
+# initContainer (see deployment.yaml) running the golang-migrate image. That
+# image needs the .sql files mounted somewhere — this ConfigMap is how we get
+# them there WITHOUT giving the migrate container access to the service image.
+#
+# HOW the SQL gets in here: Helm's `.Files.Glob` can read any file INSIDE the
+# chart directory (it CANNOT reach back into services/<svc>/migrations — Helm
+# sandboxes file access to the chart). So we keep a copy of the migrations at
+# deploy/helm/fp-experiment-tracker/migrations/*.sql (byte-identical to the service's own
+# migrations/) and template them in here. `AsConfig` renders each globbed file
+# as a key→content pair, producing one ConfigMap data key per .sql file
+# (e.g. 001_init_auth_schema.up.sql: <contents>). golang-migrate reads BOTH the
+# .up.sql and .down.sql from the mounted dir; we ship both so `down` works too.
+#
+# checksum-on-content: because the ConfigMap name is stable, a change to the SQL
+# alone would NOT roll the pod. The Deployment annotates the pod template with a
+# sha256 of this file (see deployment.yaml checksum/migrations), so editing a
+# migration forces a new rollout — and thus re-runs the migrate initContainer.
+#
+# REAL-WORLD COMPARISON: this is the Helm-native equivalent of a Flyway/Liquibase
+# "migrations as a mounted volume" pattern, or an Atlas/Prisma migrate Job. We use
+# an initContainer (not a Job) so migration success GATES pod startup: the app
+# container never starts against an un-migrated schema.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "fp-experiment-tracker.fullname" . }}-migrations
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fp-experiment-tracker.labels" . | nindent 4 }}
+data:
+  {{- /*
+    Glob every .sql under the chart's migrations/ dir and emit them as data keys.
+    AsConfig handles the YAML-escaping of multi-line SQL for us. Indented 2 to sit
+    under `data:`. If the glob matches nothing the ConfigMap is empty and the
+    migrate step finds no versions (a safe no-op), but for a Postgres service the
+    files are always present.
+  */}}
+  {{- (.Files.Glob "migrations/*.sql").AsConfig | nindent 2 }}
+{{- end }}

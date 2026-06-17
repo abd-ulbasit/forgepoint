@@ -58,6 +58,14 @@ spec:
         {{- if .Values.secrets.create }}
         checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
         {{- end }}
+        {{- if .Values.migrations.enabled }}
+        # Roll the pods when the SQL changes: the migrations ConfigMap name is
+        # stable, so without this hash an edited migration would NOT trigger a new
+        # rollout (and thus would never re-run the migrate initContainer). Hashing
+        # the rendered ConfigMap into the pod template makes a SQL change a pod
+        # template change -> new ReplicaSet -> migrate step runs again.
+        checksum/migrations: {{ include (print $.Template.BasePath "/migrations-configmap.yaml") . | sha256sum }}
+        {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -76,6 +84,70 @@ spec:
       # Must exceed the gRPC graceful-drain timeout (25s) so in-flight RPCs
       # finish before SIGKILL — see pkg/grpcutil drain logic.
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- /*
+        SELF-CONTAINED DB MIGRATIONS (migrate initContainer).
+        --------------------------------------------------------------------------
+        Gate on BOTH:
+          - migrations.enabled (operator opt-out / non-Postgres services), AND
+          - a DSN actually being available: either the chart creates the Secret
+            with secrets.databaseUrl, OR an externally-managed existingSecret is
+            named. This second guard means turning migrations on without a
+            database can't emit a half-broken initContainer.
+
+        FLOW:  initContainer (migrate up) --completes--> app container starts
+               If migrate fails (bad SQL, unreachable DB), the initContainer
+               fails, the Pod stays in Init:Error, and the app NEVER starts
+               against an un-migrated schema. That gating is the whole point of
+               using an initContainer instead of a side Job.
+
+        IDEMPOTENCY: golang-migrate tracks the applied version in schema_migrations.
+        A re-deploy with no new files prints "no change" and exits 0 -- safe to run
+        on every rollout and every replica (it serializes on the DB).
+      */}}
+      {{- if and .Values.migrations.enabled (or (and .Values.secrets.create .Values.secrets.databaseUrl) (and (not .Values.secrets.create) .Values.secrets.existingSecret)) }}
+      initContainers:
+        - name: migrate
+          image: "{{ .Values.migrations.image.repository }}:{{ .Values.migrations.image.tag }}"
+          imagePullPolicy: {{ .Values.migrations.image.pullPolicy }}
+          # Same hardened context as the app container. The migrate image is
+          # Alpine-based and runs fine as the nonroot UID -- it only needs network
+          # egress to Postgres and read access to the mounted (world-readable)
+          # ConfigMap. readOnlyRootFilesystem is safe: migrate writes nothing to
+          # its own filesystem.
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          # WHY /bin/sh -c (not the image's `migrate` entrypoint directly): we want
+          # the DSN to come from the Secret WITHOUT it appearing in the rendered
+          # pod spec (a -database="postgres://user:pass@..." arg would show up in
+          # `kubectl describe pod`). So we inject it as the DATABASE_URL env var via
+          # secretKeyRef and let the shell expand "$DATABASE_URL" at runtime. The
+          # Alpine base provides /bin/sh; distroless app image does not -- which is
+          # exactly why migration can't run in the app container.
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              echo "[migrate] applying migrations from /migrations ..."
+              migrate -path=/migrations -database="$DATABASE_URL" up
+              echo "[migrate] done."
+          env:
+            # Pull the DSN from the SAME Secret the app envFrom's, but expose it
+            # under the bare name the migrate CLI documents (DATABASE_URL), mapping
+            # from the service's FP_DATABASE_URL key.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "fp-registry.secretName" . }}
+                  key: FP_DATABASE_URL
+          resources:
+            {{- toYaml .Values.migrations.resources | nindent 12 }}
+          volumeMounts:
+            # The chart's migrations/*.sql, surfaced read-only at /migrations.
+            - name: migrations
+              mountPath: /migrations
+              readOnly: true
+      {{- end }}
       containers:
         - name: {{ .Chart.Name }}
           image: {{ include "fp-registry.image" . }}
@@ -147,6 +219,15 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- if and .Values.migrations.enabled (or (and .Values.secrets.create .Values.secrets.databaseUrl) (and (not .Values.secrets.create) .Values.secrets.existingSecret)) }}
+        # The migrations ConfigMap (the chart's migrations/*.sql) mounted into the
+        # migrate initContainer at /migrations. defaultMode 0444 = world-readable,
+        # read-only -- the nonroot migrate process can read it without owning it.
+        - name: migrations
+          configMap:
+            name: {{ include "fp-registry.fullname" . }}-migrations
+            defaultMode: 0444
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

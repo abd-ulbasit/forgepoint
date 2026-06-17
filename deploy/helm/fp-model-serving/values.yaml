@@ -144,6 +144,19 @@ secrets:
   s3SecretKey: "dev-only-change-me-minio-secret"
 
 # ----------------------------------------------------------------------------
+# Migrations — DISABLED: this service has NO Postgres database.
+# ----------------------------------------------------------------------------
+# The platform's migrate initContainer pattern (a golang-migrate initContainer
+# that applies schema migrations before the app starts) only applies to
+# Postgres-backed services. This service owns no relational schema — there is
+# nothing to migrate — so we explicitly turn the step off. The Deployment also
+# self-gates on a DSN being present (secrets.databaseUrl / existingSecret), which
+# this chart never sets, so even if flipped on by mistake no initContainer would
+# render. Kept here as an explicit, documented opt-out rather than an absent key.
+migrations:
+  enabled: false
+
+# ----------------------------------------------------------------------------
 # Resources — requests AND limits both set (a "Guaranteed" QoS-friendly shape).
 #   requests = what the scheduler reserves; sets the floor and drives HPA math.
 #   limits   = the ceiling; CPU is throttled, memory OOM-kills above it.
