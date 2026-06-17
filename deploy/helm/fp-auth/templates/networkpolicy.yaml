@@ -1,0 +1,102 @@
+{{- if .Values.networkPolicy.enabled -}}
+# ============================================================================
+# NetworkPolicy — zero-trust east-west isolation for the auth pods.
+# ============================================================================
+# By DEFAULT, Kubernetes pod networking is wide open: any pod can reach any other
+# pod on any port. A NetworkPolicy flips a workload to default-deny for the
+# directions it lists in policyTypes, then re-allows ONLY the explicit rules.
+#
+# This policy:
+#   INGRESS → default-deny, allow only from the fp-system namespace (the platform
+#             services / gateway that legitimately call AuthService). Nothing else
+#             in the cluster can even open a connection to auth.
+#   EGRESS  → default-deny, allow only: DNS (so the pod can resolve service
+#             names at all), Postgres, NATS, and the OTel collector. auth has no
+#             business talking to anything else; if it's compromised it can't
+#             exfiltrate to arbitrary endpoints.
+#
+# ENFORCEMENT CAVEAT (interview-critical): a NetworkPolicy is only enforced if
+# the cluster's CNI supports it (Calico, Cilium, etc.). On a CNI without policy
+# support it is silently ignored — present but not enforced. So this is defense
+# in depth, not a substitute for authn/authz at the app layer.
+#
+# DNS GOTCHA: forget the DNS egress rule and the pod can't resolve ANY service
+# DNS name, so every outbound connection fails with NXDOMAIN — a classic
+# self-inflicted outage when first adding egress policies. We always allow it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "fp-auth.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fp-auth.labels" . | nindent 4 }}
+spec:
+  # podSelector scopes this policy to THIS chart's pods (by identity labels).
+  podSelector:
+    matchLabels:
+      {{- include "fp-auth.selectorLabels" . | nindent 6 }}
+  # Listing both types makes the policy default-deny for BOTH directions; the
+  # rules below are the only allowances.
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow gRPC + health traffic from the permitted namespaces only.
+    - from:
+        {{- range .Values.networkPolicy.ingressNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              # Relies on the standard kubernetes.io/metadata.name label that the
+              # control plane auto-applies to every Namespace (K8s 1.21+). No need
+              # to hand-label namespaces.
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.ports.grpc }}
+        - protocol: TCP
+          port: {{ .Values.ports.health }}
+  egress:
+    {{- if .Values.networkPolicy.egress.dns.enabled }}
+    # DNS to the cluster resolver (kube-dns/CoreDNS in kube-system), UDP+TCP/53.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.postgres.enabled }}
+    # Postgres (per-service database lives in fp-infra).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.postgres.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.postgres.port }}
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.nats.enabled }}
+    # NATS JetStream (async event bus).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.nats.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.nats.port }}
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.otlp.enabled }}
+    # OTLP/gRPC to the OpenTelemetry Collector (traces + metrics push).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.otlp.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.otlp.port }}
+    {{- end }}
+{{- end }}

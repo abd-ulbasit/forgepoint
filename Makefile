@@ -166,19 +166,40 @@ lint: ## Run golangci-lint across all modules
 #   - Google: distroless images (they created the concept)
 #   - Netflix: minimal Alpine-based images
 #   - We use Google's distroless — industry gold standard
+#
+# WHY BUILD CONTEXT = REPO ROOT (not services/<svc>/):
+#   This is a Go WORKSPACE monorepo. services/<svc> imports sibling modules
+#   (pkg, gen/go) that are NOT published — go.work resolves them to local source.
+#   The Dockerfile therefore needs go.work + those sibling modules in its build
+#   context, so the context is the repo root (".") and we point at the per-service
+#   Dockerfile with -f. A repo-root .dockerignore keeps that context small.
+#   See the teaching block at the top of services/auth/Dockerfile.
+#
+# DOCKER_BUILDKIT=1: the Dockerfiles use `--mount=type=cache` for /go/pkg/mod and
+#   the Go build cache (fast incremental rebuilds). Those require BuildKit, which
+#   is default on modern Docker but we set it explicitly for older daemons/CI.
 # ============================================================================
+
+# Where the build context lives. Override if invoking from elsewhere.
+REPO_ROOT ?= .
 
 .PHONY: docker-build
 docker-build: ## Build Docker image: make docker-build SVC=auth
 	@if [ -z "$(SVC)" ]; then echo "ERROR: specify SVC=<service>"; exit 1; fi
 	@echo "==> Building Docker image for $(SVC)..."
-	docker build -t $(REGISTRY)-$(SVC):$(IMAGE_TAG) -f services/$(SVC)/Dockerfile services/$(SVC)/
+	DOCKER_BUILDKIT=1 docker build \
+		-t $(REGISTRY)-$(SVC):$(IMAGE_TAG) \
+		-f services/$(SVC)/Dockerfile \
+		$(REPO_ROOT)
 
 .PHONY: docker-build-all
 docker-build-all: ## Build Docker images for all services
 	@for svc in $(SERVICES); do \
 		echo "==> Building Docker image for $$svc..."; \
-		docker build -t $(REGISTRY)-$$svc:$(IMAGE_TAG) -f services/$$svc/Dockerfile services/$$svc/; \
+		DOCKER_BUILDKIT=1 docker build \
+			-t $(REGISTRY)-$$svc:$(IMAGE_TAG) \
+			-f services/$$svc/Dockerfile \
+			$(REPO_ROOT); \
 	done
 
 # ============================================================================

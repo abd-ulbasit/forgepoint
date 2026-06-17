@@ -1,0 +1,305 @@
+# =============================================================================
+# SECURITY — supply-chain gates (Forgepoint milestone M6)
+# =============================================================================
+#
+# This workflow implements the M6 "supply chain" standards from CLAUDE.md:
+#   govulncheck (known-CVE Go deps) → Trivy (filesystem + image CVEs) →
+#   Syft SBOM (CycloneDX) → cosign keyless signature (Sigstore/OIDC).
+# Together they answer: "what's in our software, is any of it vulnerable, and
+# can a consumer cryptographically verify the image we publish?"
+#
+# WHY each tool (and what it would catch in an interview answer):
+#   - govulncheck: Go-aware. Unlike a generic scanner it uses CALL-GRAPH
+#     reachability — it reports a vuln only if your code actually reaches the
+#     vulnerable symbol, so it has far fewer false positives than "this go.sum
+#     line is in the OSV database."
+#   - Trivy (fs): scans go.sum/lockfiles + IaC/secrets in the working tree —
+#     a broad net for dependency and config issues before anything is built.
+#   - Trivy (image): scans the BUILT container (OS packages + app deps). Our
+#     distroless base means this should find ~zero OS CVEs; it gates HIGH/CRITICAL.
+#   - Syft SBOM (CycloneDX): the bill of materials — required for provenance,
+#     consumed by downstream policy (e.g. "no GPL", "no log4j") and audits.
+#   - cosign keyless: signs the image using a short-lived Sigstore cert tied to
+#     this workflow's OIDC identity — NO long-lived private key to leak. The
+#     signature + Rekor transparency-log entry let anyone verify the image came
+#     from THIS repo's release workflow.
+#
+# STRUCTURE — "adding a service is trivial":
+#   The image jobs are a MATRIX keyed on `service`. To onboard a new service,
+#   add one line to the `service` list (its name == services/<name> dir == the
+#   image repo suffix). Everything else (Dockerfile path, image ref, scan, SBOM,
+#   sign) is derived from that single value. The Dockerfile template is shared
+#   (see services/auth/Dockerfile), so the build args are identical per service.
+# =============================================================================
+
+name: Security
+
+on:
+  push:
+    branches: [main]
+    # Also run on version tags — that's when we BUILD, SBOM, and SIGN a release.
+    tags:
+      - "v*"
+  pull_request:
+    branches: [main]
+  # Allow on-demand runs (e.g. to re-scan after a base-image CVE disclosure)
+  # without a code change.
+  workflow_dispatch:
+
+# SECURITY: least privilege at the TOP. The default for every job is read-only;
+# the two jobs that need more elevate locally:
+#   - The image job adds id-token:write (Sigstore OIDC for keyless cosign) and
+#     packages:write (push to GHCR) ONLY when it actually signs/pushes.
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  GO_VERSION: "1.26"
+  # Container registry + image namespace. GHCR keyed to the repo owner so
+  # `cosign verify` can assert the image came from this org's workflows.
+  REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: ${{ github.repository_owner }}
+
+jobs:
+  # ===========================================================================
+  # 1. govulncheck — Go vulnerability scan, one leg per module.
+  # ===========================================================================
+  govulncheck:
+    name: govulncheck (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # ADD A SERVICE: append its module path. gen/go is generated; we still
+        # scan it because it pulls in google.golang.org/protobuf + grpc, which
+        # do get CVEs.
+        module:
+          - pkg
+          - gen/go
+          - services/auth
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Go
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+
+      # Install govulncheck pinned to a version (not @latest) so the gate is
+      # reproducible — a new govulncheck release won't silently change results.
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+
+      # Run from inside the module so it resolves THIS module's build list.
+      # govulncheck exits non-zero only on a REACHABLE vulnerability → the job
+      # fails just for vulns your code can actually hit.
+      - name: Run govulncheck
+        run: govulncheck ./...
+        working-directory: ${{ matrix.module }}
+
+  # ===========================================================================
+  # 2. Trivy filesystem scan — deps, secrets, misconfig across the repo.
+  # ===========================================================================
+  trivy-fs:
+    name: Trivy filesystem scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947b394f2dd8c87dbb0 # v0.29.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          # Gate the build on actionable severities only; INFO/LOW noise would
+          # train people to ignore the gate.
+          severity: HIGH,CRITICAL
+          # Fail the job when a matching vuln is found (default is report-only).
+          exit-code: "1"
+          # NOTE: ignore-unfixed has been intentionally removed. Keeping it would
+          # silently pass HIGH/CRITICAL CVEs that have no upstream fix yet —
+          # exactly the ones you most need visibility on. An unfixed CVE is a
+          # real risk; we want the gate to be honest. If a specific CVE must be
+          # accepted (e.g. no fix exists and a compensating control is in place),
+          # add it to a `.trivyignore` file with a documented expiry date.
+          # Cover dependency CVEs, leaked secrets, and IaC misconfig in one pass.
+          scanners: vuln,secret,misconfig
+
+  # ===========================================================================
+  # 3. Image: build → Trivy image scan → SBOM → cosign sign (per service).
+  # ===========================================================================
+  image:
+    name: image (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    needs: [govulncheck, trivy-fs]
+    strategy:
+      fail-fast: false
+      matrix:
+        # ADD A SERVICE: one line here wires up build + scan + SBOM + sign.
+        service:
+          - auth
+    permissions:
+      contents: read
+      # Push images to GHCR (only used on push/tag, see the `if` on push/sign).
+      packages: write
+      # Sigstore keyless signing: mints a short-lived OIDC token as the cert
+      # subject. WITHOUT this, cosign would need a long-lived key (the thing we
+      # are deliberately avoiding).
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # Buildx gives us the modern BuildKit builder (cache mounts in the
+      # Dockerfile, multi-stage, provenance) used by build-push-action.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@6524bf65af31da8d45b59e8c27de4bd072b392f5 # v3.8.0
+
+      # Derive tags/labels from git context. On a PR we build but do NOT push
+      # (no login below); on push/tag we push and sign. metadata-action emits a
+      # canonical ${{ steps.meta.outputs.tags }} + OCI labels.
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/forgepoint-${{ matrix.service }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,format=long
+
+      # Log in to GHCR ONLY when we intend to push (push to main or a tag).
+      # On PRs from forks the GITHUB_TOKEN can't push anyway; gating the login
+      # keeps PR runs read-only and avoids a useless auth attempt.
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build the image from the REPO ROOT context (context: .) with the
+      # service's Dockerfile. Root context is mandatory: the Dockerfile copies
+      # sibling modules (pkg, gen/go) and generates a per-service go.work on the
+      # fly — those paths don't exist in a services/<svc>/ context. See the long
+      # header in services/<svc>/Dockerfile for the full rationale.
+      #   - load:true on PR → image stays local for the Trivy scan, no push.
+      #   - push only on a real push event.
+      #   - digest output feeds the SBOM + cosign steps (sign by digest, not tag,
+      #     so the signature is immutable even if the tag is later re-pointed).
+      - name: Build image
+        id: build
+        uses: docker/build-push-action@48aba3b46d1b1fec4febb7c5d0c644b249a11355 # v6.10.0
+        with:
+          context: .
+          file: services/${{ matrix.service }}/Dockerfile
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          push: ${{ github.event_name == 'push' }}
+          load: ${{ github.event_name != 'push' }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Scan the BUILT image. On push we built with push:true (no local image),
+      # so scan the pushed ref; on PR we scan the locally loaded tag. Either way
+      # we reference the first metadata tag. FAIL on HIGH/CRITICAL — distroless
+      # should keep this green; a red here means a dependency CVE shipped.
+      - name: Resolve scan target
+        id: target
+        # SECURITY: steps.meta.outputs.tags is derived from git context (branch
+        # name, PR ref, SHA). Interpolating ${{ ... }} directly into `run:` shell
+        # is a script-injection vector — a maliciously crafted branch name could
+        # embed shell metacharacters or commands that execute in the runner.
+        # Fix: pass the value through an environment variable (env:) instead of
+        # inline interpolation. The shell receives it as a plain string ($TAGS),
+        # so metacharacters are never interpreted by bash. This is the standard
+        # GitHub Actions mitigation for CWE-78 / GHSA script injection.
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          # Take the first line of the multi-line tags output as the scan ref.
+          ref="$(printf '%s\n' "${TAGS}" | head -n1)"
+          echo "image=${ref}" >> "$GITHUB_OUTPUT"
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947b394f2dd8c87dbb0 # v0.29.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.target.outputs.image }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          # NOTE: ignore-unfixed has been intentionally removed — same rationale
+          # as the fs scan above. A HIGH/CRITICAL with no upstream fix is still a
+          # real risk that deserves a decision, not a silent pass. Add a
+          # .trivyignore entry with justification if a specific CVE must be
+          # accepted (e.g. distroless ships an unfixed low-risk OpenSSL build).
+          vuln-type: os,library
+
+      # Generate a CycloneDX SBOM from the built image. anchore/sbom-action wraps
+      # Syft; CycloneDX is the format policy engines + `cosign attest` consume.
+      # Uploaded as an artifact (and as a release asset on a tag).
+      - name: Generate CycloneDX SBOM (Syft)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ steps.target.outputs.image }}
+          format: cyclonedx-json
+          output-file: sbom-${{ matrix.service }}.cyclonedx.json
+          # Don't auto-publish to a GitHub release on tags from here; we attach
+          # explicitly so the artifact name is deterministic.
+          upload-release-assets: false
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        with:
+          name: sbom-${{ matrix.service }}
+          path: sbom-${{ matrix.service }}.cyclonedx.json
+          if-no-files-found: error
+
+      # Install cosign for keyless signing.
+      - name: Install cosign
+        # Sign only on TAGGED release builds. We don't sign every main push —
+        # signatures are a release artifact; signing dev images is noise.
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+
+      # Keyless sign the image BY DIGEST. COSIGN_EXPERIMENTAL/--yes drive the
+      # OIDC keyless flow: cosign requests a token from GitHub's OIDC provider
+      # (enabled by id-token:write), Fulcio issues a short-lived cert bound to
+      # this workflow's identity, the signature + cert land in Rekor (public
+      # transparency log). Verifiers run:
+      #   cosign verify --certificate-identity-regexp '...forgepoint/.github/...' \
+      #                 --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      #                 ghcr.io/<owner>/forgepoint-<svc>@<digest>
+      # We sign the DIGEST (immutable), not a tag, so re-pointing the tag can't
+      # invalidate or hijack the signature.
+      - name: Cosign sign (keyless)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/forgepoint-${{ matrix.service }}
+        run: |
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      # Attach the SBOM to the image as a signed CycloneDX attestation so the
+      # bill of materials travels WITH the image and is itself verifiable.
+      - name: Cosign attest SBOM (keyless)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/forgepoint-${{ matrix.service }}
+        run: |
+          cosign attest --yes \
+            --predicate "sbom-${{ matrix.service }}.cyclonedx.json" \
+            --type cyclonedx \
+            "${IMAGE}@${DIGEST}"

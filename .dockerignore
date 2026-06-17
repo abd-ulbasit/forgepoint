@@ -1,0 +1,71 @@
+# =============================================================================
+# Repo-root .dockerignore
+# =============================================================================
+# The Docker build CONTEXT for every service is the repo ROOT (see any
+# services/<svc>/Dockerfile for why — go.work needs sibling modules). This file
+# keeps that context small: the daemon only receives the source the build needs,
+# which speeds uploads and prevents cache busting from unrelated file churn.
+#
+# RULE OF THUMB: ignore everything that is NOT Go source / module manifests /
+# migrations. The Dockerfile COPYs paths explicitly, so an over-broad ignore here
+# would silently break the build — keep the "un-ignore" allowances below in mind.
+# =============================================================================
+
+# --- Version control / CI metadata (never needed in an image) ---------------
+.git
+.gitignore
+.github
+.gitattributes
+
+# --- Build artifacts & binaries ---------------------------------------------
+bin/
+dist/
+out/
+**/*.exe
+**/*.test
+
+# --- Test / coverage output --------------------------------------------------
+**/*.out
+cover.out
+cover.html
+coverage*
+
+# --- Local env & secrets (must NEVER enter an image layer) ------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- Editor / OS / tooling junk ---------------------------------------------
+.idea
+.vscode
+.DS_Store
+*.swp
+*~
+
+# --- Node / frontend (Web UI lands in M4; not part of any Go service image) -
+node_modules/
+**/node_modules/
+npm-debug.log
+yarn-error.log
+
+# --- Docs, design, ADRs, plans (not runtime artifacts) ----------------------
+docs/
+README.md
+LICENSE
+*.md
+# ...but keep CLAUDE.md out too (covered by *.md). Migrations are *.sql, not *.md,
+# so they are NOT ignored and still copy into the image.
+
+# --- Infra / deploy configs (built/applied outside the image) ---------------
+deploy/
+docker-compose.yaml
+docker-compose.*.yaml
+scripts/
+.golangci.yml
+.claude/
+
+# --- Dockerfiles themselves (the build already has the one it needs) --------
+**/Dockerfile
+**/.dockerignore

@@ -1,0 +1,175 @@
+# ============================================================================
+# Deployment — the desired-state controller for the auth pods.
+# ============================================================================
+# A Deployment manages a ReplicaSet, which manages the Pods. We declare WHAT we
+# want (N replicas of this pod spec) and the controller reconciles reality to
+# match — including orchestrating rolling updates and self-healing crashed pods.
+#
+# This template is the reference for the whole platform; the hardening below
+# (security contexts, probes, spread, rolling strategy) is the baseline every
+# service inherits.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "fp-auth.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fp-auth.labels" . | nindent 4 }}
+spec:
+  # When the HPA owns scaling, OMIT replicas here. If we always set it, every
+  # `helm upgrade` would reset the count to replicaCount and fight the HPA
+  # (flapping the pod count on each deploy). So: set replicas only when
+  # autoscaling is disabled.
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  # revisionHistoryLimit caps retained old ReplicaSets (for rollback). Default 10
+  # is wasteful; 5 is plenty of rollback depth without etcd clutter.
+  revisionHistoryLimit: 5
+  strategy:
+    type: {{ .Values.updateStrategy.type }}
+    {{- if eq .Values.updateStrategy.type "RollingUpdate" }}
+    rollingUpdate:
+      # maxUnavailable: 0 + maxSurge: 1 = surge-then-retire: never dip below
+      # desired capacity during a roll, add at most one extra pod at a time.
+      maxUnavailable: {{ .Values.updateStrategy.rollingUpdate.maxUnavailable }}
+      maxSurge: {{ .Values.updateStrategy.rollingUpdate.maxSurge }}
+    {{- end }}
+  # selector is IMMUTABLE post-create and must equal the pod template's identity
+  # labels — both come from the same helper so they can't drift.
+  selector:
+    matchLabels:
+      {{- include "fp-auth.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "fp-auth.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # checksum/config + checksum/secret: hash the ConfigMap/Secret contents
+        # into the pod template. WHY: changing a ConfigMap/Secret does NOT by
+        # itself restart pods (env vars are read at process start). Embedding the
+        # checksum changes the pod template → the Deployment rolls the pods so the
+        # new config actually takes effect. This is the standard Helm idiom for
+        # "restart on config change".
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.secrets.create }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "fp-auth.serviceAccountName" . }}
+      # Belt-and-suspenders: also deny token automount at the pod level (the SA
+      # already defaults it). auth doesn't talk to the K8s API.
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # Pod-level hardening (runAsNonRoot, nonroot UID, fsGroup, seccomp).
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      # Must exceed the gRPC graceful-drain timeout (25s) so in-flight RPCs
+      # finish before SIGKILL — see pkg/grpcutil drain logic.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: {{ include "fp-auth.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Container-level hardening (no priv-esc, read-only rootfs, drop ALL caps).
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.ports.grpc }}
+              protocol: TCP
+            - name: health
+              containerPort: {{ .Values.ports.health }}
+              protocol: TCP
+          # envFrom pulls ALL keys from the ConfigMap (non-secret) and the Secret
+          # (sensitive) as env vars in one shot — the service reads FP_* from env.
+          # Order matters: Secret last so a secret key would win on a name clash
+          # (there are none here, but the precedence is intentional).
+          envFrom:
+            - configMapRef:
+                name: {{ include "fp-auth.fullname" . }}
+            - secretRef:
+                name: {{ include "fp-auth.secretName" . }}
+          # PROBES — all hit the HTTP health port.
+          #   liveness  → /healthz: process-alive only; failure RESTARTS the pod.
+          #   readiness → /readyz : real dependency checks; failure pulls the pod
+          #               from Service endpoints (no traffic) without restarting.
+          #   startup   → guards a slow cold start so liveness doesn't kill a pod
+          #               that's merely still booting.
+          {{- if .Values.probes.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.probes.startup.path }}
+              port: health
+            initialDelaySeconds: {{ .Values.probes.startup.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.startup.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.startup.failureThreshold }}
+          {{- end }}
+          {{- if .Values.probes.liveness.enabled }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.liveness.path }}
+              port: health
+            initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
+          {{- end }}
+          {{- if .Values.probes.readiness.enabled }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.readiness.path }}
+              port: health
+            initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
+            failureThreshold: {{ .Values.probes.readiness.failureThreshold }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          # readOnlyRootFilesystem: true means the container CANNOT write to its
+          # own filesystem. Mount a small writable emptyDir at /tmp for anything
+          # that needs scratch space (TLS cache, temp files). RAM-backed, ephemeral.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # topologySpreadConstraints — spread replicas across nodes/zones so one
+      # failure domain can't host a disproportionate share of pods. The label
+      # selector is injected from the chart's selector labels so it always
+      # targets exactly this workload's pods.
+      {{- if .Values.topologySpread.enabled }}
+      topologySpreadConstraints:
+        {{- range .Values.topologySpread.constraints }}
+        - maxSkew: {{ .maxSkew }}
+          topologyKey: {{ .topologyKey }}
+          whenUnsatisfiable: {{ .whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "fp-auth.selectorLabels" $ | nindent 14 }}
+        {{- end }}
+      {{- end }}

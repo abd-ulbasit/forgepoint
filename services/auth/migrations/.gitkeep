@@ -1,0 +1,3 @@
+# Placeholder so the Dockerfile's `COPY services/auth/migrations /migrations` is
+# valid before Phase 1.4 adds the golang-migrate SQL files (NNN_name.up.sql /
+# NNN_name.down.sql). Once real migrations land, this file can stay or be removed.

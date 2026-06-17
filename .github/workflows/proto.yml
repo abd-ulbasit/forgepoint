@@ -1,0 +1,107 @@
+# =============================================================================
+# PROTO — contract gate: buf lint + buf breaking
+# =============================================================================
+#
+# WHY a dedicated workflow for protos:
+#   In Forgepoint protos are the SOURCE OF TRUTH for every API (see proto/ and
+#   buf.yaml). A proto change ripples into generated Go in gen/go and across all
+#   consuming services. Two failure modes must be gated BEFORE merge:
+#     1. Style/consistency drift  → `buf lint` (STANDARD rules, ~40 checks).
+#     2. Backward-incompatible API change → `buf breaking` at FILE level (the
+#        strictest level: even a field rename, which is wire-compatible, is
+#        rejected because it breaks generated Go).
+#   This is our "contract test" tier from CLAUDE.md's testing conventions —
+#   run on every PR so a breaking change can't reach main unnoticed.
+#
+# WHY compare against the BASE branch (not the previous commit):
+#   "Breaking" is only meaningful relative to what's already shipped. We diff
+#   the PR's proto against the PR's target branch (origin/<base>), exactly the
+#   buf-breaking-action's `against` semantics. On a push to main there is no
+#   base to diff, so the breaking job is PR-only; lint still runs everywhere.
+# =============================================================================
+
+name: Proto
+
+on:
+  push:
+    branches: [main]
+    # Only run when proto config or definitions actually change — a Go-only PR
+    # doesn't need the proto gate.
+    paths:
+      - "proto/**"
+      - ".github/workflows/proto.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "proto/**"
+      - ".github/workflows/proto.yml"
+
+# SECURITY: read-only. The proto gate only reads the repo; it posts no comments
+# and pushes nothing.
+permissions:
+  contents: read
+
+concurrency:
+  group: proto-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Lint — STANDARD rules over the proto module.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: buf lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # buf-setup installs a pinned buf CLI on PATH for the lint/breaking actions
+      # (and any raw `buf` calls). Pinning the action by SHA AND pinning the buf
+      # version makes the whole proto gate reproducible.
+      - name: Set up buf
+        uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
+        with:
+          version: 1.50.0
+          # Avoids the action's unauthenticated GitHub API rate limit when
+          # resolving the release; not a secret-bearing token usage.
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The buf module lives in proto/ (buf.yaml is there), so scope the lint to
+      # that input. STANDARD lint rules come from proto/buf.yaml.
+      - name: Lint
+        run: buf lint
+        working-directory: proto
+
+  # ---------------------------------------------------------------------------
+  # Breaking — diff the PR's proto against the base branch.
+  # ---------------------------------------------------------------------------
+  breaking:
+    name: buf breaking
+    runs-on: ubuntu-latest
+    # Only meaningful on a PR (there is a base to diff against). Skipped on push.
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # buf breaking needs git history to materialize the base ref. Full
+          # history (fetch-depth: 0) guarantees origin/<base> is available to
+          # diff against; a shallow clone could miss the base commit.
+          fetch-depth: 0
+
+      - name: Set up buf
+        uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
+        with:
+          version: 1.50.0
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      # `--against` points at the SAME proto subdir on the PR's base branch.
+      #   .git#branch=<base>,subdir=proto  → buf reads proto/ as it exists on the
+      #   target branch and reports any FILE-level incompatibility vs the PR.
+      # Mirrors the Makefile's `proto-breaking` target so local and CI agree.
+      - name: Breaking change check
+        run: |
+          buf breaking \
+            --against ".git#branch=${{ github.base_ref }},subdir=proto"
+        working-directory: proto
