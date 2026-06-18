@@ -678,10 +678,17 @@ func ensureStreams(ctx context.Context, js jetstream.JetStream) error {
 		// The AI consumer READS fp.ai.completion.served from here. In production the AI
 		// stream is OWNED by the ai-gateway's bootstrap (it produces into it); we
 		// reconcile it idempotently so a billing-FIRST boot can attach the consumer even
-		// if the gateway hasn't booted yet (graceful degrade). Without this stream,
-		// billing's AI-token-metering consumer could not attach and AI spend would never
-		// reach GetUsage or the invoice — the third money axis silently un-metered.
-		{Name: events.StreamAI, Subjects: []string{"fp.ai.>"}},
+		// if the gateway hasn't booted yet (graceful degrade).
+		//
+		// CRITICAL: the subject list MUST match the gateway's StreamAI definition
+		// EXACTLY — the gateway binds StreamAI to the single completion subject (NOT
+		// fp.ai.>, which it deliberately avoids so the cost log and the KEDA warm-signal
+		// stream AI_REQUESTS=fp.ai.warm.requested don't collide). If billing declares
+		// fp.ai.> here it OVERLAPS the gateway's existing AI + AI_REQUESTS streams and
+		// JetStream rejects it (err_code=10065 subjects overlap) — a fatal ensureStreams
+		// crash. Declaring the IDENTICAL subject makes the two ensure calls idempotent:
+		// whoever boots first creates it, the other sees the same config.
+		{Name: events.StreamAI, Subjects: []string{events.SubjectAICompletionServed}},
 		// The DLQ stream captures poison events the consumers dead-letter
 		// (fp.dlq.billing, default in SubConfig). Without a stream binding fp.dlq.>,
 		// the subscriber's DLQ publish would vanish (core-NATS drop) and a poison
