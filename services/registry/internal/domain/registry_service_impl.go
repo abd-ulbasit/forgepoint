@@ -395,6 +395,24 @@ func (s *registryService) MarkVersionReady(ctx context.Context, actor Actor, in 
 		return ModelVersion{}, fmt.Errorf("get version: %w", err)
 	}
 
+	// TENANCY GATE (interview-critical). GetVersion(by id) above does NOT filter by
+	// team — it is the generic write-store lookup. A version id is a global handle, so
+	// without this gate a JWT from ANY team could confirm/flip a version owned by
+	// another team (a cross-tenant mutation / privilege-escalation hole). We therefore
+	// re-apply the SAME ownership check every model-targeting command uses
+	// (loadOwnedModel): load the parent model from the truth and require it belongs to
+	// the caller's team. A mismatch is mapped to ErrVersionNotFound — INDISTINGUISHABLE
+	// from "the version doesn't exist" — so a caller cannot use this endpoint as an
+	// oracle to probe whether another team's version id exists. (loadOwnedModel returns
+	// ErrModelNotFound for both the missing-model and wrong-team cases; we translate it
+	// to the version-shaped not-found because the caller is operating on a version.)
+	if _, err := s.loadOwnedModel(ctx, actor, v.ModelID); err != nil {
+		if errors.Is(err, ErrModelNotFound) {
+			return ModelVersion{}, ErrVersionNotFound
+		}
+		return ModelVersion{}, err
+	}
+
 	// IDEMPOTENCY by terminal status: a version already in its target terminal
 	// status is a no-op returning current state (a duplicate webhook delivery must
 	// not double-fire ModelVersionReady or double-meter storage). This is status-
@@ -489,6 +507,23 @@ func (s *registryService) PromoteVersion(ctx context.Context, actor Actor, in Pr
 			return PromoteResult{}, ErrVersionNotFound
 		}
 		return PromoteResult{}, fmt.Errorf("get version: %w", err)
+	}
+
+	// TENANCY GATE (the headline security fix). GetVersion(by id) is unscoped, and the
+	// swap below mutates the model's PRODUCTION pointer (and atomically demotes the
+	// prior prod version). Without this check, a JWT from ANY team could promote or
+	// demote another team's production version — a cross-tenant mutation that directly
+	// changes which weights serve another tenant's traffic. We apply loadOwnedModel —
+	// the SAME "exists AND is mine" gate UpdateModel/CreateVersion/ArchiveModel use —
+	// immediately after the unscoped fetch and BEFORE any state-machine work, the swap,
+	// or the idempotency-record write. A team mismatch returns ErrVersionNotFound,
+	// indistinguishable from "no such version", so the endpoint is not an enumeration
+	// oracle for other teams' version ids.
+	if _, err := s.loadOwnedModel(ctx, actor, v.ModelID); err != nil {
+		if errors.Is(err, ErrModelNotFound) {
+			return PromoteResult{}, ErrVersionNotFound
+		}
+		return PromoteResult{}, err
 	}
 
 	// IDEMPOTENCY: already in the target stage → no-op returning current state, no
@@ -654,17 +689,42 @@ func (s *registryService) GetModel(ctx context.Context, actor Actor, id, name st
 	return m, nil
 }
 
-// ListModels — team-scoped, newest-first page from the projection.
+// ListModels — team-scoped, newest-first page from the projection, WITH an accurate
+// total count (the value the BFF dashboard renders).
+//
+// WHY we fetch the count alongside the page: the dashboard's "N models" tile reads
+// total_count from a page_size=1 ListModels call. If we returned only the page (≤
+// PageSize rows) and left the total at 0, the dashboard showed 0 while the list showed
+// the real rows — the exact symptom this fixes. CountModels gives the whole filtered
+// set's size, scoped + filtered identically to the list, so the tile and the list
+// agree. We surface a count error as a hard failure of the query (rather than
+// silently returning Total=0) so a broken count is visible, not a confusing "0
+// models" that looks like an empty tenant.
 func (s *registryService) ListModels(ctx context.Context, actor Actor, in ListModelsInput) (Page[Model], error) {
 	opts := ListOptions{PageSize: clampPageSize(in.PageSize), PageToken: in.PageToken}
 	models, next, err := s.read.ListModels(ctx, actor.Team, in.Filter, opts)
 	if err != nil {
 		return Page[Model]{}, fmt.Errorf("list models: %w", err)
 	}
-	return Page[Model]{Items: models, NextToken: next}, nil
+	total, err := s.read.CountModels(ctx, actor.Team, in.Filter)
+	if err != nil {
+		return Page[Model]{}, fmt.Errorf("count models: %w", err)
+	}
+	return Page[Model]{Items: models, NextToken: next, Total: total}, nil
 }
 
-// GetVersion — fetch a single version from the projection.
+// GetVersion — fetch a single version from the projection, TEAM-SCOPED.
+//
+// SECURITY (cross-tenant read / IDOR): the version read paths (GetVersionByID /
+// GetVersionByLabel) are NOT team-scoped — a version id/label is a global handle and
+// the version entity does not carry the owning team. Returning the version straight
+// from the projection would let any team read another team's version metadata
+// (reachable via the BFF GET /models/{id}/versions). We close the hole by re-deriving
+// ownership from the version's PARENT model through the TEAM-SCOPED read path
+// (GetModelByID applies the actor.Team gate in the adapter): if the caller's team
+// cannot see the parent model, the version is reported as not-found — the SAME
+// not-found-on-mismatch posture as the write side's loadOwnedModel, so the endpoint
+// leaks nothing about other teams' versions.
 func (s *registryService) GetVersion(ctx context.Context, actor Actor, id, modelID, version string) (ModelVersion, error) {
 	id, modelID, version = strings.TrimSpace(id), strings.TrimSpace(modelID), strings.TrimSpace(version)
 	if id == "" && (modelID == "" || version == "") {
@@ -685,13 +745,31 @@ func (s *registryService) GetVersion(ctx context.Context, actor Actor, id, model
 		}
 		return ModelVersion{}, fmt.Errorf("read version: %w", err)
 	}
+	// TENANCY GATE: confirm the caller's team owns the version's parent model. A miss
+	// here (model absent OR not in the team) collapses to ErrVersionNotFound — no
+	// enumeration oracle for cross-team version ids.
+	if err := s.assertVersionInTeam(ctx, actor, v.ModelID); err != nil {
+		return ModelVersion{}, err
+	}
 	return v, nil
 }
 
-// ListVersions — a model's versions newest-first, optionally stage-filtered.
+// ListVersions — a model's versions newest-first, optionally stage-filtered. TEAM-SCOPED.
+//
+// SECURITY (cross-tenant list / IDOR): ListVersions(by model_id) on the projection is
+// not team-scoped, so without a gate any team could list another team's versions just
+// by knowing/guessing a model id. We FIRST confirm the caller's team can see the
+// parent model via the team-scoped read path, returning the version-shaped not-found
+// on mismatch BEFORE touching the version list — so we never even read, let alone
+// return, another team's versions.
 func (s *registryService) ListVersions(ctx context.Context, actor Actor, modelID string, stageFilter ModelStage, pageSize int, pageToken string) (Page[ModelVersion], error) {
 	if strings.TrimSpace(modelID) == "" {
 		return Page[ModelVersion]{}, fmt.Errorf("%w: model id is required", ErrValidation)
+	}
+	// TENANCY GATE before the list read (see the method doc). A cross-team or unknown
+	// model id is reported as not-found, identical to a genuinely absent model.
+	if err := s.assertVersionInTeam(ctx, actor, modelID); err != nil {
+		return Page[ModelVersion]{}, err
 	}
 	opts := ListOptions{PageSize: clampPageSize(pageSize), PageToken: pageToken}
 	versions, next, err := s.read.ListVersions(ctx, modelID, stageFilter, opts)
@@ -699,6 +777,24 @@ func (s *registryService) ListVersions(ctx context.Context, actor Actor, modelID
 		return Page[ModelVersion]{}, fmt.Errorf("list versions: %w", err)
 	}
 	return Page[ModelVersion]{Items: versions, NextToken: next}, nil
+}
+
+// assertVersionInTeam verifies the actor's team owns the model that a version belongs
+// to, reading through the TEAM-SCOPED projection path (GetModelByID applies the team
+// gate). It is the QUERY-side analog of loadOwnedModel (which gates the WRITE side off
+// the Postgres truth): both map a missing-or-wrong-team result to a not-found the
+// caller cannot distinguish from genuine absence. We surface ErrVersionNotFound (not
+// ErrModelNotFound) because the caller is operating on a version, and that is the
+// not-found the version endpoints already return for an unknown version id — so a
+// cross-tenant probe and a genuine miss are byte-for-byte identical to the client.
+func (s *registryService) assertVersionInTeam(ctx context.Context, actor Actor, modelID string) error {
+	if _, err := s.read.GetModelByID(ctx, actor.Team, modelID); err != nil {
+		if errors.Is(err, ErrRecordNotFound) {
+			return ErrVersionNotFound
+		}
+		return fmt.Errorf("read version owner model: %w", err)
+	}
+	return nil
 }
 
 // ============================================================================

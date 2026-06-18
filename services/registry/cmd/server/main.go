@@ -326,7 +326,11 @@ func main() {
 	//   write model emits events ─► projection consumes ─► upserts read model ─►
 	//   queries read Redis.  Eventual consistency; the command RESPONSE still returns
 	//   the authoritative write-side state, so a client never sees its own write miss.
-	projection := events.NewProjection(js, readStore, events.ProjectionConfig{})
+	// writeStore is passed as the ModelReader read-back source so the projection
+	// hydrates description/tags (which the thin fp.models.registered event does not
+	// carry) from the Postgres truth — making the Redis read model FIELD-COMPLETE so
+	// GET /models/{id} returns the real description. See events.ModelReader.
+	projection := events.NewProjection(js, readStore, writeStore, events.ProjectionConfig{})
 	if err := projection.Start(ctx); err != nil {
 		_ = natsConn.Drain()
 		_ = rdb.Close()

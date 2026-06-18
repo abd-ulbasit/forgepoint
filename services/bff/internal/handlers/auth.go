@@ -1,9 +1,12 @@
 package handlers
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strings"
+	"time"
 
 	authv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/auth/v1"
 	"github.com/abd-ulbasit/forgepoint/services/bff/internal/httpx"
@@ -91,8 +94,28 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	out := loginResponse{
 		AccessToken: resp.GetAccessToken(),
 	}
+
+	// PROFILE + EXPIRY POPULATION — two sources, in priority order:
+	//
+	//  1. The auth LoginResponse's OWN user/expires_at fields, IF the auth service
+	//     populates them. They are the authoritative, structured source.
+	//  2. FALLBACK: decode the access token's JWT claims. In M1 the auth service's
+	//     Login returns ONLY access_token (expires_at/user are left unset — see
+	//     auth_handler_rpcs.go), so without this fallback the SPA receives
+	//     user:null / expiresAt:"" and the header renders "User"/"?". The JWT
+	//     itself carries everything the header needs (sub/email/name/team/role/exp),
+	//     so we read it back out here for display convenience.
+	//
+	// WHY WE DO NOT VERIFY THE SIGNATURE HERE (interview-critical): the BFF is not
+	// an identity authority (see httpx/auth.go) and this token did not arrive from
+	// an untrusted client — we MINTED it one line above via a trusted in-cluster
+	// gRPC call to the auth service. Re-verifying would force the BFF to hold
+	// FP_JWT_SECRET, which is exactly the coupling the ADR forbids. The decoded
+	// claims are used ONLY to render the user's own profile back to that same user;
+	// no authorization decision is made on them. Downstream services still verify
+	// the signature on every forwarded call, so a tampered token gains nothing.
 	if ts := resp.GetExpiresAt(); ts != nil {
-		out.ExpiresAt = ts.AsTime().UTC().Format("2006-01-02T15:04:05Z07:00")
+		out.ExpiresAt = ts.AsTime().UTC().Format(time.RFC3339)
 	}
 	if u := resp.GetUser(); u != nil {
 		out.User = &userView{
@@ -101,6 +124,23 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 			Name:  u.GetName(),
 			Team:  u.GetTeam(),
 			Role:  u.GetRole(),
+		}
+	}
+	// Fallback: fill any field the auth response left blank from the JWT claims.
+	if out.User == nil || out.ExpiresAt == "" {
+		if claims, ok := decodeJWTClaims(resp.GetAccessToken()); ok {
+			if out.User == nil {
+				out.User = &userView{
+					ID:    claims.Sub,
+					Email: claims.Email,
+					Name:  claims.Name,
+					Team:  claims.Team,
+					Role:  claims.Role,
+				}
+			}
+			if out.ExpiresAt == "" && claims.Exp > 0 {
+				out.ExpiresAt = time.Unix(claims.Exp, 0).UTC().Format(time.RFC3339)
+			}
 		}
 	}
 
@@ -120,4 +160,52 @@ func (u *userView) GetID() string {
 		return ""
 	}
 	return u.ID
+}
+
+// jwtClaims mirrors the subset of the auth service's JWT payload the SPA header
+// needs. The field tags match exactly how the auth service signs them
+// (services/auth/internal/domain/jwt.go): "sub" is the registered subject claim
+// (the user id); email/name/team/role are private claims; "exp" is the registered
+// expiry as a NumericDate (Unix SECONDS, per RFC 7519 §2). Any field the token
+// omits stays at its zero value.
+type jwtClaims struct {
+	Sub   string `json:"sub"`
+	Email string `json:"email"`
+	Name  string `json:"name"`
+	Team  string `json:"team"`
+	Role  string `json:"role"`
+	Exp   int64  `json:"exp"`
+}
+
+// decodeJWTClaims base64url-decodes the PAYLOAD segment of a JWT and unmarshals
+// it into jwtClaims. It returns ok=false on any malformed input so the caller can
+// silently skip the convenience fields rather than fail the login.
+//
+// IT DELIBERATELY DOES NOT VERIFY THE SIGNATURE. A JWT is three base64url
+// segments joined by dots: header.payload.signature. We split on '.', take
+// segment [1] (the payload), and decode it. This is safe ONLY because the token
+// originated from the trusted auth service over an in-cluster call and is used
+// solely to echo the caller's own profile (no authZ decision). See the long
+// comment at the call site for the full rationale.
+//
+// RawURLEncoding is the correct alphabet: JWT uses base64url WITHOUT padding
+// (RFC 7515 §2 / RFC 4648 §5). StdEncoding would reject the '-'/'_' characters
+// and the missing '=' padding.
+func decodeJWTClaims(token string) (jwtClaims, bool) {
+	var claims jwtClaims
+	if token == "" {
+		return claims, false
+	}
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return claims, false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return claims, false
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return claims, false
+	}
+	return claims, true
 }

@@ -221,6 +221,11 @@ func (s *Subscribers) handleModelDeployed(ctx context.Context, env natsutil.Even
 		return err
 	}
 	return s.deps.Service.ApplyModelDeployed(ctx, domain.ModelDeployed{
+		// OwnerTeam namespaces the created route so ONLY the owning team can Predict
+		// against it (cross-tenant IDOR fix). It is server-authoritative — derived by
+		// the deploy saga from the model's owning team in the registry — and decoded
+		// from the event here, never from any client input. See deployedOwnerTeam.
+		OwnerTeam: deployedOwnerTeam(&p),
 		ModelName: p.GetModelName(),
 		Version:   p.GetVersion(),
 		Endpoint:  p.GetEndpoint(),
@@ -236,6 +241,7 @@ func (s *Subscribers) handleModelUndeployed(ctx context.Context, env natsutil.Ev
 		return err
 	}
 	return s.deps.Service.ApplyModelUndeployed(ctx, domain.ModelUndeployed{
+		OwnerTeam: undeployedOwnerTeam(&p), // scope removal to the owning team's route
 		ModelName: p.GetModelName(),
 		Version:   p.GetVersion(),
 		Reason:    p.GetReason(), // logged, not logic — suppresses alerts on expected removals
@@ -251,6 +257,7 @@ func (s *Subscribers) handleModelPromoted(ctx context.Context, env natsutil.Even
 		return err
 	}
 	return s.deps.Service.ApplyModelPromoted(ctx, domain.ModelPromoted{
+		OwnerTeam:      promotedOwnerTeam(&p), // scope the repoint to the owning team's route
 		ModelName:      p.GetModelName(),
 		Version:        p.GetVersion(),
 		DemotedVersion: p.GetDemotedVersion(),
@@ -264,8 +271,61 @@ func (s *Subscribers) handleModelArchived(ctx context.Context, env natsutil.Even
 		return err
 	}
 	return s.deps.Service.ApplyModelArchived(ctx, domain.ModelArchived{
+		OwnerTeam: archivedOwnerTeam(&p), // scope the drop to the owning team's route
 		ModelName: p.GetModelName(),
 	})
+}
+
+// ----------------------------------------------------------------------------
+// OWNER-TEAM EXTRACTION (the tenancy key source for event-driven routes)
+// ----------------------------------------------------------------------------
+//
+// The route table is namespaced by (owner_team, model_name) to close the cross-
+// tenant route IDOR. For events the owning team must come from the EVENT (server-
+// authoritative, set by the deploy saga / registry from the model's owning team) —
+// never a client. These helpers centralize that extraction so there is ONE place
+// that knows where the team lives on each event payload.
+//
+// HONEST STATUS (no silent stub): the canonical forgepoint/events/v1 deploy/promote/
+// archive proto messages do NOT yet carry an owner_team field (only ModelRegistered
+// and a few billing/feature events do). Adding it is a proto change that requires
+// `buf generate`, which is intentionally OUT OF SCOPE for this fix. Until that field
+// exists and the saga populates it, these return "" — which is the SAFE-BY-DEFAULT
+// outcome: a route created in the "" namespace is unreachable by ANY authenticated
+// tenant (whose Principal.Team is non-empty), so the IDOR is closed (no team can
+// reach another's route) even though event-created routes are not yet routable.
+// The moment the proto carries owner_team, swap the body of these to p.GetOwnerTeam()
+// and the whole event path namespaces correctly with no other change. We extract via
+// a tiny interface so this compiles today and upgrades trivially.
+
+// teamCarrier is satisfied by any generated message that grows a GetOwnerTeam()
+// accessor. Type-asserting against it lets us read the field WITHOUT a compile-time
+// dependency on a field the proto doesn't have yet — so this code is correct today
+// ("" → unreachable namespace) and automatically picks up the real team once the
+// proto is regenerated with owner_team.
+type teamCarrier interface{ GetOwnerTeam() string }
+
+func ownerTeamOf(m any) string {
+	if tc, ok := m.(teamCarrier); ok {
+		return tc.GetOwnerTeam()
+	}
+	return ""
+}
+
+func deployedOwnerTeam(p *eventsv1.ModelDeployed) string {
+	return ownerTeamOf(p)
+}
+
+func undeployedOwnerTeam(p *eventsv1.ModelUndeployed) string {
+	return ownerTeamOf(p)
+}
+
+func promotedOwnerTeam(p *eventsv1.ModelPromoted) string {
+	return ownerTeamOf(p)
+}
+
+func archivedOwnerTeam(p *eventsv1.ModelArchived) string {
+	return ownerTeamOf(p)
 }
 
 // handleQuotaExceeded: flip the team's quota cache to "blocked" so subsequent

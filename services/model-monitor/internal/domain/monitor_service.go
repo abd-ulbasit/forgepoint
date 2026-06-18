@@ -132,11 +132,14 @@ type MonitorService interface {
 	// no enumeration oracle, and not a distinguishable "forbidden").
 	GetDriftReport(ctx context.Context, ownerTeam, reportID string) (DriftReport, error)
 
-	// ListDriftReports returns a team's model drift history (newest first),
-	// paginated, with optional severity and time-range filters. ownerTeam is
-	// service-set from auth claims and combined with the model name to scope the
-	// history — because model names are not unique across teams, scoping by model
-	// name alone would leak another team's same-named model history.
+	// ListDriftReports returns a team's drift history (newest first), paginated, with
+	// optional severity, time-range, AND model_name filters. ownerTeam is service-set
+	// from auth claims and is the MANDATORY scope. model_name is OPTIONAL: when set it
+	// narrows to one model (model names are not unique across teams, so owner_team must
+	// scope first — otherwise a same-named model in another team would leak); when EMPTY
+	// it returns the most-recent reports across ALL of this team's models (the fleet /
+	// dashboard "recent drift" view). Tenancy is never relaxed — empty model_name means
+	// "all of MY models", never an unscoped read.
 	ListDriftReports(ctx context.Context, ownerTeam string, f ReportFilter, opts ListOptions) (reports []DriftReport, nextToken string, err error)
 
 	// SubmitGroundTruth backfills delayed true outcomes (batched) for performance

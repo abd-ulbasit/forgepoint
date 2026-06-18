@@ -128,9 +128,49 @@ type RouteTarget struct {
 // mutates routes via the methods below. The admin RPCs (UpsertRoute /
 // SetTrafficSplit / DeleteRoute) are the break-glass manual control plane.
 type Route struct {
+	// OwnerTeam is the TENANT that owns this route. It is the multi-tenancy
+	// boundary of the whole routing plane: a route is addressed by the pair
+	// (OwnerTeam, ModelName), never by ModelName alone. SERVER-authoritative — it
+	// comes from the caller's verified Principal.Team (Predict / control plane) or
+	// from the owning team carried on the ModelDeployed event (event reactions),
+	// NEVER from a request field a caller could spoof.
+	//
+	// SECURITY (cross-tenant route IDOR fix): the routing table used to be a GLOBAL
+	// namespace keyed only by ModelName. Any authenticated caller — regardless of
+	// team — could read, repoint, or delete another team's route by guessing its
+	// model name, or hijack a name collision (two teams both deploy "fraud"). The
+	// auth interceptor authenticates the JWT but does NOT tenancy-authorize, so
+	// authentication alone was not enough. Namespacing every route operation by
+	// (team, model_name) — and returning NO_ROUTE (not a distinguishable error) on
+	// a cross-team miss so there is no existence oracle — closes that hole: team A
+	// literally cannot name team B's route because the store key is derived from A's
+	// own claims. See routeKey below and the Predict/Get*/Upsert*/Delete* impls.
+	OwnerTeam string
 	ModelName string
 	Targets   []RouteTarget
 	UpdatedAt time.Time
+}
+
+// routeKey composes the (team, model) tenancy pair into the single string the
+// RouteStore is keyed by. It is the linchpin of the multi-tenant IDOR fix: every
+// store access (Get/Upsert/Delete) goes through this, so a route is reachable
+// ONLY under its owning team's namespace and one team can never address another's
+// route by model name.
+//
+// WHY compose into the existing string key (rather than widen the RouteStore port
+// to take a team parameter): it keeps the port — and its in-memory + Redis
+// adapters — unchanged, while making tenancy a property the DOMAIN enforces at the
+// single point where it owns the key. The store stays a dumb keyed map; the
+// business rule ("routes are per-team") lives in the layer that should own it.
+//
+// FORMAT: "<team>\x00<model>". The NUL separator can't appear in a team or model
+// name (both are identifier-like tokens from claims / the registry), so the
+// mapping is injective — ("a","b:c") and ("a:b","c") can never collide into the
+// same key the way a plain ":" join could. An empty team yields a distinct
+// "\x00<model>" namespace, so an unauthenticated/teamless principal can never
+// alias a real tenant's route either.
+func routeKey(team, modelName string) string {
+	return team + "\x00" + modelName
 }
 
 // ActiveWeightSum returns the sum of weight_bps across ELIGIBLE (active) targets.

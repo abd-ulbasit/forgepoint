@@ -139,8 +139,13 @@ func (s *inferenceService) Predict(ctx context.Context, p Principal, in PredictI
 		return PredictOutput{}, s.fail(ctx, requestID, in.ModelName, "", p, FailureReasonRateLimited, ErrRateLimited)
 	}
 
-	// --- 4. ROUTE lookup ---
-	route, err := s.routes.Get(ctx, in.ModelName)
+	// --- 4. ROUTE lookup (TENANT-SCOPED — the cross-tenant IDOR fix) ---
+	// The route is fetched under the CALLER'S team (from verified claims, p.Team),
+	// never under a bare model name. So team A resolves ONLY team A's "fraud"
+	// route; team B's identically-named route is invisible (a different store key).
+	// A cross-team name therefore yields ErrNoRoute — the same outcome as "never
+	// deployed", giving no existence oracle.
+	route, err := s.routes.Get(ctx, routeKey(p.Team, in.ModelName))
 	if err != nil {
 		// Any store error (incl. ErrNoRoute) at this point = not routable.
 		return PredictOutput{}, s.fail(ctx, requestID, in.ModelName, "", p, FailureReasonNoRoute, ErrNoRoute)
@@ -153,6 +158,16 @@ func (s *inferenceService) Predict(ctx context.Context, p Principal, in PredictI
 	}
 
 	// --- 6. CIRCUIT BREAKER gate for the CHOSEN backend ---
+	// Keyed by (model, version). NOTE: the breaker key is intentionally NOT
+	// tenant-namespaced here — the observability RPCs (GetCircuitState /
+	// ListCircuitStates) filter by the bare model name and surface it to operators,
+	// so namespacing the breaker would leak the composite key and break that filter.
+	// Post route-namespacing the two teams' "fraud" backends have DISTINCT endpoints
+	// but could share a breaker if they also shared a version label; that is a minor
+	// cross-tenant resilience-coupling (one team's outage could trip the other's
+	// breaker for a same-named version) and is tracked as a separate hardening item
+	// — it is NOT the IDOR (no data is read/written across tenants through a
+	// breaker). The route-level namespacing above is the security-critical fix.
 	breaker := s.breakers.Get(route.ModelName, target.Version)
 	if !breaker.Allow() {
 		// Fail fast: the backend is known-sick; don't touch it.
@@ -302,18 +317,40 @@ func elemSize(dtype string) int {
 // CONTROL PLANE
 // ============================================================================
 
-func (s *inferenceService) GetRoute(ctx context.Context, modelName string) (Route, error) {
-	return s.routes.Get(ctx, modelName)
+// GetRoute is TENANT-SCOPED: the lookup is keyed by (team, modelName), so a route
+// owned by another team surfaces as ErrNoRoute — no cross-tenant read, and no
+// existence oracle (the cross-team miss is indistinguishable from "absent").
+func (s *inferenceService) GetRoute(ctx context.Context, team, modelName string) (Route, error) {
+	return s.routes.Get(ctx, routeKey(team, modelName))
 }
 
-func (s *inferenceService) ListRoutes(ctx context.Context, opts ListOptions) ([]Route, string, error) {
-	return s.routes.List(ctx, opts)
+// ListRoutes returns only the CALLER'S routes. The store holds every team's routes
+// in one keyed table (keyed by routeKey), so we filter the page down to the rows
+// whose OwnerTeam matches — a team must never see another team's models/endpoints.
+//
+// WHY filter here rather than push the team into RouteStore.List: the port stays a
+// simple "page the whole table" contract (unchanged adapters), and tenancy — a
+// business rule — is enforced in the domain. The store records OwnerTeam on each
+// Route (Upsert persists it), so the filter is a cheap field compare; we do not
+// rely on parsing the composite key back apart.
+func (s *inferenceService) ListRoutes(ctx context.Context, team string, opts ListOptions) ([]Route, string, error) {
+	all, next, err := s.routes.List(ctx, opts)
+	if err != nil {
+		return nil, "", err
+	}
+	mine := make([]Route, 0, len(all))
+	for _, r := range all {
+		if r.OwnerTeam == team {
+			mine = append(mine, r)
+		}
+	}
+	return mine, next, nil
 }
 
 // UpsertRoute is the break-glass create/replace. It accepts ONLY version +
 // weight per target; endpoints are SERVER-RESOLVED from the existing route's
 // deploy records (anti-SSRF), and the resulting ACTIVE weights must sum to 10000.
-func (s *inferenceService) UpsertRoute(ctx context.Context, modelName string, proposed []ProposedTarget) (Route, error) {
+func (s *inferenceService) UpsertRoute(ctx context.Context, team, modelName string, proposed []ProposedTarget) (Route, error) {
 	if modelName == "" {
 		return Route{}, fmt.Errorf("%w: model_name is required", ErrRouteValidation)
 	}
@@ -323,8 +360,10 @@ func (s *inferenceService) UpsertRoute(ctx context.Context, modelName string, pr
 
 	// Build an endpoint lookup from the EXISTING route — the only trusted source
 	// of a backend address. A version with no known endpoint is rejected (we will
-	// not invent a host to forward to).
-	existing, _ := s.routes.Get(ctx, modelName) // ErrNoRoute → empty route, fine
+	// not invent a host to forward to). TENANCY: we read ONLY the caller's own
+	// (team, model) route, so a caller cannot resolve endpoints out of, or write
+	// over, another team's route.
+	existing, _ := s.routes.Get(ctx, routeKey(team, modelName)) // ErrNoRoute → empty route, fine
 	endpointOf := map[string]string{}
 	stableOf := map[string]bool{}
 	for _, t := range existing.Targets {
@@ -358,11 +397,14 @@ func (s *inferenceService) UpsertRoute(ctx context.Context, modelName string, pr
 		})
 	}
 
-	route := Route{ModelName: modelName, Targets: targets, UpdatedAt: s.now()}
+	// Stamp the OwnerTeam so the stored route records its tenant and the store key
+	// (routeKey(team, modelName)) places it in the caller's namespace — never
+	// overwriting another team's route of the same name.
+	route := Route{OwnerTeam: team, ModelName: modelName, Targets: targets, UpdatedAt: s.now()}
 	if err := validateActiveWeightSum(route); err != nil {
 		return Route{}, err
 	}
-	if err := s.routes.Upsert(ctx, route); err != nil {
+	if err := s.routes.Upsert(ctx, routeKey(team, modelName), route); err != nil {
 		return Route{}, err
 	}
 	return route, nil
@@ -382,8 +424,11 @@ func (s *inferenceService) UpsertRoute(ctx context.Context, modelName string, pr
 // rejected values, and the next Predict/GetRoute routed on never-committed,
 // corrupt weights. Cloning first makes a rejected write a no-op against the store:
 // nothing is committed until the entire proposed set validates.
-func (s *inferenceService) SetTrafficSplit(ctx context.Context, modelName string, weights []TrafficWeight) (Route, error) {
-	route, err := s.routes.Get(ctx, modelName)
+func (s *inferenceService) SetTrafficSplit(ctx context.Context, team, modelName string, weights []TrafficWeight) (Route, error) {
+	// TENANCY: fetch under the caller's own (team, model) key. A model name owned by
+	// another team misses → ErrNoRoute, so a caller can neither reweight nor learn
+	// of another team's route.
+	route, err := s.routes.Get(ctx, routeKey(team, modelName))
 	if err != nil {
 		return Route{}, ErrNoRoute
 	}
@@ -425,14 +470,19 @@ func (s *inferenceService) SetTrafficSplit(ctx context.Context, modelName string
 	if err := validateActiveWeightSum(proposed); err != nil {
 		return Route{}, err // nothing committed — the stored route is untouched
 	}
-	if err := s.routes.Upsert(ctx, proposed); err != nil {
+	// proposed.OwnerTeam is carried over from the fetched route (which we cloned),
+	// so it stays the owning team; re-key under the same (team, model) namespace.
+	if err := s.routes.Upsert(ctx, routeKey(team, modelName), proposed); err != nil {
 		return Route{}, err
 	}
 	return proposed, nil
 }
 
-func (s *inferenceService) DeleteRoute(ctx context.Context, modelName string) error {
-	return s.routes.Delete(ctx, modelName) // idempotent: deleting absent is a no-op
+// DeleteRoute is TENANT-SCOPED: it deletes only the key in the caller's own
+// namespace, so deleting a name owned by another team is a no-op against THIS
+// team's (absent) route and leaves the other team's route untouched.
+func (s *inferenceService) DeleteRoute(ctx context.Context, team, modelName string) error {
+	return s.routes.Delete(ctx, routeKey(team, modelName)) // idempotent: deleting absent is a no-op
 }
 
 func (s *inferenceService) CircuitStates(modelNameFilter string) []CircuitSnapshot {
@@ -457,9 +507,14 @@ func (s *inferenceService) ApplyModelDeployed(ctx context.Context, ev ModelDeplo
 		return err
 	}
 
-	route, err := s.routes.Get(ctx, ev.ModelName)
+	// TENANCY: the route is created/fetched UNDER its owning team (ev.OwnerTeam,
+	// server-resolved by the deploy saga). This is what makes a later Predict from
+	// that team — and no other — able to reach the route. A deploy event carries the
+	// owning team; the gateway never invents it.
+	key := routeKey(ev.OwnerTeam, ev.ModelName)
+	route, err := s.routes.Get(ctx, key)
 	if errors.Is(err, ErrNoRoute) {
-		route = Route{ModelName: ev.ModelName}
+		route = Route{OwnerTeam: ev.OwnerTeam, ModelName: ev.ModelName}
 	} else if err != nil {
 		return err
 	}
@@ -494,14 +549,15 @@ func (s *inferenceService) ApplyModelDeployed(ctx context.Context, ev ModelDeplo
 	}
 	route.Targets = targets
 	route.UpdatedAt = s.now()
-	return s.routes.Upsert(ctx, route)
+	return s.routes.Upsert(ctx, key, route)
 }
 
 // ApplyModelUndeployed removes a target. Removing an absent target (or model) is
 // a safe no-op (idempotent). If it was the last target the route is deleted so
 // the model becomes non-serving.
 func (s *inferenceService) ApplyModelUndeployed(ctx context.Context, ev ModelUndeployed) error {
-	route, err := s.routes.Get(ctx, ev.ModelName)
+	key := routeKey(ev.OwnerTeam, ev.ModelName) // TENANCY: act only on the owning team's route
+	route, err := s.routes.Get(ctx, key)
 	if errors.Is(err, ErrNoRoute) {
 		return nil // already gone — idempotent
 	} else if err != nil {
@@ -518,11 +574,11 @@ func (s *inferenceService) ApplyModelUndeployed(ctx context.Context, ev ModelUnd
 		}
 	}
 	if len(kept) == 0 {
-		return s.routes.Delete(ctx, ev.ModelName)
+		return s.routes.Delete(ctx, key)
 	}
 	route.Targets = kept
 	route.UpdatedAt = s.now()
-	return s.routes.Upsert(ctx, route)
+	return s.routes.Upsert(ctx, key, route)
 }
 
 // ApplyModelPromoted repoints ALL traffic to the newly-promoted production
@@ -531,7 +587,8 @@ func (s *inferenceService) ApplyModelUndeployed(ctx context.Context, ev ModelUnd
 // deleting) the old one lets in-flight requests finish gracefully; a later
 // undeploy event removes it entirely.
 func (s *inferenceService) ApplyModelPromoted(ctx context.Context, ev ModelPromoted) error {
-	route, err := s.routes.Get(ctx, ev.ModelName)
+	key := routeKey(ev.OwnerTeam, ev.ModelName) // TENANCY: promote within the owning team's namespace
+	route, err := s.routes.Get(ctx, key)
 	if err != nil {
 		return ErrNoRoute
 	}
@@ -565,12 +622,14 @@ func (s *inferenceService) ApplyModelPromoted(ctx context.Context, ev ModelPromo
 	}
 	route.Targets = targets
 	route.UpdatedAt = s.now()
-	return s.routes.Upsert(ctx, route)
+	return s.routes.Upsert(ctx, key, route)
 }
 
 // ApplyModelArchived drops the whole route (the model is going away). Idempotent.
+// TENANCY: scoped to the owning team's namespace so archiving team A's model never
+// drops team B's identically-named route.
 func (s *inferenceService) ApplyModelArchived(ctx context.Context, ev ModelArchived) error {
-	return s.routes.Delete(ctx, ev.ModelName)
+	return s.routes.Delete(ctx, routeKey(ev.OwnerTeam, ev.ModelName))
 }
 
 // ============================================================================

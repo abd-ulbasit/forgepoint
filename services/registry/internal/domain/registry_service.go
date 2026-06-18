@@ -148,9 +148,17 @@ type ListModelsInput struct {
 // the result set is exhausted. WHY a generic over the concrete []Model/[]ModelVersion:
 // it keeps one consistent paginated shape across queries (the handler maps it to
 // the proto PaginationResponse identically every time).
+//
+// Total is the COUNT of the full filtered result set (NOT just this page) — the value
+// the proto's PaginationResponse.total_count carries and the BFF dashboard reads to
+// render "N models". It is maintained on the read side (see ReadStore.CountModels) so
+// the dashboard's cheap page_size=1 call still gets an accurate total without pulling
+// every row. A query that does not compute a total (e.g. ListVersions, where no caller
+// needs it yet) leaves it 0 — the documented "total unknown" sentinel.
 type Page[T any] struct {
 	Items     []T
 	NextToken string
+	Total     int
 }
 
 // ============================================================================

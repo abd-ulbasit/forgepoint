@@ -75,17 +75,22 @@ const (
 // the handler from all infrastructure.
 type mockInferenceService struct {
 	predictFn         func(ctx context.Context, p domain.Principal, in domain.PredictInput) (domain.PredictOutput, error)
-	getRouteFn        func(ctx context.Context, modelName string) (domain.Route, error)
-	listRoutesFn      func(ctx context.Context, opts domain.ListOptions) ([]domain.Route, string, error)
-	upsertRouteFn     func(ctx context.Context, modelName string, proposed []domain.ProposedTarget) (domain.Route, error)
-	setTrafficSplitFn func(ctx context.Context, modelName string, weights []domain.TrafficWeight) (domain.Route, error)
-	deleteRouteFn     func(ctx context.Context, modelName string) error
+	getRouteFn        func(ctx context.Context, team, modelName string) (domain.Route, error)
+	listRoutesFn      func(ctx context.Context, team string, opts domain.ListOptions) ([]domain.Route, string, error)
+	upsertRouteFn     func(ctx context.Context, team, modelName string, proposed []domain.ProposedTarget) (domain.Route, error)
+	setTrafficSplitFn func(ctx context.Context, team, modelName string, weights []domain.TrafficWeight) (domain.Route, error)
+	deleteRouteFn     func(ctx context.Context, team, modelName string) error
 	circuitStatesFn   func(modelNameFilter string) []domain.CircuitSnapshot
 
 	// last* capture what the handler passed the service, so a test can assert the
 	// proto→domain conversion AND the server-authoritative identity sourcing.
 	lastPrincipal domain.Principal
 	lastInput     domain.PredictInput
+
+	// lastTeam records the team the handler threaded into the LAST control-plane /
+	// GetRoute call — the value that namespaces the route (the IDOR fix). A test
+	// asserts it came from the verified claims, never a request field.
+	lastTeam string
 
 	// allInputs records EVERY PredictInput the handler forwarded, in call order.
 	// The bulk paths (BatchPredict / StreamPredict) call Predict once per item, so
@@ -100,20 +105,25 @@ func (m *mockInferenceService) Predict(ctx context.Context, p domain.Principal, 
 	m.allInputs = append(m.allInputs, in)
 	return m.predictFn(ctx, p, in)
 }
-func (m *mockInferenceService) GetRoute(ctx context.Context, modelName string) (domain.Route, error) {
-	return m.getRouteFn(ctx, modelName)
+func (m *mockInferenceService) GetRoute(ctx context.Context, team, modelName string) (domain.Route, error) {
+	m.lastTeam = team
+	return m.getRouteFn(ctx, team, modelName)
 }
-func (m *mockInferenceService) ListRoutes(ctx context.Context, opts domain.ListOptions) ([]domain.Route, string, error) {
-	return m.listRoutesFn(ctx, opts)
+func (m *mockInferenceService) ListRoutes(ctx context.Context, team string, opts domain.ListOptions) ([]domain.Route, string, error) {
+	m.lastTeam = team
+	return m.listRoutesFn(ctx, team, opts)
 }
-func (m *mockInferenceService) UpsertRoute(ctx context.Context, modelName string, proposed []domain.ProposedTarget) (domain.Route, error) {
-	return m.upsertRouteFn(ctx, modelName, proposed)
+func (m *mockInferenceService) UpsertRoute(ctx context.Context, team, modelName string, proposed []domain.ProposedTarget) (domain.Route, error) {
+	m.lastTeam = team
+	return m.upsertRouteFn(ctx, team, modelName, proposed)
 }
-func (m *mockInferenceService) SetTrafficSplit(ctx context.Context, modelName string, weights []domain.TrafficWeight) (domain.Route, error) {
-	return m.setTrafficSplitFn(ctx, modelName, weights)
+func (m *mockInferenceService) SetTrafficSplit(ctx context.Context, team, modelName string, weights []domain.TrafficWeight) (domain.Route, error) {
+	m.lastTeam = team
+	return m.setTrafficSplitFn(ctx, team, modelName, weights)
 }
-func (m *mockInferenceService) DeleteRoute(ctx context.Context, modelName string) error {
-	return m.deleteRouteFn(ctx, modelName)
+func (m *mockInferenceService) DeleteRoute(ctx context.Context, team, modelName string) error {
+	m.lastTeam = team
+	return m.deleteRouteFn(ctx, team, modelName)
 }
 func (m *mockInferenceService) CircuitStates(modelNameFilter string) []domain.CircuitSnapshot {
 	return m.circuitStatesFn(modelNameFilter)
@@ -688,7 +698,7 @@ func TestUnary_NilService_Unimplemented(t *testing.T) {
 
 func TestGetModelInfo_ProjectsCallerViewNoEndpoints(t *testing.T) {
 	mock := &mockInferenceService{
-		getRouteFn: func(_ context.Context, _ string) (domain.Route, error) {
+		getRouteFn: func(_ context.Context, _, _ string) (domain.Route, error) {
 			return domain.Route{
 				ModelName: "m",
 				UpdatedAt: time.Unix(1700000000, 0),
@@ -722,7 +732,7 @@ func TestGetModelInfo_ProjectsCallerViewNoEndpoints(t *testing.T) {
 
 func TestGetModelInfo_NoRoute_NotFound(t *testing.T) {
 	mock := &mockInferenceService{
-		getRouteFn: func(context.Context, string) (domain.Route, error) { return domain.Route{}, domain.ErrNoRoute },
+		getRouteFn: func(context.Context, string, string) (domain.Route, error) { return domain.Route{}, domain.ErrNoRoute },
 	}
 	client := newClient(t, mock)
 	_, err := client.GetModelInfo(ctxWithClaims(context.Background(), predictClaims()), &inferencev1.GetModelInfoRequest{ModelName: "ghost"})
@@ -735,7 +745,7 @@ func TestGetModelInfo_NoRoute_NotFound(t *testing.T) {
 
 func TestGetRoute_RequiresAdminScope(t *testing.T) {
 	mock := &mockInferenceService{
-		getRouteFn: func(context.Context, string) (domain.Route, error) {
+		getRouteFn: func(context.Context, string, string) (domain.Route, error) {
 			t.Fatal("GetRoute service must not run for an unauthorized caller")
 			return domain.Route{}, nil
 		},
@@ -748,7 +758,7 @@ func TestGetRoute_RequiresAdminScope(t *testing.T) {
 
 func TestGetRoute_HappyPath_OperatorViewHasEndpoints(t *testing.T) {
 	mock := &mockInferenceService{
-		getRouteFn: func(_ context.Context, _ string) (domain.Route, error) {
+		getRouteFn: func(_ context.Context, _, _ string) (domain.Route, error) {
 			return domain.Route{
 				ModelName: "m",
 				UpdatedAt: time.Unix(1700000000, 0),
@@ -772,10 +782,73 @@ func TestGetRoute_HappyPath_OperatorViewHasEndpoints(t *testing.T) {
 	}
 }
 
+// TestControlPlane_TeamComesFromClaimsNotRequest is the handler-level guard for the
+// cross-tenant route IDOR fix: the team that namespaces every control-plane / route
+// operation MUST be sourced from the verified claims (Principal.Team), never from a
+// request field a caller could spoof. The request carries NO team field at all (the
+// proto has none), so the only place team can come from is the token. We assert
+// that the team the handler threaded into the domain equals the CLAIMS team, across
+// GetRoute / ListRoutes / UpsertRoute / SetTrafficSplit / DeleteRoute. adminClaims()
+// has Team "platform"; a caller from a DIFFERENT team would namespace differently
+// and so could never reach another team's route.
+func TestControlPlane_TeamComesFromClaimsNotRequest(t *testing.T) {
+	route := domain.Route{OwnerTeam: "platform", ModelName: "m", Targets: []domain.RouteTarget{{Version: "v1", Endpoint: "e:9090", WeightBps: 10000, Status: domain.TargetStatusActive}}}
+	mock := &mockInferenceService{
+		getRouteFn: func(_ context.Context, _, _ string) (domain.Route, error) { return route, nil },
+		listRoutesFn: func(_ context.Context, _ string, _ domain.ListOptions) ([]domain.Route, string, error) {
+			return []domain.Route{route}, "", nil
+		},
+		upsertRouteFn: func(_ context.Context, _, _ string, _ []domain.ProposedTarget) (domain.Route, error) {
+			return route, nil
+		},
+		setTrafficSplitFn: func(_ context.Context, _, _ string, _ []domain.TrafficWeight) (domain.Route, error) {
+			return route, nil
+		},
+		deleteRouteFn: func(_ context.Context, _, _ string) error { return nil },
+	}
+	client := newClient(t, mock)
+	ctx := ctxWithClaims(context.Background(), adminClaims()) // Team: "platform"
+
+	if _, err := client.GetRoute(ctx, &inferencev1.GetRouteRequest{ModelName: "m"}); err != nil {
+		t.Fatalf("GetRoute: %v", err)
+	}
+	if mock.lastTeam != "platform" {
+		t.Fatalf("GetRoute threaded team %q, want the claims team %q", mock.lastTeam, "platform")
+	}
+
+	if _, err := client.ListRoutes(ctx, &inferencev1.ListRoutesRequest{}); err != nil {
+		t.Fatalf("ListRoutes: %v", err)
+	}
+	if mock.lastTeam != "platform" {
+		t.Fatalf("ListRoutes threaded team %q, want %q", mock.lastTeam, "platform")
+	}
+
+	if _, err := client.UpsertRoute(ctx, &inferencev1.UpsertRouteRequest{ModelName: "m", Targets: []*inferencev1.RouteTarget{{Version: "v1", WeightBps: 10000}}}); err != nil {
+		t.Fatalf("UpsertRoute: %v", err)
+	}
+	if mock.lastTeam != "platform" {
+		t.Fatalf("UpsertRoute threaded team %q, want %q", mock.lastTeam, "platform")
+	}
+
+	if _, err := client.SetTrafficSplit(ctx, &inferencev1.SetTrafficSplitRequest{ModelName: "m", Weights: []*inferencev1.TrafficWeight{{Version: "v1", WeightBps: 10000}}}); err != nil {
+		t.Fatalf("SetTrafficSplit: %v", err)
+	}
+	if mock.lastTeam != "platform" {
+		t.Fatalf("SetTrafficSplit threaded team %q, want %q", mock.lastTeam, "platform")
+	}
+
+	if _, err := client.DeleteRoute(ctx, &inferencev1.DeleteRouteRequest{ModelName: "m"}); err != nil {
+		t.Fatalf("DeleteRoute: %v", err)
+	}
+	if mock.lastTeam != "platform" {
+		t.Fatalf("DeleteRoute threaded team %q, want %q", mock.lastTeam, "platform")
+	}
+}
+
 func TestUpsertRoute_DropsClientEndpointAndStatus(t *testing.T) {
 	var gotProposed []domain.ProposedTarget
 	mock := &mockInferenceService{
-		upsertRouteFn: func(_ context.Context, _ string, proposed []domain.ProposedTarget) (domain.Route, error) {
+		upsertRouteFn: func(_ context.Context, _, _ string, proposed []domain.ProposedTarget) (domain.Route, error) {
 			gotProposed = proposed
 			return domain.Route{ModelName: "m", Targets: []domain.RouteTarget{{Version: "v1", Endpoint: "server-resolved:9090", WeightBps: 10000, Status: domain.TargetStatusActive}}}, nil
 		},
@@ -802,7 +875,7 @@ func TestUpsertRoute_DropsClientEndpointAndStatus(t *testing.T) {
 
 func TestUpsertRoute_DomainValidation_InvalidArgument(t *testing.T) {
 	mock := &mockInferenceService{
-		upsertRouteFn: func(context.Context, string, []domain.ProposedTarget) (domain.Route, error) {
+		upsertRouteFn: func(context.Context, string, string, []domain.ProposedTarget) (domain.Route, error) {
 			return domain.Route{}, fmt.Errorf("%w: active weights sum to 9000, want 10000", domain.ErrRouteValidation)
 		},
 	}
@@ -821,7 +894,7 @@ func TestSetTrafficSplit_ConversionAndNoRoute(t *testing.T) {
 	t.Run("happy path conversion", func(t *testing.T) {
 		var gotWeights []domain.TrafficWeight
 		mock := &mockInferenceService{
-			setTrafficSplitFn: func(_ context.Context, _ string, w []domain.TrafficWeight) (domain.Route, error) {
+			setTrafficSplitFn: func(_ context.Context, _, _ string, w []domain.TrafficWeight) (domain.Route, error) {
 				gotWeights = w
 				return domain.Route{ModelName: "m"}, nil
 			},
@@ -841,7 +914,7 @@ func TestSetTrafficSplit_ConversionAndNoRoute(t *testing.T) {
 
 	t.Run("no route maps to NotFound", func(t *testing.T) {
 		mock := &mockInferenceService{
-			setTrafficSplitFn: func(context.Context, string, []domain.TrafficWeight) (domain.Route, error) {
+			setTrafficSplitFn: func(context.Context, string, string, []domain.TrafficWeight) (domain.Route, error) {
 				return domain.Route{}, domain.ErrNoRoute
 			},
 		}
@@ -857,7 +930,7 @@ func TestSetTrafficSplit_ConversionAndNoRoute(t *testing.T) {
 func TestDeleteRoute_Idempotent(t *testing.T) {
 	called := 0
 	mock := &mockInferenceService{
-		deleteRouteFn: func(context.Context, string) error { called++; return nil },
+		deleteRouteFn: func(context.Context, string, string) error { called++; return nil },
 	}
 	client := newClient(t, mock)
 	for i := 0; i < 2; i++ {
@@ -941,7 +1014,7 @@ func TestListCircuitStates_ConversionAndFilter(t *testing.T) {
 func TestListRoutes_PageSizeCapAndConversion(t *testing.T) {
 	var gotOpts domain.ListOptions
 	mock := &mockInferenceService{
-		listRoutesFn: func(_ context.Context, opts domain.ListOptions) ([]domain.Route, string, error) {
+		listRoutesFn: func(_ context.Context, _ string, opts domain.ListOptions) ([]domain.Route, string, error) {
 			gotOpts = opts
 			return []domain.Route{{ModelName: "m"}}, "next-cursor", nil
 		},

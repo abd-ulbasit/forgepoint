@@ -152,7 +152,10 @@ secrets:
   # MUST be >= 32 bytes (pkg/auth enforces the RFC 7518 §3.2 floor) and MUST equal
   # fp-auth's secrets.jwtSecret so tokens Auth mints verify here. In prod this comes
   # from a managed secret store (External Secrets / Sealed Secrets), never git.
-  jwtSecret: "dev-only-change-me-in-prod-min-32-bytes-of-entropy"
+  # EMPTY BY DEFAULT (fail-closed): the secret template guard rejects an empty,
+  # short (<32B), or the old dev-only placeholder key, so `helm install` ERRORS
+  # until you supply a real key (--set, a non-committed -f, or secrets.existingSecret).
+  jwtSecret: ""
 
 # ----------------------------------------------------------------------------
 # Migrations — DISABLED: this service has NO Postgres database.

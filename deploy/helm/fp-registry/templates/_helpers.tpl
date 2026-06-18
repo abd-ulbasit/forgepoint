@@ -118,3 +118,28 @@ exact same image string.
 {{- $tag := default .Chart.AppVersion .Values.image.tag -}}
 {{- printf "%s:%s" .Values.image.repository $tag -}}
 {{- end -}}
+
+{{/*
+fp-registry.validateJwtSecret — fail-closed validation for the shared HMAC-SHA256 key.
+
+WHY a helper (not a bare `required`): `required` only catches an empty/nil
+value. The real security bug we are closing is a *predictable* key sneaking into
+prod, so this also (a) rejects the committed dev-only placeholder string and
+(b) enforces the >= 32-byte minimum pkg/auth demands for HS256. Centralizing it
+here means every render path that needs the key gets the identical guard.
+
+INTERVIEW NOTE: HS256 is symmetric — the same secret signs AND verifies. A leaked
+or guessable key lets an attacker forge tokens for ANY identity, so the chart must
+refuse to install with a weak/default key rather than ship a usable one. Returns
+the validated key so call sites do `{{ include "fp-registry.validateJwtSecret" . | quote }}`.
+*/}}
+{{- define "fp-registry.validateJwtSecret" -}}
+{{- $s := required "secrets.jwtSecret must be set (>=32 bytes; supply via --set, a non-committed -f, or secrets.existingSecret backed by an external secret store) and MUST match fp-auth's signing key" .Values.secrets.jwtSecret -}}
+{{- if eq $s "dev-only-change-me-in-prod-min-32-bytes-of-entropy" -}}
+{{- fail "secrets.jwtSecret is the committed dev-only placeholder; set a real, high-entropy >=32-byte HMAC-SHA256 key" -}}
+{{- end -}}
+{{- if lt (len $s) 32 -}}
+{{- fail (printf "secrets.jwtSecret must be >=32 bytes for HS256 (got %d bytes)" (len $s)) -}}
+{{- end -}}
+{{- $s -}}
+{{- end -}}

@@ -1,11 +1,13 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"google.golang.org/protobuf/encoding/protojson"
@@ -20,10 +22,154 @@ import (
 type PipelinesHandler struct {
 	pipeline PipelineClient
 	logger   *slog.Logger
+	// sse bounds concurrent WatchExecution relays (DoS guard — see sseLimiter).
+	sse *sseLimiter
 }
 
-func NewPipelinesHandler(pipeline PipelineClient, logger *slog.Logger) *PipelinesHandler {
-	return &PipelinesHandler{pipeline: pipeline, logger: logger}
+func NewPipelinesHandler(pipeline PipelineClient, logger *slog.Logger, limits SSELimits) *PipelinesHandler {
+	return &PipelinesHandler{
+		pipeline: pipeline,
+		logger:   logger,
+		sse:      newSSELimiter(limits),
+	}
+}
+
+// ============================================================================
+// SSE CONCURRENCY LIMITER — bounds the gRPC-amplification DoS surface
+// ============================================================================
+//
+// THREAT: /executions/{id}/watch is authenticated but unbounded. One client can
+// open thousands of EventSource connections; each opens a long-lived upstream
+// gRPC WatchExecution stream against the orchestrator. A handful of authenticated
+// users can thus pin a huge number of streams/goroutines/conns on a downstream
+// they don't otherwise control — an authenticated DoS amplified through the BFF.
+//
+// DEFENSE (three independent bounds, all configurable via pkg/config):
+//
+//	1. GLOBAL cap (counted semaphore): a buffered channel of MaxGlobal tokens.
+//	   acquire() does a NON-BLOCKING send; a full channel means the process is at
+//	   its ceiling, so we 429 immediately rather than queue (queuing would just
+//	   move the resource exhaustion into the BFF's own goroutines). This is the
+//	   classic Go "semaphore = buffered channel" idiom.
+//	2. PER-USER cap (keyed counter): a map[subject]int under a mutex. Without it,
+//	   one user could consume the entire global budget and starve everyone else.
+//	   Keyed on the JWT subject (the token's "sub") so it is per-identity, not
+//	   per-connection (which the attacker controls).
+//	3. ABSOLUTE LIFETIME (in Watch, not here): even a well-behaved-looking client
+//	   that answers every heartbeat keeps its slot forever. A hard max lifetime
+//	   reaps any single stream after MaxLifetime so a slot cannot be held
+//	   indefinitely. This is the backstop the heartbeat-liveness check cannot
+//	   provide (a slow-loris that keeps the TCP write side healthy never trips the
+//	   heartbeat failure path).
+//
+// WHY a release() func instead of exposing the internals: acquire returns a
+// single idempotent release closure the handler defers. It decrements BOTH the
+// per-user counter and returns the global token, and a sync.Once guards against a
+// double-release (e.g. if a future refactor calls it twice). One acquire = one
+// release, symmetric and leak-free.
+
+// SSELimits is the configurable budget for concurrent SSE relays. Zero/negative
+// values disable the corresponding bound (useful in tests and for opt-out), so a
+// caller that does not set limits gets an unlimited limiter rather than one that
+// rejects everything.
+type SSELimits struct {
+	MaxGlobal   int           // total concurrent SSE streams across all users (<=0 = unlimited)
+	MaxPerUser  int           // concurrent SSE streams per token subject (<=0 = unlimited)
+	MaxLifetime time.Duration // hard ceiling on a single stream's lifetime (<=0 = unbounded)
+}
+
+// sseLimiter enforces the global + per-user caps. It is safe for concurrent use.
+type sseLimiter struct {
+	limits SSELimits
+	// global is the counted semaphore: cap == MaxGlobal, one token per live
+	// stream. nil when MaxGlobal <= 0 (unlimited), in which case acquire skips it.
+	global chan struct{}
+
+	mu      sync.Mutex
+	perUser map[string]int // subject -> live stream count
+}
+
+func newSSELimiter(limits SSELimits) *sseLimiter {
+	l := &sseLimiter{limits: limits, perUser: make(map[string]int)}
+	if limits.MaxGlobal > 0 {
+		l.global = make(chan struct{}, limits.MaxGlobal)
+	}
+	return l
+}
+
+// acquire reserves a stream slot for the given user subject. It returns a release
+// func and ok=true on success; ok=false (and a nil release) when EITHER the global
+// or the per-user cap is already saturated — the caller then returns 429.
+//
+// ORDER MATTERS: we take the per-user slot first (cheap, under the mutex), then
+// the global token. If the global send fails we must hand the per-user slot back
+// before returning, otherwise a rejected request would leak a per-user count.
+func (l *sseLimiter) acquire(subject string) (release func(), ok bool) {
+	// Per-user reservation under the lock.
+	if l.limits.MaxPerUser > 0 {
+		l.mu.Lock()
+		if l.perUser[subject] >= l.limits.MaxPerUser {
+			l.mu.Unlock()
+			return nil, false
+		}
+		l.perUser[subject]++
+		l.mu.Unlock()
+	}
+
+	// Global reservation: non-blocking send into the counted semaphore.
+	if l.global != nil {
+		select {
+		case l.global <- struct{}{}:
+			// got a global token
+		default:
+			// Global budget exhausted — undo the per-user reservation we just took.
+			l.releaseUser(subject)
+			return nil, false
+		}
+	}
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			if l.global != nil {
+				<-l.global // return the global token
+			}
+			l.releaseUser(subject)
+		})
+	}, true
+}
+
+// releaseUser decrements (and prunes) the per-user counter.
+func (l *sseLimiter) releaseUser(subject string) {
+	if l.limits.MaxPerUser <= 0 {
+		return
+	}
+	l.mu.Lock()
+	if l.perUser[subject] <= 1 {
+		delete(l.perUser, subject) // keep the map from growing unbounded
+	} else {
+		l.perUser[subject]--
+	}
+	l.mu.Unlock()
+}
+
+// sseSubject derives the per-user limiter key from the request's forwarded token.
+// It prefers the JWT subject ("sub") so the cap is per-IDENTITY. If the token is
+// absent or not a decodable JWT, it falls back to the raw token string (still a
+// per-credential key) and finally to a fixed "anonymous" bucket — so the per-user
+// cap is NEVER silently bypassed by an unusual token shape. The BFF does not
+// verify the signature here (it never does — see auth.go); an attacker forging a
+// "sub" only changes which bucket they fall in, not whether they are bounded, and
+// every bucket is capped, so spoofing the key cannot escape the limit.
+func sseSubject(r *http.Request) string {
+	tok := httpx.TokenFromContext(r.Context())
+	if tok == "" {
+		return "anonymous"
+	}
+	if claims, ok := decodeJWTClaims(tok); ok && claims.Sub != "" {
+		return claims.Sub
+	}
+	return tok
 }
 
 // List handles GET /api/v1/pipelines.
@@ -187,6 +333,28 @@ func (h *PipelinesHandler) Watch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// SSE RESOURCE CAP (security fix): reserve a stream slot BEFORE we open the
+	// upstream gRPC stream, so a flood is rejected at the door rather than after it
+	// has already amplified into a downstream stream. We key the per-user cap on
+	// the token subject (the JWT "sub"); sseSubject falls back to the raw token if
+	// the JWT can't be decoded, so the per-user bound still applies to a malformed
+	// or opaque token. On saturation we return 429 (Too Many Requests) — the
+	// correct status for "you've hit a rate/concurrency limit", distinct from a 503
+	// (server overloaded). We have NOT written the 200 stream header yet, so a plain
+	// JSON error is still valid here.
+	release, ok := h.sse.acquire(sseSubject(r))
+	if !ok {
+		h.logger.Warn("sse stream rejected — concurrency cap reached",
+			slog.String("execution_id", r.PathValue("id")),
+		)
+		w.Header().Set("Retry-After", "5") // hint the client to back off
+		httpx.WriteError(w, http.StatusTooManyRequests, "too many concurrent watch streams")
+		return
+	}
+	// One acquire = one release. Defer guarantees the slot is returned on EVERY
+	// exit path (early error, EOF, disconnect, lifetime expiry, panic-unwind).
+	defer release()
+
 	// http.ResponseController exposes per-write deadlines on the underlying
 	// net.Conn. http.NewResponseController works with both http.ResponseWriter
 	// and the http.Flusher we already checked above. SetWriteDeadline is a
@@ -207,6 +375,19 @@ func (h *PipelinesHandler) Watch(w http.ResponseWriter, r *http.Request) {
 	// so the upstream gRPC stream both authenticates the user AND tears down when
 	// the browser goes away.
 	ctx := httpx.ContextWithToken(r.Context())
+
+	// ABSOLUTE LIFETIME CAP (security fix): bound how long THIS single stream may
+	// live, regardless of client behavior. The heartbeat detects a DEAD peer, but a
+	// peer that stays alive and answers every ping would otherwise hold its slot
+	// forever. A context.WithTimeout reaps the stream after MaxLifetime: the ctx
+	// cancels, stream.Recv() unblocks with ctx.Err(), the loop's <-ctx.Done() case
+	// fires, and the deferred release() frees the slot. Skipped when MaxLifetime
+	// <= 0 (unbounded — preserves prior behavior for callers that opt out).
+	if h.sse.limits.MaxLifetime > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, h.sse.limits.MaxLifetime)
+		defer cancel()
+	}
 
 	stream, err := h.pipeline.WatchExecution(ctx, &pipelinev1.WatchExecutionRequest{
 		ExecutionId:         r.PathValue("id"),

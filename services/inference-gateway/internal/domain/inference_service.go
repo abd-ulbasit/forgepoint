@@ -65,28 +65,39 @@ type InferenceService interface {
 	// -----------------------------------------------------------------------
 
 	// GetRoute returns the current routing-table entry for a model (operator view,
-	// includes endpoints). ErrNoRoute if absent.
-	GetRoute(ctx context.Context, modelName string) (Route, error)
+	// includes endpoints). ErrNoRoute if absent OR owned by a different team.
+	//
+	// TENANCY (cross-tenant IDOR fix): team comes from the caller's verified claims;
+	// the route is looked up under (team, modelName). A route owned by another team
+	// is reported as ErrNoRoute — identical to "doesn't exist" — so there is NO
+	// existence oracle that would let team A confirm team B owns a given name.
+	GetRoute(ctx context.Context, team, modelName string) (Route, error)
 
-	// ListRoutes returns a page of the whole routing table (operator dashboard).
-	ListRoutes(ctx context.Context, opts ListOptions) (routes []Route, nextToken string, err error)
+	// ListRoutes returns a page of the CALLER'S routing table (operator dashboard),
+	// scoped to team — a team only ever sees its own routes.
+	ListRoutes(ctx context.Context, team string, opts ListOptions) (routes []Route, nextToken string, err error)
 
 	// UpsertRoute creates or replaces a model's route (break-glass manual control;
 	// routes are normally event-driven). SECURITY: only version + weight_bps are
 	// honored from each proposed target; the endpoint is SERVER-RESOLVED from the
 	// existing route (anti-SSRF) and status/updated_at are server-owned. The
 	// weights of ACTIVE targets must sum to 10000 → else ErrRouteValidation.
-	UpsertRoute(ctx context.Context, modelName string, proposed []ProposedTarget) (Route, error)
+	// TENANCY: scoped to team — a caller can only create/replace routes UNDER its
+	// own team, and endpoint resolution reads only that team's existing route.
+	UpsertRoute(ctx context.Context, team, modelName string, proposed []ProposedTarget) (Route, error)
 
 	// SetTrafficSplit adjusts ONLY the version weights of an existing route — the
 	// canary dial (90/10 → 50/50 → 0/100). Each version must already exist in the
 	// route and the new ACTIVE weights must sum to 10000, else ErrRouteValidation.
 	// Narrow by design: a caller cannot smuggle in an endpoint/status change.
-	SetTrafficSplit(ctx context.Context, modelName string, weights []TrafficWeight) (Route, error)
+	// TENANCY: scoped to team; a cross-team model name resolves to ErrNoRoute.
+	SetTrafficSplit(ctx context.Context, team, modelName string, weights []TrafficWeight) (Route, error)
 
 	// DeleteRoute removes a model from routing entirely. Idempotent (deleting an
-	// absent route is a no-op). Subsequent predicts get ErrNoRoute.
-	DeleteRoute(ctx context.Context, modelName string) error
+	// absent route is a no-op). Subsequent predicts get ErrNoRoute. TENANCY: scoped
+	// to team — deleting a name the team does not own is a no-op against ANOTHER
+	// team's route (it only deletes within the caller's own namespace).
+	DeleteRoute(ctx context.Context, team, modelName string) error
 
 	// -----------------------------------------------------------------------
 	// RESILIENCE OBSERVABILITY
@@ -149,29 +160,44 @@ type TrafficWeight struct {
 // while still modeling the exact operation each event triggers.
 
 // ModelDeployed → fp.pipelines.model.deployed. Adds/updates a target.
+//
+// OwnerTeam is the TENANT the deploy belongs to — the team the resulting route is
+// created UNDER. It is server-authoritative (the deploy saga derives it from the
+// model's owning team in the registry, never from a client) and is the value that
+// namespaces the route so a later Predict from that team — and only that team —
+// can reach it. A deploy with an empty owner team lands in the "" namespace, which
+// is intentionally unreachable by any authenticated tenant (see routeKey).
 type ModelDeployed struct {
+	OwnerTeam string // the team that owns the deployed model — namespaces the route (anti cross-tenant IDOR)
 	ModelName string
 	Version   string
 	Endpoint  string // SERVER-resolved by the saga — the only trusted source of a backend address
 	WeightBps int    // initial traffic share (a canary typically deploys small, e.g. 1000)
 }
 
-// ModelUndeployed → fp.pipelines.model.undeployed. Removes a target.
+// ModelUndeployed → fp.pipelines.model.undeployed. Removes a target. OwnerTeam
+// namespaces which team's route the target is removed from — an undeploy for
+// team A must not touch team B's identically-named model.
 type ModelUndeployed struct {
+	OwnerTeam string
 	ModelName string
 	Version   string
 	Reason    string // "rollback"/"superseded"/"scale_to_zero"/"teardown" — for logging, not logic
 }
 
 // ModelPromoted → fp.models.promoted. Repoint traffic to the new production
-// version; tear down the auto-demoted prior one.
+// version; tear down the auto-demoted prior one. OwnerTeam scopes the promotion to
+// the owning team's route.
 type ModelPromoted struct {
+	OwnerTeam      string
 	ModelName      string
 	Version        string // the newly-promoted production version
 	DemotedVersion string // the auto-demoted prior production version (empty if none)
 }
 
-// ModelArchived → fp.models.archived. Drop the whole route.
+// ModelArchived → fp.models.archived. Drop the whole route. OwnerTeam scopes the
+// drop to the owning team's namespace.
 type ModelArchived struct {
+	OwnerTeam string
 	ModelName string
 }

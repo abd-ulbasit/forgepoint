@@ -138,7 +138,10 @@ secrets:
   # refuses to start on a shorter secret). DEV-ONLY placeholder here; in prod this is
   # synced from a managed secret store (External Secrets / Sealed Secrets) so the
   # cluster's services share one key without it touching git.
-  jwtSecret: "dev-only-change-me-in-prod-min-32-bytes-of-entropy"
+  # EMPTY BY DEFAULT (fail-closed): the secret template guard rejects an empty,
+  # short (<32B), or the old dev-only placeholder key, so `helm install` ERRORS
+  # until you supply a real key (--set, a non-committed -f, or secrets.existingSecret).
+  jwtSecret: ""
 
 # ----------------------------------------------------------------------------
 # Migrations — self-contained schema migrations via a migrate initContainer.

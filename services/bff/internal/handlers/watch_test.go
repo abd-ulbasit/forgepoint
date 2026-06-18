@@ -63,7 +63,7 @@ func TestWatch_RelaysSSEFrames(t *testing.T) {
 			}}, nil
 		},
 	}
-	h := NewPipelinesHandler(pipe, testLogger())
+	h := NewPipelinesHandler(pipe, testLogger(), testSSELimits())
 
 	r := requestWithToken(http.MethodGet, "/api/v1/executions/e-42/watch", "watch-tok", nil)
 	r.SetPathValue("id", "e-42")
@@ -103,7 +103,7 @@ func TestWatch_StreamOpenError_MapsHTTPStatus(t *testing.T) {
 			return nil, status.Error(codes.NotFound, "no such execution")
 		},
 	}
-	h := NewPipelinesHandler(pipe, testLogger())
+	h := NewPipelinesHandler(pipe, testLogger(), testSSELimits())
 	r := requestWithToken(http.MethodGet, "/api/v1/executions/missing/watch", "tok", nil)
 	r.SetPathValue("id", "missing")
 	w := serveThroughAuth(h.Watch, r)
@@ -174,7 +174,7 @@ func TestWatch_ClientDisconnect_CancelsUpstreamStream(t *testing.T) {
 			return &blockingWatchStream{streamCtx: ctx}, nil
 		},
 	}
-	h := NewPipelinesHandler(pipe, testLogger())
+	h := NewPipelinesHandler(pipe, testLogger(), testSSELimits())
 
 	// Create a cancellable request context that we control.
 	reqCtx, cancelReq := context.WithCancel(context.Background())

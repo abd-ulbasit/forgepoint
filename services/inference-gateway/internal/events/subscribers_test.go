@@ -354,19 +354,19 @@ func (f *fakeService) ApplyModelArchived(_ context.Context, ev domain.ModelArchi
 func (f *fakeService) Predict(context.Context, domain.Principal, domain.PredictInput) (domain.PredictOutput, error) {
 	panic("Predict not exercised by events tests")
 }
-func (f *fakeService) GetRoute(context.Context, string) (domain.Route, error) {
+func (f *fakeService) GetRoute(context.Context, string, string) (domain.Route, error) {
 	panic("GetRoute not exercised by events tests")
 }
-func (f *fakeService) ListRoutes(context.Context, domain.ListOptions) ([]domain.Route, string, error) {
+func (f *fakeService) ListRoutes(context.Context, string, domain.ListOptions) ([]domain.Route, string, error) {
 	panic("ListRoutes not exercised by events tests")
 }
-func (f *fakeService) UpsertRoute(context.Context, string, []domain.ProposedTarget) (domain.Route, error) {
+func (f *fakeService) UpsertRoute(context.Context, string, string, []domain.ProposedTarget) (domain.Route, error) {
 	panic("UpsertRoute not exercised by events tests")
 }
-func (f *fakeService) SetTrafficSplit(context.Context, string, []domain.TrafficWeight) (domain.Route, error) {
+func (f *fakeService) SetTrafficSplit(context.Context, string, string, []domain.TrafficWeight) (domain.Route, error) {
 	panic("SetTrafficSplit not exercised by events tests")
 }
-func (f *fakeService) DeleteRoute(context.Context, string) error {
+func (f *fakeService) DeleteRoute(context.Context, string, string) error {
 	panic("DeleteRoute not exercised by events tests")
 }
 func (f *fakeService) CircuitStates(string) []domain.CircuitSnapshot {

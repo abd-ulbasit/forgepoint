@@ -729,7 +729,7 @@ func (h *InferenceHandler) GetModelInfo(ctx context.Context, req *inferencev1.Ge
 	if h.svc == nil {
 		return nil, status.Error(codes.Unimplemented, "inference service not wired")
 	}
-	_, claims, err := principalFromContext(ctx)
+	p, claims, err := principalFromContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -739,7 +739,10 @@ func (h *InferenceHandler) GetModelInfo(ctx context.Context, req *inferencev1.Ge
 	if req.GetModelName() == "" {
 		return nil, status.Error(codes.InvalidArgument, "model_name is required")
 	}
-	route, err := h.svc.GetRoute(ctx, req.GetModelName())
+	// TENANCY: scope the lookup to the caller's own team (from verified claims) so a
+	// caller can only see its OWN model's info; another team's identically-named
+	// model resolves to NotFound (no cross-tenant read, no existence oracle).
+	route, err := h.svc.GetRoute(ctx, p.Team, req.GetModelName())
 	if err != nil {
 		return nil, statusFromDomainErr(err)
 	}
@@ -773,7 +776,7 @@ func (h *InferenceHandler) GetRoute(ctx context.Context, req *inferencev1.GetRou
 	if h.svc == nil {
 		return nil, status.Error(codes.Unimplemented, "inference service not wired")
 	}
-	_, claims, err := principalFromContext(ctx)
+	p, claims, err := principalFromContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -783,7 +786,10 @@ func (h *InferenceHandler) GetRoute(ctx context.Context, req *inferencev1.GetRou
 	if req.GetModelName() == "" {
 		return nil, status.Error(codes.InvalidArgument, "model_name is required")
 	}
-	route, err := h.svc.GetRoute(ctx, req.GetModelName())
+	// TENANCY: even an admin-scoped caller is scoped to its OWN team's routes — the
+	// admin scope gates the operator VIEW (endpoints/status), not cross-tenant
+	// reach. A route owned by another team is NotFound (no oracle).
+	route, err := h.svc.GetRoute(ctx, p.Team, req.GetModelName())
 	if err != nil {
 		return nil, statusFromDomainErr(err)
 	}
@@ -797,7 +803,7 @@ func (h *InferenceHandler) ListRoutes(ctx context.Context, req *inferencev1.List
 	if h.svc == nil {
 		return nil, status.Error(codes.Unimplemented, "inference service not wired")
 	}
-	_, claims, err := principalFromContext(ctx)
+	p, claims, err := principalFromContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -805,7 +811,9 @@ func (h *InferenceHandler) ListRoutes(ctx context.Context, req *inferencev1.List
 		return nil, err
 	}
 	opts := paginationToOptions(req.GetPagination())
-	routes, nextToken, err := h.svc.ListRoutes(ctx, opts)
+	// TENANCY: list only the caller's own team's routes (the domain filters the page
+	// by OwnerTeam) — a team never enumerates another team's models or endpoints.
+	routes, nextToken, err := h.svc.ListRoutes(ctx, p.Team, opts)
 	if err != nil {
 		return nil, statusFromDomainErr(err)
 	}
@@ -831,7 +839,7 @@ func (h *InferenceHandler) UpsertRoute(ctx context.Context, req *inferencev1.Ups
 	if h.svc == nil {
 		return nil, status.Error(codes.Unimplemented, "inference service not wired")
 	}
-	_, claims, err := principalFromContext(ctx)
+	p, claims, err := principalFromContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -854,7 +862,11 @@ func (h *InferenceHandler) UpsertRoute(ctx context.Context, req *inferencev1.Ups
 			WeightBps: int(t.GetWeightBps()),
 		})
 	}
-	route, err := h.svc.UpsertRoute(ctx, req.GetModelName(), proposed)
+	// TENANCY: the write is scoped to the caller's own team — it creates/replaces a
+	// route UNDER p.Team and resolves endpoints only from that team's existing
+	// route, so a caller can neither overwrite nor SSRF-resolve against another
+	// team's route of the same name.
+	route, err := h.svc.UpsertRoute(ctx, p.Team, req.GetModelName(), proposed)
 	if err != nil {
 		return nil, statusFromDomainErr(err)
 	}
@@ -870,7 +882,7 @@ func (h *InferenceHandler) SetTrafficSplit(ctx context.Context, req *inferencev1
 	if h.svc == nil {
 		return nil, status.Error(codes.Unimplemented, "inference service not wired")
 	}
-	_, claims, err := principalFromContext(ctx)
+	p, claims, err := principalFromContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -890,7 +902,9 @@ func (h *InferenceHandler) SetTrafficSplit(ctx context.Context, req *inferencev1
 			WeightBps: int(w.GetWeightBps()),
 		})
 	}
-	route, err := h.svc.SetTrafficSplit(ctx, req.GetModelName(), weights)
+	// TENANCY: reweight only within the caller's own team namespace; another team's
+	// model name resolves to NotFound (ErrNoRoute).
+	route, err := h.svc.SetTrafficSplit(ctx, p.Team, req.GetModelName(), weights)
 	if err != nil {
 		return nil, statusFromDomainErr(err)
 	}
@@ -904,7 +918,7 @@ func (h *InferenceHandler) DeleteRoute(ctx context.Context, req *inferencev1.Del
 	if h.svc == nil {
 		return nil, status.Error(codes.Unimplemented, "inference service not wired")
 	}
-	_, claims, err := principalFromContext(ctx)
+	p, claims, err := principalFromContext(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -914,7 +928,10 @@ func (h *InferenceHandler) DeleteRoute(ctx context.Context, req *inferencev1.Del
 	if req.GetModelName() == "" {
 		return nil, status.Error(codes.InvalidArgument, "model_name is required")
 	}
-	if err := h.svc.DeleteRoute(ctx, req.GetModelName()); err != nil {
+	// TENANCY: delete only within the caller's own team namespace — a name another
+	// team owns is untouched (the delete is a no-op against this team's absent
+	// route), so a caller can never destroy another team's route.
+	if err := h.svc.DeleteRoute(ctx, p.Team, req.GetModelName()); err != nil {
 		return nil, statusFromDomainErr(err)
 	}
 	return &inferencev1.DeleteRouteResponse{}, nil

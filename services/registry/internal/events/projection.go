@@ -92,6 +92,33 @@ type ProjectionWriter interface {
 	GetVersionByID(ctx context.Context, id string) (domain.ModelVersion, error)
 }
 
+// ModelReader is the narrow read-back port the projection uses to hydrate a model's
+// FULL field set from the WRITE store (the source of truth) when an event payload is
+// "thin" — i.e. does not carry every field the read model must serve.
+//
+// WHY THIS EXISTS (the description-dropped fix): the fp.models.registered event schema
+// (eventsv1.ModelRegistered) carries identity + ownership + framework/task_type, but
+// NOT description or tags. So a projection built ONLY from the event would store an
+// empty description, and GET /models/{id} would return "" even though the write store
+// has the real value — the exact bug. Rather than fatten the published event contract
+// (a schema change rippling to every consumer), we use the THIN-EVENT + READ-BACK
+// pattern: the event is the trigger ("model X changed"), and the projection reads
+// model X's authoritative, FIELD-COMPLETE state from the write store and projects
+// that. This keeps the event contract minimal while the read model stays complete.
+//
+// TRADEOFF (interview framing): read-back adds one write-store round-trip per
+// projected register and reintroduces a read of the truth on the projection path
+// (versus a self-contained "fat event"). We accept it here because (a) registers are
+// low-volume relative to the hot query path, (b) it avoids a contract change to a
+// shared event consumed by six services, and (c) the projection is already a
+// server-side, trusted writer (not a tenant query). The fat-event alternative —
+// adding description/tags to ModelRegistered — is the right move IF those fields ever
+// have external consumers; until then, read-back is the smaller, contained fix.
+// *postgres.WriteStore satisfies this via its GetModel(ctx, id) method.
+type ModelReader interface {
+	GetModel(ctx context.Context, id string) (domain.Model, error)
+}
+
 // ProjectionConfig is the resilience policy the wiring layer (main.go) hands the
 // consumer. Zero values get platform defaults via withDefaults so main.go can pass
 // ProjectionConfig{} for standard behavior.
@@ -141,17 +168,26 @@ func (c *ProjectionConfig) withDefaults() {
 type Projection struct {
 	js    jetstream.JetStream
 	store ProjectionWriter
+	// truth reads the FIELD-COMPLETE model from the write store to hydrate fields the
+	// thin event omits (description/tags). May be nil — see hydrateModel: when nil the
+	// projection falls back to the event's fields (the pre-fix behavior), so existing
+	// callers/tests that don't wire a reader still work, just without the enrichment.
+	truth ModelReader
 	cfg   ProjectionConfig
 
 	mu   sync.Mutex
 	subs []*natsutil.Subscriber
 }
 
-// NewProjection builds the projection consumer. main.go injects the JetStream
-// handle and the Redis read store (which satisfies ProjectionWriter).
-func NewProjection(js jetstream.JetStream, store ProjectionWriter, cfg ProjectionConfig) *Projection {
+// NewProjection builds the projection consumer. main.go injects the JetStream handle,
+// the Redis read store (which satisfies ProjectionWriter), and the Postgres write
+// store as the ModelReader read-back source (which satisfies ModelReader via GetModel)
+// so the read model is hydrated FIELD-COMPLETE (description/tags included) — see
+// ModelReader. truth may be nil (the projection then falls back to the thin event's
+// fields), which keeps unit tests that only exercise the projection mechanics simple.
+func NewProjection(js jetstream.JetStream, store ProjectionWriter, truth ModelReader, cfg ProjectionConfig) *Projection {
 	cfg.withDefaults()
-	return &Projection{js: js, store: store, cfg: cfg}
+	return &Projection{js: js, store: store, truth: truth, cfg: cfg}
 }
 
 // durableName derives a JetStream-safe durable name for a subject by replacing the
@@ -247,6 +283,10 @@ func (p *Projection) handleModelRegistered(ctx context.Context, env natsutil.Eve
 		return fmt.Errorf("%w: ModelRegistered with empty model_id (no projection key)", natsutil.ErrProcessingFailed)
 	}
 	registeredAt := ev.GetRegisteredAt().AsTime()
+	// Build the model from the THIN event first (identity + ownership + framework/
+	// task_type), then hydrate the fields the event omits (description, tags) from the
+	// write-store truth. See hydrateModel / ModelReader for why the event can't carry
+	// them and why read-back is the fix.
 	m := domain.Model{
 		ID:        ev.GetModelId(),
 		Name:      ev.GetModelName(),
@@ -257,12 +297,50 @@ func (p *Projection) handleModelRegistered(ctx context.Context, env natsutil.Eve
 		CreatedAt: registeredAt,
 		UpdatedAt: registeredAt,
 	}
+	m = p.hydrateModel(ctx, m)
 	if err := p.store.UpsertModel(ctx, m); err != nil {
 		// Transient (Redis blip) — NAK + retry. The upsert is idempotent, so a retry
 		// after a partial failure is safe.
 		return fmt.Errorf("registry/events: project ModelRegistered %s: %w", ev.GetModelId(), err)
 	}
 	return nil
+}
+
+// hydrateModel fills the FIELD-COMPLETE model from the write-store truth, copying the
+// fields the thin fp.models.registered event does not carry (description, tags) onto
+// the event-derived skeleton so the projected read model is complete (GET /models/{id}
+// returns the real description, not "").
+//
+// FAILURE POSTURE (deliberately best-effort): the read-back is an ENRICHMENT, not the
+// source of identity — the event already carries everything needed to key and serve a
+// basic projection. So if the read-back is unavailable (no ModelReader wired) or the
+// truth row can't be loaded right now (a transient write-store blip, or the rare
+// read-your-write race where the projection consumes the event a hair before the
+// committed row is visible), we keep the event-derived model rather than NAK the whole
+// projection. Result: the model is still projected promptly with its event fields; a
+// missing description self-heals on the next projection of this model (UpdateModel
+// edit, or a stream replay/rebuild). We DO NOT overwrite a non-empty event field with
+// the truth blindly — we only ADD the event-omitted fields, so a future fat-event
+// upgrade that DOES carry description would still win.
+func (p *Projection) hydrateModel(ctx context.Context, m domain.Model) domain.Model {
+	if p.truth == nil {
+		return m
+	}
+	full, err := p.truth.GetModel(ctx, m.ID)
+	if err != nil {
+		// Best-effort: log-free here (the domain/events layer has no logger by design);
+		// keep the event-derived model. The enrichment self-heals on a later projection.
+		return m
+	}
+	// Copy ONLY the fields the thin event omits. Identity/ownership/timestamps stay as
+	// the event stamped them (the event is authoritative for those).
+	if m.Description == "" {
+		m.Description = full.Description
+	}
+	if len(m.Tags) == 0 {
+		m.Tags = full.Tags
+	}
+	return m
 }
 
 // handleModelVersionCreated projects a new version row (PENDING_UPLOAD) AND advances

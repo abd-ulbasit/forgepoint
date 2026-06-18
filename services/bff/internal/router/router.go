@@ -39,6 +39,9 @@ type Config struct {
 	Clients        *clients.Clients
 	Logger         *slog.Logger
 	AllowedOrigins []string
+	// SSELimits bounds the concurrent SSE (WatchExecution) relays. Passed straight
+	// to the pipelines handler so the cap lives with the streaming code it guards.
+	SSELimits handlers.SSELimits
 }
 
 // New builds the fully-wired http.Handler (mux + middleware) for the BFF.
@@ -50,7 +53,7 @@ func New(cfg Config) http.Handler {
 	// (the concrete *ServiceClient satisfies the small interface structurally).
 	authH := handlers.NewAuthHandler(cl.Auth, log)
 	modelsH := handlers.NewModelsHandler(cl.Registry, log)
-	pipelinesH := handlers.NewPipelinesHandler(cl.Pipeline, log)
+	pipelinesH := handlers.NewPipelinesHandler(cl.Pipeline, log, cfg.SSELimits)
 	experimentsH := handlers.NewExperimentsHandler(cl.Experiment, log)
 	monitorsH := handlers.NewMonitorsHandler(cl.Monitor, log)
 	billingH := handlers.NewBillingHandler(cl.Billing, log)

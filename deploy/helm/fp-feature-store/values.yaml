@@ -120,7 +120,10 @@ secrets:
   # are the same managed secret in prod (auth signs with it, feature-store verifies
   # with it). Never commit a real key; this dev placeholder is >= 32 bytes so the
   # validator accepts it locally.
-  jwtSecret: "dev-only-change-me-in-prod-min-32-bytes-of-entropy"
+  # EMPTY BY DEFAULT (fail-closed): the secret template guard rejects an empty,
+  # short (<32B), or the old dev-only placeholder key, so `helm install` ERRORS
+  # until you supply a real key (--set, a non-committed -f, or secrets.existingSecret).
+  jwtSecret: ""
   # Full Postgres DSN the service reads as FP_DATABASE_URL — backs the EventLog
   # (write model) and the OfflineViewStore. Database "fp_featurestore" on the
   # shared Postgres in fp-infra. In prod the password comes from a managed store.

@@ -373,12 +373,21 @@ func pageSizeFromProto(p *commonv1.PaginationRequest) (int, error) {
 	return size, nil
 }
 
-// paginationResponse builds the wire PaginationResponse from a next-page cursor.
-// TotalCount is left 0: the read projection does not compute an exact total on the
-// hot path (an O(N) count would defeat the point of cursor pagination), and the
-// proto documents next_page_token as the authoritative "more pages?" signal.
-func paginationResponse(nextToken string) *commonv1.PaginationResponse {
-	return &commonv1.PaginationResponse{NextPageToken: nextToken}
+// paginationResponse builds the wire PaginationResponse from a next-page cursor plus
+// the total count of the full result set.
+//
+// total is the count of the WHOLE filtered set (not just this page), surfaced as the
+// proto's total_count. The BFF dashboard reads exactly this field (it calls ListModels
+// with page_size=1 to cheaply learn "how many models?"). Leaving it 0 — as an earlier
+// version did — made the dashboard render "0 models" while the list showed the real
+// rows. Callers that genuinely cannot/needn't compute a total pass 0 (the proto's
+// documented "total unknown"); ListModels now passes the real count from the read
+// model, while ListVersions still passes 0 (no consumer needs a version total yet).
+func paginationResponse(nextToken string, total int) *commonv1.PaginationResponse {
+	return &commonv1.PaginationResponse{
+		NextPageToken: nextToken,
+		TotalCount:    int32(total),
+	}
 }
 
 // ============================================================================
@@ -664,8 +673,10 @@ func (h *RegistryHandler) ListModels(ctx context.Context, req *registryv1.ListMo
 		models = append(models, modelToProto(m))
 	}
 	return &registryv1.ListModelsResponse{
-		Models:     models,
-		Pagination: paginationResponse(page.NextToken),
+		Models: models,
+		// Carry the read-model's accurate total so the dashboard tile ("N models")
+		// matches the list. See paginationResponse.
+		Pagination: paginationResponse(page.NextToken, page.Total),
 	}, nil
 }
 
@@ -723,7 +734,8 @@ func (h *RegistryHandler) ListVersions(ctx context.Context, req *registryv1.List
 		versions = append(versions, versionToProto(v))
 	}
 	return &registryv1.ListVersionsResponse{
-		Versions:   versions,
-		Pagination: paginationResponse(page.NextToken),
+		Versions: versions,
+		// total 0: no consumer needs a version total yet (the proto's "total unknown").
+		Pagination: paginationResponse(page.NextToken, page.Total),
 	}, nil
 }

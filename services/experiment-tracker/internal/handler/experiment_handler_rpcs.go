@@ -125,9 +125,46 @@ const (
 // experiments:write capability keeps the model honest and the token small. (If a
 // future requirement needs run-only writers, add scopeRunWrite and accept it in
 // the run RPCs — the helper composition below makes that a one-line change.)
+//
+// ROLE vs SCOPE — the bug this fixes (broken access control, the OTHER way):
+//
+//	Two distinct credential shapes flow through grpcutil.Claims (set by the auth
+//	service's validator, services/auth/internal/authn/validator.go):
+//	  - A human JWT (what the UI/BFF mints at Login) carries Role (the role NAME,
+//	    e.g. "admin"/"engineer"/"viewer") and an EMPTY Scopes slice. Scopes are a
+//	    JWT non-feature here by design: the auth service resolves a JWT's
+//	    permissions FRESH from its role at CheckPermission time and deliberately
+//	    does NOT stuff per-resource scopes into the token (see Login in
+//	    services/auth/internal/domain/auth_service_impl.go — "the role NAME, not
+//	    its permission list, goes in the token").
+//	  - An API key carries Scopes (the per-key grants) and may carry a Role too.
+//
+//	The ORIGINAL gate checked ONLY claims.Scopes. That silently denied EVERY human
+//	JWT caller — including the bootstrap ADMIN whose role is the {*,*} wildcard
+//	grant (services/auth/migrations/001_init_auth_schema.up.sql) — because a JWT's
+//	Scopes is always empty. Symptom: the UI's GET /runs (→ ListRuns) returned
+//	PermissionDenied even for an admin, making the Experiments page unusable.
+//
+//	THE FIX: authorization is satisfied by EITHER the role OR the scope. The admin
+//	role is a platform-wide superuser (the {*,*} grant), so it subsumes every
+//	experiment-tracker capability — read and write — exactly as the billing
+//	service treats claims.Role == "admin" as the authoritative admin signal at the
+//	handler boundary (services/billing/internal/handler/billing_handler_rpcs.go).
+//	Non-admin callers still need the matching experiments:read / experiments:write
+//	scope (e.g. an API key), so this does NOT over-open the surface — it only stops
+//	denying the legitimately-privileged admin role the scope check could never see.
 const (
 	scopeRead  = "experiments:read"
 	scopeWrite = "experiments:write"
+
+	// roleAdmin is the platform superuser role NAME the auth service seeds with the
+	// {*,*} wildcard permission (full platform access). A caller bearing this role
+	// satisfies every authz gate in this service. We match the role by NAME — not
+	// by re-deriving its permissions — because the JWT only carries the name and the
+	// auth service is the source of truth for what "admin" can do; duplicating the
+	// permission grammar here would be a second place to keep in sync. (Mirrors
+	// billing's adminRole constant so admin recognition is identical platform-wide.)
+	roleAdmin = "admin"
 )
 
 // actorFromContext lifts the SERVER-AUTHORITATIVE caller identity from the auth
@@ -177,14 +214,36 @@ func hasScope(claims *grpcutil.Claims, scope string) bool {
 	return false
 }
 
+// hasAdminRole reports whether the caller bears the platform admin role.
+//
+// FAIL-CLOSED like hasScope: nil claims (a call that bypassed the interceptor)
+// are NOT admin. The role string comes from the validated token's Role claim, so
+// a client cannot self-assert "admin" — the auth service set it from the user's
+// assigned role at Login, and the JWT signature protects it from tampering.
+func hasAdminRole(claims *grpcutil.Claims) bool {
+	return claims != nil && claims.Role == roleAdmin
+}
+
 // requireScope returns a PermissionDenied status iff the caller holds NONE of the
-// accepted scopes (an "any-of" check, so a higher tier can subsume a lower one).
+// accepted scopes (an "any-of" check, so a higher tier can subsume a lower one)
+// AND is not the admin role.
+//
+// ADMIN SHORT-CIRCUIT: the admin role is the {*,*} platform superuser, so it
+// satisfies every gate before any scope is consulted. This is what lets a human
+// admin JWT — which carries Role="admin" but an EMPTY Scopes slice (see the
+// ROLE vs SCOPE note on the scope constants) — use read and write RPCs. Without
+// it, the scope-only check would deny the admin (and every JWT human) outright.
 //
 // MESSAGE HYGIENE: the error names the REQUIRED capability so a client can
 // self-diagnose, but NEVER echoes the caller's actual granted scopes — leaking the
 // token's contents back would tell a probing caller exactly what else the
 // principal can (or cannot) do. We name what is needed, not what is held.
 func requireScope(claims *grpcutil.Claims, accepted ...string) error {
+	// Admin subsumes all experiment-tracker capabilities — check it FIRST so the
+	// platform superuser never trips the scope gate.
+	if hasAdminRole(claims) {
+		return nil
+	}
 	for _, s := range accepted {
 		if hasScope(claims, s) {
 			return nil

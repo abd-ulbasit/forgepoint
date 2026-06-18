@@ -517,11 +517,83 @@ func TestListMonitors_TeamScopedWithHealth(t *testing.T) {
 	}
 }
 
-func TestListDriftReports_RequiresModel(t *testing.T) {
+// TestListDriftReports_EmptyModel_ListsAllTeamModels is the regression test for the
+// dashboard "recent drift across the fleet" tile (and the unfiltered Monitoring page).
+//
+// CONTRACT CHANGE: model_name used to be a HARD requirement — an empty value returned
+// ErrValidation (a 400 at the edge), so the BFF, which passes an empty model_name to
+// list everything, got a permanent error and the tile was broken. The fix makes
+// model_name an OPTIONAL filter: empty = list ALL of the caller team's models (newest
+// first); set = narrow to that one model. This test pins BOTH halves of that contract,
+// plus the tenancy guard that empty does NOT mean "unscoped".
+func TestListDriftReports_EmptyModel_ListsAllTeamModels(t *testing.T) {
 	h := newHarness(time.Hour, true)
-	_, _, err := h.svc.ListDriftReports(context.Background(), team, ReportFilter{}, ListOptions{})
-	if !errors.Is(err, ErrValidation) {
-		t.Fatalf("list without model should be ErrValidation, got %v", err)
+	ctx := context.Background()
+
+	// team-a owns TWO models; team-b owns one (the cross-tenant decoy that must stay
+	// invisible to team-a's unfiltered list).
+	repFraud := produceReportFor(t, h, "team-a", "fraud", "a")
+	repChurn := produceReportFor(t, h, "team-a", "churn", "a")
+	repOther := produceReportFor(t, h, "team-b", "fraud", "b")
+
+	// --- EMPTY model_name → ALL of team-a's models (fleet view), team-scoped ---
+	all, _, err := h.svc.ListDriftReports(ctx, "team-a", ReportFilter{}, ListOptions{})
+	if err != nil {
+		t.Fatalf("list-all (empty model) must succeed, got %v", err)
+	}
+	gotIDs := map[string]bool{}
+	for _, r := range all {
+		gotIDs[r.ID] = true
+		if r.OwnerTeam != "team-a" {
+			t.Fatalf("TENANCY: empty-model list returned another team's report %+v", r)
+		}
+	}
+	if !gotIDs[repFraud.ID] || !gotIDs[repChurn.ID] {
+		t.Fatalf("empty-model list must include BOTH of team-a's models; got %v", gotIDs)
+	}
+	if gotIDs[repOther.ID] {
+		t.Fatal("TENANCY: empty-model list leaked team-b's same-named-model report")
+	}
+	if len(all) != 2 {
+		t.Fatalf("team-a fleet history must be exactly its 2 reports, got %d", len(all))
+	}
+
+	// --- SPECIFIC model_name → still narrows to that one model ---
+	onlyFraud, _, err := h.svc.ListDriftReports(ctx, "team-a", ReportFilter{ModelName: "fraud"}, ListOptions{})
+	if err != nil {
+		t.Fatalf("list with specific model must succeed, got %v", err)
+	}
+	if len(onlyFraud) != 1 || onlyFraud[0].ID != repFraud.ID {
+		t.Fatalf("model_name filter must return ONLY that model's report, got %+v", onlyFraud)
+	}
+}
+
+// TestListDriftReports_EmptyModel_PreservesMinSeverity proves the optional min-severity
+// filter still applies on the fleet (empty model_name) path — pagination/severity
+// filtering must survive the contract change.
+func TestListDriftReports_EmptyModel_PreservesMinSeverity(t *testing.T) {
+	h := newHarness(time.Hour, true)
+	ctx := context.Background()
+
+	rep := produceReportFor(t, h, "team-a", "fraud", "a")
+	_ = produceReportFor(t, h, "team-a", "churn", "a")
+
+	// Filter ABOVE the highest severity present → nothing matches even across models.
+	none, _, err := h.svc.ListDriftReports(ctx, "team-a", ReportFilter{MinSeverity: DriftSeverityCritical + 1}, ListOptions{})
+	if err != nil {
+		t.Fatalf("severity-filtered fleet list must succeed, got %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("min-severity above all reports must filter them out on the fleet path, got %d", len(none))
+	}
+
+	// Filter at-or-below the produced report's severity → it is returned.
+	some, _, err := h.svc.ListDriftReports(ctx, "team-a", ReportFilter{MinSeverity: rep.Severity}, ListOptions{})
+	if err != nil {
+		t.Fatalf("severity-filtered fleet list must succeed, got %v", err)
+	}
+	if len(some) == 0 {
+		t.Fatal("min-severity at the report's level must keep it on the fleet path")
 	}
 }
 

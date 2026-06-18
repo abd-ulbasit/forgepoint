@@ -63,7 +63,7 @@ type ListOptions struct {
 // monitor write model is keyed.
 type ReportFilter struct {
 	OwnerTeam   string // REQUIRED, service-set from auth claims (tenant scope)
-	ModelName   string // required by the service (history is always per-model)
+	ModelName   string // OPTIONAL filter: set = one model; empty = all of the team's models
 	MinSeverity DriftSeverity
 	Since       time.Time
 	Until       time.Time

@@ -62,9 +62,11 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -270,7 +272,19 @@ func main() {
 	if scratchDir == "" {
 		scratchDir = filepath.Join(os.TempDir(), "fp-model-serving")
 	}
-	fileFetcher := artifactstore.NewFileFetcher(scratchDir)
+	// WIRE THE ADAPTER-LEVEL TRAVERSAL GUARD (defense in depth under the domain's
+	// ArtifactURIAllowed SSRF check). NewFileFetcher's variadic allowedRoots, when
+	// non-empty, pins every file:// fetch to resolve UNDER one of these absolute
+	// directory roots — so even if a file:// URI slipped past the domain allow-list,
+	// a "file:///etc/shadow" or "file:///mnt/models/../../etc/x" still cannot escape.
+	// Previously this was constructed with NO roots, leaving the guard inert in
+	// production (the bug). We derive the root from the allow-listed bucket URI when
+	// it is itself a file:// location (a PVC/CSI mount), and ALWAYS include the pod's
+	// own scratch dir (the fetcher copies into it and may be asked to re-read it).
+	// An empty/non-file bucket URI (e.g. the s3:// default) leaves only the scratch
+	// dir as the root — still a real restriction, never an empty (inert) one.
+	fileRoots := fileFetcherRoots(cfg.ArtifactBucketURI, scratchDir)
+	fileFetcher := artifactstore.NewFileFetcher(scratchDir, fileRoots...)
 	httpFetcher := artifactstore.NewHTTPFetcher(scratchDir,
 		artifactstore.WithMaxBytes(cfg.MaxArtifactBytes),
 		artifactstore.WithRequestTimeout(60*time.Second),
@@ -532,6 +546,53 @@ func main() {
 	}
 
 	logger.Info("model-serving service stopped cleanly")
+}
+
+// ============================================================================
+// fileFetcherRoots — derive the FileFetcher's allowed filesystem roots
+// ============================================================================
+//
+// The FileFetcher's adapter-level traversal guard (defense in depth under the
+// domain's ArtifactURIAllowed SSRF check) pins every file:// fetch to resolve
+// UNDER one of the returned absolute roots. This helper builds that root set from
+// the pod's config so the guard is NEVER constructed empty (which would silently
+// disable it — the production bug we are fixing).
+//
+//   - scratchDir is ALWAYS a root: the fetcher copies artifacts into it, and it is
+//     a path this process owns, so reads against it are always legitimate.
+//   - bucketURI contributes a root ONLY when it is a file:// location (a PVC or
+//     CSI-mounted bucket the operator allow-listed). For an s3:// / http(s):// /
+//     empty bucket URI there is no filesystem root to add — the scratch-dir root
+//     still applies, so the guard remains active (never inert).
+//
+// Returning at least one root guarantees NewFileFetcher enables the guard.
+func fileFetcherRoots(bucketURI, scratchDir string) []string {
+	roots := []string{scratchDir}
+	if fileRoot, ok := fileRootFromURI(bucketURI); ok {
+		roots = append(roots, fileRoot)
+	}
+	return roots
+}
+
+// fileRootFromURI extracts a filesystem directory root from an allow-list bucket
+// URI when (and only when) it denotes a file:// location. It accepts the same
+// forms as the FileFetcher's own filePathFromURI: a "file:///abs/dir" URI or a
+// bare "/abs/dir" path. Any other scheme (s3://, http(s)://) yields ok=false.
+func fileRootFromURI(bucketURI string) (string, bool) {
+	if bucketURI == "" {
+		return "", false
+	}
+	if strings.HasPrefix(bucketURI, "/") {
+		return filepath.Clean(bucketURI), true // bare absolute path
+	}
+	u, err := url.Parse(bucketURI)
+	if err != nil || u.Scheme != "file" {
+		return "", false
+	}
+	if u.Path == "" {
+		return "", false
+	}
+	return filepath.Clean(u.Path), true
 }
 
 // ============================================================================

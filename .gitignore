@@ -54,3 +54,6 @@ CLAUDE.md
 
 # Compiled service binaries from `go build`/`make build`
 services/*/server
+
+# Playwright MCP browser test artifacts
+.playwright-mcp/

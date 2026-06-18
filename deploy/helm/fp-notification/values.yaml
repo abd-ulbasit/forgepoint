@@ -138,7 +138,10 @@ secrets:
   # auth mints will fail verification here. The service refuses to start if unset
   # (required) or shorter than 32 bytes. DEV-ONLY placeholder; in prod this comes
   # from the same external secret store that holds the auth service's signing key.
-  jwtSecret: "dev-only-change-me-in-prod-min-32-bytes-of-entropy"
+  # EMPTY BY DEFAULT (fail-closed): the secret template guard rejects an empty,
+  # short (<32B), or the old dev-only placeholder key, so `helm install` ERRORS
+  # until you supply a real key (--set, a non-committed -f, or secrets.existingSecret).
+  jwtSecret: ""
 
 # ----------------------------------------------------------------------------
 # Migrations — self-contained schema migrations via a migrate initContainer.

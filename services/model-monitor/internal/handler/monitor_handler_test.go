@@ -950,7 +950,9 @@ func TestListDriftReports_Validation(t *testing.T) {
 		name string
 		req  *monitorv1.ListDriftReportsRequest
 	}{
-		{"missing model_name", &monitorv1.ListDriftReportsRequest{}},
+		// NOTE: an EMPTY model_name is NO LONGER a validation error — it is the valid
+		// "list all of the team's models" (fleet / dashboard) request and must reach the
+		// domain. See TestListDriftReports_EmptyModel_ReachesDomain below.
 		{"unknown min_severity", &monitorv1.ListDriftReportsRequest{ModelName: "m", MinSeverity: monitorv1.DriftSeverity(99)}},
 		{"negative page_size", &monitorv1.ListDriftReportsRequest{ModelName: "m", Pagination: &commonv1.PaginationRequest{PageSize: -1}}},
 		{"since after until", &monitorv1.ListDriftReportsRequest{
@@ -974,6 +976,40 @@ func TestListDriftReports_Validation(t *testing.T) {
 				t.Fatalf("domain ListDriftReports called %d times; want 0", mock.listReportsCalls)
 			}
 		})
+	}
+}
+
+// TestListDriftReports_EmptyModel_ReachesDomain is the edge-side regression for the BFF
+// bug: the BFF/UI calls GET /drift-reports with NO model_name to populate the dashboard
+// "recent drift" tile. The handler used to reject that with InvalidArgument (a 400), so
+// the tile was permanently broken. It must now pass through to the domain with the
+// claim-derived team scope and an EMPTY ModelName (which the domain reads as "all of the
+// team's models").
+func TestListDriftReports_EmptyModel_ReachesDomain(t *testing.T) {
+	mock := &mockMonitorService{
+		listReportsFn: func(ctx context.Context, ownerTeam string, f domain.ReportFilter, opts domain.ListOptions) ([]domain.DriftReport, string, error) {
+			return []domain.DriftReport{{ID: "rep-1", ModelName: "fraud"}, {ID: "rep-2", ModelName: "churn"}}, "", nil
+		},
+	}
+	client := newTestClient(t, mock, true)
+
+	// No ModelName set — the fleet view.
+	resp, err := client.ListDriftReports(authCtx(), &monitorv1.ListDriftReportsRequest{})
+	if err != nil {
+		t.Fatalf("empty model_name must NOT be a 400 — it is the fleet view; got %v", err)
+	}
+	if mock.listReportsCalls != 1 {
+		t.Fatalf("domain must be called exactly once for the fleet view, got %d", mock.listReportsCalls)
+	}
+	// TENANCY preserved: team from claims, model_name empty (list-all within the team).
+	if mock.lastReportFilter.OwnerTeam != testTeam {
+		t.Fatalf("owner_team must come from claims, got %q", mock.lastReportFilter.OwnerTeam)
+	}
+	if mock.lastReportFilter.ModelName != "" {
+		t.Fatalf("empty request model_name must reach the domain empty, got %q", mock.lastReportFilter.ModelName)
+	}
+	if len(resp.GetReports()) != 2 {
+		t.Fatalf("fleet view must return all team reports, got %d", len(resp.GetReports()))
 	}
 }
 

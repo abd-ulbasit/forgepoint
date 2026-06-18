@@ -110,13 +110,29 @@ func (h *DashboardHandler) Dashboard(w http.ResponseWriter, r *http.Request) {
 		defer wg.Done()
 		ctx, cancel := context.WithTimeout(baseCtx, h.perCallTimeout)
 		defer cancel()
-		// page_size 1 — we only need pagination.total_count, not the rows. This
-		// keeps the dashboard cheap (we don't pull every model to count them).
+		// COUNT SOURCE-OF-TRUTH BUG (the fix):
+		//
+		// We previously requested page_size=1 and trusted pagination.total_count.
+		// But the registry's read projection leaves total_count at 0 (it does NOT
+		// compute an exact total — see registry_handler_rpc.go paginationResponse;
+		// the proto even documents total_count "may be -1 if computing the exact
+		// count is expensive"). So the tile read 0 while GET /models listed 3 — the
+		// two views disagreed.
+		//
+		// THE BFF-SIDE FIX (robust against both the broken and the fixed registry):
+		// request a generous page and prefer total_count ONLY when it is a
+		// trustworthy positive value; otherwise fall back to counting the rows the
+		// registry actually returned. modelCount() encodes that precedence. The
+		// registry team is making total_count accurate in parallel — once it does,
+		// total_count > 0 wins and this fallback never fires. Until then, len(rows)
+		// keeps the tile honest. page_size is clamped to the platform max (100), so
+		// for a small platform len(rows) is the true total; a future >100-model
+		// platform will rely on the (by-then-fixed) total_count.
 		resp, err := h.registry.ListModels(ctx, &registryv1.ListModelsRequest{
-			Pagination: &commonPageSize1,
+			Pagination: &commonPageSizeMax,
 		})
 		out.Models = h.tileFromCount("models", err, func() any {
-			return map[string]int32{"total": resp.GetPagination().GetTotalCount()}
+			return map[string]int32{"total": modelCount(resp)}
 		})
 	}()
 
@@ -207,7 +223,28 @@ var dashboardMarshaler = protojson.MarshalOptions{EmitUnpopulated: true, UseProt
 // parsed from the request. They are read-only and shared safely across the
 // concurrent goroutines (no goroutine mutates them).
 var (
-	commonPageSize1  = commonv1.PaginationRequest{PageSize: 1}
 	commonPageSize5  = commonv1.PaginationRequest{PageSize: 5}
 	commonPageSize20 = commonv1.PaginationRequest{PageSize: 20}
+	// commonPageSizeMax requests the platform's max page (100, per common.proto)
+	// so the model-count tile can fall back to len(rows) when the registry's
+	// total_count is unreliable. See the Tile 1 comment.
+	commonPageSizeMax = commonv1.PaginationRequest{PageSize: 100}
 )
+
+// modelCount derives the dashboard's model total from a ListModels response,
+// preferring the registry's authoritative total_count and falling back to the
+// number of rows the registry returned when that count is not trustworthy.
+//
+// WHY the precedence: total_count is the right answer WHEN the registry computes
+// it (it can exceed the current page, e.g. 100 returned but 4 200 total). But the
+// registry currently returns 0 (and the proto reserves -1 for "too expensive to
+// count"), so a non-positive total_count means "no real count available" — in
+// that case the rows we actually received are the best available truth. This
+// makes the BFF correct against today's registry AND forward-compatible with the
+// fix the registry team is shipping (a positive total_count then wins).
+func modelCount(resp *registryv1.ListModelsResponse) int32 {
+	if total := resp.GetPagination().GetTotalCount(); total > 0 {
+		return total
+	}
+	return int32(len(resp.GetModels()))
+}

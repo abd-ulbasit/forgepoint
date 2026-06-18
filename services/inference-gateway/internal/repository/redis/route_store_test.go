@@ -65,7 +65,7 @@ func TestRouteStore_UpsertGet_RoundTripAndNoRoute(t *testing.T) {
 	}
 
 	want := sampleRoute("iris")
-	if err := store.Upsert(ctx, want); err != nil {
+	if err := store.Upsert(ctx, "iris", want); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
 
@@ -92,7 +92,7 @@ func TestRouteStore_MirrorPersistsToRedis(t *testing.T) {
 	ctx := context.Background()
 
 	writer := NewRouteStore(rdb)
-	if err := writer.Upsert(ctx, sampleRoute("fraud")); err != nil {
+	if err := writer.Upsert(ctx, "fraud", sampleRoute("fraud")); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
 
@@ -124,7 +124,7 @@ func TestRouteStore_Delete_IdempotentAndMirror(t *testing.T) {
 	ctx := context.Background()
 	store := NewRouteStore(rdb)
 
-	if err := store.Upsert(ctx, sampleRoute("churn")); err != nil {
+	if err := store.Upsert(ctx, "churn", sampleRoute("churn")); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
 	if err := store.Delete(ctx, "churn"); err != nil {
@@ -156,7 +156,7 @@ func TestRouteStore_SnapshotIsolation(t *testing.T) {
 	ctx := context.Background()
 	store := NewRouteStore(rdb)
 
-	if err := store.Upsert(ctx, sampleRoute("iso")); err != nil {
+	if err := store.Upsert(ctx, "iso", sampleRoute("iso")); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
 
@@ -195,7 +195,7 @@ func TestRouteStore_SnapshotIsolation(t *testing.T) {
 			r := sampleRoute("iso")
 			r.Targets[0].WeightBps = 5000 + (i % 100) // churn the weights
 			r.Targets[1].WeightBps = 5000 - (i % 100)
-			_ = store.Upsert(ctx, r)
+			_ = store.Upsert(ctx, "iso", r)
 		}
 		close(stop)
 	}()
@@ -229,7 +229,7 @@ func TestRouteStore_List_CursorPaginationStable(t *testing.T) {
 	// Insert models m00..m09 (sorted names → deterministic order).
 	for i := 0; i < 10; i++ {
 		name := "m" + pad2(i)
-		if err := store.Upsert(ctx, sampleRoute(name)); err != nil {
+		if err := store.Upsert(ctx, name, sampleRoute(name)); err != nil {
 			t.Fatalf("Upsert %s: %v", name, err)
 		}
 	}
@@ -258,7 +258,7 @@ func TestRouteStore_List_CursorPaginationStable(t *testing.T) {
 		// m05 and m06. A LIMIT/OFFSET pager could skip or duplicate a neighbor; a
 		// name cursor must not. (We insert once.)
 		if pages == 1 {
-			if err := store.Upsert(ctx, sampleRoute("m05x")); err != nil {
+			if err := store.Upsert(ctx, "m05x", sampleRoute("m05x")); err != nil {
 				t.Fatalf("mid-page Upsert: %v", err)
 			}
 		}
@@ -285,7 +285,7 @@ func TestRouteStore_List_DefaultPageSize(t *testing.T) {
 	ctx := context.Background()
 	store := NewRouteStore(rdb)
 	for i := 0; i < 5; i++ {
-		if err := store.Upsert(ctx, sampleRoute("d"+pad2(i))); err != nil {
+		if err := store.Upsert(ctx, "d"+pad2(i), sampleRoute("d"+pad2(i))); err != nil {
 			t.Fatalf("Upsert: %v", err)
 		}
 	}

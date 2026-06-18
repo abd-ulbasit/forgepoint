@@ -379,12 +379,19 @@ func (s *monitorService) ListDriftReports(ctx context.Context, ownerTeam string,
 	if strings.TrimSpace(ownerTeam) == "" {
 		return nil, "", fmt.Errorf("%w: owner_team is required (from auth claims)", ErrValidation)
 	}
-	if strings.TrimSpace(f.ModelName) == "" {
-		return nil, "", fmt.Errorf("%w: model_name is required for drift history", ErrValidation)
-	}
+	// model_name is now an OPTIONAL filter, not a hard requirement. WHY the change:
+	// the dashboard's "recent drift across the fleet" tile and the Monitoring page's
+	// unfiltered list both need a team-wide history with no single model in mind. The
+	// old hard reject made those callers pass an empty model_name and get a 400, so the
+	// tile was permanently broken. TENANCY is still fully enforced below: owner_team is
+	// always set from claims and is the mandatory partition key, so an empty model_name
+	// means "every model THIS team owns", never a cross-tenant read. When model_name IS
+	// provided it still narrows to that one model (a same-named model in another team
+	// stays invisible because owner_team scopes first).
+	//
 	// TENANCY: OVERWRITE the filter's owner_team with the claim-derived value (never
-	// trust a client-supplied OwnerTeam on the filter). Combined with model_name it
-	// scopes the history to this team — a same-named model in another team is invisible.
+	// trust a client-supplied OwnerTeam on the filter). It is the always-present scope;
+	// model_name, when set, narrows within it.
 	f.OwnerTeam = ownerTeam
 	opts = capPage(opts)
 	rs, next, err := s.reports.List(ctx, f, opts)

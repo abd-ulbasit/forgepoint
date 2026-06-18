@@ -392,10 +392,12 @@ func (h *MonitorHandler) ListDriftReports(ctx context.Context, req *monitorv1.Li
 		return nil, err
 	}
 
-	if req.GetModelName() == "" {
-		return nil, status.Error(codes.InvalidArgument, "model_name is required")
-	}
-
+	// model_name is OPTIONAL. An empty value is the team-wide "recent drift across the
+	// fleet" view (the dashboard tile + the unfiltered Monitoring page); a non-empty
+	// value narrows to that one model. Tenancy is unaffected: ownerTeam (from claims) is
+	// always the mandatory scope set on the filter below, so empty model_name lists only
+	// THIS team's reports, never another tenant's. We therefore do NOT reject an empty
+	// model_name here — that hard 400 was the bug that broke the dashboard tile.
 	opts, err := paginationFromProto(req.GetPagination())
 	if err != nil {
 		return nil, err

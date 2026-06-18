@@ -130,7 +130,10 @@ secrets:
   # data (RFC 7518 §3.2 — NewJWTValidator rejects a shorter key at startup).
   # DEV-ONLY placeholder; in prod this comes from the SAME external secret store
   # entry auth reads, never from this committed file.
-  jwtSecret: "dev-only-change-me-in-prod-min-32-bytes-of-entropy"
+  # EMPTY BY DEFAULT (fail-closed): the secret template guard rejects an empty,
+  # short (<32B), or the old dev-only placeholder key, so `helm install` ERRORS
+  # until you supply a real key (--set, a non-committed -f, or secrets.existingSecret).
+  jwtSecret: ""
   # Full Postgres DSN the service reads as FP_DATABASE_URL. The database is
   # "fp_registry" (database-per-service). In prod the password component comes
   # from a managed secret store, not from this file.

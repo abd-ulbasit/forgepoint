@@ -474,6 +474,62 @@ func denyDomainMock(t *testing.T) *mockService {
 	}
 }
 
+// allowDomainMock is the inverse of denyDomainMock: every hook is wired to a
+// benign success (zero values, nil error) so a call that PASSES the authz gate
+// reaches the domain and returns cleanly. Used by the admin tests, where the unit
+// under test is "did authorization let the call through?" — not the domain
+// result. Each hook increments calls via the mockService methods, so a test can
+// assert the domain was reached (calls > 0).
+func allowDomainMock() *mockService {
+	return &mockService{
+		createExperimentFn: func(context.Context, domain.Actor, domain.CreateExperimentInput) (domain.Experiment, error) {
+			return domain.Experiment{ID: "e1", Name: "n"}, nil
+		},
+		getExperimentFn: func(_ context.Context, _ domain.Actor, id string) (domain.Experiment, error) {
+			return domain.Experiment{ID: id, Name: "n"}, nil
+		},
+		listExperimentsFn: func(context.Context, domain.Actor, bool, domain.ListOptions) ([]domain.Experiment, string, error) {
+			return nil, "", nil
+		},
+		updateExperimentFn: func(context.Context, domain.Actor, domain.UpdateExperimentInput) (domain.Experiment, error) {
+			return domain.Experiment{ID: "e1", Name: "n"}, nil
+		},
+		archiveFn: func(_ context.Context, _ domain.Actor, id string) (domain.Experiment, error) {
+			return domain.Experiment{ID: id, Name: "n"}, nil
+		},
+		startRunFn: func(_ context.Context, _ domain.Actor, in domain.StartRunInput) (domain.Run, error) {
+			return domain.Run{ID: "r1", ExperimentID: in.ExperimentID, Status: domain.RunStatusRunning}, nil
+		},
+		finishRunFn: func(_ context.Context, _ domain.Actor, in domain.FinishRunInput) (domain.Run, error) {
+			return domain.Run{ID: in.RunID, ExperimentID: "e1", Status: domain.RunStatusFinished}, nil
+		},
+		getRunFn: func(_ context.Context, _ domain.Actor, id string) (domain.Run, error) {
+			return domain.Run{ID: id, ExperimentID: "e1", Status: domain.RunStatusRunning}, nil
+		},
+		listRunsFn: func(context.Context, domain.Actor, string, domain.RunStatus, domain.ListOptions) ([]domain.Run, string, error) {
+			return nil, "", nil
+		},
+		deleteRunFn: func(context.Context, domain.Actor, string, string) error {
+			return nil
+		},
+		logMetricsFn: func(context.Context, domain.Actor, domain.LogMetricsInput) (domain.LogMetricsResult, error) {
+			return domain.LogMetricsResult{}, nil
+		},
+		logParamsFn: func(context.Context, domain.Actor, domain.LogParamsInput) (domain.LogParamsResult, error) {
+			return domain.LogParamsResult{}, nil
+		},
+		setArtifactsFn: func(_ context.Context, _ domain.Actor, in domain.SetArtifactsInput) (domain.Run, error) {
+			return domain.Run{ID: in.RunID, ExperimentID: "e1", Status: domain.RunStatusRunning}, nil
+		},
+		getHistoryFn: func(context.Context, domain.Actor, domain.GetMetricHistoryInput) ([]domain.MetricSeries, string, error) {
+			return nil, "", nil
+		},
+		compareRunsFn: func(context.Context, domain.Actor, domain.CompareRunsInput) ([]domain.RunComparison, error) {
+			return nil, nil
+		},
+	}
+}
+
 // invoke calls one RPC by name on the client with a minimally-VALID request — one
 // that would pass field validation — so the test isolates the SCOPE gate. If
 // validation rejected the request first we could not tell whether authorization
@@ -627,6 +683,95 @@ func TestAuthorization_WriteScopeImpliesRead(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("expected write-scoped read to reach the domain (write implies read)")
+	}
+}
+
+// TestAuthorization_AdminRole_ListRuns_NoScopes is the REGRESSION TEST for the
+// "GET /runs returns 403 for the bootstrap admin" bug.
+//
+// A human admin JWT (what the UI/BFF mints at Login) carries Role="admin" but an
+// EMPTY Scopes slice — the auth service never stuffs per-resource scopes into a
+// JWT (it resolves a role's permissions fresh at CheckPermission time). The old
+// scope-only gate therefore denied the admin's ListRuns with PermissionDenied,
+// making the Experiments page unusable. The admin role is the {*,*} platform
+// superuser, so the corrected gate must ALLOW it and reach the domain.
+func TestAuthorization_AdminRole_ListRuns_NoScopes(t *testing.T) {
+	called := false
+	mock := &mockService{
+		listRunsFn: func(ctx context.Context, actor domain.Actor, experimentID string, statusFilter domain.RunStatus, opts domain.ListOptions) ([]domain.Run, string, error) {
+			called = true
+			// The admin is still tenancy-scoped via Actor.Team (no over-open): the
+			// handler lifts team from the validated token, not the request.
+			if actor.Team != "team-acme" {
+				t.Fatalf("admin ListRuns should run as the caller's team, got %q", actor.Team)
+			}
+			return []domain.Run{{ID: "r1", ExperimentID: experimentID, Status: domain.RunStatusRunning}}, "", nil
+		},
+	}
+	// Role="admin" with NO scopes — exactly the bootstrap admin's JWT shape.
+	admin := &grpcutil.Claims{UserID: "admin-uuid", Team: "team-acme", Role: "admin" /* Scopes: nil */}
+	client := newTestClient(t, mock, admin)
+
+	resp, err := client.ListRuns(authCtx(), &experimentv1.ListRunsRequest{ExperimentId: "e1"})
+	if err != nil {
+		t.Fatalf("admin (role=admin, no scopes) must be allowed to ListRuns, got: %v", err)
+	}
+	if !called {
+		t.Fatal("expected admin ListRuns to reach the domain")
+	}
+	if len(resp.GetRuns()) != 1 || resp.GetRuns()[0].GetId() != "r1" {
+		t.Fatalf("expected one run r1 back, got %+v", resp.GetRuns())
+	}
+}
+
+// TestAuthorization_AdminRole_AllReadAndWriteRPCs proves the admin short-circuit
+// is uniform: the admin role (no scopes) satisfies BOTH the read gate and the
+// write gate on every RPC — admin is the {*,*} superuser, so it must never trip a
+// scope check anywhere in this service.
+func TestAuthorization_AdminRole_AllReadAndWriteRPCs(t *testing.T) {
+	admin := &grpcutil.Claims{UserID: "admin-uuid", Team: "team-acme", Role: "admin" /* Scopes: nil */}
+	for _, rpc := range append(append([]string{}, readRPCs...), mutatingRPCs...) {
+		t.Run(rpc, func(t *testing.T) {
+			// allowDomainMock returns benign zero values for every method, so the only
+			// thing under test is whether the authz gate let the call THROUGH to the
+			// domain. We must NOT get PermissionDenied for an admin.
+			mock := allowDomainMock()
+			client := newTestClient(t, mock, admin)
+
+			err := invoke(authCtx(), client, rpc)
+			if err != nil {
+				if st, _ := status.FromError(err); st.Code() == codes.PermissionDenied {
+					t.Fatalf("admin must not be denied %s, got PermissionDenied: %v", rpc, err)
+				}
+				// Any other error would be a mock/conversion issue, not authz; surface it.
+				t.Fatalf("unexpected error invoking %s as admin: %v", rpc, err)
+			}
+			if mock.calls == 0 {
+				t.Fatalf("admin %s should have reached the domain (authz passed)", rpc)
+			}
+		})
+	}
+}
+
+// TestAuthorization_NonAdminNoScope_StillDenied is the NEGATIVE control proving
+// the fix did NOT over-open the surface: a non-admin caller (a viewer-role or
+// API-key principal) with NO experiments scope is STILL denied — only the admin
+// ROLE short-circuits, a non-admin still needs the matching scope. We use a
+// non-admin role to prove role!="admin" does not leak the bypass.
+func TestAuthorization_NonAdminNoScope_StillDenied(t *testing.T) {
+	// role=viewer (a real seeded role) but no experiments:read scope and not admin.
+	nonAdmin := &grpcutil.Claims{UserID: "u-viewer", Team: "team-acme", Role: "viewer" /* Scopes: nil */}
+	for _, rpc := range readRPCs {
+		t.Run(rpc, func(t *testing.T) {
+			mock := denyDomainMock(t)
+			client := newTestClient(t, mock, nonAdmin)
+
+			err := invoke(authCtx(), client, rpc)
+			requireCode(t, err, codes.PermissionDenied)
+			if mock.calls != 0 {
+				t.Fatalf("domain was reached %d times for non-admin unscoped %s; want 0", mock.calls, rpc)
+			}
+		})
 	}
 }
 

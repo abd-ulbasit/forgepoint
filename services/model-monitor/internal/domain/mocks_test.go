@@ -2,6 +2,8 @@ package domain
 
 import (
 	"context"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -141,13 +143,40 @@ func (f *fakeReportRepo) GetByID(_ context.Context, ownerTeam, id string) (Drift
 func (f *fakeReportRepo) List(_ context.Context, ff ReportFilter, _ ListOptions) ([]DriftReport, string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var out []DriftReport
-	for _, r := range f.byScope[reportScope(ff.OwnerTeam, ff.ModelName)] {
-		if ff.MinSeverity != DriftSeverityUnspecified && r.Severity < ff.MinSeverity {
-			continue
+	// Gather the candidate partitions. model_name is OPTIONAL (mirrors the real adapter):
+	//   - set   → exactly the one (team, model) partition.
+	//   - empty → EVERY partition owned by this team (the fleet "recent drift" view).
+	// owner_team is always the mandatory scope, so the empty-model case still never
+	// crosses tenants — we only collect partitions whose team prefix matches.
+	var scopes [][]DriftReport
+	if ff.ModelName != "" {
+		scopes = append(scopes, f.byScope[reportScope(ff.OwnerTeam, ff.ModelName)])
+	} else {
+		prefix := ff.OwnerTeam + "|"
+		for key, rs := range f.byScope {
+			if strings.HasPrefix(key, prefix) {
+				scopes = append(scopes, rs)
+			}
 		}
-		out = append(out, r)
 	}
+	var out []DriftReport
+	for _, rs := range scopes {
+		for _, r := range rs {
+			if ff.MinSeverity != DriftSeverityUnspecified && r.Severity < ff.MinSeverity {
+				continue
+			}
+			out = append(out, r)
+		}
+	}
+	// Newest-first by window_end (then id), mirroring the adapter's ORDER BY — important
+	// once we merge multiple partitions so the cross-model page is deterministically
+	// ordered rather than dependent on map iteration order.
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].WindowEnd.Equal(out[j].WindowEnd) {
+			return out[i].WindowEnd.After(out[j].WindowEnd)
+		}
+		return out[i].ID > out[j].ID
+	})
 	return out, "", nil
 }
 

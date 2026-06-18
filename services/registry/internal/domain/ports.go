@@ -314,6 +314,18 @@ type ReadStore interface {
 	// ("" when exhausted). The filter only narrows within the team.
 	ListModels(ctx context.Context, team string, filter ListModelsFilter, opts ListOptions) (models []Model, nextToken string, err error)
 
+	// CountModels returns the TOTAL number of a team's models matching the filter —
+	// independent of pagination. It is the read-model's accurate aggregate count: the
+	// value ListModels' Page.Total carries, surfaced as the proto's total_count, which
+	// the BFF dashboard reads to render "N models" (it calls ListModels with page_size=1
+	// purely to read this count, NOT to fetch rows). Keeping a dedicated count method —
+	// rather than len(page) of a single page — is what makes the dashboard tile agree
+	// with the full list: a page is at most PageSize rows, but the count is the whole
+	// filtered set. Same team-scoping + filter semantics as ListModels so the count and
+	// the list can never disagree about which models are in scope (notably: archived
+	// models are excluded unless filter.IncludeArchived, matching ListModels' default).
+	CountModels(ctx context.Context, team string, filter ListModelsFilter) (int, error)
+
 	// GetVersionByID / GetVersionByLabel fetch a single projected version, by its
 	// own id or by the (modelID, label) pair — whichever the caller has on hand.
 	GetVersionByID(ctx context.Context, id string) (ModelVersion, error)

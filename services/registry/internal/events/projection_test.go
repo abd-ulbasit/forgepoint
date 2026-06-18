@@ -100,8 +100,11 @@ func TestProjection_PopulatesReadModelEndToEnd(t *testing.T) {
 		domain.NewRealClock(), domain.NewUUIDGenerator(),
 	)
 
-	// Start the projection consumer (the thing under test) against the SAME store.
-	projection := events.NewProjection(js, readStore, events.ProjectionConfig{})
+	// Start the projection consumer (the thing under test) against the SAME store. The
+	// write store is passed as the ModelReader read-back source so description/tags
+	// (which the thin event omits) are hydrated from the Postgres truth — the
+	// production wiring.
+	projection := events.NewProjection(js, readStore, writeStore, events.ProjectionConfig{})
 	if err := projection.Start(ctx); err != nil {
 		t.Fatalf("start projection: %v", err)
 	}
@@ -170,7 +173,10 @@ func TestProjection_ConsumesRawRegisteredEvent(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	projection := events.NewProjection(js, readStore, events.ProjectionConfig{})
+	// nil ModelReader: this test isolates the projection with a raw publish and no
+	// write side, so there is no truth to read back — the projection falls back to the
+	// event's fields (the documented nil-reader behavior).
+	projection := events.NewProjection(js, readStore, nil, events.ProjectionConfig{})
 	if err := projection.Start(ctx); err != nil {
 		t.Fatalf("start projection: %v", err)
 	}

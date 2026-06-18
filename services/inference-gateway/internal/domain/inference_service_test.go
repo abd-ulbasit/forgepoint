@@ -58,25 +58,27 @@ func cloneRoute(r domain.Route) domain.Route {
 	return r
 }
 
-func (m *mockRouteStore) Get(_ context.Context, name string) (domain.Route, error) {
+// Get/Upsert/Delete are keyed by the OPAQUE domain key (routeKey(team, model)) the
+// service composes — mirroring the production adapter, which is also key-opaque.
+func (m *mockRouteStore) Get(_ context.Context, key string) (domain.Route, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	r, ok := m.routes[name]
+	r, ok := m.routes[key]
 	if !ok {
 		return domain.Route{}, domain.ErrNoRoute
 	}
 	return cloneRoute(r), nil // snapshot isolation: caller gets a private copy
 }
-func (m *mockRouteStore) Upsert(_ context.Context, r domain.Route) error {
+func (m *mockRouteStore) Upsert(_ context.Context, key string, r domain.Route) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.routes[r.ModelName] = cloneRoute(r) // store a private copy, not the caller's slice
+	m.routes[key] = cloneRoute(r) // store a private copy, not the caller's slice
 	return nil
 }
-func (m *mockRouteStore) Delete(_ context.Context, name string) error {
+func (m *mockRouteStore) Delete(_ context.Context, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.routes, name)
+	delete(m.routes, key)
 	return nil
 }
 func (m *mockRouteStore) List(_ context.Context, _ domain.ListOptions) ([]domain.Route, string, error) {
@@ -107,25 +109,25 @@ type sharedBackingRouteStore struct {
 func newSharedBackingRouteStore() *sharedBackingRouteStore {
 	return &sharedBackingRouteStore{routes: map[string]domain.Route{}}
 }
-func (m *sharedBackingRouteStore) Get(_ context.Context, name string) (domain.Route, error) {
+func (m *sharedBackingRouteStore) Get(_ context.Context, key string) (domain.Route, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	r, ok := m.routes[name]
+	r, ok := m.routes[key]
 	if !ok {
 		return domain.Route{}, domain.ErrNoRoute
 	}
 	return r, nil // NO copy: shares the Targets backing array on purpose
 }
-func (m *sharedBackingRouteStore) Upsert(_ context.Context, r domain.Route) error {
+func (m *sharedBackingRouteStore) Upsert(_ context.Context, key string, r domain.Route) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.routes[r.ModelName] = r
+	m.routes[key] = r
 	return nil
 }
-func (m *sharedBackingRouteStore) Delete(_ context.Context, name string) error {
+func (m *sharedBackingRouteStore) Delete(_ context.Context, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.routes, name)
+	delete(m.routes, key)
 	return nil
 }
 func (m *sharedBackingRouteStore) List(_ context.Context, _ domain.ListOptions) ([]domain.Route, string, error) {
@@ -244,16 +246,29 @@ func buildService(t *testing.T, store domain.RouteStore, lim domain.RateLimiter,
 	})
 }
 
+// testTeam is the owning team used across the single-tenant tests: deploys create
+// routes UNDER it and predicts/control-plane calls are made AS it, so the route
+// namespacing (the IDOR fix) is satisfied transparently in the existing specs. The
+// dedicated cross-tenant tests (TestRouteTenancy_*) use two distinct teams to prove
+// isolation.
+const testTeam = "team-a"
+
 // deployStable seeds a single-version (stable, 100%) route through the event
 // reaction path — exercising ApplyModelDeployed and giving predict something to
-// route to.
+// route to. The route is created under testTeam (its owning team).
 func deployStable(t *testing.T, svc domain.InferenceService, model, version, endpoint string) {
 	t.Helper()
 	if err := svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{
-		ModelName: model, Version: version, Endpoint: endpoint, WeightBps: domain.TotalWeightBps,
+		OwnerTeam: testTeam, ModelName: model, Version: version, Endpoint: endpoint, WeightBps: domain.TotalWeightBps,
 	}); err != nil {
 		t.Fatalf("ApplyModelDeployed: %v", err)
 	}
+}
+
+// predictAs is a small helper: a Predict from testTeam with the given api key. Most
+// tests don't care about the api key value, only that the team matches the deploy.
+func predictAs(svc domain.InferenceService, apiKey string, in domain.PredictInput) (domain.PredictOutput, error) {
+	return svc.Predict(context.Background(), domain.Principal{APIKeyID: apiKey, Team: testTeam}, in)
 }
 
 func basicInput(model string) domain.PredictInput {
@@ -333,7 +348,7 @@ func TestPredict_InvalidInput(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			_, err := svc.Predict(context.Background(), domain.Principal{APIKeyID: "k"}, c.in)
+			_, err := svc.Predict(context.Background(), domain.Principal{APIKeyID: "k", Team: testTeam}, c.in)
 			if !errors.Is(err, domain.ErrInvalidInput) {
 				t.Fatalf("err = %v, want ErrInvalidInput", err)
 			}
@@ -359,7 +374,7 @@ func TestPredict_RateLimited(t *testing.T) {
 	svc := buildService(t, store, lim, be, pub, &mockQuota{})
 	deployStable(t, svc, "fraud", "v1", "e")
 
-	_, err := svc.Predict(context.Background(), domain.Principal{APIKeyID: "k"}, basicInput("fraud"))
+	_, err := svc.Predict(context.Background(), domain.Principal{APIKeyID: "k", Team: testTeam}, basicInput("fraud"))
 	if !errors.Is(err, domain.ErrRateLimited) {
 		t.Fatalf("err = %v, want ErrRateLimited", err)
 	}
@@ -402,7 +417,7 @@ func TestPredict_NoRoute(t *testing.T) {
 	pub := &mockPublisher{}
 	svc := buildService(t, store, &mockLimiter{allow: true}, &mockBackend{}, pub, &mockQuota{})
 
-	_, err := svc.Predict(context.Background(), domain.Principal{APIKeyID: "k"}, basicInput("ghost"))
+	_, err := svc.Predict(context.Background(), domain.Principal{APIKeyID: "k", Team: testTeam}, basicInput("ghost"))
 	if !errors.Is(err, domain.ErrNoRoute) {
 		t.Fatalf("err = %v, want ErrNoRoute", err)
 	}
@@ -428,7 +443,7 @@ func TestPredict_BackendFailureTripsBreaker(t *testing.T) {
 	svc := buildService(t, store, &mockLimiter{allow: true}, be, pub, &mockQuota{})
 	deployStable(t, svc, "fraud", "v1", "e")
 
-	p := domain.Principal{APIKeyID: "k"}
+	p := domain.Principal{APIKeyID: "k", Team: testTeam}
 	// 3 failing calls trip the breaker. Each reaches the backend (CLOSED/HALF
 	// admits) and is classed UPSTREAM_ERROR.
 	for i := 0; i < 3; i++ {
@@ -470,7 +485,7 @@ func TestPredict_SuccessAfterFailuresDoesNotTrip(t *testing.T) {
 	be := &mockBackend{}
 	svc := buildService(t, store, &mockLimiter{allow: true}, be, &mockPublisher{}, &mockQuota{})
 	deployStable(t, svc, "fraud", "v1", "e")
-	p := domain.Principal{APIKeyID: "k"}
+	p := domain.Principal{APIKeyID: "k", Team: testTeam}
 
 	be.err = domain.ErrUpstream
 	_, _ = svc.Predict(context.Background(), p, basicInput("fraud"))
@@ -502,16 +517,16 @@ func TestPredict_VersionOverride(t *testing.T) {
 	be := &mockBackend{}
 	svc := buildService(t, store, &mockLimiter{allow: true}, be, &mockPublisher{}, &mockQuota{})
 	// Two versions: stable 100%, canary 0% (would never be picked by weight).
-	if err := svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{ModelName: "fraud", Version: "v1", Endpoint: "v1.svc", WeightBps: domain.TotalWeightBps}); err != nil {
+	if err := svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{OwnerTeam: testTeam, ModelName: "fraud", Version: "v1", Endpoint: "v1.svc", WeightBps: domain.TotalWeightBps}); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{ModelName: "fraud", Version: "v2", Endpoint: "v2.svc", WeightBps: 0}); err != nil {
+	if err := svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{OwnerTeam: testTeam, ModelName: "fraud", Version: "v2", Endpoint: "v2.svc", WeightBps: 0}); err != nil {
 		t.Fatal(err)
 	}
 
 	in := basicInput("fraud")
 	in.VersionOverride = "v2"
-	out, err := svc.Predict(context.Background(), domain.Principal{APIKeyID: "k"}, in)
+	out, err := svc.Predict(context.Background(), domain.Principal{APIKeyID: "k", Team: testTeam}, in)
 	if err != nil {
 		t.Fatalf("override predict: %v", err)
 	}
@@ -533,7 +548,7 @@ func TestPredict_OverrideUnknownVersion(t *testing.T) {
 
 	in := basicInput("fraud")
 	in.VersionOverride = "v9-does-not-exist"
-	if _, err := svc.Predict(context.Background(), domain.Principal{APIKeyID: "k"}, in); !errors.Is(err, domain.ErrNoRoute) {
+	if _, err := svc.Predict(context.Background(), domain.Principal{APIKeyID: "k", Team: testTeam}, in); !errors.Is(err, domain.ErrNoRoute) {
 		t.Fatalf("err = %v, want ErrNoRoute for unknown override version", err)
 	}
 }
@@ -550,18 +565,18 @@ func TestPredict_CanaryFlag(t *testing.T) {
 	// in v2's [0,10000) band → v2 (the canary) serves. This proves IsCanary is a
 	// property of the SERVED TARGET's stability, set correctly by the deploy-order
 	// rule (first deploy = stable), not of the weight.
-	if err := svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{ModelName: "fraud", Version: "v1", Endpoint: "v1.svc", WeightBps: domain.TotalWeightBps}); err != nil {
+	if err := svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{OwnerTeam: testTeam, ModelName: "fraud", Version: "v1", Endpoint: "v1.svc", WeightBps: domain.TotalWeightBps}); err != nil {
 		t.Fatal(err)
 	}
-	if err := svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{ModelName: "fraud", Version: "v2", Endpoint: "v2.svc", WeightBps: 0}); err != nil {
+	if err := svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{OwnerTeam: testTeam, ModelName: "fraud", Version: "v2", Endpoint: "v2.svc", WeightBps: 0}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.SetTrafficSplit(context.Background(), "fraud", []domain.TrafficWeight{
+	if _, err := svc.SetTrafficSplit(context.Background(), testTeam, "fraud", []domain.TrafficWeight{
 		{Version: "v1", WeightBps: 0}, {Version: "v2", WeightBps: domain.TotalWeightBps},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	out, err := svc.Predict(context.Background(), domain.Principal{APIKeyID: "k"}, basicInput("fraud"))
+	out, err := svc.Predict(context.Background(), domain.Principal{APIKeyID: "k", Team: testTeam}, basicInput("fraud"))
 	if err != nil {
 		t.Fatalf("predict: %v", err)
 	}
@@ -584,11 +599,11 @@ func TestUpsertRoute_WeightSumInvariant(t *testing.T) {
 	store := newMockRouteStore()
 	svc := buildService(t, store, &mockLimiter{allow: true}, &mockBackend{}, &mockPublisher{}, &mockQuota{})
 	// Seed two known endpoints via deploy events (the trusted endpoint source).
-	_ = svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{ModelName: "fraud", Version: "v1", Endpoint: "v1.svc", WeightBps: domain.TotalWeightBps})
-	_ = svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{ModelName: "fraud", Version: "v2", Endpoint: "v2.svc", WeightBps: 0})
+	_ = svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{OwnerTeam: testTeam, ModelName: "fraud", Version: "v1", Endpoint: "v1.svc", WeightBps: domain.TotalWeightBps})
+	_ = svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{OwnerTeam: testTeam, ModelName: "fraud", Version: "v2", Endpoint: "v2.svc", WeightBps: 0})
 
 	// Bad: weights sum to 8000, not 10000.
-	_, err := svc.UpsertRoute(context.Background(), "fraud", []domain.ProposedTarget{
+	_, err := svc.UpsertRoute(context.Background(), testTeam, "fraud", []domain.ProposedTarget{
 		{Version: "v1", WeightBps: 7000}, {Version: "v2", WeightBps: 1000},
 	})
 	if !errors.Is(err, domain.ErrRouteValidation) {
@@ -597,7 +612,7 @@ func TestUpsertRoute_WeightSumInvariant(t *testing.T) {
 
 	// Good: 9000 + 1000 = 10000. Endpoints are server-resolved from the deploy
 	// records, NOT supplied by the caller.
-	r, err := svc.UpsertRoute(context.Background(), "fraud", []domain.ProposedTarget{
+	r, err := svc.UpsertRoute(context.Background(), testTeam, "fraud", []domain.ProposedTarget{
 		{Version: "v1", WeightBps: 9000}, {Version: "v2", WeightBps: 1000},
 	})
 	if err != nil {
@@ -618,7 +633,7 @@ func TestUpsertRoute_RejectsUnknownEndpoint(t *testing.T) {
 	svc := buildService(t, store, &mockLimiter{allow: true}, &mockBackend{}, &mockPublisher{}, &mockQuota{})
 	deployStable(t, svc, "fraud", "v1", "v1.svc")
 
-	_, err := svc.UpsertRoute(context.Background(), "fraud", []domain.ProposedTarget{
+	_, err := svc.UpsertRoute(context.Background(), testTeam, "fraud", []domain.ProposedTarget{
 		{Version: "v1", WeightBps: 5000}, {Version: "phantom", WeightBps: 5000}, // phantom has no endpoint
 	})
 	if !errors.Is(err, domain.ErrRouteValidation) {
@@ -631,11 +646,11 @@ func TestUpsertRoute_RejectsUnknownEndpoint(t *testing.T) {
 func TestSetTrafficSplit_Dial(t *testing.T) {
 	store := newMockRouteStore()
 	svc := buildService(t, store, &mockLimiter{allow: true}, &mockBackend{}, &mockPublisher{}, &mockQuota{})
-	_ = svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{ModelName: "fraud", Version: "v1", Endpoint: "v1.svc", WeightBps: domain.TotalWeightBps})
-	_ = svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{ModelName: "fraud", Version: "v2", Endpoint: "v2.svc", WeightBps: 0})
+	_ = svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{OwnerTeam: testTeam, ModelName: "fraud", Version: "v1", Endpoint: "v1.svc", WeightBps: domain.TotalWeightBps})
+	_ = svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{OwnerTeam: testTeam, ModelName: "fraud", Version: "v2", Endpoint: "v2.svc", WeightBps: 0})
 
 	// Dial to 50/50.
-	r, err := svc.SetTrafficSplit(context.Background(), "fraud", []domain.TrafficWeight{
+	r, err := svc.SetTrafficSplit(context.Background(), testTeam, "fraud", []domain.TrafficWeight{
 		{Version: "v1", WeightBps: 5000}, {Version: "v2", WeightBps: 5000},
 	})
 	if err != nil {
@@ -646,7 +661,7 @@ func TestSetTrafficSplit_Dial(t *testing.T) {
 	}
 
 	// Unknown version rejected.
-	if _, err := svc.SetTrafficSplit(context.Background(), "fraud", []domain.TrafficWeight{
+	if _, err := svc.SetTrafficSplit(context.Background(), testTeam, "fraud", []domain.TrafficWeight{
 		{Version: "v1", WeightBps: 5000}, {Version: "ghost", WeightBps: 5000},
 	}); !errors.Is(err, domain.ErrRouteValidation) {
 		t.Fatalf("unknown version err = %v, want ErrRouteValidation", err)
@@ -663,16 +678,17 @@ func TestSetTrafficSplit_Dial(t *testing.T) {
 func TestApplyModelPromoted_RepointsTraffic(t *testing.T) {
 	store := newMockRouteStore()
 	svc := buildService(t, store, &mockLimiter{allow: true}, &mockBackend{}, &mockPublisher{}, &mockQuota{})
-	_ = svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{ModelName: "fraud", Version: "v1", Endpoint: "v1.svc", WeightBps: 9000})
-	_ = svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{ModelName: "fraud", Version: "v2", Endpoint: "v2.svc", WeightBps: 1000})
+	_ = svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{OwnerTeam: testTeam, ModelName: "fraud", Version: "v1", Endpoint: "v1.svc", WeightBps: 9000})
+	_ = svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{OwnerTeam: testTeam, ModelName: "fraud", Version: "v2", Endpoint: "v2.svc", WeightBps: 1000})
 
 	if err := svc.ApplyModelPromoted(context.Background(), domain.ModelPromoted{
+		OwnerTeam: testTeam,
 		ModelName: "fraud", Version: "v2", DemotedVersion: "v1",
 	}); err != nil {
 		t.Fatalf("promote: %v", err)
 	}
 
-	r, err := svc.GetRoute(context.Background(), "fraud")
+	r, err := svc.GetRoute(context.Background(), testTeam, "fraud")
 	if err != nil {
 		t.Fatalf("get route: %v", err)
 	}
@@ -701,10 +717,10 @@ func TestApplyModelUndeployed_RemovesTarget(t *testing.T) {
 	svc := buildService(t, store, &mockLimiter{allow: true}, &mockBackend{}, &mockPublisher{}, &mockQuota{})
 	deployStable(t, svc, "fraud", "v1", "v1.svc")
 
-	if err := svc.ApplyModelUndeployed(context.Background(), domain.ModelUndeployed{ModelName: "fraud", Version: "v1", Reason: "teardown"}); err != nil {
+	if err := svc.ApplyModelUndeployed(context.Background(), domain.ModelUndeployed{OwnerTeam: testTeam, ModelName: "fraud", Version: "v1", Reason: "teardown"}); err != nil {
 		t.Fatalf("undeploy: %v", err)
 	}
-	if _, err := svc.Predict(context.Background(), domain.Principal{APIKeyID: "k"}, basicInput("fraud")); !errors.Is(err, domain.ErrNoRoute) {
+	if _, err := svc.Predict(context.Background(), domain.Principal{APIKeyID: "k", Team: testTeam}, basicInput("fraud")); !errors.Is(err, domain.ErrNoRoute) {
 		t.Fatalf("predict after undeploy err = %v, want ErrNoRoute", err)
 	}
 }
@@ -715,10 +731,10 @@ func TestApplyModelArchived_DropsRoute(t *testing.T) {
 	svc := buildService(t, store, &mockLimiter{allow: true}, &mockBackend{}, &mockPublisher{}, &mockQuota{})
 	deployStable(t, svc, "fraud", "v1", "v1.svc")
 
-	if err := svc.ApplyModelArchived(context.Background(), domain.ModelArchived{ModelName: "fraud"}); err != nil {
+	if err := svc.ApplyModelArchived(context.Background(), domain.ModelArchived{OwnerTeam: testTeam, ModelName: "fraud"}); err != nil {
 		t.Fatalf("archive: %v", err)
 	}
-	if _, err := svc.GetRoute(context.Background(), "fraud"); !errors.Is(err, domain.ErrNoRoute) {
+	if _, err := svc.GetRoute(context.Background(), testTeam, "fraud"); !errors.Is(err, domain.ErrNoRoute) {
 		t.Fatalf("get route after archive err = %v, want ErrNoRoute", err)
 	}
 }
@@ -730,11 +746,11 @@ func TestApplyModelArchived_DropsRoute(t *testing.T) {
 func TestApplyEvents_Idempotent(t *testing.T) {
 	store := newMockRouteStore()
 	svc := buildService(t, store, &mockLimiter{allow: true}, &mockBackend{}, &mockPublisher{}, &mockQuota{})
-	ev := domain.ModelDeployed{ModelName: "fraud", Version: "v1", Endpoint: "v1.svc", WeightBps: domain.TotalWeightBps}
+	ev := domain.ModelDeployed{OwnerTeam: testTeam, ModelName: "fraud", Version: "v1", Endpoint: "v1.svc", WeightBps: domain.TotalWeightBps}
 	_ = svc.ApplyModelDeployed(context.Background(), ev)
 	_ = svc.ApplyModelDeployed(context.Background(), ev) // redelivery
 
-	r, _ := svc.GetRoute(context.Background(), "fraud")
+	r, _ := svc.GetRoute(context.Background(), testTeam, "fraud")
 	if len(r.Targets) != 1 {
 		t.Fatalf("idempotency broken: %d targets after duplicate deploy, want 1", len(r.Targets))
 	}
@@ -762,16 +778,16 @@ func TestSetTrafficSplit_RejectedWriteDoesNotCorruptStore(t *testing.T) {
 	store := newSharedBackingRouteStore()
 	svc := buildService(t, store, &mockLimiter{allow: true}, &mockBackend{}, &mockPublisher{}, &mockQuota{})
 	// Seed a valid 9000/1000 split (the COMMITTED, correct state).
-	_ = svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{ModelName: "fraud", Version: "v1", Endpoint: "v1.svc", WeightBps: domain.TotalWeightBps})
-	_ = svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{ModelName: "fraud", Version: "v2", Endpoint: "v2.svc", WeightBps: 0})
-	if _, err := svc.SetTrafficSplit(context.Background(), "fraud", []domain.TrafficWeight{
+	_ = svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{OwnerTeam: testTeam, ModelName: "fraud", Version: "v1", Endpoint: "v1.svc", WeightBps: domain.TotalWeightBps})
+	_ = svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{OwnerTeam: testTeam, ModelName: "fraud", Version: "v2", Endpoint: "v2.svc", WeightBps: 0})
+	if _, err := svc.SetTrafficSplit(context.Background(), testTeam, "fraud", []domain.TrafficWeight{
 		{Version: "v1", WeightBps: 9000}, {Version: "v2", WeightBps: 1000},
 	}); err != nil {
 		t.Fatalf("seed split: %v", err)
 	}
 
 	// Propose a split that sums to 7000 (3000 + 4000) — MUST be rejected.
-	_, err := svc.SetTrafficSplit(context.Background(), "fraud", []domain.TrafficWeight{
+	_, err := svc.SetTrafficSplit(context.Background(), testTeam, "fraud", []domain.TrafficWeight{
 		{Version: "v1", WeightBps: 3000}, {Version: "v2", WeightBps: 4000},
 	})
 	if !errors.Is(err, domain.ErrRouteValidation) {
@@ -780,7 +796,7 @@ func TestSetTrafficSplit_RejectedWriteDoesNotCorruptStore(t *testing.T) {
 
 	// The stored route must STILL be the committed 9000/1000 — not the rejected
 	// 3000/4000. This is the assertion that fails on the old in-place code.
-	r, err := svc.GetRoute(context.Background(), "fraud")
+	r, err := svc.GetRoute(context.Background(), testTeam, "fraud")
 	if err != nil {
 		t.Fatalf("get route after reject: %v", err)
 	}
@@ -798,7 +814,7 @@ func TestSetTrafficSplit_RejectedWriteDoesNotCorruptStore(t *testing.T) {
 	// And a predict still routes on the committed weights (draw 0 → v1's band).
 	be := &mockBackend{}
 	svc2 := buildService(t, store, &mockLimiter{allow: true}, be, &mockPublisher{}, &mockQuota{})
-	out, err := svc2.Predict(context.Background(), domain.Principal{APIKeyID: "k"}, basicInput("fraud"))
+	out, err := svc2.Predict(context.Background(), domain.Principal{APIKeyID: "k", Team: testTeam}, basicInput("fraud"))
 	if err != nil {
 		t.Fatalf("predict after reject: %v", err)
 	}
@@ -838,11 +854,11 @@ func TestPredict_ConcurrentWithReweight_NoRace(t *testing.T) {
 	svc := buildService(t, store, &mockLimiter{allow: true}, be, &mockPublisher{}, &mockQuota{})
 
 	// Seed two versions so reweights/promotes have something to shuffle.
-	_ = svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{ModelName: "fraud", Version: "v1", Endpoint: "v1.svc", WeightBps: domain.TotalWeightBps})
-	_ = svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{ModelName: "fraud", Version: "v2", Endpoint: "v2.svc", WeightBps: 0})
+	_ = svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{OwnerTeam: testTeam, ModelName: "fraud", Version: "v1", Endpoint: "v1.svc", WeightBps: domain.TotalWeightBps})
+	_ = svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{OwnerTeam: testTeam, ModelName: "fraud", Version: "v2", Endpoint: "v2.svc", WeightBps: 0})
 
 	ctx := context.Background()
-	p := domain.Principal{APIKeyID: "k"}
+	p := domain.Principal{APIKeyID: "k", Team: testTeam}
 	const readers = 8
 	const iters = 200
 
@@ -869,24 +885,24 @@ func TestPredict_ConcurrentWithReweight_NoRace(t *testing.T) {
 		for j := 0; j < iters; j++ {
 			switch j % 4 {
 			case 0:
-				_, _ = svc.SetTrafficSplit(ctx, "fraud", []domain.TrafficWeight{
+				_, _ = svc.SetTrafficSplit(ctx, testTeam, "fraud", []domain.TrafficWeight{
 					{Version: "v1", WeightBps: 7000}, {Version: "v2", WeightBps: 3000},
 				})
 			case 1:
-				_, _ = svc.SetTrafficSplit(ctx, "fraud", []domain.TrafficWeight{
+				_, _ = svc.SetTrafficSplit(ctx, testTeam, "fraud", []domain.TrafficWeight{
 					{Version: "v1", WeightBps: 5000}, {Version: "v2", WeightBps: 5000},
 				})
 			case 2:
 				// Re-deploy v2 with a fresh weight (ApplyModelDeployed update path).
-				_ = svc.ApplyModelDeployed(ctx, domain.ModelDeployed{ModelName: "fraud", Version: "v2", Endpoint: "v2.svc", WeightBps: 2000})
-				_, _ = svc.SetTrafficSplit(ctx, "fraud", []domain.TrafficWeight{
+				_ = svc.ApplyModelDeployed(ctx, domain.ModelDeployed{OwnerTeam: testTeam, ModelName: "fraud", Version: "v2", Endpoint: "v2.svc", WeightBps: 2000})
+				_, _ = svc.SetTrafficSplit(ctx, testTeam, "fraud", []domain.TrafficWeight{
 					{Version: "v1", WeightBps: 8000}, {Version: "v2", WeightBps: 2000},
 				})
 			case 3:
 				// Promote v2 (rewrites the whole target set) then restore a split so
 				// v1 stays in the table for the next iteration.
-				_ = svc.ApplyModelPromoted(ctx, domain.ModelPromoted{ModelName: "fraud", Version: "v2", DemotedVersion: "v1"})
-				_, _ = svc.SetTrafficSplit(ctx, "fraud", []domain.TrafficWeight{
+				_ = svc.ApplyModelPromoted(ctx, domain.ModelPromoted{OwnerTeam: testTeam, ModelName: "fraud", Version: "v2", DemotedVersion: "v1"})
+				_, _ = svc.SetTrafficSplit(ctx, testTeam, "fraud", []domain.TrafficWeight{
 					{Version: "v1", WeightBps: 9000}, {Version: "v2", WeightBps: 1000},
 				})
 			}
@@ -896,11 +912,276 @@ func TestPredict_ConcurrentWithReweight_NoRace(t *testing.T) {
 	wg.Wait()
 	// Reaching here clean under -race IS the assertion. A final sanity check that
 	// the route is still well-formed after the storm.
-	r, err := svc.GetRoute(ctx, "fraud")
+	r, err := svc.GetRoute(ctx, testTeam, "fraud")
 	if err != nil {
 		t.Fatalf("route gone after concurrent storm: %v", err)
 	}
 	if len(r.Targets) == 0 {
 		t.Fatal("route has no targets after concurrent storm")
+	}
+}
+
+// ----------------------------------------------------------------------------
+// MULTI-TENANT ROUTE ISOLATION (cross-tenant IDOR fix)
+// ----------------------------------------------------------------------------
+//
+// The bug: the routing table used to be a GLOBAL namespace keyed only by
+// model_name. The auth interceptor authenticates a JWT from ANY team but does not
+// tenancy-authorize, so any caller could read, repoint, or delete a route owned by
+// another team purely by naming it — or hijack a name collision (two teams both
+// deploy "fraud"). The fix namespaces every route operation by (team, model_name),
+// deriving the team from the verified Principal.Team / the owning team on the
+// ModelDeployed event. These tests use TWO teams sharing the SAME model name
+// "fraud" and assert team A can never touch team B's route, while same-team access
+// keeps working. A cross-team miss returns ErrNoRoute (NOT_FOUND) — no oracle.
+
+const (
+	teamA = "team-a"
+	teamB = "team-b"
+)
+
+// deployForTeam seeds a single stable 100% route under a SPECIFIC owning team,
+// exercising the event path with the OwnerTeam set (the namespacing source).
+func deployForTeam(t *testing.T, svc domain.InferenceService, team, model, version, endpoint string) {
+	t.Helper()
+	if err := svc.ApplyModelDeployed(context.Background(), domain.ModelDeployed{
+		OwnerTeam: team, ModelName: model, Version: version, Endpoint: endpoint, WeightBps: domain.TotalWeightBps,
+	}); err != nil {
+		t.Fatalf("ApplyModelDeployed(team=%s): %v", team, err)
+	}
+}
+
+// twoTenantService wires a service and deploys the SAME model name "fraud" for two
+// different teams, each pointing at its OWN backend endpoint. The shared mock store
+// holds both rows under distinct (team, model) keys.
+func twoTenantService(t *testing.T) (domain.InferenceService, *mockBackend) {
+	t.Helper()
+	store := newMockRouteStore()
+	be := &mockBackend{result: domain.PredictResult{Outputs: map[string]domain.Tensor{"p": {Data: []byte{1}}}}}
+	svc := buildService(t, store, &mockLimiter{allow: true}, be, &mockPublisher{}, &mockQuota{})
+	deployForTeam(t, svc, teamA, "fraud", "vA", "a-backend.svc:9090")
+	deployForTeam(t, svc, teamB, "fraud", "vB", "b-backend.svc:9090")
+	return svc, be
+}
+
+// TestRouteTenancy_PredictIsolation: each team's Predict for "fraud" must resolve to
+// its OWN backend version/endpoint — never the other team's. This is the data-plane
+// half of the IDOR: a colliding model name must not let team A's traffic reach (or
+// even observe) team B's backend.
+func TestRouteTenancy_PredictIsolation(t *testing.T) {
+	svc, be := twoTenantService(t)
+
+	outA, err := svc.Predict(context.Background(), domain.Principal{APIKeyID: "ka", Team: teamA}, basicInput("fraud"))
+	if err != nil {
+		t.Fatalf("team A predict: %v", err)
+	}
+	if outA.ServedVersion != "vA" {
+		t.Fatalf("team A served %q, want vA (its own route)", outA.ServedVersion)
+	}
+
+	outB, err := svc.Predict(context.Background(), domain.Principal{APIKeyID: "kb", Team: teamB}, basicInput("fraud"))
+	if err != nil {
+		t.Fatalf("team B predict: %v", err)
+	}
+	if outB.ServedVersion != "vB" {
+		t.Fatalf("team B served %q, want vB (its own route)", outB.ServedVersion)
+	}
+
+	// The backend endpoints actually dialed must be each team's own — proof there is
+	// no cross-tenant forwarding even with a colliding model name.
+	if len(be.seenEnds) != 2 || be.seenEnds[0] != "a-backend.svc:9090" || be.seenEnds[1] != "b-backend.svc:9090" {
+		t.Fatalf("dialed endpoints = %v, want [a-backend.svc:9090 b-backend.svc:9090]", be.seenEnds)
+	}
+}
+
+// TestRouteTenancy_PredictForeignTeamWithoutOwnRouteIsNoRoute: a team that has NOT
+// deployed "fraud" gets ErrNoRoute even though ANOTHER team owns a "fraud" route —
+// it cannot ride a foreign team's route, and the miss is indistinguishable from
+// "never deployed" (no existence oracle).
+func TestRouteTenancy_PredictForeignTeamWithoutOwnRouteIsNoRoute(t *testing.T) {
+	store := newMockRouteStore()
+	svc := buildService(t, store, &mockLimiter{allow: true}, &mockBackend{}, &mockPublisher{}, &mockQuota{})
+	deployForTeam(t, svc, teamA, "fraud", "vA", "a-backend.svc:9090") // only team A owns it
+
+	_, err := svc.Predict(context.Background(), domain.Principal{APIKeyID: "kb", Team: teamB}, basicInput("fraud"))
+	if !errors.Is(err, domain.ErrNoRoute) {
+		t.Fatalf("team B predict on team A's route err = %v, want ErrNoRoute (no cross-tenant ride)", err)
+	}
+}
+
+// TestRouteTenancy_GetRouteIsolation: team B cannot READ team A's route by name —
+// GetRoute(teamB, "fraud") must miss while GetRoute(teamA, "fraud") returns A's
+// route with A's endpoint. No oracle: the cross-team read is ErrNoRoute, identical
+// to "absent".
+func TestRouteTenancy_GetRouteIsolation(t *testing.T) {
+	svc, _ := twoTenantService(t)
+
+	rA, err := svc.GetRoute(context.Background(), teamA, "fraud")
+	if err != nil {
+		t.Fatalf("team A GetRoute: %v", err)
+	}
+	if rA.OwnerTeam != teamA || len(rA.Targets) != 1 || rA.Targets[0].Endpoint != "a-backend.svc:9090" {
+		t.Fatalf("team A route = %+v, want its own (vA / a-backend)", rA)
+	}
+
+	// Same name, but team B asking for what is really team A's data → must NOT leak.
+	// (Both teams DO own a "fraud" here; we assert B sees B's, never A's.)
+	rB, err := svc.GetRoute(context.Background(), teamB, "fraud")
+	if err != nil {
+		t.Fatalf("team B GetRoute: %v", err)
+	}
+	if rB.OwnerTeam != teamB || rB.Targets[0].Endpoint != "b-backend.svc:9090" {
+		t.Fatalf("team B route = %+v leaked team A data; want vB / b-backend", rB)
+	}
+}
+
+// TestRouteTenancy_GetRouteForeignIsNoRoute: when ONLY team A owns "fraud", team B's
+// GetRoute misses — a pure cross-tenant read attempt yields ErrNoRoute (no oracle).
+func TestRouteTenancy_GetRouteForeignIsNoRoute(t *testing.T) {
+	store := newMockRouteStore()
+	svc := buildService(t, store, &mockLimiter{allow: true}, &mockBackend{}, &mockPublisher{}, &mockQuota{})
+	deployForTeam(t, svc, teamA, "fraud", "vA", "a-backend.svc:9090")
+
+	if _, err := svc.GetRoute(context.Background(), teamB, "fraud"); !errors.Is(err, domain.ErrNoRoute) {
+		t.Fatalf("team B GetRoute on team A's route err = %v, want ErrNoRoute", err)
+	}
+}
+
+// TestRouteTenancy_UpsertCannotHijack: team B's UpsertRoute for "fraud" must NOT
+// repoint team A's route. Because endpoints are server-resolved from the CALLER'S
+// own existing route, B has no endpoint for "fraud" (it never deployed one), so the
+// upsert is rejected — and team A's route is provably unchanged afterward.
+func TestRouteTenancy_UpsertCannotHijack(t *testing.T) {
+	store := newMockRouteStore()
+	svc := buildService(t, store, &mockLimiter{allow: true}, &mockBackend{}, &mockPublisher{}, &mockQuota{})
+	deployForTeam(t, svc, teamA, "fraud", "vA", "a-backend.svc:9090") // only team A owns it
+
+	// Team B tries to upsert "fraud" naming team A's version vA at 100%. Since B has
+	// no deploy record for "fraud", vA has no B-resolvable endpoint → rejected.
+	_, err := svc.UpsertRoute(context.Background(), teamB, "fraud", []domain.ProposedTarget{
+		{Version: "vA", WeightBps: domain.TotalWeightBps},
+	})
+	if !errors.Is(err, domain.ErrRouteValidation) {
+		t.Fatalf("team B hijack upsert err = %v, want ErrRouteValidation (no endpoint in B's namespace)", err)
+	}
+
+	// Team A's route is untouched: still vA → a-backend, owned by team A.
+	rA, err := svc.GetRoute(context.Background(), teamA, "fraud")
+	if err != nil {
+		t.Fatalf("team A GetRoute after B's hijack attempt: %v", err)
+	}
+	if rA.OwnerTeam != teamA || rA.Targets[0].Version != "vA" || rA.Targets[0].Endpoint != "a-backend.svc:9090" {
+		t.Fatalf("team A route corrupted by team B upsert: %+v", rA)
+	}
+
+	// And a team B Upsert lands in B's OWN namespace, never colliding with A. Deploy
+	// a B-owned endpoint first, then B can validly upsert its own "fraud".
+	deployForTeam(t, svc, teamB, "fraud", "vB", "b-backend.svc:9090")
+	rBnew, err := svc.UpsertRoute(context.Background(), teamB, "fraud", []domain.ProposedTarget{
+		{Version: "vB", WeightBps: domain.TotalWeightBps},
+	})
+	if err != nil {
+		t.Fatalf("team B valid self-upsert: %v", err)
+	}
+	if rBnew.OwnerTeam != teamB || rBnew.Targets[0].Endpoint != "b-backend.svc:9090" {
+		t.Fatalf("team B self-upsert = %+v, want its own b-backend route", rBnew)
+	}
+	// Team A STILL unchanged after B's valid self-upsert (distinct namespaces).
+	rA2, _ := svc.GetRoute(context.Background(), teamA, "fraud")
+	if rA2.Targets[0].Endpoint != "a-backend.svc:9090" {
+		t.Fatalf("team A route changed by team B self-upsert: %+v", rA2)
+	}
+}
+
+// TestRouteTenancy_SetTrafficSplitForeignIsNoRoute: team B cannot reweight team A's
+// route — SetTrafficSplit(teamB, "fraud", …) misses when B owns no "fraud" → it
+// gets ErrNoRoute and cannot dial A's canary split.
+func TestRouteTenancy_SetTrafficSplitForeignIsNoRoute(t *testing.T) {
+	store := newMockRouteStore()
+	svc := buildService(t, store, &mockLimiter{allow: true}, &mockBackend{}, &mockPublisher{}, &mockQuota{})
+	deployForTeam(t, svc, teamA, "fraud", "vA", "a-backend.svc:9090")
+
+	_, err := svc.SetTrafficSplit(context.Background(), teamB, "fraud", []domain.TrafficWeight{
+		{Version: "vA", WeightBps: domain.TotalWeightBps},
+	})
+	if !errors.Is(err, domain.ErrNoRoute) {
+		t.Fatalf("team B reweight of team A's route err = %v, want ErrNoRoute", err)
+	}
+}
+
+// TestRouteTenancy_DeleteCannotDestroyForeign: the destruction half of the IDOR.
+// team B's DeleteRoute("fraud") must be a no-op against team A's route — A's route
+// must SURVIVE and keep serving. Then a same-team delete works as expected.
+func TestRouteTenancy_DeleteCannotDestroyForeign(t *testing.T) {
+	svc, _ := twoTenantService(t) // both teams own "fraud"
+
+	// Team B deletes "fraud" — only B's own route should go.
+	if err := svc.DeleteRoute(context.Background(), teamB, "fraud"); err != nil {
+		t.Fatalf("team B DeleteRoute: %v", err)
+	}
+
+	// Team A's route MUST still exist and serve vA — B could not destroy it.
+	rA, err := svc.GetRoute(context.Background(), teamA, "fraud")
+	if err != nil {
+		t.Fatalf("team A route destroyed by team B delete: %v", err)
+	}
+	if rA.Targets[0].Endpoint != "a-backend.svc:9090" {
+		t.Fatalf("team A route altered by team B delete: %+v", rA)
+	}
+	outA, err := svc.Predict(context.Background(), domain.Principal{APIKeyID: "ka", Team: teamA}, basicInput("fraud"))
+	if err != nil || outA.ServedVersion != "vA" {
+		t.Fatalf("team A predict after team B delete: out=%+v err=%v, want vA served", outA, err)
+	}
+
+	// And team B's OWN route is now gone (same-team delete really worked).
+	if _, err := svc.GetRoute(context.Background(), teamB, "fraud"); !errors.Is(err, domain.ErrNoRoute) {
+		t.Fatalf("team B route after its own delete err = %v, want ErrNoRoute", err)
+	}
+}
+
+// TestRouteTenancy_ListIsScopedToTeam: ListRoutes returns ONLY the caller's own
+// routes — a team must never enumerate another team's models/endpoints.
+func TestRouteTenancy_ListIsScopedToTeam(t *testing.T) {
+	store := newMockRouteStore()
+	svc := buildService(t, store, &mockLimiter{allow: true}, &mockBackend{}, &mockPublisher{}, &mockQuota{})
+	deployForTeam(t, svc, teamA, "fraud", "vA", "a-backend.svc:9090")
+	deployForTeam(t, svc, teamA, "spam", "vA", "a-spam.svc:9090")
+	deployForTeam(t, svc, teamB, "fraud", "vB", "b-backend.svc:9090")
+
+	listA, _, err := svc.ListRoutes(context.Background(), teamA, domain.ListOptions{})
+	if err != nil {
+		t.Fatalf("team A ListRoutes: %v", err)
+	}
+	if len(listA) != 2 {
+		t.Fatalf("team A sees %d routes, want 2 (its own fraud+spam only)", len(listA))
+	}
+	for _, r := range listA {
+		if r.OwnerTeam != teamA {
+			t.Fatalf("team A list leaked a %s route: %+v", r.OwnerTeam, r)
+		}
+	}
+
+	listB, _, err := svc.ListRoutes(context.Background(), teamB, domain.ListOptions{})
+	if err != nil {
+		t.Fatalf("team B ListRoutes: %v", err)
+	}
+	if len(listB) != 1 || listB[0].OwnerTeam != teamB {
+		t.Fatalf("team B list = %+v, want exactly its own one route", listB)
+	}
+}
+
+// TestRouteTenancy_EmptyTeamCannotReachTenantRoute: an unauthenticated / teamless
+// principal (Team == "") must not be able to reach a real tenant's route by name —
+// the empty-team namespace is disjoint from any real team's. This guards the
+// defense-in-depth backstop (the handler rejects anonymous callers up front, but
+// the domain must also not serve a "" caller a real route).
+func TestRouteTenancy_EmptyTeamCannotReachTenantRoute(t *testing.T) {
+	store := newMockRouteStore()
+	svc := buildService(t, store, &mockLimiter{allow: true}, &mockBackend{}, &mockPublisher{}, &mockQuota{})
+	deployForTeam(t, svc, teamA, "fraud", "vA", "a-backend.svc:9090")
+
+	_, err := svc.Predict(context.Background(), domain.Principal{APIKeyID: "anon", Team: ""}, basicInput("fraud"))
+	if !errors.Is(err, domain.ErrNoRoute) {
+		t.Fatalf("empty-team predict err = %v, want ErrNoRoute (no reach into a real tenant)", err)
 	}
 }

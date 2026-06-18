@@ -134,7 +134,10 @@ secrets:
   # service). MUST be the SAME value the fp-auth chart sets for its jwtSecret and >= 32
   # bytes of entropy (HMAC-SHA256 key floor); the service fails fast otherwise. In prod
   # this comes from a managed secret store (shared across services), never from git.
-  jwtSecret: "dev-only-change-me-in-prod-min-32-bytes-of-entropy"
+  # EMPTY BY DEFAULT (fail-closed): the secret template guard rejects an empty,
+  # short (<32B), or the old dev-only placeholder key, so `helm install` ERRORS
+  # until you supply a real key (--set, a non-committed -f, or secrets.existingSecret).
+  jwtSecret: ""
   # Full Postgres DSN the service reads as FP_DATABASE_URL. Database is fp_monitor
   # (this service owns it — "database per service"). In prod the password
   # component comes from a managed secret store, not from this file.

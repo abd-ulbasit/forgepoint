@@ -33,6 +33,9 @@ package domain
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"path"
+	"strings"
 	"time"
 )
 
@@ -161,12 +164,44 @@ type Clock interface {
 // (load arbitrary weights). The allow-list pins the pod to its own bucket/prefix.
 //
 // SEMANTICS: an entry like "s3://fp-models/" allows any object under that
-// bucket+prefix. Matching is a strict PREFIX match on the normalized URI. WHY
-// prefix and not substring/glob: substring matching is a footgun
-// ("s3://fp-models-evil/" would match a substring rule for "fp-models"); a
-// strict prefix on the full "scheme://bucket/prefix" boundary is unambiguous.
-// An empty allow-list denies everything (fail-closed) — a misconfigured pod
-// refuses all loads rather than accepting any URI.
+// bucket+prefix. Matching is a STRUCTURED comparison of URL components, NOT a
+// raw string prefix:
+//
+//	scheme   — must match EXACTLY (case-insensitive). "https://" never matches an
+//	           "s3://" allow entry. Blocks a scheme-swap (e.g. file:// → SSRF).
+//	host     — bucket/host must match EXACTLY (case-insensitive). "fp-models" and
+//	           "fp-models-evil" are different hosts, so a prefix-SIBLING bucket can
+//	           never sneak in. (User-info / port are also compared so a crafted
+//	           authority can't masquerade as the allowed host.)
+//	path     — the requested path, after path.Clean, must remain UNDER the allowed
+//	           prefix with the boundary aligned on a path SEPARATOR (so prefix
+//	           "/models/" matches "/models/a.onnx" but NOT "/models-x/a.onnx"), and
+//	           must contain NO parent-dir ("..") segment.
+//
+// WHY structured and not a raw byte-prefix (the bug this fixes): the old code did
+// `uri[:len(allowed)] == allowed`. That is a substring/footgun on three axes:
+//
+//  1. PATH TRAVERSAL — "s3://fp-models/../secrets/x" starts with "s3://fp-models/"
+//     as raw bytes, so it passed; but it resolves OUTSIDE the prefix. We now reject
+//     any URI whose RAW path carries a ".." SEGMENT (checked before path.Clean —
+//     see splitArtifactURI for why cleaning first would HIDE a root-absorbed "/..")
+//     and then prove the cleaned path stays under the prefix.
+//  2. PREFIX-SIBLING HOST/BUCKET — an allow entry "s3://fp-models" (no trailing
+//     slash) would raw-prefix-match "s3://fp-models-evil/...". Comparing the HOST
+//     component for EXACT equality kills this regardless of trailing slashes.
+//  3. SCHEME CONFUSION — a raw prefix can't reason about scheme boundaries;
+//     comparing url.Scheme exactly does.
+//
+// An empty allow-list (or empty URI) denies everything (fail-closed) — a
+// misconfigured pod refuses all loads rather than accepting any URI. A malformed
+// URI, or one that does not parse into a scheme+host, is likewise denied.
+//
+// INTERVIEW: "How do you stop a path-traversal escape from an allow-list?" Parse
+// both sides, compare scheme+host exactly, reject any ".." segment in the raw path
+// (because path.Clean would absorb a root-level "/.." and hide the escape), and
+// prove the cleaned request path is a child of the allowed prefix with a
+// separator-aligned boundary — never a raw string prefix, which conflates
+// "fp-models/" with "fp-models-evil/".
 //
 // It is a free function (not a method) because it is a pure predicate over
 // inputs with no domain state — easy to test in isolation.
@@ -174,16 +209,132 @@ func ArtifactURIAllowed(uri string, allowList []string) bool {
 	if uri == "" || len(allowList) == 0 {
 		return false // fail-closed: no URI or no allow-list ⇒ deny
 	}
+	reqScheme, reqHost, reqPath, ok := splitArtifactURI(uri)
+	if !ok {
+		return false // unparseable / schemeless / hostless ⇒ deny
+	}
 	for _, allowed := range allowList {
 		if allowed == "" {
-			continue // ignore empty entries; they would match everything by prefix
+			continue // ignore empty entries; they would otherwise match everything
 		}
-		// Strict prefix match on the full scheme://bucket/prefix boundary.
-		if len(uri) >= len(allowed) && uri[:len(allowed)] == allowed {
+		alScheme, alHost, alPath, ok := splitArtifactURI(allowed)
+		if !ok {
+			continue // a malformed allow entry can never grant access
+		}
+		// Scheme + host (authority) must match EXACTLY. EqualFold makes the
+		// comparison case-insensitive (schemes and DNS hostnames are), so
+		// "S3://FP-Models/" and "s3://fp-models/" are the same entry — but
+		// "fp-models" and "fp-models-evil" never are.
+		if !strings.EqualFold(reqScheme, alScheme) || !strings.EqualFold(reqHost, alHost) {
+			continue
+		}
+		if pathUnderPrefix(reqPath, alPath) {
 			return true
 		}
 	}
 	return false
+}
+
+// splitArtifactURI parses an allow-list entry or a requested URI into its
+// (scheme, authority, cleaned-path) components. It returns ok=false for anything
+// that:
+//
+//   - fails to parse, OR
+//   - has no scheme, OR
+//   - has no host AND is not the file scheme (file:///abs/path legitimately has an
+//     empty authority — RFC 8089 — so we allow it there but nowhere else; a
+//     schemeless/hostless value for any other scheme collapses to a bare path and
+//     re-opens the substring footgun), OR
+//   - contains a literal parent-dir ("..") segment ANYWHERE in its RAW path.
+//
+// THE "..": WHY WE CHECK THE RAW PATH AND FAIL CLOSED. This is the crux of the
+// traversal fix. Go's path.Clean resolves ".." against earlier segments AND, at
+// the root, silently DROPS a leading ".." (path.Clean("/../secrets") == "/secrets").
+// So if we cleaned first and only then looked for residual "..", the escape would
+// already be absorbed and "/secrets" would look like a legitimate child of the
+// bucket root. In object-storage keys and mount paths a ".." segment is NEVER
+// legitimate, so the correct, unambiguous guard is: detect ".." in the UN-cleaned
+// path and reject the whole URI. (This also covers percent-encoded "%2e%2e" because
+// url.Parse decodes u.Path before we inspect it.)
+//
+// The authority returned is the FULL authority (user-info + host + port), so a
+// crafted "user@host" or "host:port" cannot masquerade as the allowed bare host.
+func splitArtifactURI(raw string) (scheme, authority, cleanedPath string, ok bool) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", "", "", false
+	}
+	if u.Scheme == "" {
+		return "", "", "", false
+	}
+	// host is required for every scheme EXCEPT file:// (file:///abs/path has an
+	// empty authority by RFC 8089). For file we substitute a fixed sentinel host so
+	// scheme+host comparison still works uniformly (both sides get "" → sentinel).
+	host := u.Host
+	if host == "" {
+		if u.Scheme != "file" {
+			return "", "", "", false
+		}
+		host = "localhost" // canonical empty-authority file host
+	}
+	// REJECT any ".." segment in the RAW path (see the doc above). hasParentDirSegment
+	// inspects the un-cleaned, url.Parse-decoded path so a root-absorbed "/../" can't
+	// hide the escape.
+	if hasParentDirSegment(u.Path) {
+		return "", "", "", false
+	}
+	// u.Host already includes host[:port]; prepend user-info if present so the
+	// whole authority must match (no "evil@fp-models" smuggling).
+	auth := host
+	if u.User != nil {
+		auth = u.User.String() + "@" + host
+	}
+	// path.Clean (forward-slash semantics — URI paths are always '/'-separated,
+	// regardless of the host OS) collapses redundant separators and "." segments.
+	// With ".." already rejected above, Clean here is purely cosmetic normalization.
+	// An empty path normalizes to "/" so a bucket-root entry ("s3://fp-models") and
+	// ("s3://fp-models/") behave alike.
+	p := u.Path
+	if p == "" {
+		p = "/"
+	}
+	return u.Scheme, auth, path.Clean(p), true
+}
+
+// hasParentDirSegment reports whether p contains a ".." path SEGMENT (not merely
+// the substring ".." — a filename like "model..onnx" is fine). It splits on "/"
+// and looks for an exact ".." element, so "/a/../b", "/../b", "/a/.." and a bare
+// ".." all trip it, while "/a..b/c" and "/..foo/x" do not.
+func hasParentDirSegment(p string) bool {
+	for _, seg := range strings.Split(p, "/") {
+		if seg == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+// pathUnderPrefix reports whether cleanedReq is the allowed prefix itself or a
+// descendant of it, with the boundary aligned on a path SEPARATOR. Both inputs are
+// already free of ".." segments (splitArtifactURI rejected any), so this is purely
+// a structural under-prefix test.
+//
+//	prefix "/models" (cleans to "/models"):
+//	  "/models"          → allowed (exact)
+//	  "/models/iris.onnx"→ allowed (child, boundary on '/')
+//	  "/models-evil/x"   → DENIED  (boundary not on '/': "/models-evil" ≠ child)
+func pathUnderPrefix(cleanedReq, allowedPrefix string) bool {
+	prefix := path.Clean(allowedPrefix)
+	if cleanedReq == prefix {
+		return true // exact match (the prefix root itself)
+	}
+	// Root prefix "/" is under-prefix for everything absolute (any path is its
+	// child). Otherwise require a separator-aligned boundary: cleanedReq must start
+	// with prefix + "/", so "/models" does NOT swallow "/models-evil".
+	if prefix == "/" {
+		return strings.HasPrefix(cleanedReq, "/")
+	}
+	return strings.HasPrefix(cleanedReq, prefix+"/")
 }
 
 // wrapValidation is a tiny helper to produce a %w-wrapped ErrValidation with a

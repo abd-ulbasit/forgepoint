@@ -240,6 +240,49 @@ func (s *ReadStore) ListModels(ctx context.Context, team string, filter domain.L
 	return out, "", nil
 }
 
+// CountModels returns the TOTAL number of a team's models matching the filter — the
+// accurate aggregate the dashboard renders (and the value ListModels' Page.Total /
+// the proto total_count carry).
+//
+// WHY iterate-and-filter rather than a single ZCARD: ZCARD would give the raw team
+// ZSET cardinality, which INCLUDES archived models — but ListModels HIDES archived by
+// default (IncludeArchived=false), and also narrows by task_type/framework. A count
+// computed differently from the list is exactly how the dashboard ("0") and the list
+// ("3") came to disagree. So we count through the SAME modelMatchesFilter predicate
+// the list uses, loading each member's hash, so the two can never drift. We read the
+// whole team ZSET (no score ceiling) because a COUNT must see every member, not a
+// page. For the registry's cardinality (models-per-team is modest) this is the right
+// tradeoff; a high-cardinality tenant would instead maintain a per-(team,facet)
+// counter key bumped by the projection — documented as the scale-up path, same
+// observable contract.
+//
+// A torn projection (a ZSET member whose hash vanished) is SKIPPED, mirroring
+// ListModels, so the count reflects only models a list would actually return.
+func (s *ReadStore) CountModels(ctx context.Context, team string, filter domain.ListModelsFilter) (int, error) {
+	res, err := s.rdb.ZRevRangeByScoreWithScores(ctx, teamModelsKey(team), &goredis.ZRangeBy{
+		Min: "-inf",
+		Max: "+inf",
+	}).Result()
+	if err != nil {
+		return 0, fmt.Errorf("registry/redis: zrevrangebyscore (count) %s: %w", teamModelsKey(team), err)
+	}
+	count := 0
+	for _, z := range res {
+		id, _ := z.Member.(string)
+		m, err := s.loadModel(ctx, id)
+		if err != nil {
+			if errors.Is(err, domain.ErrRecordNotFound) {
+				continue // torn projection member; skip, exactly as ListModels does
+			}
+			return 0, err
+		}
+		if modelMatchesFilter(m, filter) {
+			count++
+		}
+	}
+	return count, nil
+}
+
 // GetVersionByID loads a projected version hash by its own id.
 func (s *ReadStore) GetVersionByID(ctx context.Context, id string) (domain.ModelVersion, error) {
 	return s.loadVersion(ctx, id)

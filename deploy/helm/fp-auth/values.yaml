@@ -103,7 +103,10 @@ secrets:
   existingSecret: ""
   # DEV-ONLY values. Override via --set or a non-committed -f secrets.local.yaml.
   # jwtSecret must be >= 32 bytes of high-entropy data in prod (HMAC-SHA256 key).
-  jwtSecret: "dev-only-change-me-in-prod-min-32-bytes-of-entropy"
+  # EMPTY BY DEFAULT (fail-closed): the secret template guard rejects an empty,
+  # short (<32B), or the old dev-only placeholder key, so `helm install` ERRORS
+  # until you supply a real key (--set, a non-committed -f, or secrets.existingSecret).
+  jwtSecret: ""
   # Full Postgres DSN the service reads as FP_DATABASE_URL. In prod the password
   # component comes from a managed secret store, not from this file.
   databaseUrl: "postgres://auth:dev-only-change-me@postgres.fp-infra.svc.cluster.local:5432/auth?sslmode=disable"

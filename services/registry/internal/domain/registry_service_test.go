@@ -309,6 +309,9 @@ func (panicReadStore) GetModelByName(context.Context, string, string) (Model, er
 func (panicReadStore) ListModels(context.Context, string, ListModelsFilter, ListOptions) ([]Model, string, error) {
 	panic("command read the projection")
 }
+func (panicReadStore) CountModels(context.Context, string, ListModelsFilter) (int, error) {
+	panic("command read the projection")
+}
 func (panicReadStore) GetVersionByID(context.Context, string) (ModelVersion, error) {
 	panic("command read the projection")
 }
@@ -781,6 +784,7 @@ type recordingReadStore struct {
 	gotFilter   ListModelsFilter
 	gotStage    ModelStage
 	returnModel Model
+	returnCount int
 	returnErr   error
 }
 
@@ -801,6 +805,10 @@ func (r *recordingReadStore) GetModelByName(_ context.Context, team, name string
 func (r *recordingReadStore) ListModels(_ context.Context, team string, f ListModelsFilter, o ListOptions) ([]Model, string, error) {
 	r.gotTeam, r.gotFilter, r.gotOpts = team, f, o
 	return nil, "", nil
+}
+func (r *recordingReadStore) CountModels(_ context.Context, team string, f ListModelsFilter) (int, error) {
+	r.gotTeam, r.gotFilter = team, f
+	return r.returnCount, r.returnErr
 }
 func (r *recordingReadStore) GetVersionByID(context.Context, string) (ModelVersion, error) {
 	return ModelVersion{}, r.returnErr

@@ -116,22 +116,35 @@ type ModelServerClient interface {
 // fetched Route in place — see SetTrafficSplit/ApplyModel* cloneTargets), so the
 // two layers are belt-and-suspenders: either alone closes the race; together they
 // make the invariant impossible to break by a future careless edit on one side.
+// TENANCY (cross-tenant IDOR fix): the store is keyed by an OPAQUE key the DOMAIN
+// composes — routeKey(team, modelName) — NOT by the bare model name. The store
+// treats the key as an opaque string; it neither knows nor cares that it encodes a
+// (team, model) pair. This deliberate split keeps the multi-tenancy RULE in the
+// domain (where Principal.Team is known and trusted) while the adapter stays a dumb
+// keyed map. WHY a key parameter instead of widening to (team, model): the store
+// must not bake in the tenancy scheme — if the key derivation ever changes, only
+// the domain changes; the adapters keep working unchanged.
 type RouteStore interface {
-	// Get returns the route for a model name. Returns ErrNoRoute if absent (the
+	// Get returns the route stored under key, or ErrNoRoute if absent (the
 	// use-case maps that straight to a NO_ROUTE failure). The returned Route is a
 	// DEEP COPY (see SNAPSHOT ISOLATION above): callers may read it without locking
-	// and a concurrent Upsert never mutates it.
-	Get(ctx context.Context, modelName string) (Route, error)
-	// Upsert creates or replaces a model's route (used by event consumers and
-	// the admin control plane). The caller passes a fully-validated Route; the
+	// and a concurrent Upsert never mutates it. key is the domain-composed
+	// (team, model) key — a cross-team lookup simply misses (ErrNoRoute).
+	Get(ctx context.Context, key string) (Route, error)
+	// Upsert creates or replaces the route stored under key (used by event consumers
+	// and the admin control plane). The caller passes a fully-validated Route; the
 	// adapter stores it atomically (swap the map entry under the write lock) so a
-	// concurrent Get sees either the whole old route or the whole new one.
-	Upsert(ctx context.Context, route Route) error
-	// Delete removes a model from the table (ModelUndeployed/Archived, DeleteRoute).
-	// Deleting an absent route is a safe no-op (idempotent consumers).
-	Delete(ctx context.Context, modelName string) error
-	// List returns a page of routes for the operator dashboard / CLI. pageSize is
-	// already capped by the handler; the store honors the cursor.
+	// concurrent Get sees either the whole old route or the whole new one. The Route
+	// carries its own OwnerTeam/ModelName for projection; the adapter persists it as
+	// data and keys solely by the supplied key.
+	Upsert(ctx context.Context, key string, route Route) error
+	// Delete removes the route stored under key (ModelUndeployed/Archived,
+	// DeleteRoute). Deleting an absent key is a safe no-op (idempotent consumers).
+	Delete(ctx context.Context, key string) error
+	// List returns a page of ALL routes for the operator dashboard / CLI. pageSize
+	// is already capped by the handler; the store honors the cursor. The store does
+	// NOT filter by team (it can't read the opaque key) — the DOMAIN filters the
+	// page to the caller's OwnerTeam (see ListRoutes), so a team only sees its own.
 	List(ctx context.Context, opts ListOptions) (routes []Route, nextToken string, err error)
 }
 

@@ -89,8 +89,15 @@ type RouteStore struct {
 	// mu guards table. RWMutex because Get (hot path, read) vastly outnumbers
 	// Upsert/Delete (control-plane / event-driven, write) — readers don't block
 	// each other, exactly the access pattern an RWMutex optimizes for.
+	//
+	// KEY (multi-tenant IDOR fix): the map is keyed by the DOMAIN-composed opaque
+	// key — routeKey(team, modelName) — NOT by the bare model name. The adapter
+	// treats the key as opaque; it never parses it. This is what makes two teams'
+	// identically-named models distinct rows so one team can never address (read,
+	// repoint, delete) another's route. The Route's OwnerTeam/ModelName fields carry
+	// the human-readable identity for projection/responses.
 	mu    sync.RWMutex
-	table map[string]domain.Route // modelName → authoritative Route
+	table map[string]domain.Route // routeKey(team, modelName) → authoritative Route
 }
 
 // NewRouteStore builds the adapter over a go-redis client. The caller owns the
@@ -131,12 +138,13 @@ func cloneRoute(r domain.Route) domain.Route {
 // HOT PATH — Get reads the in-memory map, never Redis.
 // ----------------------------------------------------------------------------
 
-// Get returns the route for modelName, or domain.ErrNoRoute if absent. The
-// returned Route is a DEEP COPY (snapshot isolation): the caller may scan
-// route.Targets lock-free while a concurrent Upsert swaps the stored route.
-func (s *RouteStore) Get(_ context.Context, modelName string) (domain.Route, error) {
+// Get returns the route stored under key, or domain.ErrNoRoute if absent. key is
+// the domain-composed (team, model) key (opaque here). The returned Route is a
+// DEEP COPY (snapshot isolation): the caller may scan route.Targets lock-free
+// while a concurrent Upsert swaps the stored route.
+func (s *RouteStore) Get(_ context.Context, key string) (domain.Route, error) {
 	s.mu.RLock()
-	r, ok := s.table[modelName]
+	r, ok := s.table[key]
 	s.mu.RUnlock()
 	if !ok {
 		// ErrNoRoute is the domain sentinel the use-case maps straight to a
@@ -151,31 +159,34 @@ func (s *RouteStore) Get(_ context.Context, modelName string) (domain.Route, err
 // mirrors it to Redis. The caller passes an already-validated Route (the domain
 // enforces the weight-sum / status invariants before calling); the adapter is not
 // the validation layer, it is the persistence layer.
-func (s *RouteStore) Upsert(ctx context.Context, route domain.Route) error {
+func (s *RouteStore) Upsert(ctx context.Context, key string, route domain.Route) error {
 	// Deep-copy on the way IN so a later mutation of the caller's slice cannot
 	// reach into our stored map (the symmetric half of copy-on-read).
 	stored := cloneRoute(route)
 
-	// 1) Authoritative in-memory swap under the write lock. A concurrent Get sees
-	//    either the whole old route or the whole new one — never a half-applied
-	//    one — because map assignment of the (already-built) value is atomic from
-	//    the reader's perspective and the reader copies under RLock.
+	// 1) Authoritative in-memory swap under the write lock, keyed by the opaque
+	//    domain key (routeKey(team, model)) — NOT route.ModelName, which is no
+	//    longer unique across tenants. A concurrent Get sees either the whole old
+	//    route or the whole new one — never a half-applied one — because map
+	//    assignment of the (already-built) value is atomic from the reader's
+	//    perspective and the reader copies under RLock.
 	s.mu.Lock()
-	s.table[route.ModelName] = stored
+	s.table[key] = stored
 	s.mu.Unlock()
 
-	// 2) Mirror to Redis (best-effort warm-start state). Marshal the deep copy so
-	//    the JSON reflects exactly what we stored.
+	// 2) Mirror to Redis (best-effort warm-start state) under the SAME key, so a
+	//    warm() restores the table with tenant namespacing intact. Marshal the deep
+	//    copy so the JSON reflects exactly what we stored.
 	blob, err := json.Marshal(stored)
 	if err != nil {
 		// Marshal failing is a programming error (Route is plain data), not a
 		// Redis problem — surface it; the in-memory truth is already correct.
-		return fmt.Errorf("redisrepo: marshal route %q for mirror: %w", route.ModelName, err)
+		return fmt.Errorf("redisrepo: marshal route %q for mirror: %w", key, err)
 	}
-	if err := s.rdb.HSet(ctx, routesHashKey, route.ModelName, blob).Err(); err != nil {
+	if err := s.rdb.HSet(ctx, routesHashKey, key, blob).Err(); err != nil {
 		// Mirror write failed: in-memory state is correct and serving; only the
 		// warm-start cache is stale. Return for observability, do NOT roll back.
-		return fmt.Errorf("redisrepo: mirror upsert route %q: %w", route.ModelName, err)
+		return fmt.Errorf("redisrepo: mirror upsert route %q: %w", key, err)
 	}
 	return nil
 }
@@ -183,34 +194,37 @@ func (s *RouteStore) Upsert(ctx context.Context, route domain.Route) error {
 // Delete removes a model from the table (ModelUndeployed/Archived, DeleteRoute).
 // Idempotent: deleting an absent route is a no-op (idempotent consumers — a
 // redelivered ModelUndeployed must not error).
-func (s *RouteStore) Delete(ctx context.Context, modelName string) error {
-	// 1) Authoritative removal first.
+func (s *RouteStore) Delete(ctx context.Context, key string) error {
+	// 1) Authoritative removal first (keyed by the opaque domain key — so a delete
+	//    only ever touches the caller's own tenant namespace).
 	s.mu.Lock()
-	delete(s.table, modelName) // delete of an absent key is a safe no-op in Go
+	delete(s.table, key) // delete of an absent key is a safe no-op in Go
 	s.mu.Unlock()
 
 	// 2) Mirror removal. HDEL of an absent field returns 0, not an error — so a
 	//    redelivered delete is naturally idempotent here too.
-	if err := s.rdb.HDel(ctx, routesHashKey, modelName).Err(); err != nil {
-		return fmt.Errorf("redisrepo: mirror delete route %q: %w", modelName, err)
+	if err := s.rdb.HDel(ctx, routesHashKey, key).Err(); err != nil {
+		return fmt.Errorf("redisrepo: mirror delete route %q: %w", key, err)
 	}
 	return nil
 }
 
-// List returns a page of routes for the operator dashboard / CLI, served entirely
-// from the authoritative in-memory map (Redis is never touched). Pagination is
-// CURSOR-based over a STABLE SORT by model name:
+// List returns a page of ALL routes (every tenant) for the operator dashboard /
+// CLI, served entirely from the authoritative in-memory map (Redis is never
+// touched). The DOMAIN scopes the result to the caller's team (see
+// domain.ListRoutes) — the store can't read the opaque key, so it does not filter.
+// Pagination is CURSOR-based over a STABLE SORT by the store KEY:
 //
-//   - We sort the model names, then return the page of routes whose name is
-//     strictly greater than the cursor (PageToken). The next token is the last
-//     model name returned. Empty token = from the start; empty next token = end.
+//   - We sort the keys, then return the page of routes whose key is strictly
+//     greater than the cursor (PageToken). The next token is the last key returned.
+//     Empty token = from the start; empty next token = end.
 //
-// WHY a name cursor and not LIMIT/OFFSET: the routing table mutates from events
+// WHY a key cursor and not LIMIT/OFFSET: the routing table mutates from events
 // while an operator pages through it. An OFFSET-based page can SKIP a route (if an
 // earlier one is deleted between pages) or DUPLICATE one (if an earlier one is
-// inserted). A name cursor is stable: "everything after fraud-detector" means the
-// same thing regardless of inserts/deletes elsewhere. The token is the model name
-// itself — opaque to the caller, which only round-trips it.
+// inserted). A key cursor is stable regardless of inserts/deletes elsewhere. The
+// token is the opaque store key itself — opaque to the caller, which only
+// round-trips it.
 func (s *RouteStore) List(_ context.Context, opts domain.ListOptions) ([]domain.Route, string, error) {
 	const defaultPageSize = 50
 	pageSize := opts.PageSize

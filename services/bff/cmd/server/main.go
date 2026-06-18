@@ -46,6 +46,7 @@ import (
 	"github.com/abd-ulbasit/forgepoint/pkg/health"
 	"github.com/abd-ulbasit/forgepoint/pkg/observability"
 	"github.com/abd-ulbasit/forgepoint/services/bff/internal/clients"
+	"github.com/abd-ulbasit/forgepoint/services/bff/internal/handlers"
 	"github.com/abd-ulbasit/forgepoint/services/bff/internal/router"
 )
 
@@ -78,6 +79,22 @@ type BFFConfig struct {
 	// other services' split. Default 8081 to avoid clashing with a co-located
 	// service's 8080 health port in local dev.
 	HTTPPort int `env:"HTTP_PORT" default:"8081"`
+
+	// ---- SSE (server-stream relay) resource caps ----------------------------
+	// Each /executions/{id}/watch opens one upstream gRPC stream that lives as
+	// long as the browser keeps the EventSource open. Without caps an
+	// AUTHENTICATED client can open thousands of these, each amplified into a
+	// long-lived gRPC stream against the orchestrator (gRPC amplification DoS).
+	// These bounds make that finite. See handlers.SSELimits.
+	//
+	// SSEMaxGlobal caps total concurrent SSE streams across ALL users (process
+	// fuse). SSEMaxPerUser caps per-token-subject so one user cannot consume the
+	// whole global budget. SSEMaxLifetime force-closes any single stream after a
+	// hard ceiling so a stuck client that keeps the heartbeat alive is still
+	// reaped (defense against a slow-loris that answers pings forever).
+	SSEMaxGlobal   int           `env:"SSE_MAX_GLOBAL" default:"256"`
+	SSEMaxPerUser  int           `env:"SSE_MAX_PER_USER" default:"8"`
+	SSEMaxLifetime time.Duration `env:"SSE_MAX_LIFETIME" default:"30m"`
 }
 
 func main() {
@@ -153,6 +170,11 @@ func main() {
 		Clients:        cl,
 		Logger:         logger,
 		AllowedOrigins: cfg.AllowedOrigins,
+		SSELimits: handlers.SSELimits{
+			MaxGlobal:   cfg.SSEMaxGlobal,
+			MaxPerUser:  cfg.SSEMaxPerUser,
+			MaxLifetime: cfg.SSEMaxLifetime,
+		},
 	})
 
 	// HTTP server with TIMEOUTS (anti-slowloris). Read/Write/Idle bound how long a

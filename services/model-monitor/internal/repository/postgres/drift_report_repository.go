@@ -180,8 +180,9 @@ func (r *DriftReportRepository) LatestByModel(ctx context.Context, ownerTeam, mo
 // List returns a page of a (team, model)'s reports (newest window_end first) under
 // the filter, plus a next-page cursor.
 //
-// The mandatory scope is (owner_team, model_name) — BOTH set by the service (team
-// from auth claims, model from the request). Optional filters: MinSeverity (>=),
+// The mandatory scope is owner_team (set by the service from auth claims). model_name
+// is an OPTIONAL filter — set narrows to one model, empty spans all of the team's
+// models (the fleet "recent drift" view). Other optional filters: MinSeverity (>=),
 // Since (window_end >= ), Until (window_end <= ). Every value is a BOUND parameter;
 // the dynamic part is only the placeholder text, so SQL injection is impossible even
 // with the assembled WHERE. Keyset cursor rides (window_end, id) — the index's total
@@ -196,10 +197,19 @@ func (r *DriftReportRepository) List(ctx context.Context, f domain.ReportFilter,
 		return nil, "", err
 	}
 
-	args := []any{f.OwnerTeam, f.ModelName}
-	conds := []string{"owner_team = $1", "model_name = $2"}
+	// owner_team is the MANDATORY tenant scope — always bound, always first. model_name
+	// is now OPTIONAL: when set it narrows to one model; when empty the predicate is
+	// omitted so the page spans ALL of the team's models (the fleet "recent drift" view).
+	// Tenancy is unaffected — owner_team is still the keyed scope, so an empty model_name
+	// can never widen past this team. The keyset cursor still rides (window_end, id), so
+	// the cross-model page is ordered newest-first and paginates stably.
+	args := []any{f.OwnerTeam}
+	conds := []string{"owner_team = $1"}
 	next := func(v any) string { args = append(args, v); return fmt.Sprintf("$%d", len(args)) }
 
+	if f.ModelName != "" {
+		conds = append(conds, "model_name = "+next(f.ModelName))
+	}
 	if f.MinSeverity != domain.DriftSeverityUnspecified {
 		conds = append(conds, "severity >= "+next(int16(f.MinSeverity)))
 	}
