@@ -47,6 +47,24 @@ data:
   # Circuit breaker — consecutive provider failures to trip OPEN + OPEN cooldown.
   FP_CIRCUIT_FAILURE_THRESHOLD: {{ .Values.config.circuitFailureThreshold | quote }}
   FP_CIRCUIT_RESET_SECONDS: {{ .Values.config.circuitResetSeconds | quote }}
+  # ----- L5 AI GOVERNANCE: the model/provider ALLOW-LIST (policy-as-config) -----
+  # Comma-separated lists of the model names and provider kinds this deployment may
+  # serve. ChatCompletion rejects anything not listed with PermissionDenied (audited as
+  # a DENY). EMPTY = ALLOW ALL (dev). These are NON-secret governance config, so they
+  # ride in the ConfigMap. In non-dev, set FP_AI_ALLOWED_MODELS to the approved-models
+  # list — the Kyverno require-ai-allowlist policy (deploy/policies) flags a deployment
+  # that leaves it empty (wildcard-allow) outside dev.
+  FP_AI_ALLOWED_MODELS: {{ .Values.config.allowedModels | quote }}
+  FP_AI_ALLOWED_PROVIDERS: {{ .Values.config.allowedProviders | quote }}
+  {{- if .Values.config.openaiBaseUrl }}
+  # OPTIONAL: override the OpenAI API root (Azure OpenAI / a proxy). Non-secret (no
+  # credential), so it lives here, not in the Secret. The KEY itself is in the Secret.
+  FP_OPENAI_BASE_URL: {{ .Values.config.openaiBaseUrl | quote }}
+  {{- end }}
+  {{- if .Values.config.anthropicBaseUrl }}
+  # OPTIONAL: override the Anthropic API root (a proxy). Non-secret; the key is in the Secret.
+  FP_ANTHROPIC_BASE_URL: {{ .Values.config.anthropicBaseUrl | quote }}
+  {{- end }}
   {{- with .Values.config.extraEnv }}
   # Free-form additional non-secret env. Keys used verbatim.
   {{- range $key, $val := . }}

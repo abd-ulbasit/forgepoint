@@ -122,6 +122,24 @@ config:
   circuitFailureThreshold: 3
   circuitResetSeconds: 30
 
+  # ----- L5 AI GOVERNANCE: model/provider ALLOW-LIST (FP_AI_ALLOWED_*) -----
+  # Comma-separated allow-lists. EMPTY = ALLOW ALL (the dev default). ChatCompletion
+  # rejects a model/provider not on the list with PermissionDenied (audited as a DENY).
+  # In NON-DEV, set allowedModels to the approved-models list (cost control + approved-
+  # models-only compliance + shadow-model blocking). The Kyverno require-ai-allowlist
+  # policy flags a wildcard-allow (both empty) deployment outside fp-dev. Examples:
+  #   allowedModels: "smollm2:135m,gpt-4o-mini,claude-3-5-haiku-latest"
+  #   allowedProviders: "ollama,openai,anthropic,stub"
+  allowedModels: ""
+  allowedProviders: ""
+
+  # ----- OPTIONAL cloud provider API-root overrides (non-secret) -----
+  # Override the public OpenAI / Anthropic roots (Azure OpenAI, an enterprise proxy).
+  # Empty = the public default. The KEYS are secrets (see `secrets:`); these URLs are
+  # not, so they live in the ConfigMap. Rendered only when set.
+  openaiBaseUrl: ""
+  anthropicBaseUrl: ""
+
   # Extra free-form non-secret env keys (rendered into the ConfigMap as-is).
   # Keys are used verbatim — DO NOT prefix with FP_ here unless the service
   # actually reads that prefix; mirror existing FP_* naming.
@@ -173,6 +191,16 @@ secrets:
   # initContainer then applies the schema before the app starts. In prod the password
   # comes from a managed secret store, never this committed file.
   databaseUrl: ""
+  # OPTIONAL (L5 GOVERNANCE — CLOUD PROVIDERS) — the cloud LLM API keys. EMPTY BY
+  # DEFAULT: with no key the secret omits the env, the provider is NOT registered, and
+  # the failover order stays Ollama+Stub (no cloud account needed for the default
+  # deploy). SET a key to enable that provider — KEY-GATING by presence (see
+  # cmd/server/main.go). These are auth CREDENTIALS, so they live in the Secret (never
+  # the ConfigMap, never inline as a Deployment env value — the Kyverno
+  # require-cloud-keys-from-secret policy enforces that). In prod they come from a
+  # managed secret store (External Secrets / Sealed Secrets), never this committed file.
+  openaiApiKey: ""
+  anthropicApiKey: ""
 
 # ----------------------------------------------------------------------------
 # Migrations — the self-contained prompt-registry schema migration (L3).

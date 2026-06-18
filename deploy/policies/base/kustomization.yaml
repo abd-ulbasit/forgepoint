@@ -17,3 +17,4 @@ resources:
   - 10-require-resources.yaml
   - 20-image-policies.yaml
   - 30-workload-policies.yaml
+  - 40-ai-gateway-policies.yaml

@@ -27,4 +27,13 @@ var (
 	// errored. The stream's terminal frame carries FinishReasonError; the unary
 	// caller sees → Unavailable. This is the FAILOVER-exhausted outcome.
 	ErrAllProvidersFailed = errors.New("ai-gateway: all providers failed")
+
+	// ErrModelNotAllowed — the requested model/provider is not on the runtime
+	// governance ALLOW-LIST (see allowlist.go). → PermissionDenied. The handler maps
+	// it to codes.PermissionDenied, which the audit interceptor records as a DENY —
+	// so a request for a disallowed (e.g. shadow / unpriced / unapproved) model is
+	// REJECTED before any provider call AND audited with the real actor. Distinct from
+	// ErrNoProvider (a routing/availability miss): this is a POLICY denial — the model
+	// COULD be served, but governance forbids it.
+	ErrModelNotAllowed = errors.New("ai-gateway: model or provider not permitted by allow-list")
 )

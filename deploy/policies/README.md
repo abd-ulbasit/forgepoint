@@ -30,6 +30,26 @@ This is part of milestone **M6 — Platform security, GitOps & autoscaling**
 | `disallow-host-namespaces` | no `hostPID`/`hostIPC`/`hostNetwork` | (none of ours use them) |
 | `disallow-host-path` | no `hostPath` volumes | we use PVCs/emptyDir only |
 | `disallow-host-ports` | no `hostPort` | we use ClusterIP Services only |
+| `require-cloud-keys-from-secret` | cloud LLM API keys (`FP_OPENAI_API_KEY`/`FP_ANTHROPIC_API_KEY`) never inline — Secret only | fp-ai-gateway `templates/secret.yaml` (envFrom a Secret) |
+| `require-ai-allowlist` | fp-ai-gateway ConfigMap sets a non-empty `FP_AI_ALLOWED_MODELS` outside `fp-dev` (no wildcard-allow in non-dev) | the gateway's runtime allow-list (`domain/allowlist.go`) |
+
+### AI governance (M7/L5) — `40-ai-gateway-policies.yaml`
+
+Two policies govern the **AI gateway** at admission, complementing its in-process
+governance (the runtime model/provider **allow-list** and the **prompt/response
+audit** trail):
+
+- **`require-cloud-keys-from-secret`** forbids an inline env `value:` for the cloud
+  LLM keys (`FP_OPENAI_API_KEY` / `FP_ANTHROPIC_API_KEY`) on any fp-* container — they
+  must be sourced from a Secret (the chart uses `envFrom` a Secret). An inline
+  credential would leak into the manifest, git, and every `kubectl -o yaml`. The
+  key-gated default (key not set at all) passes trivially.
+- **`require-ai-allowlist`** requires the **fp-ai-gateway ConfigMap** (selected by the
+  `app.kubernetes.io/name: fp-ai-gateway` label) to carry a **non-empty
+  `FP_AI_ALLOWED_MODELS`** outside the **`fp-dev`** namespace — a wildcard-allow
+  (empty = allow-all) data plane is the ungoverned posture this milestone closes, so
+  it's disallowed in non-dev. `fp-dev` is excluded so the permissive dev default stays
+  frictionless locally.
 
 ### The documented `readOnlyRootFilesystem` exception
 
@@ -173,7 +193,9 @@ deploy/policies/
 │   │                                  seccomp RuntimeDefault
 │   ├── 10-require-resources.yaml   ← requests + limits (cpu & memory)
 │   ├── 20-image-policies.yaml      ← disallow-latest-tag, restrict-registries
-│   └── 30-workload-policies.yaml   ← part-of label, host ns/path/port
+│   ├── 30-workload-policies.yaml   ← part-of label, host ns/path/port
+│   └── 40-ai-gateway-policies.yaml ← AI governance: cloud-keys-from-secret,
+│                                       require-ai-allowlist (non-dev)
 └── overlays/
     ├── audit/kustomization.yaml    ← Step 1: observe (pass-through)
     └── enforce/kustomization.yaml  ← Step 2: patch Audit→Enforce (block)

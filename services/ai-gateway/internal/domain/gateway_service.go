@@ -134,6 +134,13 @@ type ServiceDeps struct {
 	// CacheThreshold is the minimum cosine similarity for a CACHE HIT (default 0.95 if
 	// <= 0). Higher = stricter (fewer, more-exact hits); lower = more hits, looser.
 	CacheThreshold float64
+	// AllowList is the RUNTIME GOVERNANCE gate (M7/L5): the config-driven set of
+	// model names / provider kinds this deployment may serve. ChatCompletion checks
+	// the request against it BEFORE routing and rejects a disallowed model/provider
+	// with ErrModelNotAllowed (→ PermissionDenied, audited as a DENY). The ZERO VALUE
+	// is the ALLOW-ALL gate (AllowList{} permits everything), so a deployment that
+	// wires nothing here keeps the permissive dev default — see allowlist.go.
+	AllowList AllowList
 	// Publisher emits the served event + the warm signal. Best-effort, off the path.
 	Publisher EventPublisher
 	// EvalIncludeText opts the gateway INTO attaching the raw prompt+response text to
@@ -160,6 +167,7 @@ type gatewayService struct {
 	embedder        Embedder
 	cache           SemanticCache
 	cacheThreshold  float64
+	allowList       AllowList
 	publisher       EventPublisher
 	evalIncludeText bool
 	now             func() time.Time
@@ -187,6 +195,7 @@ func NewGatewayService(deps ServiceDeps) GatewayService {
 		embedder:        deps.Embedder,
 		cache:           deps.Cache,
 		cacheThreshold:  threshold,
+		allowList:       deps.AllowList,
 		publisher:       deps.Publisher,
 		evalIncludeText: deps.EvalIncludeText,
 		now:             now,
@@ -198,6 +207,23 @@ func (s *gatewayService) ChatCompletion(ctx context.Context, team string, req Ch
 	// --- 1. VALIDATE ---------------------------------------------------------
 	if len(req.Messages) == 0 {
 		return Completion{}, ErrInvalidInput
+	}
+
+	// --- 1a. ALLOW-LIST GATE (runtime governance, BEFORE any routing) --------
+	// Reject a model/provider this deployment is not permitted to serve, BEFORE the
+	// budget check and BEFORE any provider call. This is policy-as-config at the data
+	// plane: cost control (only priced models run), approved-models-only compliance,
+	// and shadow-model blocking (see allowlist.go). The ZERO-value AllowList permits
+	// everything, so an ungoverned (dev) deployment skips straight through.
+	//
+	// WHY this returns a TYPED sentinel rather than denying inline: the handler maps
+	// ErrModelNotAllowed → codes.PermissionDenied, and the audit interceptor wired in
+	// the gRPC chain records that PermissionDenied as a DENY (with the real actor) — so
+	// the governance denial is AUDITED through the existing layers, no extra code here.
+	// It is checked BEFORE the budget gate so a disallowed model is a clean policy DENY
+	// (not masked by a ResourceExhausted if the team also happens to be over budget).
+	if !s.allowList.Permits(req.Model, req.Provider) {
+		return Completion{}, ErrModelNotAllowed
 	}
 
 	// --- 2. BUDGET GATE (pre-flight, claims-derived team) --------------------

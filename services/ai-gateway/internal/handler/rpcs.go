@@ -84,6 +84,13 @@ func (h *AIGatewayHandler) handleChatError(stream aiv1.AIGatewayService_ChatComp
 	switch {
 	case isErr(err, domain.ErrInvalidInput):
 		return status.Error(codes.InvalidArgument, "request has no messages")
+	case isErr(err, domain.ErrModelNotAllowed):
+		// RUNTIME GOVERNANCE DENY: the requested model/provider is not on the allow-list.
+		// PermissionDenied (not InvalidArgument) is the honest code — the request is
+		// well-formed; POLICY forbids it. The audit interceptor records this code as a
+		// DENY, so the attempt to call a disallowed/shadow model is in the audit trail.
+		// The message names neither the model nor any payload (no PII / no config leak).
+		return status.Error(codes.PermissionDenied, "requested model or provider is not permitted")
 	case isErr(err, domain.ErrBudgetExceeded):
 		return status.Error(codes.ResourceExhausted, "team token budget exceeded")
 	case isErr(err, domain.ErrNoProvider):

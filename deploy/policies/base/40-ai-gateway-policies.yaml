@@ -1,0 +1,178 @@
+# =============================================================================
+# AI GOVERNANCE POLICIES (M7/L5) — govern the AI gateway at the K8s layer
+# =============================================================================
+#
+# These two ClusterPolicies are governance-AS-CODE for the AI gateway, the K8s-
+# admission complement to the gateway's IN-PROCESS governance (the runtime allow-list
+# + the prompt/response audit trail). They mirror, at admission time, two contracts
+# the gateway's Helm chart already follows by convention — so a future manifest that
+# quietly drops them is FLAGGED (Audit) or REJECTED (Enforce), not silently accepted:
+#
+#   1. require-cloud-keys-from-secret — the OpenAI / Anthropic API keys (a CLOUD
+#      provider's credential) must be supplied from a SECRET, never pasted INLINE as a
+#      Deployment env `value:`. Inline secrets leak into `kubectl get deploy -o yaml`,
+#      git, and every audit of the manifest — the chart sources them via envFrom a
+#      Secret (templates/secret.yaml); this policy makes that the RULE.
+#
+#   2. require-ai-allowlist — the fp-ai-gateway ConfigMap must carry a NON-EMPTY
+#      FP_AI_ALLOWED_MODELS outside the dev namespace, i.e. a wildcard-allow (empty =
+#      allow-all) data plane is disallowed in non-dev. This is the K8s-layer backstop
+#      for the cost-control / approved-models-only / shadow-model-blocking posture the
+#      runtime allow-list enforces (domain/allowlist.go).
+#
+# STYLE (matches the rest of deploy/policies): ClusterPolicy, validationFailureAction
+# Audit by default (the enforce overlay flips every policy to Enforce), background
+# scan on, scoped to the fp-* namespaces with the kube-* system namespaces excluded.
+# =============================================================================
+
+---
+# -----------------------------------------------------------------------------
+# require-cloud-keys-from-secret — cloud LLM API keys must come from a Secret
+# -----------------------------------------------------------------------------
+# A cloud provider key (FP_OPENAI_API_KEY / FP_ANTHROPIC_API_KEY) is an auth
+# CREDENTIAL. Supplying it as an inline env `value:` on the pod spec bakes a live
+# secret into the Deployment manifest — visible to anyone with `get deploy`, captured
+# in git, GitOps diffs, and every `-o yaml`. It MUST instead come from a Secret
+# (envFrom a secretRef, as the chart does, or a per-key valueFrom.secretKeyRef). This
+# policy forbids the inline-value form for those two env names; absence (the key not
+# set at all — the key-gated default) trivially passes.
+#
+# HOW THE PATTERN WORKS: for every container, for every env entry, IF its name is one
+# of the cloud-key names THEN its `value` must be null (i.e. it must use valueFrom /
+# envFrom instead). Entries with other names, and the common case where the key is
+# delivered via envFrom (so it isn't an explicit `env:` entry at all), are unaffected.
+# We match the workload Pod; Kyverno auto-gen extends it to the Deployment template.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-cloud-keys-from-secret
+  annotations:
+    policies.kyverno.io/title: Cloud LLM API Keys Must Come From a Secret
+    policies.kyverno.io/category: AI Governance
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Cloud LLM provider API keys (FP_OPENAI_API_KEY / FP_ANTHROPIC_API_KEY) must be
+      sourced from a Secret (envFrom/secretKeyRef), never set as an inline env value —
+      an inline credential leaks into the manifest, git, and every kubectl -o yaml.
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: no-inline-cloud-api-key
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - fp-system
+                - fp-models
+                - fp-jobs
+                - fp-infra
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-node-lease
+                - kube-public
+      validate:
+        message: >-
+          Cloud LLM API keys (FP_OPENAI_API_KEY / FP_ANTHROPIC_API_KEY) must come from
+          a Secret (envFrom a secretRef or valueFrom.secretKeyRef), not an inline env
+          value.
+        # For every container, every env entry whose name is a cloud-key name must NOT
+        # carry an inline `value`. `=(env)` makes env optional; the conditional anchor
+        # `(name): FP_OPENAI_API_KEY` selects only matching entries; `X(value): "null"`
+        # asserts that, for those, the value field is absent (forcing valueFrom/envFrom).
+        foreach:
+          - list: "request.object.spec.containers"
+            pattern:
+              =(env):
+                - =(name): "FP_OPENAI_API_KEY"
+                  X(value): "null"
+          - list: "request.object.spec.containers"
+            pattern:
+              =(env):
+                - =(name): "FP_ANTHROPIC_API_KEY"
+                  X(value): "null"
+          - list: "request.object.spec.initContainers"
+            pattern:
+              =(env):
+                - =(name): "FP_OPENAI_API_KEY"
+                  X(value): "null"
+          - list: "request.object.spec.initContainers"
+            pattern:
+              =(env):
+                - =(name): "FP_ANTHROPIC_API_KEY"
+                  X(value): "null"
+
+---
+# -----------------------------------------------------------------------------
+# require-ai-allowlist — the gateway must declare a model allow-list (non-dev)
+# -----------------------------------------------------------------------------
+# The runtime allow-list (FP_AI_ALLOWED_MODELS) is the gateway's cost-control /
+# approved-models-only / shadow-model-blocking gate. EMPTY = ALLOW ALL is a fine DEV
+# default, but a wildcard-allow data plane in PRODUCTION is exactly the ungoverned
+# posture this milestone closes. So this policy requires the fp-ai-gateway ConfigMap to
+# carry a NON-EMPTY FP_AI_ALLOWED_MODELS in the non-dev fp-* namespaces.
+#
+# We target the ConfigMap (where the gateway's non-secret governance config lives) and
+# SELECT only the gateway's own ConfigMap via the app.kubernetes.io/name label the
+# chart stamps — so this never touches other services' ConfigMaps. The `fp-dev`
+# namespace is EXCLUDED: the permissive allow-all default is acceptable there (it's the
+# documented dev convenience), and developers shouldn't be forced to maintain an
+# allow-list locally. Everywhere else, an empty/unset list is a violation.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-ai-allowlist
+  annotations:
+    policies.kyverno.io/title: AI Gateway Must Declare a Model Allow-List (non-dev)
+    policies.kyverno.io/category: AI Governance
+    policies.kyverno.io/severity: medium
+    policies.kyverno.io/subject: ConfigMap
+    policies.kyverno.io/description: >-
+      The fp-ai-gateway ConfigMap must set a non-empty FP_AI_ALLOWED_MODELS outside the
+      dev namespace — a wildcard-allow (empty allow-list) data plane is not permitted in
+      non-dev. This is the K8s-layer backstop for the gateway's runtime governance gate.
+spec:
+  validationFailureAction: Audit
+  background: true
+  rules:
+    - name: ai-gateway-configmap-has-allowlist
+      match:
+        any:
+          - resources:
+              kinds:
+                - ConfigMap
+              namespaces:
+                - fp-system
+                - fp-models
+                - fp-jobs
+                - fp-infra
+              selector:
+                matchLabels:
+                  # The chart stamps this on every fp-ai-gateway resource; selecting on
+                  # it scopes the policy to the gateway's ConfigMap ONLY.
+                  app.kubernetes.io/name: fp-ai-gateway
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kube-node-lease
+                - kube-public
+                # fp-dev: the allow-all dev default is acceptable here (see the policy
+                # header). Add this namespace to the cluster for local/dev gateways.
+                - fp-dev
+      validate:
+        message: >-
+          The fp-ai-gateway ConfigMap must set a non-empty FP_AI_ALLOWED_MODELS outside
+          dev (a wildcard-allow data plane is not permitted in non-dev). Set the approved
+          model list in values.yaml (config.allowedModels).
+        pattern:
+          data:
+            # "?*" = at least one character → the key must be present AND non-empty.
+            FP_AI_ALLOWED_MODELS: "?*"

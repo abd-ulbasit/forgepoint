@@ -49,9 +49,11 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"time"
 
 	aiv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/ai/v1"
+	pkgaudit "github.com/abd-ulbasit/forgepoint/pkg/audit"
 	fpauth "github.com/abd-ulbasit/forgepoint/pkg/auth"
 	"github.com/abd-ulbasit/forgepoint/pkg/config"
 	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
@@ -140,6 +142,39 @@ type AIConfig struct {
 	// completion UNSCORED, notes the limitation) rather than judging blind. Off keeps
 	// the served event byte-identical to its pre-L4 shape (omitempty on the wire).
 	EvalIncludeText bool `env:"AI_EVAL_INCLUDE_TEXT" default:"false"`
+
+	// --- L5 AI GOVERNANCE (M7) ----------------------------------------------
+	// AllowedModels / AllowedProviders are the RUNTIME GOVERNANCE allow-list (policy-
+	// as-config at the data plane): the comma-separated model names and provider kinds
+	// this deployment is PERMITTED to serve. ChatCompletion rejects anything not on the
+	// list with PermissionDenied (audited as a DENY). EMPTY = ALLOW ALL (the dev
+	// default) — frictionless local/CI; production tightens these AND a Kyverno policy
+	// flags a wildcard-allow in non-dev namespaces. See domain/allowlist.go for the
+	// cost-control / approved-models / shadow-model-blocking rationale.
+	//
+	// pkg/config parses a comma-separated env into []string (FP_AI_ALLOWED_MODELS=
+	// "smollm2:135m,gpt-4o-mini"). Provider kinds are parsed from their string labels
+	// ("ollama","openai","anthropic","stub") in main (the domain enum isn't a config
+	// primitive). Unknown provider strings are logged and ignored (fail-safe: an
+	// unparseable governance knob must not crash the gateway, just not widen the gate).
+	AllowedModels    []string `env:"AI_ALLOWED_MODELS"`
+	AllowedProviders []string `env:"AI_ALLOWED_PROVIDERS"`
+
+	// OpenAIAPIKey / AnthropicAPIKey KEY-GATE the optional CLOUD providers. When a key
+	// is SET, that provider is registered into the failover order (after Ollama, before
+	// the stub); when ABSENT, the provider is NOT wired and the order stays Ollama+Stub
+	// — so the default deploy needs NO cloud account. The keys are SECRETS (injected
+	// from a K8s Secret as FP_OPENAI_API_KEY / FP_ANTHROPIC_API_KEY) and are NEVER
+	// logged — only their PRESENCE is logged (key_set=true/false). Not required:"true":
+	// the cloud providers are strictly optional. See step 6 wiring.
+	OpenAIAPIKey    string `env:"OPENAI_API_KEY"`
+	AnthropicAPIKey string `env:"ANTHROPIC_API_KEY"`
+
+	// OpenAIBaseURL / AnthropicBaseURL optionally override the cloud API roots (Azure
+	// OpenAI, an enterprise proxy, a compatible gateway). Empty = the public default.
+	// Non-secret, so they ride in the ConfigMap, not the Secret.
+	OpenAIBaseURL    string `env:"OPENAI_BASE_URL"`
+	AnthropicBaseURL string `env:"ANTHROPIC_BASE_URL"`
 }
 
 func main() {
@@ -230,13 +265,35 @@ func main() {
 
 	// 6. ADAPTERS → DOMAIN SERVICE → HANDLER.
 	//
-	// PROVIDERS in FAILOVER ORDER: Ollama FIRST (the real model, preferred), the
-	// deterministic Stub LAST (the always-available fallback). A cold/down Ollama
-	// trips its breaker and the loop fails over to the stub — so the gateway always
-	// answers. This is the failover demo made real on a RAM-tight node.
+	// PROVIDERS in FAILOVER ORDER: Ollama FIRST (the real local model, preferred), then
+	// the OPTIONAL key-gated CLOUD providers (OpenAI, Anthropic) when their keys are
+	// set, then the deterministic Stub LAST (the always-available fallback). A cold/down
+	// provider trips its breaker and the loop fails over to the next — so the gateway
+	// always answers. This is the multi-provider failover story: local + cloud, with the
+	// stub as the ultimate fallback that needs no account.
+	//
+	// CLOUD KEY-GATING (the whole point): a cloud provider is appended ONLY when its API
+	// key env is set. Absent key ⇒ NOT registered ⇒ the failover order stays exactly
+	// Ollama+Stub, so the DEFAULT deploy needs no cloud account. The key is a SECRET
+	// (from a K8s Secret); we log only its PRESENCE (key_set), never the value.
 	ollama := providers.NewOllamaProvider(cfg.OllamaURL)
 	stub := providers.NewStubProvider()
-	registry := domain.NewProviderRegistry(ollama, stub)
+
+	// Assemble the failover order: Ollama FIRST, then any KEY-GATED cloud providers,
+	// then Stub LAST. providers.CloudProviders does the gating (a provider is included
+	// only when its key is set) and is the unit-tested seam for the registration matrix.
+	// We log only the PRESENCE of each key (never the value).
+	cloud := providers.CloudProviders(cfg.OpenAIAPIKey, cfg.OpenAIBaseURL, cfg.AnthropicAPIKey, cfg.AnthropicBaseURL)
+	logger.Info("cloud providers resolved (key-gated)",
+		slog.Bool("openai_key_set", cfg.OpenAIAPIKey != ""),
+		slog.Bool("anthropic_key_set", cfg.AnthropicAPIKey != ""),
+		slog.Int("cloud_providers_enabled", len(cloud)))
+
+	ordered := make([]domain.Provider, 0, len(cloud)+2)
+	ordered = append(ordered, ollama)
+	ordered = append(ordered, cloud...)
+	ordered = append(ordered, stub)
+	registry := domain.NewProviderRegistry(ordered...)
 
 	breakers := domain.NewBreakerRegistry(domain.BreakerTuning{
 		FailureThreshold: cfg.CircuitFailureThreshold,
@@ -280,6 +337,22 @@ func main() {
 		logger.Info("semantic cache DISABLED (AI_CACHE_ENABLED=false); serving every request via providers")
 	}
 
+	// ALLOW-LIST (L5 runtime governance): build the model/provider gate from config.
+	// EMPTY = ALLOW ALL (dev). We parse the provider-kind strings here (the domain enum
+	// is not a config primitive); an unrecognized kind is logged and skipped (fail-safe:
+	// a typo'd governance knob must not crash the gateway, and must NOT silently widen
+	// the gate to "all"). ChatCompletion enforces it before routing → PermissionDenied
+	// (audited as a DENY) for a disallowed model/provider.
+	allowedProviders := parseProviderKinds(cfg.AllowedProviders, logger)
+	allowList := domain.NewAllowList(cfg.AllowedModels, allowedProviders)
+	if allowList.AllowsAll() {
+		logger.Warn("AI allow-list: ALLOW ALL (no FP_AI_ALLOWED_MODELS / FP_AI_ALLOWED_PROVIDERS set) — ungoverned data plane; set the allow-list in non-dev (a Kyverno policy flags this)")
+	} else {
+		logger.Info("AI allow-list ENABLED (runtime governance)",
+			slog.Any("allowed_models", cfg.AllowedModels),
+			slog.Any("allowed_providers", cfg.AllowedProviders))
+	}
+
 	svc := domain.NewGatewayService(domain.ServiceDeps{
 		Providers:       registry,
 		Breakers:        breakers,
@@ -288,11 +361,12 @@ func main() {
 		Embedder:        embedder,
 		Cache:           semanticCache,
 		CacheThreshold:  cfg.CacheSimilarityThreshold,
+		AllowList:       allowList,
 		Publisher:       publisher,
 		EvalIncludeText: cfg.EvalIncludeText,
 		Now:             time.Now,
 	})
-	logger.Info("ai-gateway domain service constructed (ollama + stub, failover order)")
+	logger.Info("ai-gateway domain service constructed (ollama + optional cloud + stub, failover order)")
 
 	// 6b. PROMPT REGISTRY (L3) — Postgres-backed, SELF-GATING on FP_DATABASE_URL.
 	//
@@ -354,9 +428,48 @@ func main() {
 	}
 	var publicMethods []string
 
+	// AUDIT INTERCEPTORS (L5 governance — PROMPT/RESPONSE AUDIT). We mirror auth's
+	// main.go exactly: the OUTER pre-auth DENY-capture interceptor (records the
+	// anonymous/forbidden probes auth short-circuits before claims exist) PLUS the
+	// INNER post-auth interceptor (records authenticated ALLOW/handler-DENY/ERROR with
+	// the real actor). Both publish to fp.audit.recorded via a NATSAuditSink over the
+	// SAME natsutil.Publisher the gateway already built for its domain events; the
+	// AUTH-hosted consumer persists them into the hash-chained audit_log. The gateway
+	// only PUBLISHES — it does NOT provision the AUDIT stream (auth owns fp.audit.>),
+	// so there is no overlapping stream.
+	//
+	// WHAT IS CAPTURED (and what is NOT): the audit Record carries actor (team/user
+	// from claims) + method + decision + correlation id — and DELIBERATELY has NO field
+	// for the prompt or response TEXT or any secret (see pkg/audit/record.go: secret-
+	// free by construction). So ChatCompletion is audited as "team X ran ChatCompletion,
+	// ALLOW" — never the prompt content. The allow-list DENY surfaces here as a
+	// PermissionDenied → DENY record (the governance signal), again with no payload.
+	//
+	// CUSTOM PREDICATE: the default predicate audits mutations + auth verbs and SKIPS
+	// reads. CreatePrompt (+ the future prompt mutations) match "Create" and are audited
+	// automatically; but ChatCompletion is neither — by default it would be SKIPPED on
+	// success. We want the security-relevant completion path audited, so we wrap the
+	// default predicate to ALSO audit ChatCompletion. (DENYs on any method — incl. the
+	// allow-list DENY and auth rejections — are ALWAYS audited regardless of predicate.)
+	auditSink := pkgaudit.NewNATSAuditSink(natsutil.NewPublisher(js, events.Source))
+	auditOpts := pkgaudit.Options{
+		Source:    events.Source, // "ai-gateway"
+		Logger:    logger,
+		Predicate: auditPredicate(),
+	}
+
 	srv := grpcutil.NewServer(
 		grpcutil.WithLogger(logger),
 		grpcutil.WithAuthValidator(validator, append(publicMethods, grpcutil.HealthAndReflectionMethods()...)...),
+		// OUTER (wraps auth): captures auth's short-circuit Unauthenticated/
+		// PermissionDenied denials the inner interceptor never sees.
+		grpcutil.WithPreAuthUnaryInterceptors(pkgaudit.DenyUnaryInterceptor(auditSink, auditOpts)),
+		grpcutil.WithPreAuthStreamInterceptors(pkgaudit.DenyStreamInterceptor(auditSink, auditOpts)),
+		// INNER (post-auth): captures authenticated ALLOW/handler-DENY/ERROR with the
+		// real actor (team/user from claims). ChatCompletion is a STREAM RPC, so the
+		// stream interceptor is the one that audits it.
+		grpcutil.WithUnaryInterceptors(pkgaudit.UnaryServerInterceptor(auditSink, auditOpts)),
+		grpcutil.WithStreamInterceptors(pkgaudit.StreamServerInterceptor(auditSink, auditOpts)),
 		grpcutil.WithReflection(),
 	)
 	// Wire BOTH services into the handler. promptSvc may be nil (no database) — then
@@ -411,4 +524,54 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("ai-gateway stopped cleanly")
+}
+
+// parseProviderKinds maps the configured provider-kind STRINGS (from
+// FP_AI_ALLOWED_PROVIDERS) to the domain enum for the allow-list. It is FAIL-SAFE:
+// an unrecognized kind is LOGGED and SKIPPED — never crashes the gateway and never
+// silently widens the gate (an ignored entry just isn't allowed). Case-insensitive,
+// trims whitespace, drops blanks (so a trailing comma is harmless).
+func parseProviderKinds(kinds []string, logger *slog.Logger) []domain.ProviderKind {
+	out := make([]domain.ProviderKind, 0, len(kinds))
+	for _, raw := range kinds {
+		switch strings.ToLower(strings.TrimSpace(raw)) {
+		case "":
+			// blank entry (e.g. trailing comma) — ignore.
+		case "ollama":
+			out = append(out, domain.ProviderKindOllama)
+		case "stub":
+			out = append(out, domain.ProviderKindStub)
+		case "openai":
+			out = append(out, domain.ProviderKindOpenAI)
+		case "anthropic":
+			out = append(out, domain.ProviderKindAnthropic)
+		default:
+			// Fail-safe: don't crash on a typo'd governance knob, and don't treat an
+			// unknown kind as "allow all" — just log and skip it.
+			logger.Warn("AI allow-list: ignoring unrecognized provider kind in FP_AI_ALLOWED_PROVIDERS",
+				slog.String("value", raw))
+		}
+	}
+	return out
+}
+
+// auditPredicate returns the gateway's audit MethodPredicate: the platform default
+// (audit mutations + auth verbs, skip reads) PLUS ChatCompletion. ChatCompletion is
+// neither a mutating verb nor an auth verb, so the default would SKIP it on success —
+// but the prompt→completion path IS the security-relevant action the gateway audits
+// (who ran a completion, ALLOW/DENY). We therefore opt it in explicitly. DENYs on any
+// method (the allow-list PermissionDenied, auth rejections) are ALWAYS audited
+// regardless of this predicate — it only governs what is captured on SUCCESS.
+//
+// Audited gateway RPCs:
+//   - ChatCompletion (this opt-in)              → ALLOW + DENY captured
+//   - CreatePrompt / future prompt mutations    → matched by the default "Create"... verb
+//   - any DENIED RPC (allow-list / auth)         → always, via the interceptor
+func auditPredicate() pkgaudit.MethodPredicate {
+	return func(fullMethod string) bool {
+		if fullMethod == aiv1.AIGatewayService_ChatCompletion_FullMethodName {
+			return true
+		}
+		return pkgaudit.DefaultSecurityRelevant(fullMethod)
+	}
 }
