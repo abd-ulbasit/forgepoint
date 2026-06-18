@@ -145,6 +145,19 @@ func (s *ReadStore) GetModelByID(ctx context.Context, team, id string) (domain.M
 	return m, nil
 }
 
+// GetModelByIDUnscoped loads a projected model by id WITHOUT enforcing team
+// scoping. It exists for the CQRS PROJECTION CONSUMER (internal/events/projection.go),
+// which rebuilds the read model from fp.models.* events and must load-merge an
+// existing model to apply a partial update (e.g. a version event that only changes
+// the latest/production pointer) without clobbering the fields the event doesn't
+// carry. The projection is a TRUSTED, server-side writer — it is not a tenant query
+// path — so the cross-tenant gate that GetModelByID applies (and which needs a team
+// the version events don't carry) is deliberately absent here. Tenant-facing READS
+// must always go through GetModelByID/GetModelByName, never this.
+func (s *ReadStore) GetModelByIDUnscoped(ctx context.Context, id string) (domain.Model, error) {
+	return s.loadModel(ctx, id)
+}
+
 // GetModelByName resolves the team-scoped name index to an id, then loads the hash.
 // Two round-trips (GET id, HGETALL hash); both O(1). A missing name index OR a missing
 // hash is a clean not-found.

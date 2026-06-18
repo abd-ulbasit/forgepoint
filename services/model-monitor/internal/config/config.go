@@ -62,5 +62,13 @@ type MonitorConfig struct {
 	// must NOT be able to redirect the retrain call to an attacker-chosen host
 	// (an SSRF-class footgun). The loop's target is operator config, full stop.
 	// Optional at boot; required once the orchestrator client adapter lands.
-	OrchestratorEndpoint string `env:"ORCHESTRATOR_ENDPOINT" default:"pipeline-orchestrator:9090"`
+	//
+	// DEFAULT = the Helm chart's Service FQDN. The chart names the Service
+	// "fp-pipeline-orchestrator" (release-prefixed) in namespace fp-system, so the
+	// bare "pipeline-orchestrator:9090" would NOT resolve in-cluster — DNS has no
+	// such Service. We default to the fully-qualified
+	// fp-pipeline-orchestrator.fp-system.svc.cluster.local:9090 so the closed loop
+	// works out of the box on the chart's wiring; still env-overridable for other
+	// topologies (a different namespace/release name, or a local/test target).
+	OrchestratorEndpoint string `env:"ORCHESTRATOR_ENDPOINT" default:"fp-pipeline-orchestrator.fp-system.svc.cluster.local:9090"`
 }

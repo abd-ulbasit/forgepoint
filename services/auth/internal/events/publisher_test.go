@@ -42,6 +42,7 @@ import (
 	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
 
 	"github.com/nats-io/nats.go/jetstream"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // newJS connects to a fresh NATS server and ensures the AUTH stream exists.
@@ -120,7 +121,7 @@ func TestPublishUserCreated_LandsOnSubjectWithEnvelopeAndPayload(t *testing.T) {
 
 		// Payload assertions: decode the events.v1 message and check the mapping.
 		var payload eventsv1.UserCreated
-		if err := json.Unmarshal(env.Data, &payload); err != nil {
+		if err := protojson.Unmarshal(env.Data, &payload); err != nil {
 			t.Fatalf("unmarshal UserCreated payload: %v", err)
 		}
 		if payload.GetUserId() != in.UserID {
@@ -194,7 +195,7 @@ func TestPublishAPIKeyRotated_LandsOnSubjectAndCarriesNoSecret(t *testing.T) {
 		}
 
 		var payload eventsv1.ApiKeyRotated
-		if err := json.Unmarshal(env.Data, &payload); err != nil {
+		if err := protojson.Unmarshal(env.Data, &payload); err != nil {
 			t.Fatalf("unmarshal ApiKeyRotated payload: %v", err)
 		}
 		if payload.GetKeyId() != in.KeyID {
@@ -402,7 +403,7 @@ func TestSubscriber_PoisonMessageRoutedToDLQ(t *testing.T) {
 	case env := <-dlqReceived:
 		// The DLQ copy preserves the original payload so ops can inspect/replay it.
 		var payload eventsv1.ApiKeyRotated
-		if err := json.Unmarshal(env.Data, &payload); err != nil {
+		if err := protojson.Unmarshal(env.Data, &payload); err != nil {
 			t.Fatalf("unmarshal DLQ payload: %v", err)
 		}
 		if payload.GetKeyId() != "key-poison" {

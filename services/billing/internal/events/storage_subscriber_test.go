@@ -39,6 +39,7 @@ import (
 	"github.com/abd-ulbasit/forgepoint/services/billing/internal/events"
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go/jetstream"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -159,7 +160,10 @@ func TestStorageConsumer_IdempotentRedelivery(t *testing.T) {
 	}
 
 	dupID := uuid.NewString()
-	data, err := json.Marshal(&eventsv1.ModelVersionReady{
+	// protojson (NOT encoding/json): ModelVersionReady carries a
+	// google.protobuf.Timestamp (ready_at). The consumer decodes with protojson, so
+	// the simulated wire bytes must be canonical proto-JSON, matching the publisher.
+	data, err := protojson.Marshal(&eventsv1.ModelVersionReady{
 		ModelId: "m-1", VersionId: "ver-dup", SizeBytes: 2048,
 		ReadyAt: timestamppb.New(time.Now().UTC()),
 	})
@@ -238,7 +242,8 @@ func TestStorageConsumer_PoisonGoesToDLQ(t *testing.T) {
 	select {
 	case env := <-dlq:
 		var p eventsv1.ModelVersionReady
-		if err := json.Unmarshal(env.Data, &p); err != nil {
+		// protojson: the DLQ copy preserves the original canonical proto-JSON payload.
+		if err := protojson.Unmarshal(env.Data, &p); err != nil {
 			t.Fatalf("decode DLQ payload: %v", err)
 		}
 		if p.GetVersionId() != "ver-poison" {

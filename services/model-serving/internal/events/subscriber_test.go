@@ -15,6 +15,8 @@ import (
 	"github.com/abd-ulbasit/forgepoint/services/model-serving/internal/domain"
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go/jetstream"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 // errTransient is a non-domain error used by the DLQ test to force the handler to
@@ -248,7 +250,17 @@ func waitForUnload(t *testing.T, f *fakeService, n int) []unloadCall {
 // JetStream stores both, identical envelope.ID so the ProcessedStore dedupes).
 func publishEnvelope(t *testing.T, js jetstream.JetStream, subject, eventType, envelopeID, natsMsgID string, payload any) {
 	t.Helper()
-	data, err := json.Marshal(payload)
+	// Marshal the payload with the SAME dialect natsutil.Publisher now uses:
+	// protojson for proto messages (so a hand-built envelope matches the consumer's
+	// protojson decode), encoding/json otherwise. Without this, the simulated wire
+	// bytes would be Go-JSON and the protojson handler would DLQ a valid event.
+	var data []byte
+	var err error
+	if pm, ok := payload.(proto.Message); ok {
+		data, err = protojson.Marshal(pm)
+	} else {
+		data, err = json.Marshal(payload)
+	}
 	if err != nil {
 		t.Fatalf("marshal payload: %v", err)
 	}
@@ -526,7 +538,8 @@ func TestPoisonMessageRoutedToDLQ(t *testing.T) {
 	case env := <-dead:
 		// Confirm the DLQ'd envelope is the one we sent (decode its payload).
 		var p eventsv1.ModelVersionReady
-		if err := json.Unmarshal(env.Data, &p); err != nil {
+		// protojson: the DLQ copy preserves the original protojson-encoded payload.
+		if err := protojson.Unmarshal(env.Data, &p); err != nil {
 			t.Fatalf("decode DLQ payload: %v", err)
 		}
 		if p.GetModelName() != "poison" {

@@ -88,31 +88,48 @@
 // handlers only choose ACK-vs-NAK by returning nil vs an error).
 //
 // ============================================================================
-// WIRE-FORMAT NOTE — WHY THE DECODER IS DUAL-FORMAT (a real platform concern)
+// WIRE-FORMAT NOTE — THE PLATFORM IS UNIFORM ON PROTOJSON; THE DECODER IS
+// DUAL-FORMAT ONLY AS DEFENSIVE COMPAT TOLERANCE
 // ============================================================================
 //
-// The platform's producers are NOT uniform in how they encode the events.v1
-// payload into EventEnvelope.Data:
+// The platform is now UNIFORM on canonical proto-JSON for proto events. The
+// natsutil.Publisher has a single, consistent serialization dialect: it
+// protojson.Marshal's anything that is a proto.Message, and reserves
+// encoding/json for plain (non-proto) Go structs. So every producer that hands a
+// generated events.v1 message to Publish emits the SAME canonical shape on the
+// wire — camelCase names, RFC-3339 timestamp STRINGS, correct Struct/Any
+// well-known encodings.
 //
-//   - registry & inference-gateway hand the RAW generated proto message to
-//     natsutil.Publisher.Publish, which json.Marshal's it → encoding/json shape
-//     (snake_case json tags, well-known types as their Go-struct JSON, e.g. a
-//     Timestamp as {"seconds":..,"nanos":..}).
-//   - feature-store, experiment-tracker & pipeline-orchestrator protojson.Marshal
-//     the payload into a json.RawMessage first → canonical proto-JSON shape
-//     (camelCase, RFC-3339 timestamp STRINGS, Struct/Any well-known encodings).
+// Concretely, every event Model Monitor consumes is canonical proto-JSON today:
 //
-// Model Monitor consumes events from BOTH camps (InferenceCompleted/ModelPromoted
-// are encoding/json; FeaturesWritten is protojson). Rather than hard-code one
-// decoder per subject and silently break if a producer's encoding changes, the
-// adapter uses a DUAL-FORMAT decoder (codec.go): try protojson first (the
-// canonical, well-known-type-correct form), fall back to encoding/json. This is
-// robust to either producer style and to a future platform-wide convergence onto
-// protojson. The cost is one extra unmarshal attempt on the encoding/json path —
-// negligible against the broker round-trip, and worth it for cross-producer
-// resilience. (Interview framing: "your producers disagreed on wire format — how
-// did the consumer stay correct?" → decode defensively against both canonical
-// proto-JSON and the encoding/json struct form, prefer canonical.)
+//   - InferenceCompleted (from inference-gateway) — raw *eventsv1.InferenceCompleted
+//     to Publish → protojson.
+//   - ModelPromoted (from registry) — raw *eventsv1.ModelPromoted → protojson.
+//   - FeaturesWritten (from feature-store) — protojson.
+//
+// Before the natsutil dialect fix, registry & inference-gateway handed the raw
+// proto to a Publisher that json.Marshal'd EVERYTHING, so they used to emit the
+// encoding/json struct shape (snake_case tags, a Timestamp as {seconds,nanos})
+// while feature-store et al. emitted protojson — producers genuinely disagreed.
+// That divergence is GONE; describing it as current behavior would now be a lie.
+//
+// So why keep a dual-format decoder (codec.go) instead of protojson-only? Not to
+// describe today's producers — protojson-first ALWAYS succeeds for them — but as
+// DEFENSIVE forward/backward-compat tolerance:
+//
+//   - a rolling deploy where an OLDER producer build (pre-dialect-fix, still
+//     json.Marshal-ing raw proto) is briefly live alongside the new one, and
+//   - a hypothetical future producer that publishes a PLAIN Go struct (encoding/json
+//     by design) for some payload this consumer must still read.
+//
+// The encoding/json branch is therefore a cheap safety net, not the expected path.
+// protojson-first is the path that fires for every real producer today; the
+// fallback costs one extra unmarshal attempt ONLY when protojson fails — negligible
+// against the broker round-trip, and worth it for graceful behavior across a mixed
+// fleet during a deploy. (Interview framing: "the platform converged on protojson
+// — why didn't you delete the fallback?" → it's compat tolerance for rolling
+// deploys / a future plain-JSON producer, not a claim that producers still
+// disagree; the canonical path is what actually runs.)
 //
 // ============================================================================
 // CLEAN ARCHITECTURE PLACEMENT

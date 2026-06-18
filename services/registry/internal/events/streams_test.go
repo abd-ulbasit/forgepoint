@@ -25,7 +25,6 @@ package events_test
 
 import (
 	"context"
-	"encoding/json"
 	"testing"
 	"time"
 
@@ -36,6 +35,7 @@ import (
 	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
 	"github.com/abd-ulbasit/forgepoint/services/registry/internal/domain"
 	"github.com/abd-ulbasit/forgepoint/services/registry/internal/events"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // dialNATSRaw connects to a fresh testcontainers NATS WITHOUT declaring any stream.
@@ -181,7 +181,9 @@ func TestEnsureStream_EnablesRealPublishEndToEnd(t *testing.T) {
 			t.Errorf("envelope.Type = %q, want %q", env.Type, "version.ready")
 		}
 		var p eventsv1.ModelVersionReady
-		if err := json.Unmarshal(env.Data, &p); err != nil {
+		// protojson: the registry publishes via natsutil.Publisher, which now emits
+		// canonical proto-JSON for proto payloads (ready_at is a Timestamp).
+		if err := protojson.Unmarshal(env.Data, &p); err != nil {
 			t.Fatalf("decode payload: %v", err)
 		}
 		if p.GetVersionId() != "ver-9" {

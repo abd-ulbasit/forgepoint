@@ -11,6 +11,8 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 // ============================================================================
@@ -70,7 +72,18 @@ var (
 // subject and (via deriveEventType inside the envelope) the envelope Type — exactly
 // the convention natsutil.Publisher uses.
 func (p *RelayPublisher) PublishWithID(ctx context.Context, subject, envelopeID string, payload any) error {
-	data, err := json.Marshal(payload)
+	// Serialize the payload with the SAME canonical dialect natsutil.Publisher uses:
+	// protojson for proto messages, encoding/json for plain Go structs. The relay's
+	// decodeOutboxPayload reconstructs a forgepoint/events/v1 PROTO (UsageRecorded /
+	// QuotaExceeded / InvoiceGenerated) from the stored row, and those carry
+	// google.protobuf.Timestamp fields (occurred_at, …). Under encoding/json a
+	// Timestamp renders as the Go-only {seconds,nanos} shape that NO protojson
+	// consumer can read — so this MUST be protojson to stay symmetric with the
+	// billing consumers (experiment-tracker, notification) that protojson.Unmarshal
+	// these events. This is the outbox half of the serialization-dialect fix: the
+	// relay builds its own envelope (to stamp the outbox row id), so the protojson
+	// switch lives here too, not only in natsutil.Publisher.
+	data, err := marshalRelayPayload(payload)
 	if err != nil {
 		return fmt.Errorf("events: marshal payload for %s: %w", subject, err)
 	}
@@ -115,6 +128,19 @@ func (p *RelayPublisher) PublishWithID(ctx context.Context, subject, envelopeID 
 // *RelayPublisher satisfies the narrower interface for wiring flexibility.
 func (p *RelayPublisher) Publish(ctx context.Context, subject string, payload any) error {
 	return fmt.Errorf("events: RelayPublisher requires an explicit envelope id; use PublishWithID (subject=%s)", subject)
+}
+
+// marshalRelayPayload serializes the relay payload into EventEnvelope.Data using the
+// canonical dialect for its kind — IDENTICAL to natsutil.Publisher's marshalPayload:
+// protojson for proto.Message (the events.v1 payloads the relay republishes carry
+// well-known Timestamps that only protojson round-trips across languages),
+// encoding/json for any plain struct. Kept here because the relay builds its own
+// envelope (to control the id) and so cannot route through natsutil.Publisher.
+func marshalRelayPayload(payload any) ([]byte, error) {
+	if pm, ok := payload.(proto.Message); ok {
+		return protojson.Marshal(pm)
+	}
+	return json.Marshal(payload)
 }
 
 // eventTypeFromSubject derives the envelope Type from the subject the SAME way

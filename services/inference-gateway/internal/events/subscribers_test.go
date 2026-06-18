@@ -15,6 +15,7 @@ import (
 	"github.com/abd-ulbasit/forgepoint/services/inference-gateway/internal/events"
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go/jetstream"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // ============================================================================
@@ -140,9 +141,11 @@ func TestSubscribers_IdempotentRedelivery(t *testing.T) {
 		t.Fatalf("Register: %v", err)
 	}
 
-	// Build ONE envelope (one id) carrying a ModelArchived payload.
+	// Build ONE envelope (one id) carrying a ModelArchived payload. protojson, not
+	// encoding/json: the consumer decodes via decodeData (protojson), so the
+	// simulated wire bytes must be canonical proto-JSON to match.
 	dupID := uuid.NewString()
-	data, err := json.Marshal(&eventsv1.ModelArchived{ModelName: "dup-model"})
+	data, err := protojson.Marshal(&eventsv1.ModelArchived{ModelName: "dup-model"})
 	if err != nil {
 		t.Fatalf("marshal payload: %v", err)
 	}
@@ -236,8 +239,9 @@ func TestSubscribers_PoisonMessageGoesToDLQ(t *testing.T) {
 	select {
 	case env := <-dlq:
 		// The DLQ message preserves the original envelope; the payload still decodes.
+		// protojson, matching the canonical proto-JSON the publisher now emits.
 		var p eventsv1.QuotaExceeded
-		if err := json.Unmarshal(env.Data, &p); err != nil {
+		if err := protojson.Unmarshal(env.Data, &p); err != nil {
 			t.Fatalf("decode DLQ payload: %v", err)
 		}
 		if p.GetTeam() != "" {
@@ -269,7 +273,7 @@ func TestPublishConsumeRoundTrip(t *testing.T) {
 	if err := raw.Subscribe(context.Background(), events.StreamInference, events.SubjectInferenceCompleted,
 		func(_ context.Context, env natsutil.EventEnvelope) error {
 			var p eventsv1.InferenceCompleted
-			if err := json.Unmarshal(env.Data, &p); err != nil {
+			if err := protojson.Unmarshal(env.Data, &p); err != nil {
 				return err
 			}
 			got <- &p

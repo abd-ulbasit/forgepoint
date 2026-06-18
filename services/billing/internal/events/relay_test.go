@@ -28,6 +28,7 @@ import (
 	"github.com/abd-ulbasit/forgepoint/services/billing/internal/domain"
 	"github.com/abd-ulbasit/forgepoint/services/billing/internal/events"
 	"github.com/google/uuid"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // TestRelay_PublishesAndMarks proves the relay publishes one stored row of EACH
@@ -105,7 +106,10 @@ func TestRelay_PublishesAndMarks(t *testing.T) {
 		t.Errorf("UsageRecorded envelope id = %q, want the outbox row id %q", usageEnv.ID, usageID)
 	}
 	var ur eventsv1.UsageRecorded
-	if err := json.Unmarshal(usageEnv.Data, &ur); err != nil {
+	// protojson: the relay publishes the proto via natsutil.Publisher (canonical
+	// proto-JSON now). occurred_at is a google.protobuf.Timestamp — only protojson
+	// round-trips its RFC-3339 wire form (the test asserts it Equals `now`).
+	if err := protojson.Unmarshal(usageEnv.Data, &ur); err != nil {
 		t.Fatalf("decode UsageRecorded: %v", err)
 	}
 	if ur.GetTeam() != "acme" || ur.GetQuantity() != 1500 || ur.GetCostMicros() != 600000 ||
@@ -125,7 +129,7 @@ func TestRelay_PublishesAndMarks(t *testing.T) {
 		t.Errorf("QuotaExceeded envelope id = %q, want %q", quotaEnv.ID, quotaID)
 	}
 	var qe eventsv1.QuotaExceeded
-	if err := json.Unmarshal(quotaEnv.Data, &qe); err != nil {
+	if err := protojson.Unmarshal(quotaEnv.Data, &qe); err != nil {
 		t.Fatalf("decode QuotaExceeded: %v", err)
 	}
 	if qe.GetTeam() != "acme" || qe.GetQuotaLimit() != 1000 || qe.GetCurrentUsage() != 1500 {
@@ -138,7 +142,7 @@ func TestRelay_PublishesAndMarks(t *testing.T) {
 		t.Errorf("InvoiceGenerated envelope id = %q, want %q", invEnv.ID, invoiceID)
 	}
 	var ig eventsv1.InvoiceGenerated
-	if err := json.Unmarshal(invEnv.Data, &ig); err != nil {
+	if err := protojson.Unmarshal(invEnv.Data, &ig); err != nil {
 		t.Fatalf("decode InvoiceGenerated: %v", err)
 	}
 	if ig.GetInvoiceNumber() != "INV-2026-000042" || ig.GetTotalMicros() != 600000 || ig.GetTeam() != "acme" {

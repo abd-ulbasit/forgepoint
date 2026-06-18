@@ -38,24 +38,29 @@
 //	  is the correct, contract-grounded shape for auth, not an omission.
 //
 // ============================================================================
-// SERIALIZATION CHOICE — encoding/json (NOT protobuf binary / protojson)
+// SERIALIZATION CHOICE — protojson (canonical proto-JSON, NOT encoding/json)
 // ============================================================================
 //
-// pkg/natsutil.Publisher marshals the payload with encoding/json and stores it
-// in EventEnvelope.Data (a json.RawMessage); the Subscriber hands the handler
-// that same json.RawMessage to decode. To round-trip cleanly, BOTH ends must use
-// the same codec. We therefore marshal/decode the events/v1 messages with
-// encoding/json too. The generated messages carry proto3 json tags
-// (json:"user_id,omitempty", etc.), and google.protobuf.Timestamp round-trips
-// through encoding/json as {"seconds":..,"nanos":..} — symmetric on both sides
-// because producer and consumer share this one codec. (A platform-wide move to
-// protojson would be a natsutil-level change, not an auth-level one.)
+// The auth events (UserCreated, ApiKeyRotated) are forgepoint/events/v1 PROTO
+// messages. This adapter hands the RAW proto message to pkg/natsutil.Publisher,
+// which now marshals proto payloads with protojson (the canonical proto-JSON
+// dialect) and stores the bytes in EventEnvelope.Data (a json.RawMessage). Any
+// consumer therefore decodes with protojson.Unmarshal — both ends symmetric on
+// the one canonical codec.
 //
-// INTERVIEW FRAMING: "Why JSON on the bus and not protobuf?" → the envelope/codec
-// is a transport concern owned by the shared natsutil layer; the event SCHEMA is
-// still the versioned events/v1 contract (buf-breaking-guarded). JSON keeps
-// messages human-readable in the NATS CLI / DLQ for ops, at a modest size cost —
-// acceptable for an ML control-plane's event rates (~1K/s), not a data plane.
+// WHY protojson, NOT encoding/json: the messages carry well-known types —
+// google.protobuf.Timestamp renders as an RFC-3339 STRING under protojson (vs the
+// Go-only {"seconds":..,"nanos":..} under encoding/json), enums render as NAMES,
+// fields as lowerCamelCase. Only protojson is the cross-language proto3 JSON
+// contract that the (now polyglot — there is a Python SDK) platform can read. An
+// encoding/json payload would be Go-only and would DLQ in any protojson consumer.
+//
+// INTERVIEW FRAMING: "Why JSON on the bus and not protobuf binary?" → the
+// envelope/codec is a transport concern owned by the shared natsutil layer; the
+// event SCHEMA is still the versioned events/v1 contract (buf-breaking-guarded).
+// protojson keeps messages human-readable in the NATS CLI / DLQ for ops AND stays
+// canonical proto3 JSON across languages, at a modest size cost — acceptable for
+// an ML control-plane's event rates (~1K/s), not a data plane.
 package events
 
 import (

@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"github.com/nats-io/nats.go/jetstream"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 // ============================================================================
@@ -17,7 +19,9 @@ import (
 //   1. Automatically wraps events in EventEnvelope (consistent metadata)
 //   2. Sets the Nats-Msg-Id header for deduplication (JetStream feature)
 //   3. Derives event type from subject for the envelope
-//   4. Serializes payload to JSON (consistent serialization)
+//   4. Serializes payload with the CANONICAL dialect (protojson for proto
+//      messages, encoding/json for plain Go structs) so every publish/consume
+//      pair is symmetric — see marshalPayload below.
 //
 // Without Publisher:
 //   data, _ := json.Marshal(event)
@@ -65,8 +69,8 @@ func NewPublisher(js jetstream.JetStream, source string) *Publisher {
 // This convention ensures event types are stable identifiers (not tied to
 // NATS subject structure, which may change if we reorganize subjects).
 func (p *Publisher) Publish(ctx context.Context, subject string, payload any) error {
-	// Serialize the payload to JSON.
-	data, err := json.Marshal(payload)
+	// Serialize the payload with the CANONICAL dialect for its kind.
+	data, err := marshalPayload(payload)
 	if err != nil {
 		return fmt.Errorf("natsutil: marshal payload: %w", err)
 	}
@@ -99,6 +103,61 @@ func (p *Publisher) Publish(ctx context.Context, subject string, payload any) er
 	}
 
 	return nil
+}
+
+// marshalPayload serializes the event payload into EventEnvelope.Data using the
+// CANONICAL JSON dialect for the payload's kind. This is the heart of the
+// serialization-dialect fix.
+//
+// WHY protojson FOR proto.Message (and why plain encoding/json is WRONG here):
+//
+//	The platform's canonical domain events are forgepoint/events/v1 PROTO
+//	messages. encoding/json and protojson are INCOMPATIBLE proto-JSON dialects:
+//	  - Well-known types: google.protobuf.Timestamp renders as the Go struct
+//	    {"seconds":..,"nanos":..} under encoding/json, but as an RFC-3339 STRING
+//	    ("2026-06-18T12:00:00Z") under protojson. google.protobuf.Struct and
+//	    Duration do not round-trip through encoding/json at all.
+//	  - Field names: encoding/json uses the generated json tags; protojson uses
+//	    lowerCamelCase (proto3 JSON mapping) by default.
+//	  - Enums: encoding/json emits the integer; protojson emits the enum NAME.
+//	A proto event published with encoding/json is DELIVERED but FAILS to decode in
+//	any protojson consumer (and in any non-Go protojson runtime — there is now a
+//	Python SDK). So we marshal proto.Message payloads with protojson, the single
+//	canonical, cross-language encoding the event contract requires, and EVERY
+//	consumer decodes the same proto event with protojson.Unmarshal — symmetric.
+//
+// WHY plain Go structs STAY on encoding/json:
+//
+//	Some payloads are genuinely NOT proto — e.g. the audit Record
+//	(pkg/audit.Record), which is a hand-rolled Go struct. protojson cannot marshal
+//	a non-proto value, and encoding/json is the natural, symmetric codec for a
+//	plain struct (the audit consumer decodes it with encoding/json). The type
+//	switch below routes each payload to the codec its consumer expects.
+//
+// PASSTHROUGH NOTE (no double-encoding): producers that PRE-MARSHAL their proto
+// with protojson and hand us a json.RawMessage (pipeline-orchestrator,
+// feature-store, experiment-tracker, model-monitor) are NOT proto.Message, so
+// they fall to the json.Marshal branch — and json.Marshal of a json.RawMessage is
+// the identity (it copies the bytes verbatim). Their canonical protojson bytes
+// therefore land in EventEnvelope.Data unchanged, exactly as before.
+func marshalPayload(payload any) (json.RawMessage, error) {
+	// proto.Message → canonical proto-JSON (protojson). This is what makes the
+	// proto event readable by every protojson consumer and every non-Go runtime.
+	if pm, ok := payload.(proto.Message); ok {
+		data, err := protojson.Marshal(pm)
+		if err != nil {
+			return nil, err
+		}
+		return json.RawMessage(data), nil
+	}
+	// Plain Go struct (or a pre-marshalled json.RawMessage) → encoding/json. For a
+	// json.RawMessage this is the identity passthrough; for a struct (audit Record)
+	// it is the symmetric codec the consumer uses.
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	return json.RawMessage(data), nil
 }
 
 // deriveEventType extracts the event type from a NATS subject by stripping the

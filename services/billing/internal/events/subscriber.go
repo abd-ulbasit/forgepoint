@@ -2,7 +2,6 @@ package events
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -11,6 +10,7 @@ import (
 	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/services/billing/internal/domain"
 	"github.com/nats-io/nats.go/jetstream"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // ============================================================================
@@ -177,7 +177,13 @@ func (c *InferenceConsumer) Close() {
 // the request fee (always) and the token fee (when token_count > 0).
 func (c *InferenceConsumer) handleInferenceCompleted(ctx context.Context, env natsutil.EventEnvelope) error {
 	var ev eventsv1.InferenceCompleted
-	if err := json.Unmarshal(env.Data, &ev); err != nil {
+	// protojson (NOT encoding/json): InferenceCompleted is a forgepoint/events/v1
+	// PROTO message and the gateway publishes it via natsutil.Publisher, which now
+	// marshals proto payloads with protojson (the canonical proto-JSON dialect).
+	// Its completed_at is a google.protobuf.Timestamp — an RFC-3339 string on the
+	// wire that ONLY protojson decodes; a plain json.Unmarshal would fail or
+	// silently zero it. Symmetric publish/consume = no spurious DLQ.
+	if err := protojson.Unmarshal(env.Data, &ev); err != nil {
 		// Corrupt payload — redelivery can't fix it → poison → DLQ.
 		return fmt.Errorf("%w: decode InferenceCompleted from event %s: %v",
 			natsutil.ErrProcessingFailed, env.ID, err)
@@ -417,7 +423,11 @@ func (c *StorageConsumer) Close() {
 // the artifact's storage bytes.
 func (c *StorageConsumer) handleModelVersionReady(ctx context.Context, env natsutil.EventEnvelope) error {
 	var ev eventsv1.ModelVersionReady
-	if err := json.Unmarshal(env.Data, &ev); err != nil {
+	// protojson (NOT encoding/json): ModelVersionReady is a proto message the
+	// registry publishes via natsutil.Publisher (now protojson-encoded). ready_at
+	// is a google.protobuf.Timestamp (RFC-3339 string on the wire), so the decode
+	// must be protojson to stay symmetric with the publisher.
+	if err := protojson.Unmarshal(env.Data, &ev); err != nil {
 		// Corrupt payload — redelivery can't fix it → poison → DLQ.
 		return fmt.Errorf("%w: decode ModelVersionReady from event %s: %v",
 			natsutil.ErrProcessingFailed, env.ID, err)

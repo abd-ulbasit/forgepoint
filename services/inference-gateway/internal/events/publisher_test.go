@@ -2,7 +2,6 @@ package events_test
 
 import (
 	"context"
-	"encoding/json"
 	"testing"
 	"time"
 
@@ -12,6 +11,7 @@ import (
 	"github.com/abd-ulbasit/forgepoint/services/inference-gateway/internal/domain"
 	"github.com/abd-ulbasit/forgepoint/services/inference-gateway/internal/events"
 	"github.com/nats-io/nats.go/jetstream"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // ============================================================================
@@ -80,7 +80,7 @@ func TestPublisher_PublishCompleted_LandsOnSubjectWithEnvelopeAndPayload(t *test
 	// Payload assertions: it must decode back to the canonical wire message with
 	// the server-authoritative fields intact.
 	var p eventsv1.InferenceCompleted
-	if err := json.Unmarshal(env.Data, &p); err != nil {
+	if err := protojson.Unmarshal(env.Data, &p); err != nil {
 		t.Fatalf("decode payload: %v", err)
 	}
 	if p.GetRequestId() != "req-123" {
@@ -153,7 +153,7 @@ func TestPublisher_PublishFailed_MapsReasonAndSubject(t *testing.T) {
 	}
 
 	var p eventsv1.InferenceFailed
-	if err := json.Unmarshal(env.Data, &p); err != nil {
+	if err := protojson.Unmarshal(env.Data, &p); err != nil {
 		t.Fatalf("decode payload: %v", err)
 	}
 	if p.GetRequestId() != "req-err-9" {

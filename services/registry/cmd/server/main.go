@@ -38,19 +38,23 @@
 //
 // EVENT SUBSCRIBERS — WHY THERE ARE NONE TO START HERE (deliberate, not missing):
 //
-//	The Registry is a pure event PRODUCER. Per the event contract (and the header
-//	of internal/events/publisher.go) it emits five model-lifecycle facts
-//	(fp.models.registered / version.created / version.ready / promoted / archived)
-//	and CONSUMES none — so there is no subscriber to register or start in this
-//	composition root. The one async INPUT the registry has — the projection
-//	consumer that rebuilds the Redis read model from those same events — is a
-//	SEPARATE deployable (a later phase) precisely so the read side can be scaled,
-//	replayed, and rebuilt independently of the command server (the whole point of
-//	the CQRS split documented in domain/ports.go). When it lands it will be its own
-//	process wiring redis.(projection writer) to a natsutil subscriber; it does not
-//	belong inside this gRPC server's lifecycle. So step 5's "start subscribers" is
-//	intentionally a no-op for THIS service — wiring a fake subscriber would be a
-//	lie about the architecture.
+//	The Registry is the sole event PRODUCER of five model-lifecycle facts
+//	(fp.models.registered / version.created / version.ready / promoted / archived).
+//	It is ALSO its own internal CONSUMER: the CQRS PROJECTION that rebuilds the
+//	Redis read model from those same events (events.Projection). Commands write
+//	Postgres (the truth) and emit the events; the projection consumes them and
+//	UPSERTS Redis; queries read Redis. Without the projection wired here, the read
+//	side stays EMPTY — POST /models would write Postgres but GET /models would
+//	return [] (the bug this wiring fixes). So step 5 DOES start a subscriber for
+//	this service: the projection consumer, bound to the registry's own MODELS
+//	stream, started under the serve context and Closed on shutdown.
+//
+//	The projection is an idempotent, durable consumer (one durable per subject,
+//	load-merge-upsert handlers, a ProcessedStore fast-path, a DLQ for poison
+//	events) — see internal/events/projection.go. It is intentionally IN-PROCESS
+//	here for simplicity; the CQRS split still holds (read store is independently
+//	rebuildable by replaying the stream), and extracting it to a separate
+//	deployable later is a wiring change, not an architecture change.
 //
 // ============================================================================
 package main
@@ -308,6 +312,32 @@ func main() {
 		domain.NewUUIDGenerator(), // domain.IDGenerator (UUIDv4)
 	)
 
+	// --- CQRS PROJECTION CONSUMER (the read-side rebuild) ---
+	// This is the OTHER half of CQRS, and the bug this wires fixes: commands above
+	// write Postgres and emit fp.models.* events, but nothing was UPDATING the Redis
+	// read model — so GET /models returned [] no matter how many models were
+	// registered. The projection is an idempotent, durable NATS consumer that
+	// subscribes to the registry's OWN events on the MODELS stream and upserts the
+	// Redis read store (readStore satisfies events.ProjectionWriter — it exposes the
+	// UpsertModel/UpsertVersion/unscoped-load methods the projection needs). Decodes
+	// with protojson (the canonical dialect the publisher emits). We start it under
+	// the serve context so it drains on SIGTERM, and Close it in shutdown.
+	//
+	//   write model emits events ─► projection consumes ─► upserts read model ─►
+	//   queries read Redis.  Eventual consistency; the command RESPONSE still returns
+	//   the authoritative write-side state, so a client never sees its own write miss.
+	projection := events.NewProjection(js, readStore, events.ProjectionConfig{})
+	if err := projection.Start(ctx); err != nil {
+		_ = natsConn.Drain()
+		_ = rdb.Close()
+		pgPool.Close()
+		logger.Error("failed to start CQRS projection consumer", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	logger.Info("CQRS projection consumer started (Redis read model now rebuilt from fp.models.* events)",
+		slog.String("stream", events.StreamName),
+	)
+
 	// ================================================================
 	// 6. BUILD gRPC SERVER + REGISTER THE WIRED HANDLER (real svc, NOT nil)
 	// ================================================================
@@ -444,23 +474,29 @@ func main() {
 			logger.Error("health server shutdown error", slog.String("error", err.Error()))
 		}
 
-		// (b) DRAIN NATS (not Close): Drain flushes any buffered publishes and lets
+		// (b) STOP the projection consume loops BEFORE draining NATS, so no handler is
+		//     mid-upsert against Redis when we close it below. Close is idempotent and
+		//     the consume loops also stop on ctx cancellation — this is belt-and-braces
+		//     for a clean drain.
+		projection.Close()
+
+		// (c) DRAIN NATS (not Close): Drain flushes any buffered publishes and lets
 		//     in-flight messages complete before tearing down the connection — so the
 		//     last events a draining RPC emitted are not lost. Close would discard them.
 		if err := natsConn.Drain(); err != nil {
 			logger.Error("nats drain error", slog.String("error", err.Error()))
 		}
 
-		// (c) Close the datastore pools. Safe now because gRPC has drained: no handler
-		//     is still mid-query holding a borrowed connection. Closing earlier could
-		//     fail an in-flight RPC's query. We close the RAW handles we own (the
-		//     adapters are thin wrappers over exactly these).
+		// (d) Close the datastore pools. Safe now because gRPC has drained AND the
+		//     projection has stopped: no handler is still mid-query/mid-upsert holding a
+		//     borrowed connection. Closing earlier could fail an in-flight RPC's query.
+		//     We close the RAW handles we own (the adapters are thin wrappers over these).
 		if err := rdb.Close(); err != nil {
 			logger.Error("redis close error", slog.String("error", err.Error()))
 		}
 		pgPool.Close() // pgxpool.Close has no error to return
 
-		// (d) FLUSH OpenTelemetry LAST so the spans/metrics produced during (a)-(c)
+		// (e) FLUSH OpenTelemetry LAST so the spans/metrics produced during (a)-(d)
 		//     (and during the gRPC drain) are exported, not dropped. This is exactly
 		//     why otelShutdown was NOT deferred up top.
 		if err := otelShutdown(shutdownCtx); err != nil {

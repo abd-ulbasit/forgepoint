@@ -98,7 +98,6 @@ package events
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -107,6 +106,7 @@ import (
 	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/services/model-serving/internal/domain"
 	"github.com/nats-io/nats.go/jetstream"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // ============================================================================
@@ -303,10 +303,14 @@ func durableName(subject string) string {
 // ============================================================================
 //
 // Each handler:
-//   1. Decodes envelope.Data into its eventsv1 payload (encoding/json — the
-//      symmetric inverse of natsutil.Publisher's json.Marshal; producers on this
-//      platform publish via that same Publisher, so the wire form of Data is JSON
-//      over the proto struct's json tags).
+//   1. Decodes envelope.Data into its eventsv1 payload with protojson — the
+//      symmetric inverse of natsutil.Publisher's protojson encoding for proto
+//      messages. These payloads carry well-known types (e.g. ModelVersionReady's
+//      ready_at google.protobuf.Timestamp renders as an RFC-3339 string), which
+//      ONLY protojson decodes; a plain encoding/json would fail or mis-decode and
+//      DLQ a valid event. Every producer on this platform now publishes proto
+//      events via that same Publisher, so the wire form of Data is canonical
+//      proto-JSON, both ends agreeing on protojson.
 //   2. Validates the minimum fields it needs (name+version).
 //   3. Calls the idempotent domain reaction.
 //
@@ -324,7 +328,7 @@ func durableName(subject string) string {
 // also POPULATES the desired-artifact map that deployed/promoted reuse.
 func (s *Subscriber) handleModelVersionReady(ctx context.Context, env natsutil.EventEnvelope) error {
 	var p eventsv1.ModelVersionReady
-	if err := json.Unmarshal(env.Data, &p); err != nil {
+	if err := protojson.Unmarshal(env.Data, &p); err != nil {
 		s.log.WarnContext(ctx, "drop unparseable ModelVersionReady payload",
 			slog.String("event.id", env.ID), slog.String("error.type", "payload_decode"))
 		return nil // non-retryable: a bad payload won't parse on redelivery
@@ -357,7 +361,7 @@ func (s *Subscriber) handleModelVersionReady(ctx context.Context, env natsutil.E
 // URI of its own — see the package doc's artifact-uri problem).
 func (s *Subscriber) handleModelDeployed(ctx context.Context, env natsutil.EventEnvelope) error {
 	var p eventsv1.ModelDeployed
-	if err := json.Unmarshal(env.Data, &p); err != nil {
+	if err := protojson.Unmarshal(env.Data, &p); err != nil {
 		s.log.WarnContext(ctx, "drop unparseable ModelDeployed payload",
 			slog.String("event.id", env.ID), slog.String("error.type", "payload_decode"))
 		return nil
@@ -374,7 +378,7 @@ func (s *Subscriber) handleModelDeployed(ctx context.Context, env natsutil.Event
 // undeploy event is the authoritative teardown signal.
 func (s *Subscriber) handleModelPromoted(ctx context.Context, env natsutil.EventEnvelope) error {
 	var p eventsv1.ModelPromoted
-	if err := json.Unmarshal(env.Data, &p); err != nil {
+	if err := protojson.Unmarshal(env.Data, &p); err != nil {
 		s.log.WarnContext(ctx, "drop unparseable ModelPromoted payload",
 			slog.String("event.id", env.ID), slog.String("error.type", "payload_decode"))
 		return nil
@@ -386,7 +390,7 @@ func (s *Subscriber) handleModelPromoted(ctx context.Context, env natsutil.Event
 // handleModelUndeployed reacts to fp.pipelines.model.undeployed → Unload.
 func (s *Subscriber) handleModelUndeployed(ctx context.Context, env natsutil.EventEnvelope) error {
 	var p eventsv1.ModelUndeployed
-	if err := json.Unmarshal(env.Data, &p); err != nil {
+	if err := protojson.Unmarshal(env.Data, &p); err != nil {
 		s.log.WarnContext(ctx, "drop unparseable ModelUndeployed payload",
 			slog.String("event.id", env.ID), slog.String("error.type", "payload_decode"))
 		return nil
@@ -409,7 +413,7 @@ func (s *Subscriber) handleModelUndeployed(ctx context.Context, env natsutil.Eve
 // (no version), so we tear down whatever version of that model this pod holds.
 func (s *Subscriber) handleModelArchived(ctx context.Context, env natsutil.EventEnvelope) error {
 	var p eventsv1.ModelArchived
-	if err := json.Unmarshal(env.Data, &p); err != nil {
+	if err := protojson.Unmarshal(env.Data, &p); err != nil {
 		s.log.WarnContext(ctx, "drop unparseable ModelArchived payload",
 			slog.String("event.id", env.ID), slog.String("error.type", "payload_decode"))
 		return nil

@@ -53,6 +53,9 @@ import (
 	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
 	"github.com/abd-ulbasit/forgepoint/services/registry/internal/domain"
 	"github.com/abd-ulbasit/forgepoint/services/registry/internal/events"
+
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 // streamName is the JetStream stream that captures every registry subject. In
@@ -357,7 +360,9 @@ func TestConsume_DuplicateRedeliveryIsIdempotent(t *testing.T) {
 	// Build ONE envelope with a FIXED id wrapping a real ModelRegistered payload,
 	// then publish it TWICE with the same Nats-Msg-Id.
 	payload := &eventsv1.ModelRegistered{ModelId: "model-dup", ModelName: "dup", Team: "t"}
-	data, err := json.Marshal(payload)
+	// protojson: simulate the canonical proto-JSON wire form natsutil.Publisher now
+	// produces, so this hand-built envelope is byte-faithful to a real publish.
+	data, err := protojson.Marshal(payload)
 	if err != nil {
 		t.Fatalf("marshal payload: %v", err)
 	}
@@ -500,9 +505,15 @@ func TestConsume_PoisonMessageGoesToDLQ(t *testing.T) {
 // small assertion helpers (kept local; no external test deps)
 // ============================================================================
 
-func mustUnmarshal(t *testing.T, data json.RawMessage, v any) {
+// mustUnmarshal decodes an EventEnvelope.Data payload into a proto message with
+// protojson — the canonical proto-JSON dialect natsutil.Publisher now emits for
+// proto payloads. WHY protojson, not encoding/json: the registry events carry
+// google.protobuf.Timestamp fields (registered_at, ready_at, …) that render as
+// RFC-3339 strings on the wire; only protojson decodes them (the assertTS checks
+// would fail under encoding/json).
+func mustUnmarshal(t *testing.T, data json.RawMessage, v proto.Message) {
 	t.Helper()
-	if err := json.Unmarshal(data, v); err != nil {
+	if err := protojson.Unmarshal(data, v); err != nil {
 		t.Fatalf("unmarshal payload: %v", err)
 	}
 }

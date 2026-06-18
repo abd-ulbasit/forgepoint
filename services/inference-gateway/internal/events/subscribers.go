@@ -2,7 +2,6 @@ package events
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -10,6 +9,8 @@ import (
 	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/services/inference-gateway/internal/domain"
 	"github.com/nats-io/nats.go/jetstream"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 )
 
 // ============================================================================
@@ -293,14 +294,23 @@ func (s *Subscribers) handleQuotaExceeded(ctx context.Context, env natsutil.Even
 	return nil
 }
 
-// decodeData unmarshals the envelope's JSON payload into the given events.v1
-// message. A decode failure is a POISON message (redelivery will never fix
-// corrupt bytes), so we wrap natsutil.ErrProcessingFailed — but the subscriber's
-// retry→DLQ machinery still gives ops a chance to inspect it before it is parked,
-// and a transient handler is distinguished from poison by NOT wrapping this
-// sentinel for retryable infra errors (see handleQuotaExceeded).
-func decodeData(env natsutil.EventEnvelope, msg any) error {
-	if err := json.Unmarshal(env.Data, msg); err != nil {
+// decodeData unmarshals the envelope's payload into the given events.v1 message
+// using protojson — the CANONICAL proto-JSON dialect every producer now emits via
+// natsutil.Publisher. WHY protojson, not encoding/json: these payloads are
+// forgepoint/events/v1 PROTO messages carrying well-known types (e.g. a
+// google.protobuf.Timestamp renders as an RFC-3339 string, an enum as its NAME);
+// only protojson decodes that form. Using encoding/json here would fail to decode
+// (or silently mis-decode) and DLQ a perfectly valid event. The parameter is a
+// proto.Message (not any) so the protojson call is type-safe and every caller
+// passes a *eventsv1.* pointer.
+//
+// A decode failure is a POISON message (redelivery will never fix corrupt bytes),
+// so we wrap natsutil.ErrProcessingFailed — but the subscriber's retry→DLQ
+// machinery still gives ops a chance to inspect it before it is parked, and a
+// transient handler is distinguished from poison by NOT wrapping this sentinel for
+// retryable infra errors (see handleQuotaExceeded).
+func decodeData(env natsutil.EventEnvelope, msg proto.Message) error {
+	if err := protojson.Unmarshal(env.Data, msg); err != nil {
 		return fmt.Errorf("%w: decode %T from event %s: %v",
 			natsutil.ErrProcessingFailed, msg, env.ID, err)
 	}
