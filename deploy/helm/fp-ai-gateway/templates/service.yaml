@@ -1,0 +1,47 @@
+# ============================================================================
+# Service — stable in-cluster VIP + DNS for the ai-gateway pods.
+# ============================================================================
+# ClusterIP (internal only): the gateway is reached by other platform services /
+# the API gateway over gRPC inside the mesh; external client traffic enters via
+# the edge API gateway, never directly. The Service gives a stable name
+# (fp-ai-gateway.fp-system.svc.cluster.local) and load balances across the
+# (selector-matched) Ready pods, so callers never track pod IPs and a rolling
+# deploy is transparent.
+#
+# Two named ports mirror the two listeners:
+#   grpc   → the AIGatewayService API (HTTP/2).
+#   health → /healthz, /readyz, /metrics (HTTP/1.1).
+# Named (not just numbered) ports let probes, the ServiceMonitor, and any
+# ServiceEntry reference them by name and stay correct if numbers ever change.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "fp-ai-gateway.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fp-ai-gateway.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  # Selector uses ONLY the immutable identity labels — it must match the pod
+  # template labels in the Deployment exactly, or the Service has no endpoints.
+  selector:
+    {{- include "fp-ai-gateway.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ .Values.ports.grpc }}
+      # targetPort references the container port by NAME, decoupling the Service
+      # port number from the container's listen port.
+      targetPort: grpc
+      protocol: TCP
+      # appProtocol hints the mesh/LB that this is HTTP/2-framed gRPC, enabling
+      # proper L7 load balancing of long-lived gRPC connections.
+      appProtocol: grpc
+    - name: health
+      port: {{ .Values.ports.health }}
+      targetPort: health
+      protocol: TCP
+      appProtocol: http

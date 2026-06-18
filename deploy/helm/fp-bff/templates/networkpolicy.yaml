@@ -88,9 +88,11 @@ spec:
     {{- end }}
     {{- if .Values.networkPolicy.egress.fpSystemGrpc.enabled }}
     # All fp-system platform services on the gRPC port — the BFF fans out to auth,
-    # registry, pipeline, experiment, monitor, billing, and notification per
-    # request. Allowing the whole fp-system namespace on :9090 is the right grain
-    # since the BFF legitimately dials seven services there.
+    # registry, pipeline, experiment, monitor, billing, notification, and the M7
+    # ai-gateway (chat SSE + provider/usage) per request. Allowing the whole
+    # fp-system namespace on :9090 is the right grain since the BFF legitimately
+    # dials all eight services there — the ai-gateway needs no new rule, it is
+    # already covered by this namespace-scoped allowance.
     - to:
         - namespaceSelector:
             matchLabels:

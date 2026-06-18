@@ -6,6 +6,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 
+	aiv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/ai/v1"
 	authv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/auth/v1"
 	billingv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/billing/v1"
 	experimentv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/experiment/v1"
@@ -158,6 +159,24 @@ func (m *mockNotification) ListNotifications(ctx context.Context, in *notificati
 	return m.listFn(ctx, in)
 }
 
+// ---- AI Gateway mock --------------------------------------------------------
+
+type mockAIGateway struct {
+	chatFn      func(ctx context.Context, in *aiv1.ChatCompletionRequest) (grpc.ServerStreamingClient[aiv1.ChatCompletionResponse], error)
+	providersFn func(ctx context.Context, in *aiv1.ListProvidersRequest) (*aiv1.ListProvidersResponse, error)
+	usageFn     func(ctx context.Context, in *aiv1.GetUsageRequest) (*aiv1.GetUsageResponse, error)
+}
+
+func (m *mockAIGateway) ChatCompletion(ctx context.Context, in *aiv1.ChatCompletionRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[aiv1.ChatCompletionResponse], error) {
+	return m.chatFn(ctx, in)
+}
+func (m *mockAIGateway) ListProviders(ctx context.Context, in *aiv1.ListProvidersRequest, _ ...grpc.CallOption) (*aiv1.ListProvidersResponse, error) {
+	return m.providersFn(ctx, in)
+}
+func (m *mockAIGateway) GetUsage(ctx context.Context, in *aiv1.GetUsageRequest, _ ...grpc.CallOption) (*aiv1.GetUsageResponse, error) {
+	return m.usageFn(ctx, in)
+}
+
 // Compile-time assertions that the mocks satisfy the handler ports.
 var (
 	_ AuthClient         = (*mockAuth)(nil)
@@ -167,4 +186,5 @@ var (
 	_ MonitorClient      = (*mockMonitor)(nil)
 	_ BillingClient      = (*mockBilling)(nil)
 	_ NotificationClient = (*mockNotification)(nil)
+	_ AIGatewayClient    = (*mockAIGateway)(nil)
 )

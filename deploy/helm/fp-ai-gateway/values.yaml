@@ -1,0 +1,433 @@
+# ============================================================================
+# fp-ai-gateway — default values
+# ============================================================================
+# Copied from the reference values file (fp-auth) and adjusted for THIS service.
+# Everything the templates render is driven from here so the manifests stay
+# declarative and nothing is hardcoded. Override per-environment with
+# `-f values-prod.yaml` or `--set key=value`.
+#
+# WHAT'S SERVICE-SPECIFIC HERE (vs fp-auth):
+#   - image.repository → fp-ai-gateway
+#   - config.*         → adds FP_OLLAMA_URL (the first-in-failover provider), the
+#                        per-team token-budget tuning (FP_TEAM_TOKEN_BUDGET,
+#                        FP_BUDGET_WINDOW_SECONDS), and the per-provider circuit-
+#                        breaker tuning (FP_CIRCUIT_*). NO DATABASE_URL: this core
+#                        owns no Postgres — its only datastore is Redis (the per-team
+#                        token-budget buckets).
+#   - secrets.*        → TWO sensitive values: FP_REDIS_URL (it may embed a
+#                        password) and FP_JWT_SECRET (the shared HMAC key the
+#                        gateway uses to LOCALLY verify the bearer JWT on every
+#                        RPC — design D2, no per-request call to Auth). No DB DSN.
+#   - resources.*      → a bit larger than auth: the gateway is a hot-path proxy
+#                        terminating streaming completions + holding per-team budget
+#                        buckets and per-provider breaker state.
+#   - networkPolicy.egress → Redis + NATS + OTLP + Ollama (fp-ml:11434). NO Postgres
+#                        egress (it owns no database — don't open a port it never uses).
+#
+# SECURITY CONTRACT (read this before touching `secrets:` below):
+#   The plaintext secret values in this file are DEV-ONLY placeholders so the
+#   chart renders and runs on a local Kind cluster. In any real environment the
+#   Secret is produced by External Secrets Operator (pulls from AWS Secrets
+#   Manager / Vault) or Sealed Secrets — NOT from committed values. See
+#   `secrets.create` and templates/secret.yaml for how to turn the in-chart
+#   Secret off and point at an externally-managed one.
+# ============================================================================
+
+# replicaCount: 2 is the floor for a stateless HA service. Two replicas means a
+# single node drain or pod eviction never takes the service fully down, and the
+# PodDisruptionBudget (minAvailable: 1) can always be satisfied. When autoscaling
+# is enabled the HPA owns the replica count and this value is ignored.
+#
+# NOTE on gateway state: the gateway holds per-replica in-memory state (the route
+# table mirror and, when not shared via Redis, the token buckets / breaker
+# counts). That state is a CACHE, not the source of truth (Redis + the event
+# stream are), so replicas remain interchangeable and horizontally scalable — a
+# fresh replica warms its route table from Redis and rebuilds breakers lazily.
+replicaCount: 2
+
+image:
+  repository: ghcr.io/abd-ulbasit/forgepoint/ai-gateway
+  # tag "" → the chart falls back to Chart.appVersion (see _helpers "image").
+  # Pin an explicit immutable tag (git SHA or semver) in prod; never :latest,
+  # which breaks reproducibility and defeats rollbacks.
+  tag: ""
+  # IfNotPresent: don't re-pull an image the node already has (faster, fewer
+  # registry round-trips). Use Always only for mutable dev tags.
+  pullPolicy: IfNotPresent
+
+# imagePullSecrets: names of pre-existing docker-registry Secrets for private
+# registries. Empty for public ghcr; populated in prod from a registry secret.
+imagePullSecrets: []
+
+# nameOverride / fullnameOverride let an operator rename the release-derived
+# resource names without editing templates (see _helpers "fullname").
+nameOverride: ""
+fullnameOverride: ""
+
+# ----------------------------------------------------------------------------
+# Ports — two distinct listeners (see services/ai-gateway/cmd/server/main.go).
+#   grpc:   HTTP/2, the actual AIGatewayService API (Predict + control plane).
+#   health: HTTP/1.1, serves /healthz, /readyz, and /metrics. Kept on a separate
+#           port because gRPC (HTTP/2) and kubelet probes (HTTP/1.1) cannot share
+#           one net.Listener.
+# These names ("grpc", "health") are referenced by service.yaml, the probes, and
+# the ServiceMonitor — change them here and they propagate everywhere.
+# ----------------------------------------------------------------------------
+ports:
+  grpc: 9090
+  health: 8080
+
+service:
+  type: ClusterIP
+  annotations: {}
+
+# ----------------------------------------------------------------------------
+# Non-secret configuration → rendered into a ConfigMap, injected via envFrom.
+# These map 1:1 to FP_* env vars the service reads (pkg/config BaseConfig +
+# AIConfig). The service prefixes every env var with FP_
+# (config.Load[AIConfig]("FP")). FP_REDIS_URL is NOT here — it may carry
+# a password, so it lives in the Secret (see `secrets:`).
+#
+# WHY no DATABASE_URL: the ai-gateway core has NO Postgres database. Its config
+# struct embeds BaseConfig (which DEFINES DatabaseURL) but the service never
+# dials Postgres — it is Redis-backed only. We deliberately do NOT render a
+# FP_DATABASE_URL so nothing implies a database that doesn't exist.
+# ----------------------------------------------------------------------------
+config:
+  # FP_ENV labels telemetry/logs with the deployment environment.
+  env: "local"
+  logLevel: "info"
+  # In-cluster service DNS. fp-infra is the namespace hosting shared infra
+  # (NATS, Redis, OTel collector) per CLAUDE.md K8s namespaces.
+  otelEndpoint: "otel-collector.fp-infra.svc.cluster.local:4317"
+  natsUrl: "nats://nats.fp-infra.svc.cluster.local:4222"
+
+  # ----- OLLAMA serving endpoint (FP_OLLAMA_URL) -----
+  # The preferred (first-in-failover) provider: the in-cluster Ollama Service in
+  # fp-ml. KEDA scales it 0->1 on the AI_REQUESTS warm-signal lag; the gateway
+  # retries-with-backoff on a cold dial and falls over to the stub if it stays down.
+  ollamaUrl: "http://ollama.fp-ml.svc.cluster.local:11434"
+
+  # ----- PER-TEAM TOKEN BUDGET knobs (the token-denominated rate limiter) -----
+  # teamTokenBudget: tokens a team may spend per rolling window (0 = unlimited).
+  # budgetWindowSeconds: the rolling window length the budget refills over.
+  # Conservative defaults; production tunes per plan. Enforced via Redis (atomic Lua).
+  teamTokenBudget: 1000000
+  budgetWindowSeconds: 3600
+
+  # ----- CIRCUIT BREAKER knobs (FP_CIRCUIT_*) -----
+  # Per-PROVIDER breaker tuning that drives failover: consecutive provider failures
+  # to trip OPEN (skip that provider), and the OPEN cooldown (seconds) before a
+  # half-open probe. Consumed by domain.NewBreakerRegistry.
+  circuitFailureThreshold: 3
+  circuitResetSeconds: 30
+
+  # Extra free-form non-secret env keys (rendered into the ConfigMap as-is).
+  # Keys are used verbatim — DO NOT prefix with FP_ here unless the service
+  # actually reads that prefix; mirror existing FP_* naming.
+  extraEnv: {}
+
+# ----------------------------------------------------------------------------
+# Secrets — DEV placeholders only. See the SECURITY CONTRACT at the top.
+#   secrets.create: true  → chart renders templates/secret.yaml from the values
+#                           below. Convenient for local Kind; NEVER commit real
+#                           values here.
+#   secrets.create: false → chart renders NO Secret. You must provide a Secret
+#                           named `secrets.existingSecret` out-of-band (External
+#                           Secrets / Sealed Secrets / kubectl). The Deployment
+#                           still envFrom's it.
+#
+# The gateway has TWO sensitive values:
+#   - redisUrl (FP_REDIS_URL): the DSN may embed a password / TLS auth.
+#   - jwtSecret (FP_JWT_SECRET): the shared HMAC-SHA256 key the gateway uses to
+#     LOCALLY verify the bearer JWT on every RPC (design D2 — no per-request gRPC
+#     call to Auth on the hot path). The gateway only VERIFIES; it never mints
+#     tokens. This MUST be the SAME secret the Auth service signs with (fp-auth's
+#     secrets.jwtSecret) — a mismatch means every token fails verification and the
+#     gateway 401s all traffic. It lives in the Secret (not the ConfigMap) because
+#     a signing key is access-controlled, not plaintext config.
+# ----------------------------------------------------------------------------
+secrets:
+  create: true
+  # When create=false, the Deployment envFrom's this externally-managed Secret.
+  # Defaults to the chart's fullname when empty (see _helpers "secretName").
+  existingSecret: ""
+  # DEV-ONLY value. Override via --set or a non-committed -f secrets.local.yaml.
+  # Full Redis connection string the service reads as FP_REDIS_URL. In prod the
+  # password component comes from a managed secret store, not from this file.
+  redisUrl: "redis://redis.fp-infra.svc.cluster.local:6379"
+  # DEV-ONLY placeholder. The shared HMAC-SHA256 verification key (FP_JWT_SECRET).
+  # MUST be >= 32 bytes (pkg/auth enforces the RFC 7518 §3.2 floor) and MUST equal
+  # fp-auth's secrets.jwtSecret so tokens Auth mints verify here. In prod this comes
+  # from a managed secret store (External Secrets / Sealed Secrets), never git.
+  # EMPTY BY DEFAULT (fail-closed): the secret template guard rejects an empty,
+  # short (<32B), or the old dev-only placeholder key, so `helm install` ERRORS
+  # until you supply a real key (--set, a non-committed -f, or secrets.existingSecret).
+  jwtSecret: ""
+
+# ----------------------------------------------------------------------------
+# Migrations — DISABLED: this service has NO Postgres database.
+# ----------------------------------------------------------------------------
+# The platform's migrate initContainer pattern (a golang-migrate initContainer
+# that applies schema migrations before the app starts) only applies to
+# Postgres-backed services. This service owns no relational schema — there is
+# nothing to migrate — so we explicitly turn the step off. The Deployment also
+# self-gates on a DSN being present (secrets.databaseUrl / existingSecret), which
+# this chart never sets, so even if flipped on by mistake no initContainer would
+# render. Kept here as an explicit, documented opt-out rather than an absent key.
+migrations:
+  enabled: false
+
+# ----------------------------------------------------------------------------
+# Resources — requests AND limits both set (a "Guaranteed" QoS-friendly shape).
+#   requests = what the scheduler reserves; sets the floor and drives HPA math.
+#   limits   = the ceiling; CPU is throttled, memory OOM-kills above it.
+# The gateway is a HOT-PATH proxy: it terminates many gRPC streams, runs the
+# token-bucket + circuit-breaker + traffic-split logic per request, and holds the
+# in-memory route mirror. So it gets more CPU headroom than auth and a larger
+# memory floor for the in-memory route table + per-backend breaker state. Tune
+# from real RED metrics before raising. memory request==limit avoids OOM
+# surprises under burst; CPU limit > request lets short bursts use idle node CPU.
+# ----------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# ----------------------------------------------------------------------------
+# Autoscaling — HPA. Disabled by default; replicaCount governs when off.
+# When enabled the HPA, not replicaCount, owns the replica number.
+# `customMetrics` is wired for the Prometheus-Adapter / KEDA path the platform
+# uses later (e.g. gRPC RPS, p99 latency) — see templates/hpa.yaml. The gateway
+# is the most load-sensitive service (it sees ALL inference traffic), so it is
+# the prime candidate for RPS-based custom-metric autoscaling once that lands.
+# ----------------------------------------------------------------------------
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  # Optional memory target; null/omit to disable the memory metric.
+  targetMemoryUtilizationPercentage: 80
+  # Extra metrics passed through verbatim into the HPA spec.metrics list
+  # (autoscaling/v2). Example (custom Pods metric):
+  #   - type: Pods
+  #     pods:
+  #       metric:
+  #         name: grpc_requests_per_second
+  #       target:
+  #         type: AverageValue
+  #         averageValue: "500"
+  customMetrics: []
+  # Scaling behavior — conservative scale-down to avoid flapping (thundering herd
+  # of pod churn). Tune per service SLO.
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+
+# PodDisruptionBudget — protects availability during VOLUNTARY disruptions only
+# (node drains, cluster upgrades), NOT crashes. minAvailable: 1 lets the cluster
+# evict at most (replicas-1) pods at once, so a drain never zeroes the service.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# ServiceAccount — own identity per service (least privilege, audit trail).
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # automountServiceAccountToken: false — the gateway does NOT call the K8s API
+  # (it forwards to model-serving by SERVICE DNS resolved from the route, not via
+  # the K8s API), so it has no reason to carry a mountable API token. Mounting one
+  # needlessly widens blast radius if the pod is compromised. Flip to true only
+  # for a service that genuinely uses the in-cluster K8s client.
+  automountServiceAccountToken: false
+
+# ----------------------------------------------------------------------------
+# Pod-level security context — the non-negotiable hardened baseline. Applied to
+# every service. These satisfy the "restricted" Pod Security Standard.
+# ----------------------------------------------------------------------------
+podSecurityContext:
+  # runAsNonRoot makes the kubelet REFUSE to start the pod if the image's user
+  # resolves to UID 0 — a guard against an accidentally-root image.
+  runAsNonRoot: true
+  # 65532 = the "nonroot" UID/GID baked into gcr.io/distroless/* base images,
+  # which our multi-stage Dockerfile uses. Matches the image's filesystem owner.
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  # seccompProfile RuntimeDefault → the container runtime's default syscall
+  # filter (blocks ~44 dangerous syscalls). Cheap, strong kernel-surface
+  # reduction; required by the restricted PSS.
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level security context — defense in depth on top of the pod context.
+containerSecurityContext:
+  allowPrivilegeEscalation: false  # blocks setuid/gainprivs (no sudo-up inside)
+  readOnlyRootFilesystem: true     # immutable rootfs; tamper-resistant, forces
+                                   # explicit emptyDir for any writable path
+  runAsNonRoot: true
+  runAsUser: 65532
+  capabilities:
+    # Drop ALL Linux capabilities. A network service needs none — it binds a
+    # high port (>1024) and does no privileged kernel ops. Least privilege.
+    drop:
+      - ALL
+
+# ----------------------------------------------------------------------------
+# Rolling update strategy — zero-downtime deploys for a stateless service.
+#   maxUnavailable: 0 → never drop below desired count during a roll (no capacity
+#                       dip; the PDB also enforces this for disruptions).
+#   maxSurge: 1       → bring up one extra new pod, wait for it Ready, then retire
+#                       an old one. Bounded extra cost (one pod) per step.
+# ----------------------------------------------------------------------------
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+# ----------------------------------------------------------------------------
+# Probes — liveness on /healthz (process-alive only), readiness on /readyz
+# (real dependency checks — Redis + NATS once those readiness checks are wired in
+# main.go). Both hit the HTTP health port. Tunable so each service can match its
+# own startup profile. startupProbe shields slow cold starts (the gateway warms
+# its route table from Redis on boot) from premature liveness restarts.
+# ----------------------------------------------------------------------------
+probes:
+  liveness:
+    enabled: true
+    path: /healthz
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    enabled: true
+    path: /readyz
+    initialDelaySeconds: 3
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 2
+  startup:
+    enabled: true
+    path: /healthz
+    initialDelaySeconds: 0
+    periodSeconds: 3
+    # 30 * 3s = 90s budget for the process to come up before liveness engages.
+    failureThreshold: 30
+    timeoutSeconds: 2
+
+# ----------------------------------------------------------------------------
+# topologySpreadConstraints — spread replicas across failure domains so a single
+# node/zone loss can't take out a disproportionate share of pods. whenUnsatisfiable
+# ScheduleAnyway keeps scheduling possible on small/single-zone clusters (Kind)
+# while still preferring spread. The selector is injected by the template from the
+# chart's standard selector labels.
+# ----------------------------------------------------------------------------
+topologySpread:
+  enabled: true
+  constraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+
+# Generic scheduling knobs, passed through untouched.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Extra pod annotations/labels (merged into pod template metadata).
+podAnnotations: {}
+podLabels: {}
+
+# terminationGracePeriodSeconds — must exceed the gRPC drain timeout (25s in
+# pkg/grpcutil) so in-flight RPCs finish before SIGKILL. 30s gives 5s slack.
+terminationGracePeriodSeconds: 30
+
+# ----------------------------------------------------------------------------
+# ServiceMonitor (Prometheus Operator CRD) — DISABLED by default ON PURPOSE.
+#
+# Forgepoint's canonical metrics path is OTLP PUSH to the OTel Collector, which
+# Prometheus then scrapes (see pkg/observability/setup.go). So there is normally
+# NO per-pod /metrics endpoint to scrape. This ServiceMonitor exists for the
+# alternative setup where a service is configured to expose /metrics directly on
+# the health port (the prometheus.yml dev scrape config assumes this). Enable it
+# only when you've turned on the in-process Prometheus exporter for the service.
+# Guarded so `helm template` never emits a ServiceMonitor referencing a CRD the
+# cluster may not have.
+# ----------------------------------------------------------------------------
+serviceMonitor:
+  enabled: false
+  # path/port of the metrics endpoint when enabled.
+  path: /metrics
+  portName: health
+  interval: 30s
+  scrapeTimeout: 10s
+  # Extra labels so a Prometheus Operator with a label selector picks this up
+  # (e.g. release: kube-prometheus-stack).
+  labels: {}
+
+# ----------------------------------------------------------------------------
+# NetworkPolicy — default-deny ingress, allow only what the service needs.
+# Zero-trust east-west: even inside the cluster, only fp-system callers (the BFF)
+# reach the gateway, and the gateway may only egress to DNS, Redis, NATS, the OTel
+# collector, and Ollama (fp-ml:11434) — the completion forward path.
+# Disable on clusters whose CNI doesn't enforce NetworkPolicy (it becomes a
+# silent no-op there anyway).
+#
+# NOTE vs the reference chart: there is NO postgres egress block — this core owns no
+# Postgres database. We add a `redis` egress (the per-team budget store) and an
+# `ollama` egress (the backend it forwards completions to). Don't open a port the
+# service never uses.
+# ----------------------------------------------------------------------------
+networkPolicy:
+  enabled: true
+  # Namespaces allowed to send INGRESS to the AI gateway. The BFF (web backend) is
+  # the primary caller — it bridges the browser SSE stream to ChatCompletion. The
+  # BFF lives in fp-system alongside the other platform services, so one fp-system
+  # ingress rule covers it; listed as a comment-of-record for the reviewer.
+  ingressNamespaces:
+    - fp-system   # BFF + platform services that call AIGatewayService.
+  # Egress allow-list. dns is special-cased to the kube-system resolver.
+  egress:
+    dns:
+      enabled: true
+    redis:
+      enabled: true
+      namespace: fp-infra
+      port: 6379
+    nats:
+      enabled: true
+      namespace: fp-infra
+      port: 4222
+    otlp:
+      enabled: true
+      namespace: fp-infra
+      port: 4317
+    # Ollama serving lives in fp-ml (per CLAUDE.md namespace map): the gateway
+    # forwards every completion to Ollama over HTTP on 11434. The URL is SERVER-
+    # configured (FP_OLLAMA_URL), never client-supplied (anti-SSRF). Allowing the
+    # fp-ml namespace on 11434 is the right grain (Ollama is the only backend there).
+    ollama:
+      enabled: true
+      namespace: fp-ml
+      port: 11434

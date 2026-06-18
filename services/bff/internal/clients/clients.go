@@ -43,6 +43,7 @@ import (
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 
+	aiv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/ai/v1"
 	authv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/auth/v1"
 	billingv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/billing/v1"
 	experimentv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/experiment/v1"
@@ -67,6 +68,12 @@ type Addresses struct {
 	Monitor      string
 	Billing      string
 	Notification string
+	// AIGateway is the LLM entry point (M7). Defaults to
+	// fp-ai-gateway.fp-system.svc.cluster.local:9090. It is dialed like every
+	// other downstream — same insecure in-cluster transport, same lazy connect —
+	// because the BFF relays its ChatCompletion server-stream to the browser as
+	// SSE (the chat playground) and proxies its ListProviders/GetUsage RPCs.
+	AIGateway string
 }
 
 // Clients bundles the live gRPC connections and the typed stubs the handlers
@@ -88,6 +95,7 @@ type Clients struct {
 	Monitor      monitorv1.MonitorServiceClient
 	Billing      billingv1.BillingServiceClient
 	Notification notificationv1.NotificationServiceClient
+	AIGateway    aiv1.AIGatewayServiceClient
 }
 
 // Dial constructs one ClientConn per service and wires the typed stubs.
@@ -156,6 +164,11 @@ func Dial(logger *slog.Logger, addrs Addresses) (*Clients, error) {
 		_ = c.Close()
 		return nil, err
 	}
+	aiGatewayConn, err := dial("ai-gateway", addrs.AIGateway)
+	if err != nil {
+		_ = c.Close()
+		return nil, err
+	}
 
 	c.authConn = authConn
 	c.registryConn = registryConn
@@ -167,6 +180,7 @@ func Dial(logger *slog.Logger, addrs Addresses) (*Clients, error) {
 	c.Monitor = monitorv1.NewMonitorServiceClient(monitorConn)
 	c.Billing = billingv1.NewBillingServiceClient(billingConn)
 	c.Notification = notificationv1.NewNotificationServiceClient(notificationConn)
+	c.AIGateway = aiv1.NewAIGatewayServiceClient(aiGatewayConn)
 
 	return c, nil
 }

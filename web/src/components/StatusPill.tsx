@@ -74,6 +74,12 @@ const VALUE_TONE: Record<string, Tone> = {
   NOTIFICATION_SEVERITY_WARNING: 'warning',
   NOTIFICATION_SEVERITY_ERROR: 'danger',
   NOTIFICATION_SEVERITY_CRITICAL: 'danger',
+  // AI Gateway provider kind (which backend served the completion)
+  PROVIDER_KIND_OLLAMA: 'info',
+  PROVIDER_KIND_STUB: 'neutral',
+  PROVIDER_KIND_OPENAI: 'success',
+  PROVIDER_KIND_ANTHROPIC: 'success',
+  PROVIDER_KIND_UNSPECIFIED: 'neutral',
 }
 
 /** Strip the longest known prefix so the label reads cleanly. */
@@ -91,6 +97,7 @@ function labelFor(value: string): string {
     'PIPELINE_TYPE_',
     'STEP_TYPE_',
     'METER_TYPE_',
+    'PROVIDER_KIND_',
   ]
   const p = prefixes.find((pre) => value.startsWith(pre))
   return humanizeEnum(value, p)

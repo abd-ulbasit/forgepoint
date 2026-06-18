@@ -11,6 +11,7 @@ import { NavLink, Outlet, useNavigate } from 'react-router-dom'
 import { useAuth } from '@/auth/AuthContext'
 import {
   BillingIcon,
+  ChatIcon,
   DashboardIcon,
   ExperimentsIcon,
   LogoutIcon,
@@ -30,6 +31,7 @@ interface NavItem {
 
 const NAV: NavItem[] = [
   { to: '/', label: 'Dashboard', Icon: DashboardIcon },
+  { to: '/playground', label: 'Playground', Icon: ChatIcon },
   { to: '/models', label: 'Models', Icon: ModelsIcon },
   { to: '/pipelines', label: 'Pipelines', Icon: PipelinesIcon },
   { to: '/experiments', label: 'Experiments', Icon: ExperimentsIcon },

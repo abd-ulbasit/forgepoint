@@ -112,6 +112,11 @@ config:
   monitorAddr: "fp-model-monitor.fp-system.svc.cluster.local:9090"
   billingAddr: "fp-billing.fp-system.svc.cluster.local:9090"
   notificationAddr: "fp-notification.fp-system.svc.cluster.local:9090"
+  # AI Gateway (M7) lives in fp-system on the standard gRPC port. The BFF dials it
+  # for the chat playground (ChatCompletion stream -> SSE) + provider/usage proxies.
+  # It is already covered by the namespace-wide fp-system :9090 egress rule below;
+  # this explicit address keeps the deployed config self-documenting + overridable.
+  aiGatewayAddr: "fp-ai-gateway.fp-system.svc.cluster.local:9090"
   # model-serving lives in the fp-models namespace. The BFF does NOT call it
   # directly today (inference goes through the inference-gateway), so main.go has
   # no MODEL_SERVING_ADDR field — this key is provided for forward-compatibility and

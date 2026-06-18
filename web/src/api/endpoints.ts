@@ -15,6 +15,8 @@
 
 import { apiClient } from './client'
 import type {
+  AIUsageResponse,
+  ListProvidersResponse,
   DashboardResponse,
   GetExecutionResponse,
   GetModelResponse,
@@ -192,6 +194,32 @@ export async function listNotifications(
 export async function getDashboard(): Promise<DashboardResponse> {
   const { data } = await apiClient.get<DashboardResponse>('/v1/dashboard')
   return data
+}
+
+// ---- AI Gateway (M7) -------------------------------------------------------
+
+/** GET /api/v1/ai/providers — configured backends + live circuit state. */
+export async function listAIProviders(): Promise<ListProvidersResponse> {
+  const { data } = await apiClient.get<ListProvidersResponse>('/v1/ai/providers')
+  return data
+}
+
+/** GET /api/v1/ai/usage — the caller team's token/cost usage + remaining budget. */
+export async function getAIUsage(): Promise<AIUsageResponse> {
+  const { data } = await apiClient.get<AIUsageResponse>('/v1/ai/usage')
+  return data
+}
+
+/**
+ * The chat endpoint is a POST whose RESPONSE is an SSE stream (the BFF bridges
+ * the AI gateway's ChatCompletion server-stream). Like the watch stream it is
+ * consumed via fetch()+ReadableStream (NOT axios, NOT EventSource) because the
+ * request carries a JSON body AND must set the Authorization header — neither of
+ * which EventSource can do. The useChat hook owns that fetch; this just names the
+ * relative, same-origin URL so the host is never hardcoded in the bundle.
+ */
+export function chatStreamUrl(): string {
+  return `/api/v1/chat`
 }
 
 // ---- SSE watch URL ---------------------------------------------------------

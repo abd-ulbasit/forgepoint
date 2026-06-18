@@ -1,0 +1,51 @@
+apiVersion: v2
+
+# fp-ai-gateway is adapted from the reference chart fp-inference-gateway — it
+# changes only the name, image, the env/config block, the resource shape, and the
+# NetworkPolicy egress allow-list (this service talks to Redis + NATS + OTLP, plus
+# Ollama in fp-ml; NOT Postgres in this core). Everything structural (security
+# contexts, probes, PDB, HPA, spread, ServiceMonitor) is identical so the
+# platform's deployment surface stays boringly uniform and interview-explainable.
+name: fp-ai-gateway
+description: Forgepoint AI Gateway (LLM provider routing, circuit-breaker failover, per-team token budgets, streaming) — the LLM front door over Ollama + a deterministic stub.
+
+# CHART TYPE: "application" (the default) vs "library".
+#   application → renders into deployable K8s objects (what we want).
+#   library     → reusable templates only, never installed directly.
+type: application
+
+# TWO DISTINCT VERSIONS — a common point of confusion:
+#   version    = the CHART's own version. Bump on ANY template change (SemVer).
+#   appVersion = the APPLICATION (container) version this chart ships by default.
+#                It is purely informational and is what `helm list` shows as
+#                APP VERSION; the actual image tag still comes from values.yaml
+#                (.Values.image.tag), falling back to appVersion when tag is "".
+version: 0.1.0
+appVersion: "0.1.0"
+
+# kubeVersion gates installs to a cluster new enough for the APIs we use
+# (autoscaling/v2 HPA, policy/v1 PDB, networking.k8s.io/v1 NetworkPolicy all
+# stabilized by 1.21+). Helm refuses to install on older clusters with a clear
+# error instead of failing later with an unknown-API surprise.
+kubeVersion: ">=1.23.0-0"
+
+home: https://github.com/abd-ulbasit/forgepoint
+# icon is purely cosmetic (shown in chart registries/UIs). Set to silence the
+# `helm lint` "icon is recommended" INFO and to brand the chart in repo UIs.
+icon: https://raw.githubusercontent.com/abd-ulbasit/forgepoint/main/docs/assets/logo.png
+sources:
+  - https://github.com/abd-ulbasit/forgepoint
+
+maintainers:
+  - name: Forgepoint Platform Team
+
+keywords:
+  - forgepoint
+  - ai-gateway
+  - llm
+  - circuit-breaker
+  - failover
+  - token-budget
+  - streaming
+  - grpc
+  - microservice

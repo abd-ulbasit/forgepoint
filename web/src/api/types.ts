@@ -467,6 +467,99 @@ export interface DashboardResponse {
   usage: DashboardTile<GetUsageResponse>
 }
 
+// ---- AI Gateway (M7) -------------------------------------------------------
+//
+// Mirrors gen/go/forgepoint/ai/v1 as relayed by the BFF (services/bff/internal/
+// handlers/ai.go). protojson conventions apply: enums are full SCREAMING_SNAKE
+// names; int32 token counts arrive as JSON numbers; the int64 cost arrives as a
+// STRING (costMicroUsd). The chat stream is consumed over SSE (see useChat), so
+// these types describe the JSON shape of each SSE frame's `data`.
+
+/** The author of a chat message — sent to the BFF, echoed in history. */
+export type ChatRole =
+  | 'CHAT_ROLE_UNSPECIFIED'
+  | 'CHAT_ROLE_SYSTEM'
+  | 'CHAT_ROLE_USER'
+  | 'CHAT_ROLE_ASSISTANT'
+
+/** Which backend served (post-failover) / is configured. */
+export type ProviderKind =
+  | 'PROVIDER_KIND_UNSPECIFIED'
+  | 'PROVIDER_KIND_OLLAMA'
+  | 'PROVIDER_KIND_STUB'
+  | 'PROVIDER_KIND_OPENAI'
+  | 'PROVIDER_KIND_ANTHROPIC'
+  | string
+
+/** Why a completion stopped (set on the terminal frame). */
+export type FinishReason =
+  | 'FINISH_REASON_UNSPECIFIED'
+  | 'FINISH_REASON_STOP'
+  | 'FINISH_REASON_LENGTH'
+  | 'FINISH_REASON_CONTENT_FILTER'
+  | 'FINISH_REASON_ERROR'
+  | string
+
+export interface ChatMessage {
+  role: ChatRole
+  content: string
+}
+
+/** Token accounting. promptTokens/completionTokens/totalTokens are int32 →
+ *  numbers; costMicroUsd is int64 → string (1 USD = 1_000_000 micro-USD). */
+export interface TokenUsage {
+  promptTokens: number
+  completionTokens: number
+  totalTokens: number
+  costMicroUsd: string
+}
+
+/** The JSON body the SPA POSTs to /api/v1/chat. The caller's team/budget key is
+ *  derived downstream from the JWT, never sent here. */
+export interface ChatCompletionRequest {
+  model?: string
+  messages: ChatMessage[]
+  temperature?: number
+  maxTokens?: number
+  stream?: boolean
+  provider?: ProviderKind
+}
+
+/** One streamed SSE frame's `data` (a ChatCompletionResponse). For a delta frame
+ *  `delta` carries incremental text; the terminal frame sets done + finishReason
+ *  + usage. servedBy/cacheHit/requestId ride along on every frame. */
+export interface ChatCompletionFrame {
+  delta: string
+  done: boolean
+  finishReason?: FinishReason
+  usage?: TokenUsage
+  servedBy?: ProviderKind
+  cacheHit?: boolean
+  requestId?: string
+}
+
+/** A configured backend + its live circuit state (GET /api/v1/ai/providers). */
+export interface Provider {
+  kind: ProviderKind
+  name: string
+  enabled: boolean
+  circuitState: string // CLOSED | OPEN | HALF_OPEN
+  models: string[]
+}
+
+export interface ListProvidersResponse {
+  providers: Provider[]
+}
+
+/** Team token/cost usage + remaining budget (GET /api/v1/ai/usage). budgetTokens
+ *  / remainingTokens are int64 → strings. */
+export interface AIUsageResponse {
+  team: string
+  total?: TokenUsage
+  budgetTokens: string
+  remainingTokens: string
+}
+
 // ---- Generic ---------------------------------------------------------------
 
 /** The BFF's sanitized error envelope (httpx.errorBody). */

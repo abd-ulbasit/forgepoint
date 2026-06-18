@@ -31,6 +31,7 @@ import (
 
 	"google.golang.org/grpc"
 
+	aiv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/ai/v1"
 	authv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/auth/v1"
 	billingv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/billing/v1"
 	experimentv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/experiment/v1"
@@ -89,4 +90,17 @@ type BillingClient interface {
 // endpoint uses.
 type NotificationClient interface {
 	ListNotifications(ctx context.Context, in *notificationv1.ListNotificationsRequest, opts ...grpc.CallOption) (*notificationv1.ListNotificationsResponse, error)
+}
+
+// AIGatewayClient is the slice of the AI Gateway API the chat/playground
+// endpoints use. ChatCompletion is the server-streaming RPC the BFF relays to
+// the browser as SSE (the one piece of LLM real-time the BFF owns); the other
+// two are plain unary proxies. We segregate to exactly these three methods even
+// though the generated stub also exposes the prompt-registry RPCs — the BFF's
+// chat surface does not touch them, so naming only what we call keeps the
+// dependency honest and the mock tiny.
+type AIGatewayClient interface {
+	ChatCompletion(ctx context.Context, in *aiv1.ChatCompletionRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[aiv1.ChatCompletionResponse], error)
+	ListProviders(ctx context.Context, in *aiv1.ListProvidersRequest, opts ...grpc.CallOption) (*aiv1.ListProvidersResponse, error)
+	GetUsage(ctx context.Context, in *aiv1.GetUsageRequest, opts ...grpc.CallOption) (*aiv1.GetUsageResponse, error)
 }

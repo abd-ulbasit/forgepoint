@@ -73,6 +73,10 @@ type BFFConfig struct {
 	MonitorAddr      string `env:"MONITOR_ADDR" default:"fp-model-monitor.fp-system.svc.cluster.local:9090"`
 	BillingAddr      string `env:"BILLING_ADDR" default:"fp-billing.fp-system.svc.cluster.local:9090"`
 	NotificationAddr string `env:"NOTIFICATION_ADDR" default:"fp-notification.fp-system.svc.cluster.local:9090"`
+	// AIGatewayAddr is the M7 LLM gateway. The BFF relays its ChatCompletion
+	// server-stream to the browser as SSE (the chat playground) and proxies its
+	// ListProviders/GetUsage RPCs. Same fp-system/:9090 grain as the others.
+	AIGatewayAddr string `env:"AI_GATEWAY_ADDR" default:"fp-ai-gateway.fp-system.svc.cluster.local:9090"`
 
 	// HTTPPort is the SPA-facing HTTP port. We don't reuse BaseConfig.GRPCPort
 	// (the BFF serves no gRPC) and keep Port for the health server, matching the
@@ -149,6 +153,7 @@ func main() {
 		Monitor:      cfg.MonitorAddr,
 		Billing:      cfg.BillingAddr,
 		Notification: cfg.NotificationAddr,
+		AIGateway:    cfg.AIGatewayAddr,
 	})
 	if err != nil {
 		logger.Error("failed to dial downstream services", slog.String("error", err.Error()))

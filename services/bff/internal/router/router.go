@@ -59,6 +59,10 @@ func New(cfg Config) http.Handler {
 	billingH := handlers.NewBillingHandler(cl.Billing, log)
 	notificationsH := handlers.NewNotificationsHandler(cl.Notification, log)
 	dashboardH := handlers.NewDashboardHandler(cl.Registry, cl.Pipeline, cl.Monitor, cl.Billing, log)
+	// AI Gateway (M7): the chat SSE bridge + provider/usage proxies. It reuses the
+	// SAME SSELimits as the pipelines watch relay (its own limiter instance) so the
+	// chat stream inherits the global/per-user/lifetime DoS bounds.
+	aiH := handlers.NewAIHandler(cl.AIGateway, log, cfg.SSELimits)
 
 	// ---- PROTECTED routes (require a forwarded bearer token) -----------------
 	protected := http.NewServeMux()
@@ -89,6 +93,14 @@ func New(cfg Config) http.Handler {
 
 	// Notifications
 	protected.HandleFunc("GET /api/v1/notifications", notificationsH.List)
+
+	// AI Gateway (chat playground). POST /chat is the ChatCompletion-stream->SSE
+	// bridge; the other two are unary proxies. All three live on the PROTECTED mux,
+	// so a forwarded bearer token is required by construction (the gateway derives
+	// the caller's team/budget from that token, never from the request body).
+	protected.HandleFunc("POST /api/v1/chat", aiH.Chat)
+	protected.HandleFunc("GET /api/v1/ai/providers", aiH.Providers)
+	protected.HandleFunc("GET /api/v1/ai/usage", aiH.Usage)
 
 	// Aggregation
 	protected.HandleFunc("GET /api/v1/dashboard", dashboardH.Dashboard)

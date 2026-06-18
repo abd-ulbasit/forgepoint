@@ -46,6 +46,9 @@ data:
   FP_MONITOR_ADDR: {{ .Values.config.monitorAddr | quote }}
   FP_BILLING_ADDR: {{ .Values.config.billingAddr | quote }}
   FP_NOTIFICATION_ADDR: {{ .Values.config.notificationAddr | quote }}
+  # AI Gateway (M7) — the BFF relays its ChatCompletion stream to the browser as
+  # SSE and proxies its ListProviders/GetUsage RPCs.
+  FP_AI_GATEWAY_ADDR: {{ .Values.config.aiGatewayAddr | quote }}
   # model-serving address — rendered for forward-compat/documentation; the current
   # binary has no struct field for it and ignores unknown FP_* env (the BFF reaches
   # inference via the inference-gateway today, not model-serving directly).

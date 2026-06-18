@@ -32,6 +32,8 @@ export const qk = {
   driftReports: (p?: PageParams & { modelName?: string }) => ['drift-reports', p ?? {}] as const,
   usage: (p?: PageParams & { team?: string }) => ['usage', p ?? {}] as const,
   notifications: (p?: PageParams & { unreadOnly?: boolean }) => ['notifications', p ?? {}] as const,
+  aiProviders: ['ai-providers'] as const,
+  aiUsage: ['ai-usage'] as const,
 }
 
 // ---- Dashboard -------------------------------------------------------------
@@ -167,5 +169,24 @@ export function useNotifications(params?: PageParams & { unreadOnly?: boolean })
     queryKey: qk.notifications(params),
     queryFn: () => api.listNotifications(params),
     placeholderData: keepPreviousData,
+  })
+}
+
+// ---- AI Gateway (M7) -------------------------------------------------------
+
+export function useAIProviders() {
+  return useQuery({
+    queryKey: qk.aiProviders,
+    queryFn: api.listAIProviders,
+    // Circuit state changes over time; refresh in the background so the model
+    // selector + provider health reflect reality without a manual reload.
+    refetchInterval: 30_000,
+  })
+}
+
+export function useAIUsage() {
+  return useQuery({
+    queryKey: qk.aiUsage,
+    queryFn: api.getAIUsage,
   })
 }

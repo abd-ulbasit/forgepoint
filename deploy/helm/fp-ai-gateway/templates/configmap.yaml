@@ -1,0 +1,55 @@
+# ============================================================================
+# ConfigMap — NON-SECRET environment configuration.
+# ============================================================================
+# These keys are mapped into the container as env vars via `envFrom` in the
+# Deployment. The service reads them with the FP_ prefix (config.Load[...]("FP")
+# → FP_PORT, FP_GRPC_PORT, ...). Keep ONLY non-sensitive values here — a
+# ConfigMap is stored in plaintext in etcd and readable by anyone with get on
+# ConfigMaps in the namespace. The sensitive value (FP_REDIS_URL, which may embed
+# a password) lives in the Secret.
+#
+# WHY ports come from values, not hardcoded: the container, the Service, and the
+# probes must all agree on the port numbers; sourcing them from one place
+# (.Values.ports) keeps them in lockstep.
+#
+# SERVICE-SPECIFIC KEYS: the AI gateway reads FP_OLLAMA_URL (the in-cluster Ollama
+# serving endpoint it routes to first), the per-team token-budget tuning
+# (FP_TEAM_TOKEN_BUDGET, FP_BUDGET_WINDOW_SECONDS), and the per-provider circuit-
+# breaker tuning (FP_CIRCUIT_*). It deliberately has NO FP_DATABASE_URL — this core
+# owns no Postgres (the L3 prompt registry will add one later).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "fp-ai-gateway.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fp-ai-gateway.labels" . | nindent 4 }}
+data:
+  # Ports — stringified because ConfigMap values are always strings.
+  FP_PORT: {{ .Values.ports.health | quote }}
+  FP_GRPC_PORT: {{ .Values.ports.grpc | quote }}
+  # Observability + async bus endpoints (in-cluster service DNS).
+  FP_LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  FP_OTEL_ENDPOINT: {{ .Values.config.otelEndpoint | quote }}
+  FP_NATS_URL: {{ .Values.config.natsUrl | quote }}
+  # FP_ENV labels logs/traces with the deployment environment.
+  FP_ENV: {{ .Values.config.env | quote }}
+  # Ollama serving endpoint — the gateway's preferred (first-in-failover) provider.
+  # A cold/down Ollama trips its breaker and the gateway fails over to the stub.
+  FP_OLLAMA_URL: {{ .Values.config.ollamaUrl | quote }}
+  # Per-team token budget (the token-denominated rate limiter): the allowance per
+  # rolling window and the window length. 0 budget = unlimited.
+  # printf "%d" forces a PLAIN integer string — a bare `| quote` on a large YAML
+  # number (e.g. 1000000) renders scientific notation ("1e+06"), which the service's
+  # strconv.ParseInt (pkg/config) rejects at boot. Coerce to int64 first, then format.
+  FP_TEAM_TOKEN_BUDGET: {{ printf "%d" (int64 .Values.config.teamTokenBudget) | quote }}
+  FP_BUDGET_WINDOW_SECONDS: {{ printf "%d" (int64 .Values.config.budgetWindowSeconds) | quote }}
+  # Circuit breaker — consecutive provider failures to trip OPEN + OPEN cooldown.
+  FP_CIRCUIT_FAILURE_THRESHOLD: {{ .Values.config.circuitFailureThreshold | quote }}
+  FP_CIRCUIT_RESET_SECONDS: {{ .Values.config.circuitResetSeconds | quote }}
+  {{- with .Values.config.extraEnv }}
+  # Free-form additional non-secret env. Keys used verbatim.
+  {{- range $key, $val := . }}
+  {{ $key }}: {{ $val | quote }}
+  {{- end }}
+  {{- end }}
