@@ -1,0 +1,230 @@
+// ============================================================================
+// Forgepoint AI Gateway Proto Definitions (M7 — LLMOps)
+// ============================================================================
+//
+// The AI Gateway is the LLM analogue of the Inference Gateway: one entry point
+// that fronts many model backends ("providers") and applies the cross-cutting
+// concerns every production LLM system needs — provider routing + FAILOVER
+// (circuit breaker), per-tenant TOKEN BUDGETS (rate limiting), a semantic CACHE,
+// streaming, and usage/cost metering. The model itself is deliberately tiny
+// (a local Ollama smollm2); the subject is the platform infrastructure.
+//
+// PATTERN REUSE (interview framing): every concern here maps to a pattern already
+// built elsewhere in Forgepoint —
+//   - provider failover      -> Circuit Breaker (inference-gateway)
+//   - per-team token budgets  -> distributed Rate Limiter (inference-gateway)
+//   - prompt/model A-B + canary -> Traffic Splitting (model-serving)
+//   - token cost metering     -> Outbox reliable events (billing)
+//   - streaming tokens        -> server-streaming gRPC -> BFF SSE
+//
+// REAL-WORLD COMPARISON: LiteLLM / Portkey / Cloudflare AI Gateway (routing +
+// caching) — but those are thin on deep cost attribution + governance, which
+// Forgepoint already has (billing outbox, audit log, model-monitor).
+// ============================================================================
+syntax = "proto3";
+
+package forgepoint.ai.v1;
+
+option go_package = "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/ai/v1;aiv1";
+
+import "google/protobuf/timestamp.proto";
+import "forgepoint/common/v1/common.proto";
+
+// ChatRole is the author of a chat message (OpenAI/Anthropic-style roles).
+enum ChatRole {
+  CHAT_ROLE_UNSPECIFIED = 0;
+  CHAT_ROLE_SYSTEM = 1;     // instruction/persona; steers the assistant.
+  CHAT_ROLE_USER = 2;       // the human turn.
+  CHAT_ROLE_ASSISTANT = 3;  // a prior model turn (for multi-turn context).
+}
+
+// ProviderKind identifies a model backend. OLLAMA + STUB ship built-in; the
+// cloud kinds are optional and key-gated (the failover story works with two
+// local models + the stub, no cloud account required).
+enum ProviderKind {
+  PROVIDER_KIND_UNSPECIFIED = 0;
+  PROVIDER_KIND_OLLAMA = 1;     // local, self-hosted (the in-cluster serving).
+  PROVIDER_KIND_STUB = 2;       // deterministic fake; backs all CI/tests.
+  PROVIDER_KIND_OPENAI = 3;     // optional cloud.
+  PROVIDER_KIND_ANTHROPIC = 4;  // optional cloud.
+}
+
+// FinishReason explains why a completion stopped.
+enum FinishReason {
+  FINISH_REASON_UNSPECIFIED = 0;
+  FINISH_REASON_STOP = 1;            // natural end / stop sequence.
+  FINISH_REASON_LENGTH = 2;          // hit max_tokens.
+  FINISH_REASON_CONTENT_FILTER = 3;  // guardrail blocked it.
+  FINISH_REASON_ERROR = 4;           // provider/backend error after failover.
+}
+
+// PromptStage is the lifecycle stage of a versioned prompt (CQRS read model),
+// mirroring ModelStage in the registry.
+enum PromptStage {
+  PROMPT_STAGE_UNSPECIFIED = 0;
+  PROMPT_STAGE_DEV = 1;
+  PROMPT_STAGE_PRODUCTION = 2;
+  PROMPT_STAGE_ARCHIVED = 3;
+}
+
+// ChatMessage is one turn in a conversation.
+message ChatMessage {
+  ChatRole role = 1;
+  string content = 2;
+}
+
+// TokenUsage is the accounting unit — prompt + completion tokens and the derived
+// cost. Cost is in micro-USD (int64) to avoid float money errors (same lesson as
+// billing): 1 USD = 1_000_000 micro-USD.
+message TokenUsage {
+  int32 prompt_tokens = 1;
+  int32 completion_tokens = 2;
+  int32 total_tokens = 3;
+  int64 cost_micro_usd = 4;
+}
+
+// ChatCompletionRequest asks for a completion. The caller's TEAM (from the JWT,
+// not this message) is the tenancy + budget key — never trusted from the body.
+message ChatCompletionRequest {
+  // Logical model name (e.g. "smollm2:135m" or a routing alias). The gateway maps
+  // it to a provider; empty = the configured default.
+  string model = 1;
+  repeated ChatMessage messages = 2;
+  // Sampling controls (optional; provider defaults apply when unset).
+  float temperature = 3;
+  int32 max_tokens = 4;
+  // When true the server streams deltas; when false it returns one final message.
+  // (The gRPC method is always server-streaming; non-streaming clients just read
+  // the single terminal frame.)
+  bool stream = 5;
+  // Optional: pin a specific provider kind (else the gateway routes + fails over).
+  ProviderKind provider = 6;
+  // Idempotency for the (rare) non-streaming retry; the gateway dedups on it.
+  string idempotency_key = 7;
+}
+
+// ChatCompletionResponse is one streamed frame. For a stream, `delta` carries
+// incremental text and the final frame sets `done=true` + `finish_reason` +
+// `usage`. For non-streaming, a single frame carries the full `delta` + done.
+message ChatCompletionResponse {
+  string delta = 1;                 // incremental (or full) text for this frame.
+  bool done = 2;                    // terminal frame.
+  FinishReason finish_reason = 3;   // set on the terminal frame.
+  TokenUsage usage = 4;             // set on the terminal frame.
+  ProviderKind served_by = 5;       // which backend actually served (post-failover).
+  bool cache_hit = 6;               // true if served from the semantic cache.
+  string request_id = 7;            // correlation id for tracing/audit.
+}
+
+// Provider describes a configured backend and its live health (circuit state).
+message Provider {
+  ProviderKind kind = 1;
+  string name = 2;                  // human label, e.g. "ollama-local".
+  bool enabled = 3;
+  string circuit_state = 4;         // CLOSED | OPEN | HALF_OPEN.
+  repeated string models = 5;       // models this provider can serve.
+}
+
+message ListProvidersRequest {}
+
+message ListProvidersResponse {
+  repeated Provider providers = 1;
+}
+
+// GetUsageRequest returns token/cost usage for the caller's team (or a given
+// team for admins) over an optional window.
+message GetUsageRequest {
+  google.protobuf.Timestamp since = 1;  // optional lower bound.
+}
+
+message GetUsageResponse {
+  string team = 1;
+  TokenUsage total = 2;
+  int64 budget_tokens = 3;          // the team's token budget (0 = unlimited).
+  int64 remaining_tokens = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Prompt registry (L3) — versioned, templated prompts. CQRS like the model
+// registry: write side owns versions/stages, reads serve the rendered prompt.
+// ---------------------------------------------------------------------------
+
+message Prompt {
+  string id = 1;
+  string name = 2;                  // unique per team.
+  int32 version = 3;                // monotonic per name.
+  PromptStage stage = 4;
+  // The template body with {{variable}} placeholders.
+  string template = 5;
+  repeated string variables = 6;    // declared placeholders.
+  string description = 7;
+  string team = 8;
+  google.protobuf.Timestamp created_at = 9;
+}
+
+message CreatePromptRequest {
+  string name = 1;
+  string template = 2;
+  string description = 3;
+  string idempotency_key = 4;
+}
+
+// Wrapped so each RPC has a unique response type (Buf RPC_REQUEST_RESPONSE_UNIQUE)
+// and so fields can be added later without a wire-breaking change.
+message CreatePromptResponse {
+  Prompt prompt = 1;
+}
+
+message GetPromptRequest {
+  string name = 1;                  // by name...
+  int32 version = 2;                // ...optional specific version (0 = latest prod).
+}
+
+message GetPromptResponse {
+  Prompt prompt = 1;
+}
+
+message ListPromptsRequest {
+  forgepoint.common.v1.PaginationRequest pagination = 1;
+}
+
+message ListPromptsResponse {
+  repeated Prompt prompts = 1;
+  forgepoint.common.v1.PaginationResponse pagination = 2;
+}
+
+// RenderPrompt substitutes variables into a prompt template server-side, so the
+// rendered text is consistent and auditable.
+message RenderPromptRequest {
+  string name = 1;
+  int32 version = 2;
+  map<string, string> variables = 3;
+}
+
+message RenderPromptResponse {
+  string rendered = 1;
+  int32 version = 2;
+}
+
+// ============================================================================
+// AIGatewayService — the LLM entry point.
+// ============================================================================
+service AIGatewayService {
+  // ChatCompletion streams completion frames. Server-streaming so token deltas
+  // reach the browser live (via the BFF SSE bridge). The gateway routes to a
+  // provider, fails over on a tripped circuit, enforces the team token budget,
+  // checks the semantic cache, and meters usage/cost.
+  rpc ChatCompletion(ChatCompletionRequest) returns (stream ChatCompletionResponse);
+
+  // ListProviders reports configured backends + their live circuit state.
+  rpc ListProviders(ListProvidersRequest) returns (ListProvidersResponse);
+
+  // GetUsage returns the caller team's token/cost usage + remaining budget.
+  rpc GetUsage(GetUsageRequest) returns (GetUsageResponse);
+
+  // --- Prompt registry (L3) ---
+  rpc CreatePrompt(CreatePromptRequest) returns (CreatePromptResponse);
+  rpc GetPrompt(GetPromptRequest) returns (GetPromptResponse);
+  rpc ListPrompts(ListPromptsRequest) returns (ListPromptsResponse);
+  rpc RenderPrompt(RenderPromptRequest) returns (RenderPromptResponse);
+}

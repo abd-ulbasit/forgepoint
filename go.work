@@ -39,6 +39,7 @@ use (
 	./cli
 	./gen/go
 	./pkg
+	./services/ai-gateway
 	./services/auth
 	./services/bff
 	./services/billing
