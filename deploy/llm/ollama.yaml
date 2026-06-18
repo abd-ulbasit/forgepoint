@@ -1,0 +1,126 @@
+# deploy/llm/ollama.yaml — in-cluster LLM serving (Ollama) for the AI Gateway (M7/L0).
+#
+# WHY in-cluster (vs the host systemd service): the chosen design runs LLM serving
+# as a first-class k8s workload so it participates in the same story as everything
+# else — scheduling, NetworkPolicy, resource limits, and KEDA scale-to-zero (the
+# ScaledObject in ollama-scaledobject.yaml). On this RAM-constrained homelab node
+# (shared with a ~4GB TTS) the safety comes from limits + keep_alive=0: the model is
+# loaded only during inference and the cgroup memory LIMIT caps the runner so the
+# kernel sacrifices Ollama — never the TTS/Postgres — under pressure.
+#
+# MODEL: smollm2:135m (the smallest instruct model that fits the headroom). Pulled
+# once into the PVC (see the L0 runbook) so a scale 0->1 restores the model from
+# disk instead of re-downloading.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fp-ml
+  labels:
+    app.kubernetes.io/part-of: forgepoint
+    # No default-deny here yet: the AI Gateway egress policy (L1) will pin the
+    # fp-system -> fp-ml:11434 edge; until then in-cluster reach is open for L0 tests.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-models
+  namespace: fp-ml
+spec:
+  # k3s local-path provisioner (already running on the node). The model store
+  # persists across pod restarts / scale-to-zero so warm-ups are disk-fast, not
+  # re-downloads.
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 4Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: fp-ml
+  labels:
+    app.kubernetes.io/name: ollama
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  # Starts at 1 for L0 bring-up + the one-time model pull. The KEDA ScaledObject
+  # then takes ownership and drives it 0<->1 on demand (scale-to-zero when idle).
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ollama
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ollama
+        app.kubernetes.io/part-of: forgepoint
+    spec:
+      # Terminate fast on scale-down so the node reclaims RAM quickly.
+      terminationGracePeriodSeconds: 20
+      containers:
+        - name: ollama
+          image: ollama/ollama:0.30.10
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 11434
+          env:
+            # Unload the model the instant a request finishes -> resident only
+            # during inference (the whole point on a RAM-starved, TTS-shared node).
+            - name: OLLAMA_KEEP_ALIVE
+              value: "0"
+            - name: OLLAMA_MAX_LOADED_MODELS
+              value: "1"
+            - name: OLLAMA_NUM_PARALLEL
+              value: "1"
+            # Bind all interfaces so the ClusterIP Service can reach it.
+            - name: OLLAMA_HOST
+              value: "0.0.0.0:11434"
+          resources:
+            # LOW request so it schedules on the tight node (k8s schedules on
+            # requests, not live free RAM); HIGH limit = the hard ceiling during
+            # inference. If the runner balloons past this, the kernel OOM-kills
+            # OLLAMA (cgroup-scoped), protecting the TTS/Postgres.
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "1800Mi"
+          volumeMounts:
+            - name: models
+              mountPath: /root/.ollama
+          # The model loads lazily on the first request (keep_alive=0), so readiness
+          # is just the HTTP server being up, not a model being resident.
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: ollama-models
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: fp-ml
+  labels:
+    app.kubernetes.io/name: ollama
+spec:
+  selector:
+    app.kubernetes.io/name: ollama
+  ports:
+    - name: http
+      port: 11434
+      targetPort: http

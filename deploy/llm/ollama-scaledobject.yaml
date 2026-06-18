@@ -1,0 +1,55 @@
+# deploy/llm/ollama-scaledobject.yaml — KEDA scale-to-zero for in-cluster LLM serving (M7/L0).
+#
+# THE PATTERN (interview-critical): an idle LLM should cost ZERO. On a GPU box this
+# is the difference between paying for an idle A100 and paying nothing; here on a
+# RAM-starved homelab it is the difference between a ~256Mi idle pod and reclaiming
+# that memory for the TTS. KEDA scales the Ollama Deployment 1<->0 based on demand.
+#
+# TRIGGER — warm-on-demand via NATS JetStream (reuses the platform's existing
+# infra + the same KEDA nats-jetstream scaler pattern as deploy/keda/, so NO extra
+# component like the KEDA HTTP add-on is needed on this tight node):
+#   - The AI Gateway (L1), on a chat request, publishes a lightweight signal to the
+#     AI_REQUESTS stream and then serves synchronously (waiting briefly for Ollama
+#     readiness on a cold 0->1).
+#   - KEDA watches the `ollama-warmer` durable consumer's pending count; pending >= 1
+#     scales Ollama 0->1. After `cooldownPeriod` with no pending work it scales back
+#     to 0. The gateway acks the warm signal once it has served, draining the lag.
+#
+# ALTERNATIVE (documented, not used here): the KEDA HTTP add-on gives request-holding
+# scale-to-zero with no gateway-side cold-start handling, but adds an interceptor +
+# scaler pod — overhead this 7GB/TTS-shared node should avoid. Switch to it on
+# capable infra.
+#
+# NOTE: applied together with the L1 gateway (which creates the AI_REQUESTS stream +
+# publishes the warm signal). Until then Ollama runs at the Deployment's replicas:1
+# for L0 bring-up; applying this with no signal present would simply scale it to 0.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: ollama
+  namespace: fp-ml
+  labels:
+    app.kubernetes.io/name: ollama
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  scaleTargetRef:
+    name: ollama
+  minReplicaCount: 0          # scale-to-zero: nothing resident when idle
+  maxReplicaCount: 1          # one model server is plenty on this node
+  pollingInterval: 10         # check demand every 10s
+  cooldownPeriod: 120         # scale to 0 after 120s with no pending warm signals
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 60
+  triggers:
+    - type: nats-jetstream
+      metadata:
+        natsServerMonitoringEndpoint: "nats.fp-infra.svc.cluster.local:8222"
+        account: "$G"
+        stream: "AI_REQUESTS"
+        consumer: "ollama-warmer"
+        # One pending warm signal is enough to wake serving.
+        lagThreshold: "1"
+        activationLagThreshold: "0"
