@@ -51,3 +51,6 @@ tmp/
 # AI assistant instructions & local agent config (not part of the public repo)
 CLAUDE.md
 .claude/
+
+# Compiled service binaries from `go build`/`make build`
+services/*/server
