@@ -89,6 +89,7 @@ import (
 	"github.com/abd-ulbasit/forgepoint/pkg/health"
 	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/observability"
+	"github.com/abd-ulbasit/forgepoint/services/auth/internal/authn"
 	authdomain "github.com/abd-ulbasit/forgepoint/services/auth/internal/domain"
 	authevents "github.com/abd-ulbasit/forgepoint/services/auth/internal/events"
 	"github.com/abd-ulbasit/forgepoint/services/auth/internal/handler"
@@ -431,24 +432,57 @@ func main() {
 	// 8. BUILD gRPC SERVER + REGISTER HANDLER
 	// ================================================================
 	// grpcutil.NewServer applies the standard interceptor chain
-	// (recovery → logging → tracing). We do NOT add WithAuthValidator here:
+	// (recovery → logging → tracing → auth). We DO add the AUTHENTICATION
+	// interceptor here via WithAuthValidator — this is the fix for the bug where
+	// admin-gated RPCs were permanently Unauthenticated.
 	//
-	//	The AuthService itself IS the token validator — it would be circular for
-	//	the auth service to require an auth interceptor on its own RPCs (and Login/
-	//	ValidateToken are unauthenticated by design). Privileged admin RPCs
-	//	(CreateUser/AssignRole/...) enforce authorization IN the handler via
-	//	requireAdmin → CheckPermission until a platform-wide authz interceptor
-	//	lands (see auth_handler_rpcs.go). So the auth service is the source of
-	//	truth, not a consumer of the interceptor.
+	// THE BUG (now fixed): the handler's requireAdmin reads the caller's claims via
+	// grpcutil.ClaimsFromContext and fails closed ("missing authentication") when
+	// they are absent. Claims are populated ONLY by grpcutil's AuthUnaryInterceptor
+	// — which is only wired when a validator is supplied. The previous version of
+	// this file built the server WITHOUT a validator, so the interceptor never ran,
+	// claims were NEVER in the context, and CreateUser/AssignRole/RevokeAPIKey/
+	// ListUsers were unreachable even with a valid admin JWT (Login minted a token
+	// that could never be USED).
+	//
+	// WHY THE AUTH SERVICE IS NOT CIRCULAR HERE (the earlier worry was wrong):
+	//
+	//	authn.NewValidator wraps the LOCAL in-process domain token logic
+	//	(svc.ValidateToken — JWT signature verify with FP_JWT_SECRET, design D2;
+	//	plus the "fp_" API-key DB path). There is NO self-RPC: the interceptor calls
+	//	a Go method, not the AuthService over the wire. So the auth service both
+	//	IS the token authority AND uses that authority to authenticate its own
+	//	privileged RPCs — no recursion.
+	//
+	//	authn.SkipMethods() exempts the genuinely public RPCs (Login mints tokens;
+	//	ValidateToken/CheckPermission take their input in the request body and are
+	//	service-to-service) plus the gRPC health + reflection services. Everything
+	//	else is default-deny: a token is required → the interceptor injects claims →
+	//	requireAdmin's CheckPermission makes the admin authZ decision.
+	//
+	// DIVISION OF LABOR: the interceptor is AUTHENTICATION (who are you — validate
+	// the token, set claims); requireAdmin remains AUTHORIZATION (may you do this —
+	// CheckPermission admin). The interceptor does not authorize; the handler does
+	// not authenticate. (A future platform-wide authZ interceptor could absorb the
+	// requireAdmin checks, but that is a separate change.)
 	//
 	// WithReflection: lets grpcurl/grpcui introspect the service in dev without
 	// the .proto files locally.
+	//
+	// REUSABLE PATTERN FOR THE OTHER 9 SERVICES: build a grpcutil.TokenValidator
+	// (local JWT verify with the shared secret, or a gRPC call to auth.ValidateToken
+	// for API keys), then pass WithAuthValidator(validator, skipMethods...). The
+	// skip list is always: the service's public RPCs + health + reflection.
+	tokenValidator := authn.NewValidator(eventingSvc)
 	srv := grpcutil.NewServer(
 		grpcutil.WithLogger(logger),
+		grpcutil.WithAuthValidator(tokenValidator, authn.SkipMethods()...),
 		grpcutil.WithReflection(),
 	)
 	authv1.RegisterAuthServiceServer(srv.GRPC, authHandler)
-	logger.Info("auth handler registered with wired domain service")
+	logger.Info("auth handler registered with wired domain service",
+		slog.Any("public_methods", authn.PublicMethods()),
+	)
 
 	// ================================================================
 	// 9. EVENT SUBSCRIBERS — INTENTIONALLY NONE FOR AUTH

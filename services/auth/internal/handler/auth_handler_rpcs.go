@@ -136,27 +136,29 @@ func (h *AuthHandler) Login(ctx context.Context, req *authv1.LoginRequest) (*aut
 // AUTHORIZATION HELPER — in-handler admin gate (fail-closed)
 // ============================================================================
 //
-// WHY THIS EXISTS (and why it is NOT an interceptor today):
+// AUTHN vs AUTHZ — WHO POPULATES CLAIMS, WHO DECIDES ADMIN:
 //
-//	The proto marks CreateUser/ListUsers/AssignRole "Requires admin" and the
-//	platform's INTENDED home for that check is a per-method authorization
-//	interceptor (resource+action -> CheckPermission, run before the handler).
-//	That interceptor does NOT exist yet: pkg/grpcutil ships only recovery,
-//	logging, tracing, and an AUTHENTICATION interceptor (validate token ->
-//	inject claims). It never calls CheckPermission. So if the handler merely
-//	*assumed* the interceptor enforced admin, these RPCs would have ZERO
-//	authorization — any authenticated caller could create users or reassign
-//	roles. Until the authz interceptor lands we enforce admin HERE, explicitly,
-//	so the control described in the proto/comments actually exists in code.
+//	AUTHENTICATION (who are you) is now done by the shared grpcutil
+//	AuthUnaryInterceptor, which main.go wires with authn.NewValidator: it
+//	validates the Bearer token (JWT signature verify with FP_JWT_SECRET, or the
+//	"fp_" API-key path) and injects grpcutil.Claims into the context. THAT is the
+//	only thing that makes ClaimsFromContext below return a caller — without it (the
+//	original bug) these RPCs were permanently Unauthenticated.
 //
-//	When the authz interceptor is added later, these in-handler calls can be
-//	removed (the interceptor becomes the single enforcement point) — but the
-//	handler is the correct fail-closed home for the check in the meantime.
+//	AUTHORIZATION (may you do this) is still enforced HERE. pkg/grpcutil's
+//	interceptor authenticates but does NOT call CheckPermission, so if the handler
+//	merely *assumed* admin from the presence of claims, any authenticated caller
+//	could create users or reassign roles. requireAdmin closes that: it asks the
+//	domain "may THIS caller perform 'admin' on <resource>?" via the same
+//	CheckPermission a future platform-wide authz interceptor would call. Until such
+//	an authz interceptor lands, the handler is the correct fail-closed home for the
+//	admin decision.
 //
 // CONTRACT — requireAdmin(ctx, resource):
 //
-//	1. AUTHN: pull the caller's claims from the authentication interceptor. No
-//	   claims => the call bypassed authn => fail closed with Unauthenticated.
+//	1. AUTHN: pull the caller's claims that the authentication interceptor injected.
+//	   No claims => the call bypassed authn (or carried no/invalid token, which the
+//	   interceptor would already have rejected) => fail closed with Unauthenticated.
 //	2. AUTHZ: ask the domain "may THIS caller perform 'admin' on <resource>?"
 //	   via the same CheckPermission the (future) interceptor would call.
 //	     - err != nil  => "couldn't decide" (DB down) => Internal (fail closed),
