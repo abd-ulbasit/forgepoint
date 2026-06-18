@@ -125,6 +125,24 @@ type AuthConfig struct {
 	// const) so ops can tune the security/usability tradeoff per environment.
 	// time.Duration parses Go duration strings ("15m", "1h") via pkg/config.
 	JWTTTL time.Duration `env:"JWT_TTL" default:"15m"`
+
+	// BootstrapAdminEmail / BootstrapAdminPassword drive the OPTIONAL first-admin
+	// bootstrap (the chicken-and-egg fix: the migration seeds roles but no users,
+	// and CreateUser is admin-gated, so without this nobody could ever
+	// authenticate). When BOTH are set, the service ensures an admin user with
+	// this email exists at boot (see domain.AdminBootstrapper.BootstrapAdmin) —
+	// idempotent, so it's safe on every restart/replica.
+	//
+	// NEITHER is required:"true" — bootstrap is opt-in. We gate on BOTH being
+	// present (an XOR is a misconfig we warn about) rather than making either
+	// mandatory, so a cluster that provisions its first admin some other way
+	// (e.g. a one-off Job) can leave these unset.
+	//
+	// SECURITY: the EMAIL is non-secret config (ConfigMap). The PASSWORD is a
+	// SECRET (mounted from a K8s Secret, never a ConfigMap, never committed). The
+	// password is read once at boot, used to bcrypt, and never logged.
+	BootstrapAdminEmail    string `env:"BOOTSTRAP_ADMIN_EMAIL"`
+	BootstrapAdminPassword string `env:"BOOTSTRAP_ADMIN_PASSWORD"`
 }
 
 func main() {
@@ -303,6 +321,80 @@ func main() {
 		[]byte(cfg.JWTSecret),
 		cfg.JWTTTL,
 	)
+
+	// ================================================================
+	// 6a. BOOTSTRAP THE FIRST ADMIN (trusted in-process path) — OPTIONAL
+	// ================================================================
+	// THE CHICKEN-AND-EGG: the migration seeds the admin/engineer/viewer ROLES but
+	// NO users, and CreateUser is admin-gated at the RPC layer. So on a fresh
+	// database there is no identity that can authenticate and no way to mint the
+	// first admin over the API. We close that here with a TRUSTED, IN-PROCESS
+	// bootstrap that bypasses the RPC admin-gate precisely because it does NOT go
+	// through gRPC — the operator who set FP_BOOTSTRAP_ADMIN_* IS the trust anchor
+	// (the same shape as Grafana's GF_SECURITY_ADMIN_*, Keycloak's KEYCLOAK_ADMIN_*).
+	//
+	// We run it against the UN-decorated svc (the raw domain.AuthService). Bootstrap
+	// is not a platform RPC and must not emit fp.auth.user.created — it is control-
+	// plane provisioning, not an application event; using svc (not eventingSvc, built
+	// below) keeps it off the event bus by construction.
+	//
+	// ORDERING: this runs AFTER Postgres is connected (4a) and the migrate
+	// initContainer has applied the schema + seeded roles (deploy/helm: the
+	// initContainer completes before the app container starts), so the 'admin' role
+	// AssignRole resolves by name is guaranteed present. It is IDEMPOTENT, so it is
+	// safe on every boot of every replica.
+	//
+	// GATING: only when BOTH env vars are set. An XOR is a misconfiguration we warn
+	// about (and skip) rather than fail on, so a half-set config can't wedge startup.
+	switch {
+	case cfg.BootstrapAdminEmail != "" && cfg.BootstrapAdminPassword != "":
+		// The concrete domain service exposes the boot-only AdminBootstrapper
+		// capability; the type assertion is the single place that reaches past the
+		// RPC-facing AuthService interface to it (see domain/bootstrap.go for WHY it
+		// is a segregated interface and not an AuthService method).
+		bootstrapper, ok := svc.(authdomain.AdminBootstrapper)
+		if !ok {
+			// Defensive: NewAuthService always returns *authService, which satisfies
+			// AdminBootstrapper (compile-time asserted in bootstrap.go). If this ever
+			// fails, the wiring changed and we must fail loudly, not silently skip
+			// provisioning the only admin.
+			logger.Error("auth service does not implement AdminBootstrapper; cannot bootstrap admin")
+			os.Exit(1)
+		}
+		bootCtx, bootCancel := context.WithTimeout(ctx, 10*time.Second)
+		adminUser, createdNow, bootErr := bootstrapper.BootstrapAdmin(bootCtx, cfg.BootstrapAdminEmail, cfg.BootstrapAdminPassword)
+		bootCancel()
+		if bootErr != nil {
+			// A bootstrap failure (DB error, role missing, validation) is fatal: the
+			// platform is unusable without a first admin, so refusing to start makes
+			// the problem loud instead of leaving a silently login-less deployment.
+			logger.Error("failed to bootstrap admin user", slog.String("error", bootErr.Error()))
+			os.Exit(1)
+		}
+		// NOTE: we log the EMAIL and id (non-secret) but NEVER the password.
+		if createdNow {
+			logger.Info("bootstrap admin created",
+				slog.String("email", adminUser.Email),
+				slog.String("user_id", adminUser.ID),
+				slog.String("role", "admin"),
+			)
+		} else {
+			logger.Info("bootstrap admin already exists; skipping (idempotent)",
+				slog.String("email", adminUser.Email),
+				slog.String("user_id", adminUser.ID),
+			)
+		}
+	case cfg.BootstrapAdminEmail != "" || cfg.BootstrapAdminPassword != "":
+		// Exactly one of the pair is set — an operator likely intended to bootstrap
+		// but mis-wired the secret/config. Warn and proceed (don't fail): the
+		// service can still run for an already-provisioned database.
+		logger.Warn("admin bootstrap is half-configured; set BOTH FP_BOOTSTRAP_ADMIN_EMAIL and FP_BOOTSTRAP_ADMIN_PASSWORD to enable it (skipping bootstrap)",
+			slog.Bool("email_set", cfg.BootstrapAdminEmail != ""),
+			slog.Bool("password_set", cfg.BootstrapAdminPassword != ""),
+		)
+	default:
+		logger.Info("admin bootstrap disabled (FP_BOOTSTRAP_ADMIN_EMAIL/PASSWORD not set)")
+	}
 
 	// ================================================================
 	// 6b. DECORATE THE DOMAIN SERVICE WITH EVENT PUBLISHING (Phase 1.6)

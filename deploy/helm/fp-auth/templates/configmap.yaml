@@ -27,6 +27,13 @@ data:
   FP_NATS_URL: {{ .Values.config.natsUrl | quote }}
   # FP_ENV labels logs/traces with the deployment environment.
   FP_ENV: {{ .Values.config.env | quote }}
+  {{- if .Values.config.bootstrapAdminEmail }}
+  # First-admin bootstrap EMAIL (non-secret). Rendered ONLY when set, so an empty
+  # value leaves FP_BOOTSTRAP_ADMIN_EMAIL unset and the service skips bootstrap.
+  # The matching PASSWORD lives in the Secret (FP_BOOTSTRAP_ADMIN_PASSWORD); the
+  # service requires BOTH before it will provision the admin.
+  FP_BOOTSTRAP_ADMIN_EMAIL: {{ .Values.config.bootstrapAdminEmail | quote }}
+  {{- end }}
   {{- with .Values.config.extraEnv }}
   # Free-form additional non-secret env. Keys used verbatim.
   {{- range $key, $val := . }}

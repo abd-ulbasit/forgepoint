@@ -70,6 +70,17 @@ config:
   # (NATS, Postgres, OTel collector) per CLAUDE.md K8s namespaces.
   otelEndpoint: "otel-collector.fp-infra.svc.cluster.local:4317"
   natsUrl: "nats://nats.fp-infra.svc.cluster.local:4222"
+  # ----------------------------------------------------------------------------
+  # First-admin bootstrap — the EMAIL half (non-secret → ConfigMap).
+  # ----------------------------------------------------------------------------
+  # The migration seeds roles but no users, and CreateUser is admin-gated, so a
+  # fresh database has no one who can authenticate. When this email AND the
+  # secrets.bootstrapAdminPassword below are BOTH set, the service ensures an
+  # admin user with this email exists at boot (idempotent). Leave EMPTY to disable
+  # bootstrap (the key is then omitted from the ConfigMap entirely, so the service
+  # sees FP_BOOTSTRAP_ADMIN_EMAIL unset and skips). The email is non-secret, so it
+  # belongs in the ConfigMap; the PASSWORD is a Secret (see secrets: below).
+  bootstrapAdminEmail: ""
   # Extra free-form non-secret env keys (rendered into the ConfigMap as-is).
   # Keys are used verbatim — DO NOT prefix with FP_ here unless the service
   # actually reads that prefix; mirror existing FP_* naming.
@@ -96,6 +107,12 @@ secrets:
   # Full Postgres DSN the service reads as FP_DATABASE_URL. In prod the password
   # component comes from a managed secret store, not from this file.
   databaseUrl: "postgres://auth:dev-only-change-me@postgres.fp-infra.svc.cluster.local:5432/auth?sslmode=disable"
+  # First-admin bootstrap — the PASSWORD half (SECRET → rendered into the Secret,
+  # never the ConfigMap). Set together with config.bootstrapAdminEmail to enable
+  # the boot-time admin bootstrap. Leave EMPTY to omit the key from the Secret
+  # (the service then sees FP_BOOTSTRAP_ADMIN_PASSWORD unset and skips bootstrap).
+  # DEV-ONLY here; in prod this comes from an external secret store, never git.
+  bootstrapAdminPassword: ""
 
 # ----------------------------------------------------------------------------
 # Migrations — self-contained schema migrations via a migrate initContainer.
