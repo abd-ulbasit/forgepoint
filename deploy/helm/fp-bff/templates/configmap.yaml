@@ -1,0 +1,58 @@
+# ============================================================================
+# ConfigMap — NON-SECRET environment configuration for the BFF.
+# ============================================================================
+# These keys are mapped into the container as env vars via `envFrom` in the
+# Deployment. The BFF reads them with the FP_ prefix (config.Load[BFFConfig]("FP")
+# → FP_PORT, FP_HTTP_PORT, FP_CORS_ALLOWED_ORIGINS, FP_AUTH_ADDR, ...). The BFF has
+# NO sensitive config (it forwards the user's token; it holds no DB DSN, no signing
+# key, no Redis password), so EVERYTHING lives here in the ConfigMap and the chart
+# renders NO Secret at all.
+#
+# WHY ports come from values, not hardcoded: the container, the Service, and the
+# probes must all agree on the port numbers; sourcing them from one place
+# (.Values.ports) keeps them in lockstep.
+#
+# BFF-SPECIFIC KEYS (vs the reference fp-auth ConfigMap):
+#   - FP_HTTP_PORT             → the SPA-facing API port (BaseConfig has only FP_PORT,
+#                                which the BFF reuses for its HEALTH server).
+#   - FP_CORS_ALLOWED_ORIGINS  → the browser CORS allowlist.
+#   - FP_*_ADDR                → the per-service gRPC DIAL targets the BFF connects to.
+#   It deliberately has NO FP_DATABASE_URL / FP_REDIS_URL / FP_NATS_URL — the BFF is
+#   stateless and owns no datastore.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "fp-bff.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fp-bff.labels" . | nindent 4 }}
+data:
+  # Ports — stringified because ConfigMap values are always strings.
+  # FP_PORT is the HEALTH server port (BaseConfig.Port); FP_HTTP_PORT is the
+  # SPA-facing JSON/SSE API port (BFFConfig.HTTPPort).
+  FP_PORT: {{ .Values.ports.health | quote }}
+  FP_HTTP_PORT: {{ .Values.ports.http | quote }}
+  # Observability + environment label.
+  FP_LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  FP_OTEL_ENDPOINT: {{ .Values.config.otelEndpoint | quote }}
+  FP_ENV: {{ .Values.config.env | quote }}
+  # CORS — the browser allowlist (comma-separated → []string in pkg/config).
+  FP_CORS_ALLOWED_ORIGINS: {{ .Values.config.corsAllowedOrigins | quote }}
+  # Per-service gRPC dial addresses (the BFF is a gRPC CLIENT of all of these).
+  FP_AUTH_ADDR: {{ .Values.config.authAddr | quote }}
+  FP_REGISTRY_ADDR: {{ .Values.config.registryAddr | quote }}
+  FP_PIPELINE_ADDR: {{ .Values.config.pipelineAddr | quote }}
+  FP_EXPERIMENT_ADDR: {{ .Values.config.experimentAddr | quote }}
+  FP_MONITOR_ADDR: {{ .Values.config.monitorAddr | quote }}
+  FP_BILLING_ADDR: {{ .Values.config.billingAddr | quote }}
+  FP_NOTIFICATION_ADDR: {{ .Values.config.notificationAddr | quote }}
+  # model-serving address — rendered for forward-compat/documentation; the current
+  # binary has no struct field for it and ignores unknown FP_* env (the BFF reaches
+  # inference via the inference-gateway today, not model-serving directly).
+  FP_MODEL_SERVING_ADDR: {{ .Values.config.modelServingAddr | quote }}
+  {{- with .Values.config.extraEnv }}
+  # Free-form additional non-secret env. Keys used verbatim.
+  {{- range $key, $val := . }}
+  {{ $key }}: {{ $val | quote }}
+  {{- end }}
+  {{- end }}

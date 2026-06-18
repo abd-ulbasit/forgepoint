@@ -1,0 +1,46 @@
+# ============================================================================
+# Service — stable in-cluster VIP + DNS for the BFF pods.
+# ============================================================================
+# ClusterIP (internal only): the BFF is reached by the cluster's ingress
+# controller / API gateway, which terminates external browser traffic and forwards
+# to this Service. Browsers never hit the pod directly. The Service gives a stable
+# name (fp-bff.fp-system.svc.cluster.local) and load-balances across the
+# selector-matched Ready pods, so the ingress never tracks pod IPs and a rolling
+# deploy is transparent.
+#
+# Two named ports mirror the BFF's two HTTP listeners:
+#   http   → the SPA-facing JSON + SSE API (HTTP/1.1).
+#   health → /healthz, /readyz (HTTP/1.1).
+# There is NO gRPC port — the BFF is a gRPC CLIENT, not a server. Named (not just
+# numbered) ports let probes/ingress reference them by name and stay correct if the
+# numbers ever change.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "fp-bff.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fp-bff.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  # Selector uses ONLY the immutable identity labels — it must match the pod
+  # template labels in the Deployment exactly, or the Service has no endpoints.
+  selector:
+    {{- include "fp-bff.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.ports.http }}
+      # targetPort references the container port by NAME, decoupling the Service
+      # port number from the container's listen port.
+      targetPort: http
+      protocol: TCP
+      appProtocol: http
+    - name: health
+      port: {{ .Values.ports.health }}
+      targetPort: health
+      protocol: TCP
+      appProtocol: http

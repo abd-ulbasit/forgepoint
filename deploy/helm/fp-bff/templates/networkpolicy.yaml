@@ -1,0 +1,127 @@
+{{- if .Values.networkPolicy.enabled -}}
+# ============================================================================
+# NetworkPolicy — zero-trust east-west isolation for the BFF pods.
+# ============================================================================
+# By DEFAULT, Kubernetes pod networking is wide open: any pod can reach any other
+# on any port. A NetworkPolicy flips a workload to default-deny for the directions
+# it lists in policyTypes, then re-allows ONLY the explicit rules.
+#
+# This policy:
+#   INGRESS → the BFF is the SPA's single entry point, reached via the cluster's
+#             ingress controller / API gateway, which may run in ANY namespace. So
+#             we ALLOW INGRESS FROM ANYWHERE IN-CLUSTER (an empty `from`) on the
+#             HTTP API + health ports. This is intentionally broader than a backend
+#             service's ingress — but external browser traffic still arrives via
+#             that ingress, never the pod directly, and the BFF's own auth
+#             middleware (default-deny on the protected routes) is the real gate.
+#   EGRESS  → default-deny, allow only: DNS (resolve service names), all fp-system
+#             platform services on the gRPC port 9090 (the seven services the BFF
+#             fans out to), fp-models serving on 9090 (forward-compat), and OTLP to
+#             the collector. NO Postgres / Redis / NATS egress — the BFF talks to
+#             none of them (it is stateless and publishes no events).
+#
+# ENFORCEMENT CAVEAT (interview-critical): a NetworkPolicy is only enforced if the
+# CNI supports it (Calico, Cilium, ...). k3s' default Flannel does NOT — so on this
+# cluster the policy is PRESENT and GitOps-correct (it starts enforcing the moment
+# the CNI is swapped) but a runtime no-op. Defense in depth, never a substitute for
+# the app-layer authz that actually gates the protected routes.
+#
+# DNS GOTCHA: forget the DNS egress rule and the pod can't resolve ANY service DNS
+# name, so every outbound gRPC dial fails with NXDOMAIN — a classic self-inflicted
+# outage. We always allow it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "fp-bff.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fp-bff.labels" . | nindent 4 }}
+spec:
+  # podSelector scopes this policy to THIS chart's pods (by identity labels).
+  podSelector:
+    matchLabels:
+      {{- include "fp-bff.selectorLabels" . | nindent 6 }}
+  # Listing both types makes the policy default-deny for BOTH directions; the rules
+  # below are the only allowances.
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow HTTP API + health traffic.
+    {{- if .Values.networkPolicy.ingressAllowAll }}
+    # FROM ANYWHERE IN-CLUSTER: a rule with `ports` but NO `from` selector matches
+    # traffic from ALL pods in ALL namespaces. The BFF's ingress controller may live
+    # anywhere, and the SPA's traffic enters through it — so we don't constrain the
+    # source namespace here. (External clients still can't reach the pod directly;
+    # they go through the ingress, and the BFF's auth middleware gates the routes.)
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.ports.http }}
+        - protocol: TCP
+          port: {{ .Values.ports.health }}
+    {{- else }}
+    # Constrained mode (ingressAllowAll=false): allow only from listed namespaces.
+    - from:
+        {{- range .Values.networkPolicy.ingressNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.ports.http }}
+        - protocol: TCP
+          port: {{ .Values.ports.health }}
+    {{- end }}
+  egress:
+    {{- if .Values.networkPolicy.egress.dns.enabled }}
+    # DNS to the cluster resolver (CoreDNS in kube-system), UDP+TCP/53.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.fpSystemGrpc.enabled }}
+    # All fp-system platform services on the gRPC port — the BFF fans out to auth,
+    # registry, pipeline, experiment, monitor, billing, and notification per
+    # request. Allowing the whole fp-system namespace on :9090 is the right grain
+    # since the BFF legitimately dials seven services there.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.fpSystemGrpc.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.fpSystemGrpc.port }}
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.modelServing.enabled }}
+    # Model-serving backends (fp-models) on the gRPC port. Forward-compat: the BFF
+    # reaches inference via the inference-gateway today and doesn't dial
+    # model-serving directly, but the egress is opened so a future direct path needs
+    # no policy change. Disable if you want the tightest possible egress.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.modelServing.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.modelServing.port }}
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.otlp.enabled }}
+    # OTLP/gRPC to the OpenTelemetry Collector (traces + metrics push), when an
+    # OTLP endpoint is configured (config.otelEndpoint). Harmless to allow even when
+    # the endpoint is empty (the exporter is then a no-op and opens no connection).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.otlp.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.otlp.port }}
+    {{- end }}
+{{- end }}

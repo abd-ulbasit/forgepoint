@@ -1,0 +1,369 @@
+# ============================================================================
+# fp-bff — default values
+# ============================================================================
+# Derived from the reference values file (fp-auth / fp-inference-gateway) and
+# adjusted for the BFF. Everything the templates render is driven from here so the
+# manifests stay declarative and nothing is hardcoded. Override per-environment
+# with `-f values-prod.yaml` or `--set key=value`.
+#
+# WHAT'S BFF-SPECIFIC (vs the reference charts):
+#   - image.repository → ghcr.io/abd-ulbasit/forgepoint/bff
+#   - ports            → an HTTP API port for the SPA (http=8081) + a health port
+#                        (health=8080). NO gRPC SERVER port (9090): the BFF is a
+#                        gRPC CLIENT of the 10 services, not a gRPC server.
+#   - config.*         → the per-service gRPC DIAL ADDRESSES the BFF connects to
+#                        (FP_AUTH_ADDR, FP_REGISTRY_ADDR, ...) + the CORS allowlist
+#                        (FP_CORS_ALLOWED_ORIGINS = the UI origin). NO DATABASE_URL,
+#                        NO REDIS_URL, NO NATS_URL — the BFF is stateless and owns
+#                        no datastore and publishes no events.
+#   - NO secrets block / NO Secret template / NO JWT key: the BFF FORWARDS the
+#                        caller's bearer token to the services (which validate it
+#                        with the shared HMAC secret). It never mints or validates
+#                        JWTs, so it needs no signing/verification key.
+#   - migrations.enabled=false: the BFF has NO database to migrate.
+#   - networkPolicy    → INGRESS from ANYWHERE in-cluster (the UI / ingress reaches
+#                        it); EGRESS to all fp-system services (:9090), fp-models
+#                        serving (:9090), DNS, and OTLP. NO Postgres/Redis/NATS
+#                        egress (it talks to none of them).
+# ============================================================================
+
+# replicaCount: the task pins this to 1 for the validation deploy. 1 is fine for a
+# stateless service in dev; production would raise it (>=2) so a node drain / pod
+# eviction never zeroes the BFF, and the PDB (minAvailable: 1) stays satisfiable.
+# When autoscaling is enabled the HPA owns the count and this value is ignored.
+replicaCount: 1
+
+image:
+  repository: ghcr.io/abd-ulbasit/forgepoint/bff
+  # tag "" → the chart falls back to Chart.appVersion (see _helpers "image").
+  # The local k3s deploy overrides this with --set image.tag=dev + repository=fp-bff
+  # + pullPolicy=Never (the image is side-loaded via `ctr images import`, not pulled).
+  tag: ""
+  # IfNotPresent: don't re-pull an image the node already has. The local deploy
+  # overrides to Never so the node uses ONLY the side-loaded image.
+  pullPolicy: IfNotPresent
+
+# imagePullSecrets: names of pre-existing docker-registry Secrets for private
+# registries. Empty for public ghcr / side-loaded dev images.
+imagePullSecrets: []
+
+# nameOverride / fullnameOverride let an operator rename the release-derived
+# resource names without editing templates (see _helpers "fullname").
+nameOverride: ""
+fullnameOverride: ""
+
+# ----------------------------------------------------------------------------
+# Ports — two distinct HTTP listeners (see services/bff/cmd/server/main.go).
+#   http:   the SPA-facing JSON + SSE API (FP_HTTP_PORT, default 8081 in main.go).
+#   health: /healthz + /readyz (FP_PORT / BaseConfig.Port, default 8080). Kept on a
+#           separate port so the public API surface and the kubelet/ops health
+#           surface are independently firewalled and observable.
+# The BFF serves NO gRPC — it is a gRPC CLIENT — so there is NO grpc port here.
+# These names ("http", "health") are referenced by service.yaml, the probes, and
+# the NetworkPolicy ingress — change them here and they propagate everywhere.
+# ----------------------------------------------------------------------------
+ports:
+  http: 8081
+  health: 8080
+
+service:
+  type: ClusterIP
+  annotations: {}
+
+# ----------------------------------------------------------------------------
+# Non-secret configuration → rendered into a ConfigMap, injected via envFrom.
+# These map 1:1 to the FP_* env vars the BFF reads (config.Load[BFFConfig]("FP")):
+# BaseConfig (FP_PORT, FP_LOG_LEVEL, FP_OTEL_ENDPOINT) + BFFConfig (FP_HTTP_PORT,
+# FP_CORS_ALLOWED_ORIGINS, and the per-service FP_*_ADDR dial targets).
+#
+# WHY no FP_DATABASE_URL / FP_REDIS_URL / FP_NATS_URL: the BFF is a STATELESS
+# HTTP↔gRPC translator. It owns no relational schema, caches nothing in Redis, and
+# publishes no events to NATS. Rendering any of those would imply a dependency that
+# doesn't exist (and would need a NetworkPolicy egress port the BFF never uses).
+# ----------------------------------------------------------------------------
+config:
+  # FP_ENV labels telemetry/logs with the deployment environment.
+  env: "local"
+  logLevel: "info"
+
+  # OTLP endpoint for traces/metrics push. Left EMPTY by default per the task: with
+  # no collector configured the BFF's observability setup is a no-op exporter, so a
+  # missing/absent OTel collector can't block BFF startup or readiness. Point it at
+  # otel-collector.fp-infra.svc.cluster.local:4317 when the collector is deployed.
+  otelEndpoint: ""
+
+  # ----- CORS (FP_CORS_ALLOWED_ORIGINS) -----
+  # The browser-session allowlist the BFF echoes in Access-Control-Allow-Origin.
+  # NEVER "*": a wildcard with credentials is forbidden by the Fetch spec and unsafe.
+  # Default is the SPA's local Vite dev origin; production sets the real UI origin.
+  # Comma-separated → pkg/config parses into []string (CORS_ALLOWED_ORIGINS env).
+  corsAllowedOrigins: "http://localhost:5173"
+
+  # ----- Per-service gRPC DIAL ADDRESSES (FP_*_ADDR) -----
+  # The in-cluster DNS targets the BFF dials. All platform services live in
+  # fp-system on the standard gRPC port 9090; model-serving lives in fp-models.
+  # These mirror the defaults baked into main.go's BFFConfig so a vanilla deploy
+  # works, but we set them EXPLICITLY here so the deployed config is self-documenting
+  # and overridable per environment (e.g. point at port-forwards in local dev).
+  authAddr: "fp-auth.fp-system.svc.cluster.local:9090"
+  registryAddr: "fp-registry.fp-system.svc.cluster.local:9090"
+  pipelineAddr: "fp-pipeline-orchestrator.fp-system.svc.cluster.local:9090"
+  experimentAddr: "fp-experiment-tracker.fp-system.svc.cluster.local:9090"
+  monitorAddr: "fp-model-monitor.fp-system.svc.cluster.local:9090"
+  billingAddr: "fp-billing.fp-system.svc.cluster.local:9090"
+  notificationAddr: "fp-notification.fp-system.svc.cluster.local:9090"
+  # model-serving lives in the fp-models namespace. The BFF does NOT call it
+  # directly today (inference goes through the inference-gateway), so main.go has
+  # no MODEL_SERVING_ADDR field — this key is provided for forward-compatibility and
+  # to document the address; it is rendered into the ConfigMap but the current
+  # binary ignores any FP env it doesn't have a struct field for.
+  modelServingAddr: "fp-model-serving.fp-models.svc.cluster.local:9090"
+
+  # Extra free-form non-secret env keys (rendered into the ConfigMap as-is). Keys
+  # are used verbatim — mirror the FP_* naming the service actually reads.
+  extraEnv: {}
+
+# ----------------------------------------------------------------------------
+# Migrations — DISABLED: the BFF has NO database.
+# ----------------------------------------------------------------------------
+# The platform's migrate-initContainer pattern only applies to Postgres-backed
+# services. The BFF owns no relational schema — there is nothing to migrate — so we
+# explicitly turn the step off (and the image carries no /migrations dir). Kept as
+# an explicit, documented opt-out rather than an absent key.
+migrations:
+  enabled: false
+
+# ----------------------------------------------------------------------------
+# Resources — requests AND limits both set (a "Guaranteed"-friendly shape).
+#   requests = what the scheduler reserves; the floor and the HPA denominator.
+#   limits   = the ceiling; CPU is throttled, memory OOM-kills above it.
+# The BFF is a thin translator: it terminates HTTP/SSE, fans out a handful of gRPC
+# calls per request, and holds a few long-lived gRPC client conns. It needs little
+# CPU and memory. memory request==limit avoids OOM surprises; CPU limit > request
+# lets short bursts (a dashboard fan-out) use idle node CPU. Tune from RED metrics.
+# ----------------------------------------------------------------------------
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 250m
+    memory: 128Mi
+
+# ----------------------------------------------------------------------------
+# Autoscaling — HPA. Disabled by default; replicaCount governs when off. When
+# enabled the HPA, not replicaCount, owns the replica number. customMetrics is the
+# hook for later RPS-based scaling via Prometheus-Adapter / KEDA.
+# ----------------------------------------------------------------------------
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+  customMetrics: []
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+
+# PodDisruptionBudget — protects availability during VOLUNTARY disruptions only
+# (node drains, upgrades), NOT crashes. minAvailable: 1 lets the cluster evict at
+# most (replicas-1) pods at once. With replicaCount: 1 this means a drain can't
+# evict the only pod until a replacement is Ready — acceptable for a dev single
+# replica; raise replicaCount in prod for real HA.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# ServiceAccount — own identity per service (least privilege, audit trail).
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # automountServiceAccountToken: false — the BFF does NOT call the K8s API (it
+  # dials downstream services by SERVICE DNS, not via the K8s client), so it has no
+  # reason to carry a mountable API token. Not mounting one shrinks blast radius if
+  # the pod is compromised.
+  automountServiceAccountToken: false
+
+# ----------------------------------------------------------------------------
+# Pod-level security context — the non-negotiable hardened baseline (satisfies the
+# "restricted" Pod Security Standard).
+# ----------------------------------------------------------------------------
+podSecurityContext:
+  # runAsNonRoot makes the kubelet REFUSE to start the pod if the image's user
+  # resolves to UID 0 — a guard against an accidentally-root image.
+  runAsNonRoot: true
+  # 65532 = the "nonroot" UID/GID baked into gcr.io/distroless/* base images, which
+  # our multi-stage Dockerfile uses. Matches the image's filesystem owner.
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  # seccompProfile RuntimeDefault → the runtime's default syscall filter (blocks
+  # ~44 dangerous syscalls). Cheap, strong kernel-surface reduction; required by
+  # the restricted PSS.
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container-level security context — defense in depth on top of the pod context.
+containerSecurityContext:
+  allowPrivilegeEscalation: false  # blocks setuid/gainprivs (no sudo-up inside)
+  readOnlyRootFilesystem: true     # immutable rootfs; tamper-resistant, forces an
+                                   # explicit emptyDir for any writable path
+  runAsNonRoot: true
+  runAsUser: 65532
+  capabilities:
+    # Drop ALL Linux capabilities. The BFF binds high ports (>1024) and does no
+    # privileged kernel ops, so it needs none. Least privilege.
+    drop:
+      - ALL
+
+# ----------------------------------------------------------------------------
+# Rolling update strategy — zero-downtime deploys for a stateless service.
+#   maxUnavailable: 0 → never drop below desired count during a roll.
+#   maxSurge: 1       → bring up one extra new pod, wait Ready, then retire an old.
+# (With replicaCount: 1, maxUnavailable:0 + maxSurge:1 means a new pod must become
+# Ready before the old one is removed — a brief 2-pod overlap, no downtime.)
+# ----------------------------------------------------------------------------
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+# ----------------------------------------------------------------------------
+# Probes — liveness on /healthz (process-alive only), readiness on /readyz (real
+# dependency checks: the BFF's /readyz verifies it can REACH auth + registry over
+# gRPC — see main.go health wiring). Both hit the HTTP HEALTH port. startupProbe
+# shields a slow cold start from premature liveness restarts.
+# ----------------------------------------------------------------------------
+probes:
+  liveness:
+    enabled: true
+    path: /healthz
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 2
+    failureThreshold: 3
+  readiness:
+    enabled: true
+    path: /readyz
+    initialDelaySeconds: 3
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 2
+  startup:
+    enabled: true
+    path: /healthz
+    initialDelaySeconds: 0
+    periodSeconds: 3
+    # 30 * 3s = 90s budget for the process to come up before liveness engages.
+    failureThreshold: 30
+    timeoutSeconds: 2
+
+# ----------------------------------------------------------------------------
+# topologySpreadConstraints — spread replicas across failure domains so a single
+# node/zone loss can't take out a disproportionate share of pods. ScheduleAnyway
+# keeps scheduling possible on small/single-node clusters (k3s) while still
+# preferring spread. The selector is injected from the chart's selector labels.
+# ----------------------------------------------------------------------------
+topologySpread:
+  enabled: true
+  constraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+
+# Generic scheduling knobs, passed through untouched.
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Extra pod annotations/labels (merged into pod template metadata).
+podAnnotations: {}
+podLabels: {}
+
+# terminationGracePeriodSeconds — the BFF's HTTP graceful-shutdown drain in main.go
+# is bounded at 15s; 30s gives comfortable slack for in-flight requests + SSE
+# teardown before SIGKILL.
+terminationGracePeriodSeconds: 30
+
+# ----------------------------------------------------------------------------
+# ServiceMonitor (Prometheus Operator CRD) — DISABLED by default ON PURPOSE.
+# Forgepoint's canonical metrics path is OTLP PUSH to the OTel Collector, which
+# Prometheus then scrapes (see pkg/observability/setup.go). Enable only when the
+# BFF is configured to ALSO expose /metrics on the health port. Guarded so
+# `helm template` never emits a CR for a CRD the cluster may not have.
+# ----------------------------------------------------------------------------
+serviceMonitor:
+  enabled: false
+  path: /metrics
+  portName: health
+  interval: 30s
+  scrapeTimeout: 10s
+  labels: {}
+
+# ----------------------------------------------------------------------------
+# NetworkPolicy — default-deny, allow only what the BFF needs.
+# ----------------------------------------------------------------------------
+# Zero-trust east-west. The BFF is the SPA's single entry point, so its ingress
+# rule is DELIBERATELY BROADER than a backend service's: the UI traffic arrives via
+# an ingress controller / API gateway (which may live in any namespace), so we
+# allow ingress from ANYWHERE IN-CLUSTER on the HTTP API + health ports. (External
+# browser traffic still enters through that ingress, never the pod directly.)
+#
+# Egress is tightly scoped to exactly what the BFF dials:
+#   - DNS (so it can resolve any service name at all — forget this and EVERY
+#     outbound call fails with NXDOMAIN, a classic self-inflicted outage).
+#   - all fp-system platform services on the gRPC port 9090 (auth, registry,
+#     pipeline, experiment, monitor, billing, notification) — the BFF fans out to
+#     these per request. Allowing the whole fp-system namespace on :9090 is the
+#     right grain since the BFF legitimately dials seven of them.
+#   - fp-models serving on 9090 (forward-compat; the BFF doesn't call it today).
+#   - OTLP to the OTel collector (traces/metrics push), when configured.
+#
+# There is NO Postgres / Redis / NATS egress — the BFF talks to none of them.
+#
+# ENFORCEMENT CAVEAT (interview-critical): a NetworkPolicy is only enforced if the
+# CNI supports it (Calico, Cilium, ...). k3s' default Flannel does NOT, so here the
+# policy is PRESENT (GitOps-correct, enforced the moment the CNI is swapped) but a
+# no-op at runtime. Defense in depth, never a substitute for app-layer authz (the
+# BFF's default-deny auth middleware is the real gate — see validation step c).
+# ----------------------------------------------------------------------------
+networkPolicy:
+  enabled: true
+  # Ingress: allow from ANYWHERE in-cluster. An empty `from` on the rule (rendered
+  # by the template when ingressAllowAll=true) selects all pods in all namespaces —
+  # the SPA/ingress can reach the BFF regardless of which namespace it runs in.
+  ingressAllowAll: true
+  egress:
+    dns:
+      enabled: true
+    # All platform services share the fp-system namespace and the gRPC port.
+    fpSystemGrpc:
+      enabled: true
+      namespace: fp-system
+      port: 9090
+    # Model-serving backends live in fp-models (per the CLAUDE.md namespace map).
+    modelServing:
+      enabled: true
+      namespace: fp-models
+      port: 9090
+    # OTLP/gRPC to the OpenTelemetry Collector (traces + metrics push).
+    otlp:
+      enabled: true
+      namespace: fp-infra
+      port: 4317

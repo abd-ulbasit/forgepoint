@@ -1,0 +1,53 @@
+============================================================================
+  {{ include "fp-bff.fullname" . }} deployed to namespace "{{ .Release.Namespace }}"
+  Chart {{ .Chart.Name }}-{{ .Chart.Version }}  •  App version {{ .Chart.AppVersion }}
+============================================================================
+
+Image:     {{ include "fp-bff.image" . }}
+Replicas:  {{ if .Values.autoscaling.enabled }}autoscaled {{ .Values.autoscaling.minReplicas }}..{{ .Values.autoscaling.maxReplicas }} (HPA){{ else }}{{ .Values.replicaCount }} (fixed){{ end }}
+
+PORTS
+  HTTP API (SPA: JSON + SSE):   {{ .Values.ports.http }}  (in-cluster only — ClusterIP; reach via your ingress)
+  HTTP health:                  {{ .Values.ports.health }}  (/healthz, /readyz{{ if .Values.serviceMonitor.enabled }}, {{ .Values.serviceMonitor.path }}{{ end }})
+  (No gRPC port — the BFF is a gRPC CLIENT of the 10 services, not a server.)
+
+CORS allowed origins:  {{ .Values.config.corsAllowedOrigins }}
+
+1. Watch the rollout reach Ready:
+
+   kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "fp-bff.fullname" . }}
+
+2. Check pod health:
+
+   kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+
+3. Probe the health endpoints (port-forward the HTTP health port):
+
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "fp-bff.fullname" . }} {{ .Values.ports.health }}:{{ .Values.ports.health }}
+   curl -s localhost:{{ .Values.ports.health }}/healthz   # liveness
+   curl -s localhost:{{ .Values.ports.health }}/readyz    # readiness (+ checks it can reach auth + registry over gRPC)
+
+4. Exercise the HTTP API (port-forward the API port):
+
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "fp-bff.fullname" . }} {{ .Values.ports.http }}:{{ .Values.ports.http }}
+   # Login (public) → returns an access token:
+   curl -s -X POST localhost:{{ .Values.ports.http }}/api/v1/login \
+        -H 'Content-Type: application/json' \
+        -d '{"email":"admin@forgepoint.local","password":"<bootstrap-password>"}'
+   # List models WITH the bearer token (protected) → 200:
+   curl -s localhost:{{ .Values.ports.http }}/api/v1/models -H 'Authorization: Bearer <token>'
+   # List models WITHOUT the token → 401 (default-deny on the protected sub-tree).
+
+SECRETS: none. The BFF holds NO Secret — it FORWARDS the caller's JWT to the
+   downstream services (which validate it with the shared secret). It never mints
+   or validates tokens, has no DB DSN, and no signing key.
+
+{{- if not .Values.networkPolicy.enabled }}
+
+NOTE: NetworkPolicy is DISABLED. The BFF is reachable from any namespace.
+{{- else }}
+
+NOTE: A NetworkPolicy is rendered (ingress from anywhere in-cluster; egress to
+   fp-system :9090, fp-models :9090, DNS, OTLP). It is only ENFORCED on a CNI that
+   supports NetworkPolicy (Calico/Cilium) — k3s' default Flannel ignores it.
+{{- end }}

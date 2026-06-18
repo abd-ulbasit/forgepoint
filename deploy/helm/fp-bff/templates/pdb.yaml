@@ -1,0 +1,32 @@
+{{- if .Values.podDisruptionBudget.enabled -}}
+# ============================================================================
+# PodDisruptionBudget — availability floor during VOLUNTARY disruptions.
+# ============================================================================
+# A PDB constrains how many pods the cluster may voluntarily evict at once: node
+# drains (`kubectl drain`), cluster autoscaler scale-down, rolling node upgrades.
+# minAvailable: 1 tells the eviction API "never let the BFF drop below 1 Ready pod"
+# — so a node drain that would take the last replica is BLOCKED until a replacement
+# is Ready elsewhere.
+#
+# CAVEAT at replicaCount: 1 — with a single replica, minAvailable: 1 means the
+# eviction API can NEVER voluntarily evict the only pod (there's no second pod to
+# keep availability). That's the correct safety behavior, but it also means a node
+# drain will block on this pod until you scale up or force it. Raise replicaCount
+# to >=2 in prod for real HA so drains can proceed.
+#
+# IMPORTANT — what a PDB does NOT do: it does not protect against INVOLUNTARY
+# disruptions (node crash, OOM-kill, kubelet death); those bypass the eviction API.
+# The PDB plus replicaCount>=2 plus topology spread together give real HA.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "fp-bff.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "fp-bff.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "fp-bff.selectorLabels" . | nindent 6 }}
+{{- end }}

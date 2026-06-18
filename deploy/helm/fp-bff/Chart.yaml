@@ -1,0 +1,55 @@
+apiVersion: v2
+
+# fp-bff is derived from the reference chart (fp-auth / fp-inference-gateway) and
+# kept structurally IDENTICAL (security contexts, probes, PDB, HPA, spread,
+# ServiceMonitor) so the platform's deployment surface stays boringly uniform and
+# interview-explainable. It changes only:
+#   - the name + image + component label
+#   - the config/env block (per-service gRPC ADDRESSES it dials + CORS origin; NO
+#     database, NO Redis, NO NATS — the BFF is a stateless HTTP↔gRPC translator)
+#   - the ports (an HTTP API port for the SPA + a health port; NO 9090 gRPC server
+#     port — the BFF is a gRPC CLIENT, not a server)
+#   - the NetworkPolicy (ingress from anywhere in-cluster so the UI/ingress reaches
+#     it; egress to all fp-system services on :9090, fp-models serving, DNS, OTLP)
+#   - NO Secret / NO JWT key (the BFF FORWARDS the user's token; it never mints or
+#     validates JWTs — the downstream services validate with the shared secret)
+#   - NO migrate initContainer (NO database to migrate)
+# See fp-auth/Chart.yaml for the rationale behind each structural field.
+name: fp-bff
+description: Forgepoint BFF (Backend-for-Frontend) — stateless HTTP/SSE-to-gRPC gateway for the SPA; forwards the caller's JWT to the 10 domain services.
+
+# CHART TYPE: "application" renders into deployable K8s objects (what we want);
+# "library" would be reusable templates only, never installed directly.
+type: application
+
+# version    = the CHART's own version (bump on ANY template change, SemVer).
+# appVersion = the APP (container) version this chart ships by default; purely
+#              informational — the real image tag still comes from .Values.image.tag,
+#              falling back to appVersion when tag is "".
+version: 0.1.0
+appVersion: "0.1.0"
+
+# kubeVersion gates installs to a cluster new enough for the APIs we use
+# (autoscaling/v2 HPA, policy/v1 PDB, networking.k8s.io/v1 NetworkPolicy — all
+# stable by 1.21+). Helm refuses to install on older clusters with a clear error.
+kubeVersion: ">=1.23.0-0"
+
+home: https://github.com/abd-ulbasit/forgepoint
+# icon is cosmetic (shown in chart registries/UIs); set to silence the helm-lint
+# "icon is recommended" INFO and to brand the chart.
+icon: https://raw.githubusercontent.com/abd-ulbasit/forgepoint/main/docs/assets/logo.png
+sources:
+  - https://github.com/abd-ulbasit/forgepoint
+
+maintainers:
+  - name: Forgepoint Platform Team
+
+keywords:
+  - forgepoint
+  - bff
+  - backend-for-frontend
+  - api-gateway
+  - http
+  - sse
+  - grpc-client
+  - microservice
