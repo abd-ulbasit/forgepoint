@@ -16,3 +16,5 @@ zero-padded (`0001`, `0002`, …). Use `docs/adr/template.md` as the starting po
 | [0005](0005-ports-in-domain-hexagonal.md) | Hexagonal ports live in the domain package | Accepted | 2026-06-17 |
 | [0006](0006-go-workspace-monorepo.md) | Go-workspace monorepo with one module per service | Accepted | 2026-06-17 |
 | [0007](0007-one-pattern-per-service.md) | One distributed-systems pattern per service | Accepted | 2026-06-17 |
+| [0008](0008-istio-service-mesh.md) | Istio service mesh — STRICT mTLS, deny-by-default authz, mesh resilience | Accepted | 2026-06-18 |
+| [0009](0009-tamper-evident-audit-log.md) | Tamper-evident, hash-chained audit log (interceptor capture + append-only sink) | Accepted | 2026-06-18 |

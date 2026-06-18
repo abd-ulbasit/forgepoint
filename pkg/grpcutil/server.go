@@ -31,11 +31,15 @@ import (
 //   4. gRPC reflection (grpcurl/grpcui can discover services without .proto)
 //   5. Graceful shutdown + readiness status control
 //
-// INTERCEPTOR ORDER (outermost → innermost): recovery → logging → auth → custom
+// INTERCEPTOR ORDER (outermost → innermost):
+//   recovery → logging → pre-auth → auth → custom
 //   - Recovery outermost: catches panics from everything below.
 //   - Logging next: logs every RPC including auth failures (security audit).
-//   - Auth innermost (of the standard chain): only authenticated RPCs reach
-//     the handler / custom interceptors.
+//   - Pre-auth (WithPreAuthUnaryInterceptors): WRAPS auth so it can observe auth's
+//     own short-circuit denials — the slot the audit DENY-capture interceptor uses
+//     (anything inner of auth never runs when auth rejects a request).
+//   - Auth (of the standard chain): only authenticated RPCs reach the handler /
+//     custom (post-auth) interceptors.
 //
 // WHERE TRACING LIVES (and why it's NOT an interceptor):
 //   otelgrpc moved from interceptors to a grpc.StatsHandler. The stats handler
@@ -60,13 +64,15 @@ const defaultDrainTimeout = 25 * time.Second
 type ServerOption func(*serverConfig)
 
 type serverConfig struct {
-	logger         *slog.Logger
-	validator      TokenValidator
-	skipMethods    []string
-	enableReflect  bool
-	drainTimeout   time.Duration
-	extraUnaryInt  []grpc.UnaryServerInterceptor
-	extraStreamInt []grpc.StreamServerInterceptor
+	logger           *slog.Logger
+	validator        TokenValidator
+	skipMethods      []string
+	enableReflect    bool
+	drainTimeout     time.Duration
+	preAuthUnaryInt  []grpc.UnaryServerInterceptor
+	preAuthStreamInt []grpc.StreamServerInterceptor
+	extraUnaryInt    []grpc.UnaryServerInterceptor
+	extraStreamInt   []grpc.StreamServerInterceptor
 }
 
 // WithLogger sets the logger for the logging interceptor.
@@ -120,6 +126,34 @@ func WithUnaryInterceptors(interceptors ...grpc.UnaryServerInterceptor) ServerOp
 func WithStreamInterceptors(interceptors ...grpc.StreamServerInterceptor) ServerOption {
 	return func(cfg *serverConfig) {
 		cfg.extraStreamInt = append(cfg.extraStreamInt, interceptors...)
+	}
+}
+
+// WithPreAuthUnaryInterceptors adds custom unary interceptors that run BEFORE the
+// auth interceptor — i.e. they WRAP auth (chain position:
+// recovery → logging → THESE → auth → WithUnaryInterceptors → handler).
+//
+// WHY a distinct slot OUTSIDE auth: most cross-cutting interceptors want to run
+// AFTER auth (so Claims are available) — that is WithUnaryInterceptors. But the
+// audit DENY-capture interceptor must OBSERVE auth's own rejection: when auth
+// short-circuits an unauthenticated/forbidden request, it returns WITHOUT calling
+// its inner handler, so anything wired inner of auth never runs for that denial.
+// Placing an interceptor here lets it see auth's Unauthenticated/PermissionDenied
+// return and record it (the anonymous-probe audit signal). This is the ONLY case
+// in the platform that needs to wrap auth; the option is deliberately separate
+// from WithUnaryInterceptors so the common (post-auth) case stays the default.
+func WithPreAuthUnaryInterceptors(interceptors ...grpc.UnaryServerInterceptor) ServerOption {
+	return func(cfg *serverConfig) {
+		cfg.preAuthUnaryInt = append(cfg.preAuthUnaryInt, interceptors...)
+	}
+}
+
+// WithPreAuthStreamInterceptors is the streaming counterpart of
+// WithPreAuthUnaryInterceptors: stream interceptors that wrap the auth stream
+// interceptor so they can capture auth's short-circuit denials on streaming RPCs.
+func WithPreAuthStreamInterceptors(interceptors ...grpc.StreamServerInterceptor) ServerOption {
+	return func(cfg *serverConfig) {
+		cfg.preAuthStreamInt = append(cfg.preAuthStreamInt, interceptors...)
 	}
 }
 
@@ -203,23 +237,28 @@ func NewServer(opts ...ServerOption) *Server {
 		opt(cfg)
 	}
 
-	// Unary chain: recovery → logging → auth → custom.
+	// Unary chain: recovery → logging → pre-auth (wraps auth) → auth → custom.
+	// Pre-auth interceptors go OUTSIDE auth on purpose (see WithPreAuthUnary-
+	// Interceptors) so the audit DENY-capture interceptor can observe auth's own
+	// short-circuit rejection of an unauthenticated/forbidden request.
 	unary := []grpc.UnaryServerInterceptor{
 		RecoveryUnaryInterceptor(),
 		LoggingUnaryInterceptor(cfg.logger),
 	}
+	unary = append(unary, cfg.preAuthUnaryInt...)
 	if cfg.validator != nil {
 		unary = append(unary, AuthUnaryInterceptor(cfg.validator, WithSkipMethods(cfg.skipMethods...)))
 	}
 	unary = append(unary, cfg.extraUnaryInt...)
 
 	// Stream chain: the same shape as unary, so streaming RPCs are equally
-	// protected (recovery + logging + auth). This parity is the fix for the
-	// previously-unauthenticated, panic-unsafe streaming path.
+	// protected (recovery + logging + pre-auth + auth). This parity is the fix for
+	// the previously-unauthenticated, panic-unsafe streaming path.
 	stream := []grpc.StreamServerInterceptor{
 		RecoveryStreamInterceptor(),
 		LoggingStreamInterceptor(cfg.logger),
 	}
+	stream = append(stream, cfg.preAuthStreamInt...)
 	if cfg.validator != nil {
 		stream = append(stream, AuthStreamInterceptor(cfg.validator, WithSkipMethods(cfg.skipMethods...)))
 	}

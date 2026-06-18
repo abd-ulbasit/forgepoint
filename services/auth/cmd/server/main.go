@@ -58,11 +58,14 @@
 //     already committed; the lost event is the documented at-most-once tradeoff
 //     (the transactional outbox, as in billing, is the upgrade path).
 //
-//   - SUBSCRIBERS: auth CONSUMES nothing by design — identity is the ROOT of the
-//     platform's trust graph, not a downstream of it (see events/events.go). So
-//     "start the subscribers" is intentionally a NO-OP for this service. Other
-//     services (gateway/serving/monitor/billing/notification) wire subscribers
-//     here; auth deliberately does not. This is contract-correct, not an omission.
+//   - SUBSCRIBERS: auth consumes no DOMAIN events — identity is the ROOT of the
+//     platform's trust graph, not a downstream of it (see events/events.go). The
+//     ONE exception is the cross-cutting AUDIT feed: auth HOSTS the platform's
+//     tamper-evident audit sink, so it consumes fp.audit.recorded (the records
+//     every service, including auth itself, publishes via the audit interceptor)
+//     and appends them to the append-only, hash-chained audit_log table. That is
+//     the PERSIST half of the capture/persist split (Phase 25 / ADR 0009); the
+//     consumer is wired in step 9.
 //
 //   - REDIS: the design doc lists Redis (validation cache) as a FUTURE optimization
 //     for ValidateToken. No auth code consumes Redis today, so wiring a go-redis
@@ -84,11 +87,13 @@ import (
 	"time"
 
 	authv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/auth/v1"
+	pkgaudit "github.com/abd-ulbasit/forgepoint/pkg/audit"
 	"github.com/abd-ulbasit/forgepoint/pkg/config"
 	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/health"
 	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/observability"
+	authauditpkg "github.com/abd-ulbasit/forgepoint/services/auth/internal/audit"
 	"github.com/abd-ulbasit/forgepoint/services/auth/internal/authn"
 	authdomain "github.com/abd-ulbasit/forgepoint/services/auth/internal/domain"
 	authevents "github.com/abd-ulbasit/forgepoint/services/auth/internal/events"
@@ -280,6 +285,24 @@ func main() {
 		slog.String("subjects", authevents.StreamSubjects),
 	)
 
+	// Provision the AUDIT stream (fp.audit.>). Unlike the AUTH stream — which auth
+	// owns as the fp.auth.* PRODUCER — the AUDIT stream is owned by auth as the host
+	// of the platform's single audit CONSUMER: every service publishes audit events
+	// onto fp.audit.recorded, and auth is the one service that persists them, so auth
+	// must guarantee the stream exists or those publishes would be dropped. Mirrors
+	// experiment-tracker's EnsureStream: idempotent, convergent, fail-fast on error.
+	auditStreamCtx, auditStreamCancel := context.WithTimeout(ctx, 10*time.Second)
+	err = authauditpkg.EnsureStream(auditStreamCtx, js)
+	auditStreamCancel()
+	if err != nil {
+		logger.Error("failed to ensure AUDIT jetstream stream", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	logger.Info("AUDIT stream ensured",
+		slog.String("stream", authauditpkg.StreamName),
+		slog.String("subjects", authauditpkg.StreamSubjects),
+	)
+
 	// ================================================================
 	// 5. CONSTRUCT ADAPTERS (repositories + event publisher)
 	// ================================================================
@@ -306,6 +329,19 @@ func main() {
 		slog.String("subject_user_created", authevents.SubjectUserCreated),
 		slog.String("subject_apikey_rotated", authevents.SubjectAPIKeyRotated),
 	)
+
+	// AUDIT SINK (capture side): the NATSAuditSink reuses the SAME natsutil.Publisher
+	// above to publish audit records onto fp.audit.recorded. The audit interceptor
+	// (wired into the gRPC chain below) builds a Record per security-relevant RPC and
+	// hands it to this sink — decoupling CAPTURE (interceptor, in every service) from
+	// PERSIST (the consumer wired in step 9). A publish failure here NEVER fails the
+	// RPC (best-effort on the hot path; the interceptor logs-and-continues).
+	auditSink := pkgaudit.NewNATSAuditSink(natsPublisher)
+
+	// AUDIT REPOSITORY (persist side): appends records to the append-only,
+	// hash-chained audit_log table over the SHARED Postgres pool. The consumer
+	// (step 9) drives it. It is the single writer of the chain.
+	auditRepo := authauditpkg.NewRepository(db.Pool())
 
 	// ================================================================
 	// 6. CONSTRUCT DOMAIN SERVICE
@@ -474,9 +510,46 @@ func main() {
 	// for API keys), then pass WithAuthValidator(validator, skipMethods...). The
 	// skip list is always: the service's public RPCs + health + reflection.
 	tokenValidator := authn.NewValidator(eventingSvc)
+
+	// AUDIT INTERCEPTORS (capture) — wired at TWO positions, by design:
+	//
+	//   1. INNER (WithUnaryInterceptors / WithStreamInterceptors): runs AFTER the
+	//      auth validator, so the auth interceptor has already populated claims —
+	//      the audit Record's Actor is the AUTHENTICATED identity, not "anonymous".
+	//      Being inner of auth it also wraps the business handler, so it captures
+	//      every HANDLER-level authZ DENY (requireAdmin → PermissionDenied) plus
+	//      successful mutations (ALLOW) and non-security errors (ERROR).
+	//
+	//   2. OUTER (WithPreAuthUnaryInterceptors / WithPreAuthStreamInterceptors): runs
+	//      BEFORE auth, so it WRAPS auth and observes auth's OWN short-circuit
+	//      rejection. This is the fix for the completeness gap (ADR 0009 force #1):
+	//      when auth rejects a missing/expired/forged token it returns BEFORE the
+	//      inner interceptor, so the inner one never records the denial. The outer
+	//      DENY-capture interceptor records exactly those anonymous probes of
+	//      privileged methods — the single most valuable audit signal — as a DENY
+	//      with Actor=anonymous. A shared marker stops the two interceptors from
+	//      double-recording a handler-level DENY (inner records it; outer stays
+	//      silent). See pkg/audit/deny.go.
+	//
+	// Audit is best-effort at BOTH points: a sink failure is logged, never surfaced
+	// as an RPC error.
+	//
+	// ONE-LINE ROLLOUT FOR THE OTHER 9 SERVICES: each adds these four options with
+	// its OWN Source and a NATSAuditSink over its own publisher; the records all land
+	// on fp.audit.recorded and this auth-hosted consumer persists them. No other
+	// service needs the repository/consumer/stream — only the interceptors. See ADR 0009.
+	auditOpts := pkgaudit.Options{Source: authevents.SourceName, Logger: logger}
 	srv := grpcutil.NewServer(
 		grpcutil.WithLogger(logger),
 		grpcutil.WithAuthValidator(tokenValidator, authn.SkipMethods()...),
+		// OUTER (wraps auth): captures auth's short-circuit Unauthenticated/
+		// PermissionDenied denials the inner interceptor never sees.
+		grpcutil.WithPreAuthUnaryInterceptors(pkgaudit.DenyUnaryInterceptor(auditSink, auditOpts)),
+		grpcutil.WithPreAuthStreamInterceptors(pkgaudit.DenyStreamInterceptor(auditSink, auditOpts)),
+		// INNER (post-auth): captures authenticated ALLOW/handler-DENY/ERROR with the
+		// real actor.
+		grpcutil.WithUnaryInterceptors(pkgaudit.UnaryServerInterceptor(auditSink, auditOpts)),
+		grpcutil.WithStreamInterceptors(pkgaudit.StreamServerInterceptor(auditSink, auditOpts)),
 		grpcutil.WithReflection(),
 	)
 	authv1.RegisterAuthServiceServer(srv.GRPC, authHandler)
@@ -485,15 +558,32 @@ func main() {
 	)
 
 	// ================================================================
-	// 9. EVENT SUBSCRIBERS — INTENTIONALLY NONE FOR AUTH
+	// 9. EVENT SUBSCRIBERS — THE AUDIT CONSUMER (the one thing auth consumes)
 	// ================================================================
-	// Auth CONSUMES no events: identity is the ROOT of the platform's trust graph,
-	// not a downstream of it (events/events.go). Every other consuming service
-	// would here construct natsutil.NewSubscriber(...).Subscribe(...) for each
-	// subject it reacts to, and register their lifecycle in shutdown. Auth has
-	// nothing to subscribe to, so this step is a deliberate, contract-correct
-	// NO-OP — recorded in the log so the absence is explicit, not an oversight.
-	logger.Info("no event subscribers for auth (identity is the trust-graph root; consumes nothing)")
+	// Auth consumes no DOMAIN events (identity is the trust-graph root). The ONE
+	// exception is the cross-cutting AUDIT feed: auth HOSTS the platform's audit sink,
+	// so it consumes fp.audit.recorded — the records every service (including auth
+	// itself, via the interceptor above) publishes — and appends them to the
+	// append-only, hash-chained audit_log table. This is the PERSIST half of the
+	// capture/persist split; it is a textbook choreography consumer (durable group,
+	// retry cap, DLQ), idempotent on the envelope id at the DATABASE (ON CONFLICT).
+	//
+	// WHY auth and not a separate service: the IAM service owns identity and is the
+	// trust root, so hosting the audit trail here keeps the security record with the
+	// service that owns the security model — no new service for a single consumer.
+	auditConsumer := authauditpkg.NewConsumer(js, auditRepo, logger)
+	if startErr := auditConsumer.Start(ctx); startErr != nil {
+		logger.Error("failed to start audit consumer", slog.String("error", startErr.Error()))
+		os.Exit(1)
+	}
+	// DEFER: stop the audit consume loop during shutdown. Registered here (after the
+	// NATS-drain defer) so by LIFO it runs BEFORE the NATS connection drains — the
+	// consumer stops pulling before the bus it pulls from is torn down.
+	defer auditConsumer.Close()
+	logger.Info("audit consumer started (auth hosts the platform audit sink)",
+		slog.String("stream", authauditpkg.StreamName),
+		slog.String("subject", authauditpkg.SubjectRecorded),
+	)
 
 	// ================================================================
 	// 10. HEALTH SERVER (HTTP) — readiness checks the REAL dependencies
