@@ -8,9 +8,11 @@
 # DELTAS vs fp-auth (the reference) — what's notification-specific:
 #   - config adds redisUrl (the IdempotencyStore — event + sync dedup) and
 #     smtpAddr (the EMAIL delivery channel). Both are non-secret in dev.
-#   - secrets carries ONLY databaseUrl (the inbox/delivery_log/preferences DB).
-#     There is NO jwtSecret: notification does not sign tokens — it reads caller
-#     claims from the auth interceptor and recipient identity from events.
+#   - secrets carries databaseUrl (the inbox/delivery_log/preferences DB) AND
+#     jwtSecret. notification does NOT sign tokens, but its gRPC auth interceptor
+#     must VERIFY caller JWTs locally (design D2), so it needs the SAME HMAC key the
+#     auth service signs with — hence a jwtSecret here too. (It still mints nothing
+#     and has no bootstrap-admin password, unlike fp-auth.)
 #   - networkPolicy egress adds redis (its dedup store) on top of
 #     postgres + nats + otlp.
 #
@@ -113,10 +115,13 @@ config:
 #                           Secrets / Sealed Secrets / kubectl). The Deployment
 #                           still envFrom's it.
 #
-# WHY no jwtSecret here (vs fp-auth): notification does not MINT tokens. It is a
-# downstream reactor — the gRPC interceptor validates caller tokens with the
-# Auth service's public key, and event-driven work uses the recipient identity
-# carried in the event envelope. So the only sensitive value is the DB DSN.
+# WHY a jwtSecret here even though notification does NOT mint tokens: the gRPC auth
+# interceptor VERIFIES every caller's JWT locally (design D2 — no per-request hop to
+# the auth service), and HMAC-SHA256 verification needs the SAME symmetric key the
+# auth service signed with. So this is the auth service's signing key, shared as a
+# verify-only key here. It must be >= 32 bytes (the service refuses to start on a
+# weaker key — fpauth.NewJWTValidator enforces RFC 7518 §3.2). It lives in the Secret
+# (NOT the ConfigMap) because it is sensitive symmetric key material.
 # ----------------------------------------------------------------------------
 secrets:
   create: true
@@ -128,6 +133,12 @@ secrets:
   # "fp_notification" on the shared Postgres in fp-infra. In prod the password
   # component comes from a managed secret store, not from this file.
   databaseUrl: "postgres://notification:dev-only-change-me@postgres.fp-infra.svc.cluster.local:5432/fp_notification?sslmode=disable"
+  # HMAC-SHA256 key the auth interceptor uses to VERIFY caller JWTs (read as
+  # FP_JWT_SECRET). This MUST match the auth service's signing key, or every token
+  # auth mints will fail verification here. The service refuses to start if unset
+  # (required) or shorter than 32 bytes. DEV-ONLY placeholder; in prod this comes
+  # from the same external secret store that holds the auth service's signing key.
+  jwtSecret: "dev-only-change-me-in-prod-min-32-bytes-of-entropy"
 
 # ----------------------------------------------------------------------------
 # Migrations — self-contained schema migrations via a migrate initContainer.

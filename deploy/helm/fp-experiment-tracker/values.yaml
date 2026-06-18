@@ -108,15 +108,26 @@ config:
 #                           Secrets / Sealed Secrets / kubectl). The Deployment
 #                           still envFrom's it.
 #
-# UNLIKE fp-auth, this service has NO JWT signing key of its own (it VALIDATES
-# caller JWTs by calling the Auth service, it does not MINT them). The only
-# secret it needs is the Postgres DSN.
+# This service does NOT MINT JWTs (auth is the sole minter), but it MUST VERIFY
+# caller JWTs in-process for its auth interceptor (design D2 — local HMAC verify,
+# no per-RPC hop to auth). That verification needs the SAME shared signing key
+# auth signs with, so this service carries an FP_JWT_SECRET too — identical key,
+# different role (verify, not mint). It therefore needs TWO secrets: the shared
+# JWT signing key and its own Postgres DSN.
 # ----------------------------------------------------------------------------
 secrets:
   create: true
   # When create=false, the Deployment envFrom's this externally-managed Secret.
   # Defaults to the chart's fullname when empty (see _helpers "secretName").
   existingSecret: ""
+  # DEV-ONLY value. Override via --set or a non-committed -f secrets.local.yaml.
+  # The HMAC-SHA256 key the auth interceptor uses to VERIFY caller JWTs locally.
+  # It MUST be the SAME value as fp-auth's secrets.jwtSecret (auth signs with it;
+  # this service verifies with it) and >= 32 bytes of high-entropy data in prod
+  # (pkg/auth rejects shorter keys at startup). The service refuses to start if
+  # unset (FP_JWT_SECRET is required). In prod this comes from a shared external
+  # secret store entry, never this file.
+  jwtSecret: "dev-only-change-me-in-prod-min-32-bytes-of-entropy"
   # DEV-ONLY value. Override via --set or a non-committed -f secrets.local.yaml.
   # Full Postgres DSN the service reads as FP_DATABASE_URL. Points at the
   # per-service database "fp_experiment" on the shared Postgres in fp-infra. In

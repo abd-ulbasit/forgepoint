@@ -145,14 +145,24 @@ config:
 #                           Secrets / Sealed Secrets / kubectl). The Deployment
 #                           still envFrom's it.
 #
-# Unlike fp-auth (JWT key + DB DSN), model-serving's ONLY secret is the
-# OBJECT-STORAGE credential pair the storage adapter uses to pull the artifact.
+# Unlike fp-auth (which also has a DB DSN), model-serving has no database. It
+# DOES share fp-auth's JWT signing key (the gRPC auth interceptor verifies every
+# RPC's token against it — symmetric HS256, so it MUST match the auth service's
+# value) and adds the OBJECT-STORAGE credential pair the storage adapter uses to
+# pull the artifact.
 # ----------------------------------------------------------------------------
 secrets:
   create: true
   # When create=false, the Deployment envFrom's this externally-managed Secret.
   # Defaults to the chart's fullname when empty (see _helpers "secretName").
   existingSecret: ""
+  # jwtSecret: the shared HMAC-SHA256 verification key for the gRPC auth
+  # interceptor. Rendered as FP_JWT_SECRET. MUST equal the auth service's
+  # secrets.jwtSecret (symmetric HS256 — the verifier needs the identical key the
+  # signer used) and be >= 32 bytes of high-entropy data in prod. DEV-ONLY value
+  # here; supply from a managed secret store (External Secrets / Sealed Secrets) in
+  # any real environment.
+  jwtSecret: "dev-only-change-me-in-prod-min-32-bytes-of-entropy"
   # DEV-ONLY MinIO credentials (match docker-compose / fp-infra MinIO defaults).
   # In prod these come from a managed secret store, never from this file. Rendered
   # as FP_S3_ACCESS_KEY / FP_S3_SECRET_KEY env vars (consumed by the storage

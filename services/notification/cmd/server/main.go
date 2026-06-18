@@ -100,6 +100,7 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 
 	notificationv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/notification/v1"
+	fpauth "github.com/abd-ulbasit/forgepoint/pkg/auth"
 	"github.com/abd-ulbasit/forgepoint/pkg/config"
 	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/health"
@@ -119,6 +120,21 @@ import (
 // FP_PORT, FP_GRPC_PORT, FP_NATS_URL, etc. via reflection (see pkg/config).
 type NotificationConfig struct {
 	config.BaseConfig
+
+	// JWTSecret is the HMAC-SHA256 key the gRPC auth interceptor uses to VERIFY
+	// (never to mint) caller tokens. Notification does not issue JWTs — the Auth
+	// service does — but every authenticated RPC here must validate the bearer
+	// token locally (design D2: in-process signature verify, no per-request hop to
+	// auth), so this verifier MUST share the SAME secret the auth service signs
+	// with. fpauth.NewJWTValidator enforces a >=32-byte floor (RFC 7518 §3.2), so a
+	// weak/short secret fails startup rather than silently accepting forgeable tokens.
+	//
+	// required:"true" → fail-fast: a notification pod with no JWT secret cannot
+	// authenticate anyone, so it must refuse to start rather than boot into a state
+	// where every authenticated RPC is permanently Unauthenticated. K8s injects this
+	// from a Secret mounted as FP_JWT_SECRET (never a ConfigMap — secrets are
+	// access-controlled; see deploy/helm/fp-notification/templates/secret.yaml).
+	JWTSecret string `env:"JWT_SECRET" required:"true"`
 
 	// RedisURL backs the IdempotencyStore (sync dedup: prefs/test idempotency keys)
 	// AND the reactor's domain-level per-(event,recipient) dedup store. A redis://
@@ -382,19 +398,62 @@ func main() {
 	// 6. BUILD gRPC SERVER + REGISTER THE REAL HANDLER
 	// ================================================================
 	// grpcutil.NewServer applies the standard interceptor chain (recovery → logging →
-	// [auth] → tracing). The auth validator is wired when this service is connected to
-	// the Auth service's ValidateToken (a later phase); the handler reads identity
-	// from claims in context (never from a request body — the anti-IDOR rule).
+	// auth → tracing). We now wire the AUTHENTICATION interceptor via
+	// WithAuthValidator — until this was added, the auth interceptor never ran, so
+	// caller claims were NEVER injected into the request context and every handler
+	// that scopes to grpcutil.ClaimsFromContext (the inbox/prefs RPCs, which read the
+	// caller's UserID — the anti-IDOR rule) had no identity to scope to.
+	//
+	// authN vs authZ — THE DIVISION OF LABOR (interview-critical):
+	//   - AUTHENTICATION (this interceptor): "who are you?" It validates the bearer
+	//     JWT's signature/expiry LOCALLY with the shared secret (design D2 — no
+	//     per-request hop to the auth service) and, on success, puts the typed
+	//     *grpcutil.Claims (UserID, Email, Team, Role, Scopes) into the context. On
+	//     failure it rejects with Unauthenticated before the handler ever runs. It
+	//     makes NO permission decision.
+	//   - AUTHORIZATION ("may you do this?") stays in the HANDLERS: each RPC reads the
+	//     claims the interceptor injected and enforces its own per-RPC rule (e.g.
+	//     scope every inbox/prefs query to claims.UserID so one user can never read or
+	//     mutate another's notifications/preferences). The interceptor authenticates;
+	//     it does not authorize. That handler-side authZ is unchanged by this wiring.
+	//
+	// fpauth.NewJWTValidator returns the shared grpcutil.TokenValidator (the SAME
+	// local-verify implementation all 9 non-auth services use) and ERRORS on a weak
+	// (<32-byte) secret — we fail startup on that rather than boot a pod that would
+	// accept forgeable tokens.
+	//
+	// PUBLIC METHODS = EMPTY (default-deny). EVERY NotificationService RPC operates on
+	// the AUTHENTICATED CALLER'S OWN platform resources — the inbox (List/Get/MarkRead),
+	// the delivery-log audit (ListDeliveryAttempts), and preferences/self-test
+	// (Get/UpdatePreferences/TestChannel). The proto deliberately omits a user_id on
+	// every request precisely BECAUSE identity comes from the token, so NONE of these
+	// can function without authenticated claims and NONE is intended for unauthenticated
+	// access. There is no Login-style token-minting RPC here and no service-to-service
+	// RPC that takes its credential in the request body (contrast auth's ValidateToken/
+	// CheckPermission). So the only methods we skip are the gRPC health + reflection
+	// infrastructure RPCs (kubelet probes / grpcurl carry no token) via
+	// grpcutil.HealthAndReflectionMethods(). Adding a new RPC to the proto is therefore
+	// authenticated-by-default unless someone consciously adds it to publicMethods.
+	//
 	// WithReflection lets grpcurl/grpcui introspect the service in development.
+	validator, err := fpauth.NewJWTValidator([]byte(cfg.JWTSecret))
+	if err != nil {
+		logger.Error("failed to build JWT validator", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	publicMethods := []string{} // no genuinely-public business RPCs — all require auth
 	srv := grpcutil.NewServer(
 		grpcutil.WithLogger(logger),
+		grpcutil.WithAuthValidator(validator, append(publicMethods, grpcutil.HealthAndReflectionMethods()...)...),
 		grpcutil.WithReflection(),
 	)
 
 	// Register the FULLY-WIRED handler (real service, NOT nil). Every control-plane
 	// RPC now hits the domain service backed by Postgres + Redis.
 	notificationv1.RegisterNotificationServiceServer(srv.GRPC, handler.NewNotificationHandler(svc))
-	logger.Info("notification handler registered (wired: postgres inbox/prefs + redis idempotency)")
+	logger.Info("notification handler registered (wired: postgres inbox/prefs + redis idempotency; all RPCs require a valid JWT — only health/reflection are public)",
+		slog.Int("public_methods", len(publicMethods)),
+	)
 
 	// ================================================================
 	// 7. START THE NATS REACTOR (the choreography consumer on fp.>)

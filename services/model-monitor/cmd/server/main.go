@@ -115,6 +115,7 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 
 	monitorv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/monitor/v1"
+	fpauth "github.com/abd-ulbasit/forgepoint/pkg/auth"
 	"github.com/abd-ulbasit/forgepoint/pkg/config"
 	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/health"
@@ -313,21 +314,75 @@ func main() {
 	)
 
 	// ================================================================
-	// 6a. BUILD gRPC SERVER + REGISTER THE REAL HANDLER
+	// 6a. BUILD gRPC SERVER + REGISTER THE REAL HANDLER (auth wired)
 	// ================================================================
 	// grpcutil.NewServer applies the standard interceptor chain (recovery → logging →
-	// [auth] → tracing). The auth validator (WithAuthValidator) is added once the auth
-	// client is wired — every Model Monitor RPC is team-scoped by the caller's claims,
-	// so it WILL run here in production. WithReflection lets grpcurl/grpcui introspect.
+	// auth → tracing). WithReflection lets grpcurl/grpcui introspect in dev.
+	//
+	// AUTHENTICATION vs AUTHORIZATION — the division of labor (read before an interview):
+	//
+	//   AUTHENTICATION (THIS interceptor): "WHO are you?" The AuthUnaryInterceptor/
+	//   AuthStreamInterceptor that WithAuthValidator installs runs on EVERY RPC that
+	//   is not in the skip list. It pulls the bearer JWT off the request metadata,
+	//   VERIFIES it in-process (HS256 signature against FP_JWT_SECRET, exp/nbf, alg
+	//   pinning — design D2 LOCAL verify, NO network hop to the auth service), and on
+	//   success injects the typed *grpcutil.Claims (UserID, Team, Role, Scopes) into
+	//   the request context. On any failure it returns Unauthenticated and the handler
+	//   is never reached. So past this interceptor, claims are GUARANTEED present.
+	//
+	//   AUTHORIZATION (the HANDLERS, per-RPC): "MAY you do THIS?" The handler reads
+	//   those claims via grpcutil.ClaimsFromContext and makes the per-RPC permission /
+	//   team-scoping decision — e.g. derive owner_team from claims.Team on Configure-
+	//   Monitor (the mass-assignment guard the proto documents), scope List/Get reads
+	//   to the caller's team, and gate writes (Configure/Delete/ResetBaseline/Submit-
+	//   GroundTruth) on the right scope. The interceptor does NOT authorize; the
+	//   handler does NOT authenticate. This file only wires the authN half — it does
+	//   not touch handler authZ logic.
+	//
+	// LOCAL VERIFY, NO SELF-DEPENDENCY: NewJWTValidator does a pure SHA-256 HMAC check
+	// with the shared secret — model-monitor never calls the auth service to validate a
+	// token, so auth being down does NOT block monitor RPCs (the D2 tradeoff: a revoked
+	// JWT is accepted until it expires, bounded by the short 15m TTL the minter uses).
+	//
+	// fail-fast: a missing/short secret makes NewJWTValidator error and we exit — a
+	// monitor that can't authenticate its operationally-sensitive RPCs (drift scores,
+	// retrain config) must not start in an open state (default-deny).
+	validator, err := fpauth.NewJWTValidator([]byte(cfg.JWTSecret))
+	if err != nil {
+		logger.Error("failed to build JWT validator", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+
+	// publicMethods — the Model Monitor RPCs that BYPASS authentication. It is
+	// DELIBERATELY EMPTY: MonitorService has NO genuinely-public business RPC. Every
+	// RPC operates on a platform resource and is TEAM-SCOPED from the caller's claims
+	// (the proto's service-level AUTH note: "every RPC is guarded by the shared auth
+	// interceptor … EVERY RPC is additionally TEAM-SCOPED by the interceptor from the
+	// caller's auth claims — no request carries a team field"). The reads (GetModel-
+	// Health/GetMonitorStatus/ListMonitors/GetDriftReport/ListDriftReports/StreamDrift-
+	// Events) expose operationally-sensitive drift scores; the writes (ConfigureMonitor/
+	// DeleteMonitor/ResetBaseline/SubmitGroundTruth) are mutating/admin. None may be
+	// reached anonymously → default-deny: require a valid JWT for all of them. Only the
+	// gRPC health + reflection infra RPCs are skipped (appended below), because the
+	// kubelet probe and grpcurl call them with no credential. Adding a new RPC to the
+	// proto therefore requires auth automatically unless it is consciously listed here.
+	var publicMethods []string
+
 	srv := grpcutil.NewServer(
 		grpcutil.WithLogger(logger),
+		// Skip list = service public methods (none) + health/reflection. The variadic
+		// append + spread is the SAME shape every other service uses (see pkg/auth's
+		// NewJWTValidator usage doc and services/auth/internal/authn.SkipMethods).
+		grpcutil.WithAuthValidator(validator, append(publicMethods, grpcutil.HealthAndReflectionMethods()...)...),
 		grpcutil.WithReflection(),
 	)
 
 	// Register the FULLY-WIRED handler (real service, NOT nil). Every control-plane RPC
 	// now reaches the domain service backed by Postgres + Redis + NATS.
 	monitorv1.RegisterMonitorServiceServer(srv.GRPC, handler.NewMonitorHandler(svc))
-	logger.Info("monitor handler registered (wired: postgres config+history, redis windows, nats drift publisher)")
+	logger.Info("monitor handler registered (wired: postgres config+history, redis windows, nats drift publisher; JWT auth enforced on every RPC)",
+		slog.Any("public_methods", publicMethods), // empty by design — all RPCs require auth (only health+reflection skipped)
+	)
 
 	// ================================================================
 	// 6b. START THE EVENT SUBSCRIBERS (the DATA PLANE — the heartbeat)

@@ -69,6 +69,7 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 
 	registryv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/registry/v1"
+	fpauth "github.com/abd-ulbasit/forgepoint/pkg/auth"
 	"github.com/abd-ulbasit/forgepoint/pkg/config"
 	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/health"
@@ -114,6 +115,27 @@ type RegistryConfig struct {
 	// hard-coding true as the early auth scaffold did — is the correct, env-driven
 	// 12-factor approach: the same binary is secure in prod and convenient locally.
 	OTelInsecure bool `env:"OTEL_INSECURE" default:"true"`
+
+	// JWTSecret is the SHARED HMAC-SHA256 verification key for inbound JWTs.
+	//
+	// WHY the registry needs a JWT secret even though it never MINTS tokens (only
+	// auth does): under design D2 (LOCAL verification — see pkg/auth/validator.go),
+	// every non-auth service verifies the JWT signature IN-PROCESS rather than
+	// calling auth.ValidateToken on the hot path. That local HMAC verify needs the
+	// SAME secret auth signed with — so this key is the verify-side counterpart of
+	// auth's sign-side FP_JWT_SECRET. It MUST be byte-identical to auth's secret
+	// (same K8s Secret value), or every token auth issues fails verification here.
+	//
+	// required:"true" — the auth interceptor cannot be built without it, and a
+	// registry that can't authenticate any caller is useless; fail-fast at startup
+	// (config.Load returns an error) is the correct posture for security config,
+	// exactly as auth does. pkg/auth.NewJWTValidator additionally rejects a secret
+	// shorter than 32 bytes (RFC 7518 §3.2 — the HMAC key must be >= the SHA-256
+	// output width), so a weak key is caught at construction, not under load.
+	//
+	// K8s: injected from a Secret (never a ConfigMap — secrets are access-controlled,
+	// ConfigMaps are plaintext), mirroring auth's FP_JWT_SECRET wiring.
+	JWTSecret string `env:"JWT_SECRET" required:"true"`
 }
 
 func main() {
@@ -289,13 +311,64 @@ func main() {
 	// ================================================================
 	// 6. BUILD gRPC SERVER + REGISTER THE WIRED HANDLER (real svc, NOT nil)
 	// ================================================================
-	// WHY no WithAuthValidator yet: the registry's RPCs DO require auth in
-	// production (owner/team come from validated claims), but the auth interceptor
-	// needs an auth-service TokenValidator client, which is wired in a later phase.
-	// Adding it now with a nil validator would reject every call. WithReflection lets
-	// grpcurl/grpcui introspect the service during development.
+	// AUTHENTICATION (authN) vs AUTHORIZATION (authZ) — the division of labor:
+	//
+	//   - authN (THIS interceptor): "WHO are you?" Every RPC must carry a valid JWT.
+	//     The grpcutil auth interceptor pulls the bearer token from the
+	//     `authorization` metadata, hands it to the validator below, and on success
+	//     injects the resolved *grpcutil.Claims (UserID, Team, Role, Scopes) into the
+	//     request context. On failure it returns Unauthenticated and the handler is
+	//     never reached. This is the LOCAL-VERIFY path of design D2 (pkg/auth):
+	//     in-process HS256 signature check with the shared secret — zero network hop,
+	//     and auth-service downtime does NOT block registry RPCs (the tradeoff is that
+	//     a revoked JWT stays valid until it expires; short TTLs bound that window).
+	//
+	//   - authZ (the HANDLERS, per-RPC): "MAY you do THIS?" The registry's handlers
+	//     read those injected claims to make per-RPC permission/tenancy decisions —
+	//     owner_id/team are taken from claims.Team/claims.UserID (the mass-assignment
+	//     guard in the proto header), and a write may be gated on role. The
+	//     interceptor does NOT authorize; it only authenticates and populates claims
+	//     so the handlers HAVE something authoritative to authorize against. Before
+	//     this wiring, claims were never in the context, so any claims-based handler
+	//     check would fail closed — every authenticated RPC was effectively unreachable.
+	//
+	// The validator is the shared pkg/auth JWT validator (NOT an auth-service RPC
+	// client): registry verifies the signature itself with cfg.JWTSecret. We fail
+	// startup if the secret is missing/weak — NewJWTValidator rejects a <32-byte key
+	// (RFC 7518 §3.2), so a misconfigured secret can never silently accept forgeable
+	// tokens. This is the exact pattern auth uses (services/auth/cmd/server/main.go),
+	// generalized: build a TokenValidator, pass it to WithAuthValidator with the skip
+	// list = this service's PUBLIC RPCs + the health/reflection infra RPCs.
+	validator, err := fpauth.NewJWTValidator([]byte(cfg.JWTSecret))
+	if err != nil {
+		logger.Error("failed to build JWT validator", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+
+	// publicMethods — the registry's GENUINELY-public, unauthenticated RPCs.
+	//
+	// It is EMPTY, and that is the correct, default-deny answer: every RegistryService
+	// RPC operates on platform resources (models/versions owned by a team) and is
+	// either a mutating command (RegisterModel, UpdateModel, CreateVersion,
+	// ConfirmVersionUpload, PromoteVersion, DeleteModel), a tenancy-scoped query
+	// (GetModel, ListModels, SearchByTag, GetVersion, ListVersions — all scoped to the
+	// caller's team FROM CLAIMS, never the request body), or a credential-minting
+	// storage op (GetUploadURL/GetDownloadURL hand out presigned object-store URLs).
+	// NONE of these has any business being callable without an identity — an
+	// unauthenticated lister could enumerate another team's models, and an
+	// unauthenticated upload-URL grant is a write credential for anyone. So unlike
+	// auth (whose Login/ValidateToken/CheckPermission are inherently pre-auth or S2S),
+	// the registry has NO public business RPC. We therefore skip ONLY the gRPC health
+	// and reflection services (which the kubelet probe and grpcurl call with no
+	// credential — gating them would make the pod fail its own readiness probe).
+	//
+	// SECURE-BY-DEFAULT: a NEW RPC added to the proto is automatically authenticated
+	// unless someone consciously adds it here — exactly the posture we want.
+	var publicMethods []string
+
 	srv := grpcutil.NewServer(
 		grpcutil.WithLogger(logger),
+		grpcutil.WithAuthValidator(validator, append(publicMethods, grpcutil.HealthAndReflectionMethods()...)...),
 		grpcutil.WithReflection(),
 	)
 
@@ -305,7 +378,11 @@ func main() {
 	// the scaffold (NewRegistryHandler(nil) → every RPC Unimplemented) and a working
 	// service.
 	registryv1.RegisterRegistryServiceServer(srv.GRPC, handler.NewRegistryHandler(svc))
-	logger.Info("registry handler registered with wired service")
+	logger.Info("registry handler registered with wired service (JWT auth enforced)",
+		// Empty by design: every business RPC requires a token. Logged explicitly so
+		// the absence of public RPCs is visible/auditable, not a silent assumption.
+		slog.Any("public_methods", publicMethods),
+	)
 
 	// ================================================================
 	// 7. HEALTH SERVER (HTTP /healthz liveness + /readyz readiness over real deps)

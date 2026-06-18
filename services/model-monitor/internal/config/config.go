@@ -22,6 +22,22 @@ import (
 type MonitorConfig struct {
 	config.BaseConfig
 
+	// JWTSecret is the HMAC-SHA256 signing key the shared auth interceptor uses to
+	// VERIFY incoming JWTs (it does NOT mint them — only the auth service mints).
+	//
+	// WHY required:"true": the gRPC server wires grpcutil.WithAuthValidator with a
+	// JWT validator built from this secret; without it the validator can't be
+	// constructed and authn would be impossible — so the service refuses to start
+	// (fail-fast on security config is correct). The secret MUST be the SAME value
+	// the auth service signs with and at least 32 bytes (256-bit floor matching
+	// SHA-256's width); pkg/auth.NewJWTValidator rejects a shorter key at startup
+	// (ErrWeakSecret-equivalent), turning a misconfig into a loud boot failure
+	// rather than a fleet that accepts trivially-forgeable tokens. This is design
+	// D2 (LOCAL in-process JWT verify — zero network on the hot path; see
+	// pkg/auth/validator.go). K8s: mounted from a Secret (FP_JWT_SECRET), NEVER a
+	// ConfigMap — secrets are access-controlled, ConfigMaps are plaintext in etcd.
+	JWTSecret string `env:"JWT_SECRET" required:"true"`
+
 	// RedisURL is the connection string for the live sliding-window store. WHY
 	// Redis (not Postgres) for the live window: the window is a hot, frequently-
 	// mutated summary updated on EVERY inference event — Redis's in-memory

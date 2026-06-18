@@ -84,6 +84,7 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 
 	featurestorev1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/featurestore/v1"
+	fpauth "github.com/abd-ulbasit/forgepoint/pkg/auth"
 	"github.com/abd-ulbasit/forgepoint/pkg/config"
 	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/health"
@@ -112,6 +113,26 @@ import (
 // down" (drain from the LB) versus a hard startup crash.
 type FeatureStoreConfig struct {
 	config.BaseConfig
+
+	// JWTSecret is the HMAC-SHA256 verification key for inbound JWTs. The shared
+	// AUTHENTICATION interceptor (wired in main below) uses it to verify the
+	// signature of the bearer token on every non-public RPC — feature-store does NOT
+	// mint tokens (auth does), it only VERIFIES them locally (design D2: stateless
+	// local verify, no per-request round-trip to auth). The two services share the
+	// SAME secret precisely so a token auth signs verifies here without a callout.
+	//
+	// required:"true" → the process refuses to start without it. That is the correct
+	// fail-fast posture for security config: a feature-store running with auth
+	// silently disabled (no validator) would serve every team's features to any
+	// unauthenticated caller. pkg/auth.NewJWTValidator additionally rejects a secret
+	// shorter than 32 bytes (RFC 7518 §3.2 — the HMAC key must be >= the hash output
+	// width), so a weak key fails startup too, not just an absent one.
+	//
+	// K8s: mounted from a SECRET (never a ConfigMap — a ConfigMap is plaintext in
+	// etcd and readable by anyone with get on ConfigMaps). Same FP_JWT_SECRET key the
+	// auth chart uses, sourced from the SAME managed secret in prod so the signing and
+	// verifying halves of the platform can never drift apart.
+	JWTSecret string `env:"JWT_SECRET" required:"true"`
 
 	// RedisURL points at the Redis backing the online (latest-value) projection.
 	// Format: redis://host:port/db. Injected via env (K8s ConfigMap, or a Secret if
@@ -336,13 +357,65 @@ func main() {
 	// 6. BUILD gRPC SERVER + REGISTER THE REAL HANDLER
 	// ================================================================
 	// grpcutil.NewServer applies the standard interceptor chain (recovery →
-	// logging → [auth] → tracing). The auth validator is added when this service is
-	// wired to the Auth service's ValidateToken (a later phase); without it the
-	// handler still reads identity from claims in context when present (and rejects
-	// calls with no claims as Unauthenticated). WithReflection lets grpcurl/grpcui
-	// introspect the service in development.
+	// logging → auth → tracing). WithReflection lets grpcurl/grpcui introspect the
+	// service in development.
+	//
+	// AUTHENTICATION (this interceptor) vs AUTHORIZATION (the handlers) — the
+	// division of labor is the interview-critical point:
+	//
+	//   - AUTHN here: fpauth.NewJWTValidator verifies the bearer token's HS256
+	//     signature LOCALLY with the shared FP_JWT_SECRET (design D2: stateless
+	//     local verify, no per-RPC round-trip to the auth service) and, on success,
+	//     puts the caller's *grpcutil.Claims (user_id, team, role, scopes) into the
+	//     request context. It answers ONLY "who are you, and is your token genuine
+	//     and unexpired" — it does NOT decide what you may do.
+	//
+	//   - AUTHZ in the handlers: each RPC reads those claims via
+	//     grpcutil.ClaimsFromContext and makes the PER-RPC permission decision —
+	//     the proto's "Requires features:read / features:write / features:admin"
+	//     scopes, plus the team-scoping that stops one team reading another team's
+	//     views (the mass-assignment / cross-team guards documented throughout
+	//     featurestore.proto). Without the interceptor those claims would never be
+	//     in the context and every authz check would fail closed (Unauthenticated),
+	//     making the whole service unreachable — so this wiring is what makes the
+	//     handlers' authz checks actually work, not a bypass of them.
+	//
+	// PUBLIC METHODS — DEFAULT-DENY, and feature-store has NO public business RPCs:
+	//   Every FeatureStoreService RPC operates on TEAM-SCOPED platform resources
+	//   (define/read/write/serve/delete/rebuild feature views) and the proto marks
+	//   each one as requiring a scope derived from an authenticated principal —
+	//   there is no "log in" or "validate token" style RPC here that must be
+	//   reachable WITHOUT a credential (that lives in the auth service). So the
+	//   service-specific public set is EMPTY: we skip ONLY the gRPC health + server
+	//   reflection methods (grpcutil.HealthAndReflectionMethods), which the kubelet
+	//   probe and grpcurl call with no token. Everything else requires a valid JWT.
+	//   Adding a future RPC therefore requires auth automatically unless someone
+	//   consciously adds it to publicMethods — the secure default (default-deny).
+	//
+	// REUSABLE PATTERN (mirrors services/auth/cmd/server/main.go): build the
+	// validator from the shared secret, then
+	//   WithAuthValidator(validator, append(publicMethods, HealthAndReflectionMethods()...)...).
+	validator, err := fpauth.NewJWTValidator([]byte(cfg.JWTSecret))
+	if err != nil {
+		// Fail fast: a missing/short secret means we cannot authenticate callers.
+		// Starting anyway would mean either no auth (open service) or every RPC
+		// rejected — both worse than refusing to boot so K8s surfaces the misconfig.
+		logger.Error("failed to build JWT validator", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+
+	// publicMethods: the feature-store RPCs that bypass authentication. EMPTY by
+	// design (see the comment above) — no FeatureStoreService RPC is intended for
+	// unauthenticated access. We keep it as a named, explicitly-empty slice rather
+	// than inlining nothing so the default-deny stance is visible and a future
+	// genuinely-public RPC has an obvious, single place to be added (consciously).
+	publicMethods := []string{}
+
 	srv := grpcutil.NewServer(
 		grpcutil.WithLogger(logger),
+		// Append the constant health+reflection exemptions to this service's public
+		// set; the variadic spread passes the full skip list to the interceptor.
+		grpcutil.WithAuthValidator(validator, append(publicMethods, grpcutil.HealthAndReflectionMethods()...)...),
 		grpcutil.WithReflection(),
 	)
 
@@ -350,7 +423,9 @@ func main() {
 	// the event-sourcing engine backed by Postgres + Redis, and Define/Write fire
 	// NATS events via the decorator.
 	featurestorev1.RegisterFeatureStoreServiceServer(srv.GRPC, handler.NewFeatureStoreHandler(wiredSvc))
-	logger.Info("feature-store handler registered (wired: postgres event log + redis online + nats publisher)")
+	logger.Info("feature-store handler registered (wired: postgres event log + redis online + nats publisher; JWT auth enabled)",
+		slog.Any("public_methods", publicMethods), // empty: every business RPC requires a valid JWT
+	)
 
 	// ================================================================
 	// 7. HEALTH SERVER (HTTP) — readiness checks the REAL dependencies

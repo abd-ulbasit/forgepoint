@@ -83,6 +83,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 
 	pipelinev1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/pipeline/v1"
+	fpauth "github.com/abd-ulbasit/forgepoint/pkg/auth"
 	"github.com/abd-ulbasit/forgepoint/pkg/config"
 	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/health"
@@ -115,6 +116,24 @@ const shutdownTimeout = 15 * time.Second
 // FP_PORT, FP_GRPC_PORT, FP_DATABASE_URL, etc. via reflection (see pkg/config).
 type PipelineConfig struct {
 	config.BaseConfig
+
+	// JWTSecret is the shared HMAC-SHA256 key the AUTHENTICATION interceptor uses to
+	// VERIFY (never mint) the JWT on every inbound RPC.
+	//
+	// WHY required: without it the service cannot construct the validator, so every
+	// authenticated RPC would have no way to establish the caller's identity. A
+	// missing secret is a security misconfiguration, not a degraded mode — so we
+	// fail-fast at boot (required:"true") rather than silently start a service that
+	// can't authenticate anyone. pkg/auth additionally rejects a secret < 32 bytes
+	// (RFC 7518 §3.2: the HMAC key must be at least the hash output width), so a
+	// weak key is caught at NewJWTValidator, not at the first forged-token attempt.
+	//
+	// WHY the SAME secret as fp-auth (and not its own): this is design D2 — every
+	// service verifies the JWT LOCALLY with the shared signing key (no per-RPC call
+	// to auth.ValidateToken). The orchestrator only VERIFIES; only fp-auth holds the
+	// key to MINT. K8s: mounted from a Secret (never a ConfigMap — secrets are
+	// access-controlled; a plaintext ConfigMap would leak the platform signing key).
+	JWTSecret string `env:"JWT_SECRET" required:"true"`
 
 	// CompensationTimeout bounds how long a single step's compensation may run
 	// during a rollback before the engine declares it COMPENSATION_FAILED (a stuck
@@ -364,16 +383,64 @@ func main() {
 	// ================================================================
 	// 6. BUILD gRPC SERVER + REGISTER THE WIRED HANDLER (real svc, NOT nil)
 	// ================================================================
-	// grpcutil.NewServer applies the standard chain (recovery → logging → … ). The
-	// auth interceptor (WithAuthValidator) is added once the auth-service
-	// TokenValidator client is wired in a later phase — adding it now with a nil
-	// validator would reject every call. The auth interceptor is what supplies the
-	// TokenClaims the handler turns into a domain.Actor (CreatedBy/TriggeredBy/Team are
-	// then server-authoritative, never client request fields). WithReflection lets
-	// grpcurl/grpcui introspect the service in development.
+	// grpcutil.NewServer applies the standard chain (recovery → logging → tracing →
+	// AUTH). The AUTHENTICATION interceptor is now wired via WithAuthValidator.
+	//
+	// AUTHENTICATION vs AUTHORIZATION — the division of labor (interview-critical):
+	//   - authN (THIS interceptor): "who are you?" It verifies the JWT signature with
+	//     the shared secret (design D2 — LOCAL verify, no per-RPC hop to auth), and on
+	//     success injects the caller's TokenClaims (UserID/Team/Role/Scopes) into the
+	//     request context. Every RPC except the skip-list REQUIRES a valid token; a
+	//     missing/forged/expired token is rejected with Unauthenticated BEFORE the
+	//     handler runs. This is what makes the server-authoritative fields real: the
+	//     handler derives Execution.triggered_by / PipelineDefinition.created_by / team
+	//     from these claims, NEVER from client request fields (anti-spoofing).
+	//   - authZ (the HANDLERS, per RPC): "may you do THIS?" — the per-RPC permission /
+	//     team-scoping checks (e.g. only your team's executions are listed, only an
+	//     authorized role may DeletePipeline). The interceptor does NOT authorize; it
+	//     only authenticates and populates claims for those checks to read.
+	//
+	// WHY D2 (local verify) and not a call to auth.ValidateToken per RPC: a synchronous
+	// hop to auth on every request would add latency and make auth a hard dependency in
+	// the hot path (auth down ⇒ orchestrator down). Local HS256 verification is a pure
+	// in-process HMAC check; short token TTLs bound the staleness/revocation window.
+	//
+	// fail-fast: NewJWTValidator rejects a secret < 32 bytes (RFC 7518 §3.2) at
+	// construction, so a weak/misconfigured key aborts boot here rather than silently
+	// accepting brute-forceable tokens at runtime.
+	validator, err := fpauth.NewJWTValidator([]byte(cfg.JWTSecret))
+	if err != nil {
+		_ = natsConn.Drain()
+		store.Close()
+		logger.Error("failed to construct JWT validator", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+
+	// publicMethods: the orchestrator's GENUINELY-PUBLIC business RPCs — and there are
+	// NONE. Every RPC on PipelineOrchestratorService operates on platform resources
+	// (pipeline templates, saga executions) that are team-scoped and identity-stamped:
+	// CreatePipeline/Update/Delete/TriggerExecution/Cancel are mutating/admin paths, and
+	// even the reads (Get/List/Watch) are scoped to the caller's team from token claims
+	// (anti-IDOR — there is no client-supplied team field). So default-deny applies to
+	// the WHOLE service: an empty public list means we skip ONLY the infrastructure RPCs
+	// (gRPC health + reflection), which carry no caller credential and would otherwise
+	// fail their own probes / discovery. (The drift-driven auto-retrain does NOT enter
+	// through this gRPC surface — it arrives over NATS via the DriftRetrainSubscriber,
+	// authenticated at the bus, not here — so no RPC needs to be opened for it.)
+	var publicMethods []string
+
+	// WithAuthValidator(validator, skip...): the skip list is publicMethods (empty) +
+	// the shared health/reflection methods. append(publicMethods, ...) keeps the same
+	// shape as every other service's wiring so a future genuinely-public RPC is a
+	// one-line addition to publicMethods, never a change to the skip plumbing.
+	// WithReflection lets grpcurl/grpcui introspect the service in development.
 	srv := grpcutil.NewServer(
 		grpcutil.WithLogger(logger),
+		grpcutil.WithAuthValidator(validator, append(publicMethods, grpcutil.HealthAndReflectionMethods()...)...),
 		grpcutil.WithReflection(),
+	)
+	logger.Info("auth interceptor wired (local JWT verify, design D2)",
+		slog.Int("public_methods", len(publicMethods)),
 	)
 
 	// The composition is complete: hand the fully-wired saga engine to the handler.

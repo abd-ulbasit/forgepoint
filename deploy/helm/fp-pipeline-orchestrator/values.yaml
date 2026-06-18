@@ -99,15 +99,22 @@ config:
 #                           Secrets / Sealed Secrets / kubectl). The Deployment
 #                           still envFrom's it.
 #
-# NOTE vs fp-auth: the orchestrator has NO JWT signing key of its own (it VALIDATES
-# tokens with the shared validator, it does not MINT them — only fp-auth holds the
-# HMAC signing secret). So the only secret here is the Postgres DSN.
+# NOTE vs fp-auth: the orchestrator does not MINT tokens (only fp-auth holds the
+# authority to issue them), but it DOES need the shared HMAC key to VERIFY inbound
+# JWTs locally (design D2 — verify in-process, no per-RPC hop to auth). So it carries
+# the SAME jwtSecret as fp-auth, plus its own Postgres DSN.
 # ----------------------------------------------------------------------------
 secrets:
   create: true
   # When create=false, the Deployment envFrom's this externally-managed Secret.
   # Defaults to the chart's fullname when empty (see _helpers "secretName").
   existingSecret: ""
+  # Shared HMAC-SHA256 verification key, read as FP_JWT_SECRET. MUST be the SAME value
+  # as fp-auth's secrets.jwtSecret — it is the key fp-auth signs tokens with and this
+  # service verifies them with. >= 32 bytes of high-entropy data in prod (enforced by
+  # pkg/auth). DEV-ONLY placeholder below; in prod both charts reference the same
+  # managed secret. NEVER commit a real value here.
+  jwtSecret: "dev-only-change-me-in-prod-min-32-bytes-of-entropy"
   # DEV-ONLY value. Override via --set or a non-committed -f secrets.local.yaml.
   # Full Postgres DSN the service reads as FP_DATABASE_URL. Database "fp_pipeline"
   # is this service's OWN database (database-per-service) on the shared Postgres in

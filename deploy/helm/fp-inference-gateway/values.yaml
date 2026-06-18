@@ -13,8 +13,10 @@
 #                        FP_CIRCUIT_*). NO DATABASE_URL: the gateway has NO
 #                        Postgres database — its only datastore is Redis (rate-
 #                        limit buckets, route mirror, quota cache, breaker state).
-#   - secrets.*        → the ONE sensitive value is FP_REDIS_URL (it may embed a
-#                        password). No JWT key, no DB DSN.
+#   - secrets.*        → TWO sensitive values: FP_REDIS_URL (it may embed a
+#                        password) and FP_JWT_SECRET (the shared HMAC key the
+#                        gateway uses to LOCALLY verify the bearer JWT on every
+#                        RPC — design D2, no per-request call to Auth). No DB DSN.
 #   - resources.*      → a bit larger than auth: the gateway is a hot-path proxy
 #                        holding many in-memory token buckets + breaker state and
 #                        forwarding every prediction.
@@ -127,10 +129,15 @@ config:
 #                           Secrets / Sealed Secrets / kubectl). The Deployment
 #                           still envFrom's it.
 #
-# The gateway's ONLY sensitive value is the Redis URL (the DSN may embed a
-# password / TLS auth). There is no JWT signing key here: the gateway does not
-# mint or verify HMAC tokens itself — it validates bearer tokens by calling the
-# Auth service over gRPC, so it holds no signing secret of its own.
+# The gateway has TWO sensitive values:
+#   - redisUrl (FP_REDIS_URL): the DSN may embed a password / TLS auth.
+#   - jwtSecret (FP_JWT_SECRET): the shared HMAC-SHA256 key the gateway uses to
+#     LOCALLY verify the bearer JWT on every RPC (design D2 — no per-request gRPC
+#     call to Auth on the hot path). The gateway only VERIFIES; it never mints
+#     tokens. This MUST be the SAME secret the Auth service signs with (fp-auth's
+#     secrets.jwtSecret) — a mismatch means every token fails verification and the
+#     gateway 401s all traffic. It lives in the Secret (not the ConfigMap) because
+#     a signing key is access-controlled, not plaintext config.
 # ----------------------------------------------------------------------------
 secrets:
   create: true
@@ -141,6 +148,11 @@ secrets:
   # Full Redis connection string the service reads as FP_REDIS_URL. In prod the
   # password component comes from a managed secret store, not from this file.
   redisUrl: "redis://redis.fp-infra.svc.cluster.local:6379"
+  # DEV-ONLY placeholder. The shared HMAC-SHA256 verification key (FP_JWT_SECRET).
+  # MUST be >= 32 bytes (pkg/auth enforces the RFC 7518 §3.2 floor) and MUST equal
+  # fp-auth's secrets.jwtSecret so tokens Auth mints verify here. In prod this comes
+  # from a managed secret store (External Secrets / Sealed Secrets), never git.
+  jwtSecret: "dev-only-change-me-in-prod-min-32-bytes-of-entropy"
 
 # ----------------------------------------------------------------------------
 # Migrations — DISABLED: this service has NO Postgres database.

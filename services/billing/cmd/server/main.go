@@ -74,6 +74,7 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 
 	billingv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/billing/v1"
+	fpauth "github.com/abd-ulbasit/forgepoint/pkg/auth"
 	"github.com/abd-ulbasit/forgepoint/pkg/config"
 	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/health"
@@ -112,6 +113,25 @@ const idempotencyTTL = 48 * time.Hour
 // FP_REDIS_URL, FP_DEFAULT_CURRENCY, etc. via reflection (see pkg/config).
 type BillingConfig struct {
 	config.BaseConfig
+
+	// JWTSecret is the HMAC-SHA256 verification key for the auth interceptor.
+	//
+	// WHY billing needs it even though it never MINTS tokens: every BillingService
+	// RPC is team-scoped (the handler reads the caller's team/role from claims for
+	// tenant isolation and the CreateRatePlan admin gate), so every RPC must be
+	// AUTHENTICATED. Authentication here is design D2 — LOCAL JWT verification
+	// (pkg/auth.NewJWTValidator): the interceptor verifies the HS256 signature
+	// in-process with this shared secret, so there is NO synchronous hop to the auth
+	// service on the hot path and an auth-service outage cannot block in-flight
+	// metering. The auth service SIGNS with the same FP_JWT_SECRET; billing only
+	// VERIFIES with it — symmetric key, asymmetric role.
+	//
+	// required:"true" (fail-fast): the interceptor cannot be wired without it, and a
+	// billing service that accepted unauthenticated RPCs would mis-attribute money.
+	// pkg/auth enforces a >=32-byte floor (RFC 7518 §3.2) at construction, rejecting
+	// a weak/forgeable secret at startup rather than under load. K8s: mounted from a
+	// Secret (access-controlled), NEVER a ConfigMap (plaintext in etcd).
+	JWTSecret string `env:"JWT_SECRET" required:"true"`
 
 	// DefaultCurrency is the deployment's settlement currency (ISO-4217). Used as
 	// the fallback currency for server-built artifacts when no plan currency
@@ -314,17 +334,50 @@ func main() {
 	// ================================================================
 	// 6. BUILD gRPC SERVER + REGISTER THE WIRED HANDLER
 	// ================================================================
-	// WHY no WithAuthValidator yet: billing's RPCs DO require auth in production
-	// (the handler reads the caller's team/role from claims for the
-	// server-authoritative `team` and the admin gate on CreateRatePlan), but the
-	// auth interceptor needs an auth-service TokenValidator client wired in a later
-	// phase. Adding it now with a nil validator would reject every call. The handler
-	// already fails closed with Unauthenticated when claims are absent, so an
-	// unauthenticated call cannot meter usage even without the interceptor.
+	// AUTHENTICATION (the interceptor we wire here) vs AUTHORIZATION (the handler):
+	//
+	//   - authN — WHO ARE YOU. The auth UnaryInterceptor (added by WithAuthValidator)
+	//     runs BEFORE every RPC: it reads the bearer JWT, has the validator verify the
+	//     HS256 signature LOCALLY (design D2 — no hop to the auth service), and injects
+	//     the verified *grpcutil.Claims into the request context. A missing/invalid
+	//     token is rejected with Unauthenticated before the handler is ever entered.
+	//   - authZ — MAY YOU DO THIS. The handler then makes the per-RPC permission
+	//     decisions off those claims: scoping reads to the caller's own team (tenant
+	//     isolation on GetUsage/GetInvoice/ListInvoices/GetRatePlan/CheckQuota) and the
+	//     admin gate on CreateRatePlan. The interceptor does not authorize; the handler
+	//     does not authenticate. This is the same division of labor as the auth service.
+	//
+	// THE VALIDATOR (fpauth.NewJWTValidator): local HS256 verification with the shared
+	// FP_JWT_SECRET — the auth service SIGNS with this key, every other service VERIFIES
+	// with it. NewJWTValidator fails fast if the secret is < 32 bytes (RFC 7518 §3.2), so
+	// a misconfigured-weak secret aborts boot here, not on the first forged token.
+	validator, err := fpauth.NewJWTValidator([]byte(cfg.JWTSecret))
+	if err != nil {
+		logger.Error("failed to build JWT validator", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+
+	// publicMethods — the BillingService RPCs that BYPASS authentication. It is
+	// EMPTY by deliberate design: there is no genuinely-public business RPC on
+	// billing. EVERY RPC operates on a team's money/usage and reads the caller's
+	// team/role from claims for tenant isolation (the proto's "non-admins are scoped
+	// to their own team server-side" contract) — so every one requires a valid token.
+	// This is DEFAULT-DENY: a new RPC added to the proto is authenticated unless it is
+	// consciously listed here, the secure default. Only the gRPC health + reflection
+	// infrastructure RPCs are exempt (appended below) — the kubelet probe and grpcurl
+	// call those with no credential, so gating them would make the pod fail its own
+	// readiness probe / break dev introspection.
+	var publicMethods []string
+
 	// WithReflection lets grpcurl/grpcui introspect the service during development.
 	srv := grpcutil.NewServer(
 		grpcutil.WithLogger(logger),
+		grpcutil.WithAuthValidator(validator, append(publicMethods, grpcutil.HealthAndReflectionMethods()...)...),
 		grpcutil.WithReflection(),
+	)
+	logger.Info("auth interceptor wired (local JWT verify, design D2)",
+		slog.Int("public_business_methods", len(publicMethods)),
+		slog.Int("infra_skip_methods", len(grpcutil.HealthAndReflectionMethods())),
 	)
 
 	// The composition is complete: hand the fully-wired domain service to the

@@ -72,6 +72,7 @@ import (
 	"time"
 
 	experimentv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/experiment/v1"
+	fpauth "github.com/abd-ulbasit/forgepoint/pkg/auth"
 	"github.com/abd-ulbasit/forgepoint/pkg/config"
 	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/health"
@@ -114,6 +115,19 @@ type ExperimentTrackerConfig struct {
 	// natsutil's production guard (FP_ENV=production refuses the in-memory
 	// ProcessedStore), so we keep the name aligned with FP_ENV.
 	Environment string `env:"ENV" default:"local"`
+
+	// JWTSecret is the HMAC-SHA256 signing key the AUTHENTICATION interceptor uses
+	// to verify caller JWTs IN-PROCESS (design D2 — local verify, no per-RPC hop to
+	// auth; see pkg/auth/validator.go). This service does NOT mint tokens — auth is
+	// the sole minter — but every verifier across the platform must hold the SAME
+	// shared secret so a token signed by auth validates here. It is `required` so a
+	// misconfigured deploy fails fast at startup rather than silently accepting
+	// unverifiable tokens; pkg/auth.NewJWTValidator additionally rejects a secret
+	// shorter than 32 bytes (RFC 7518 §3.2 — the HMAC key must be >= the hash output
+	// width, or the keyspace is brute-forceable). In K8s this is injected from a
+	// Secret (FP_JWT_SECRET), never a ConfigMap — secrets are access-controlled,
+	// plaintext ConfigMaps are not.
+	JWTSecret string `env:"JWT_SECRET" required:"true"`
 
 	// OTLPInsecure drives whether the OTLP exporter uses plaintext (no TLS).
 	//
@@ -290,19 +304,69 @@ func main() {
 	logger.Info("experiment domain service constructed")
 
 	// ================================================================
-	// 6. BUILD gRPC SERVER + REGISTER THE REAL HANDLER
+	// 6. BUILD gRPC SERVER (+ AUTHENTICATION) + REGISTER THE REAL HANDLER
 	// ================================================================
 	// grpcutil.NewServer applies the standard interceptor chain
-	// (recovery → logging → …). WithReflection lets grpcurl/grpcui introspect the
-	// service in dev without the .proto files locally.
+	// (recovery → logging → auth). WithReflection lets grpcurl/grpcui introspect
+	// the service in dev without the .proto files locally.
 	//
-	// NO WithAuthValidator yet: the auth interceptor needs a TokenValidator that
-	// calls the Auth service's ValidateToken over gRPC — wired once the auth gRPC
-	// client adapter exists. When added, each handler lifts the server-authoritative
-	// Actor{UserID, Team} from the verified TokenClaims (never a request field —
-	// the mass-assignment guard the domain relies on).
+	// ── AUTHN vs AUTHZ — the division of labor (read before an interview) ──
+	// The auth interceptor wired here is AUTHENTICATION ("WHO are you?"): it takes
+	// the bearer JWT off the request metadata, verifies its HS256 signature LOCALLY
+	// against the shared FP_JWT_SECRET (design D2 — no per-RPC network hop to the
+	// auth service; pkg/auth/validator.go does the SHA-256 HMAC verify in-process),
+	// and on success injects the caller's *grpcutil.Claims (UserID, Team, Role,
+	// Scopes) into the request context. It does NOT decide what the caller may DO.
+	//
+	// AUTHORIZATION ("MAY you do this?") is the HANDLERS' job, per RPC: a handler
+	// reads those claims via grpcutil.ClaimsFromContext and enforces the per-RPC
+	// permission rule (e.g. experiments:write for CreateExperiment, owner/team-admin
+	// for DeleteRun) AND lifts the server-authoritative Actor{UserID, Team} from the
+	// verified claims rather than any request field — the mass-assignment / IDOR
+	// guard the domain relies on (owner_id/team are set from claims, never accepted
+	// from the client). Interceptor = authentication; handler = authorization. The
+	// interceptor never authorizes; the handler never re-authenticates.
+	//
+	// WHY LOCAL VERIFY (D2) AND NOT AN RPC TO AUTH (D1): every authenticated RPC on
+	// all 9 non-auth services must check a token. A synchronous auth.ValidateToken
+	// call per request would put auth's latency and availability in this service's
+	// hot path and make auth a platform-wide SPOF. A local HMAC verify is a few µs
+	// and survives an auth outage. The cost is that a revoked JWT stays valid until
+	// it expires — bounded by auth's short (15m) TTL. (API keys, which DO need a DB
+	// lookup, are a future RPCValidator; this service only takes user JWTs.)
+	//
+	// FAIL FAST: NewJWTValidator rejects a secret shorter than 32 bytes (RFC 7518
+	// §3.2). We surface that as a startup abort — a service that can't verify tokens
+	// must not come up and silently behave as if unauthenticated.
+	validator, err := fpauth.NewJWTValidator([]byte(cfg.JWTSecret))
+	if err != nil {
+		logger.Error("failed to build JWT validator", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+
+	// PUBLIC METHODS — the skip list passed to the auth interceptor.
+	//
+	// experiment-tracker has NO genuinely-public BUSINESS RPCs. Every RPC on
+	// ExperimentTrackerService operates on platform resources scoped to a caller's
+	// team — create/read/update/archive experiments, run lifecycle, metric/param
+	// ingestion, history/compare reads. There is no "log in", no "validate token",
+	// no service-to-service credential-free gate (this service is a CONSUMER of auth,
+	// not the authority). So the only exemptions are the infra RPCs every service
+	// must skip: the gRPC health service (the K8s gRPC probe calls Check/Watch with
+	// no credential — gating it would make the pod fail its own readiness probe) and
+	// reflection (grpcurl/grpcui discovery in dev). Everything else is DEFAULT-DENY:
+	// a valid JWT is required, and adding a new RPC to the proto automatically
+	// requires auth unless someone consciously lists it here. We do NOT exempt the
+	// mutating/ingestion RPCs (StartRun, LogMetrics, DeleteRun, …) — that would be
+	// an open write path. (Contrast auth, which DOES have public Login/ValidateToken/
+	// CheckPermission RPCs; this service has no analog.)
+	//
+	// HealthAndReflectionMethods() lives in pkg/grpcutil so the exact health +
+	// reflection full-method strings stay defined once for all 10 services.
+	var publicMethods []string // intentionally empty — no public business RPCs
 	srv := grpcutil.NewServer(
 		grpcutil.WithLogger(logger),
+		grpcutil.WithAuthValidator(validator, append(publicMethods, grpcutil.HealthAndReflectionMethods()...)...),
 		grpcutil.WithReflection(),
 	)
 

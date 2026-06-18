@@ -64,6 +64,7 @@ import (
 	"time"
 
 	inferencev1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/inference/v1"
+	fpauth "github.com/abd-ulbasit/forgepoint/pkg/auth"
 	"github.com/abd-ulbasit/forgepoint/pkg/config"
 	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/health"
@@ -94,6 +95,20 @@ const serviceName = "inference-gateway"
 // Defaults make it runnable against local docker-compose with no env set.
 type InferenceConfig struct {
 	config.BaseConfig
+
+	// JWTSecret is the HMAC-SHA256 key the gateway uses to LOCALLY verify the
+	// bearer JWT on every RPC (design D2: stateless local verification, no per-
+	// request round-trip to the Auth service). It is the SAME shared secret Auth
+	// signs tokens with — the gateway only verifies, it never mints. required:"true"
+	// so the service fails fast at startup if it is unset rather than discovering it
+	// on the first request (a gateway that can't authenticate is useless, not
+	// degraded). pkg/auth.NewJWTValidator enforces the >= 32-byte (256-bit) floor
+	// per RFC 7518 §3.2 and rejects a short key at construction.
+	//
+	// K8s: injected from a Secret (NOT a ConfigMap — a signing key is access-
+	// controlled, not plaintext config) as FP_JWT_SECRET via envFrom. See
+	// deploy/helm/fp-inference-gateway/templates/secret.yaml.
+	JWTSecret string `env:"JWT_SECRET" required:"true"`
 
 	// RedisURL is the connection string for the rate-limit buckets, the quota
 	// cache, and the routing-table mirror. In K8s this points at the fp-infra
@@ -306,21 +321,75 @@ func main() {
 	// ================================================================
 	// 6. BUILD gRPC SERVER + REGISTER THE REAL HANDLER
 	// ================================================================
-	// NO WithAuthValidator yet: the auth interceptor needs a TokenValidator that
-	// calls the Auth service's ValidateToken over gRPC — wired once the auth gRPC
-	// client adapter exists. When added, the data-plane RPCs require an inference
-	// scope and the control-plane RPCs an elevated deploy/admin scope; the principal
-	// (api_key_id, team) is read from the verified claims, never a request field.
+	// AUTHENTICATION (this interceptor) vs AUTHORIZATION (the handlers):
+	//
+	//   - authN — "WHO are you?" — is what WithAuthValidator wires here. The shared
+	//     auth UNARY/STREAM interceptor runs on EVERY RPC, reads the bearer JWT from
+	//     the authorization metadata, verifies it LOCALLY with the shared HMAC secret
+	//     (design D2 — no round-trip to the Auth service on the hot path; the gateway
+	//     sees ALL inference traffic, so a per-request auth RPC would be a latency and
+	//     availability tax), and on success injects the *grpcutil.Claims (sub, team,
+	//     scopes) into the request context. On failure it short-circuits with
+	//     Unauthenticated and the handler never runs.
+	//
+	//   - authZ — "MAY you do this?" — stays in the handlers / domain. The interceptor
+	//     does NOT decide permissions; it only proves identity and populates claims.
+	//     Each RPC's own check (e.g. data-plane needs an inference scope; control-plane
+	//     UpsertRoute/SetTrafficSplit/DeleteRoute and version_override need an elevated
+	//     deploy/admin scope) reads those claims via grpcutil.ClaimsFromContext and
+	//     fails closed when the scope is absent. This interceptor is the precondition
+	//     that makes those claims trustworthy and present.
+	//
+	// WHY fpauth.NewJWTValidator and not a gRPC call to Auth.ValidateToken: the proto's
+	// design block (and design D2) call for LOCAL verification with the shared secret —
+	// the validator is a pure function over the JWT signature, no network. The Auth
+	// service is the only MINTER; every other service is a stateless VERIFIER holding
+	// the same key. Construction fails fast if the key is < 32 bytes (RFC 7518 §3.2).
+	//
+	// SKIP LIST = publicMethods + health + reflection. publicMethods is EMPTY for this
+	// service: there are NO genuinely-public business RPCs. Every InferenceGatewayService
+	// RPC operates on a platform resource and meters/authorizes against the caller's
+	// token (the proto's AUTH & TENANCY block is explicit: the principal — api_key_id,
+	// team, scopes — is taken FROM THE VERIFIED TOKEN, never a request field; a client-
+	// supplied principal would be account-takeover-for-billing). So Predict/BatchPredict/
+	// StreamPredict, GetModelInfo, and the whole routing/breaker control plane ALL require
+	// auth — default-deny. We skip ONLY the infrastructure RPCs the kubelet/grpcurl call
+	// with no credential: grpc.health.v1.Health/* and the reflection services
+	// (grpcutil.HealthAndReflectionMethods). Adding a new RPC to the proto is therefore
+	// authenticated automatically unless someone consciously lists it public.
+	//
 	// Reflection is on for grpcurl/grpcui during development.
+	validator, err := fpauth.NewJWTValidator([]byte(cfg.JWTSecret))
+	if err != nil {
+		// A weak/missing secret is a security misconfiguration, not a runtime
+		// condition to limp along with: refuse to start so the pod never serves
+		// traffic it cannot authenticate. (required:"true" already guarantees the
+		// var is set; this additionally enforces the >= 32-byte key-strength floor.)
+		logger.Error("failed to construct JWT validator", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+
+	// publicMethods: the gateway's genuinely-PUBLIC RPC full-method strings
+	// (/forgepoint.inference.v1.InferenceGatewayService/<Rpc>). Empty by design —
+	// every business RPC requires a valid token (see the rationale above). Declared
+	// as an explicit slice so the wiring reads the same as every other service and a
+	// future genuinely-public RPC has an obvious, reviewed place to be added.
+	var publicMethods []string
+
 	srv := grpcutil.NewServer(
 		grpcutil.WithLogger(logger),
+		grpcutil.WithAuthValidator(validator, append(publicMethods, grpcutil.HealthAndReflectionMethods()...)...),
 		grpcutil.WithReflection(),
 	)
 
 	// The handler now holds the REAL domain service (not nil): every per-RPC method
 	// delegates to svc, and the nil-guards in inference_handler_impl.go are inert.
 	inferencev1.RegisterInferenceGatewayServiceServer(srv.GRPC, handler.NewInferenceHandler(svc))
-	logger.Info("inference-gateway handler registered (real service wired)")
+	logger.Info("inference-gateway handler registered (real service wired)",
+		// public_methods is empty: every business RPC requires a valid JWT; only
+		// health + reflection bypass auth (default-deny, see the wiring comment).
+		slog.Any("public_methods", publicMethods),
+	)
 
 	// ================================================================
 	// 7. EVENT SUBSCRIBERS — the route table + quota cache as event reactors

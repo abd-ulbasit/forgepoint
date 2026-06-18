@@ -98,12 +98,15 @@ config:
 #                           Secrets / Sealed Secrets / kubectl). The Deployment
 #                           still envFrom's it.
 #
-# NOTE vs fp-auth: feature-store has NO JWT signing key (it does not mint
-# tokens — it validates caller tokens via the shared interceptor, which needs no
-# per-service secret). So there is no jwtSecret here. Instead it carries a
-# redisUrl, because the Redis online store DSN carries an auth token in prod
-# (ElastiCache) — see deploy/secrets/external-secrets, which maps FP_REDIS_URL
-# from a managed store exactly like FP_DATABASE_URL.
+# NOTE vs fp-auth: feature-store does NOT MINT tokens (auth does) — but it must
+# VERIFY them. The shared authentication interceptor verifies each caller's JWT
+# signature LOCALLY with the SAME HMAC-SHA256 key auth signs with (design D2:
+# stateless local verify, no per-request callout to auth), so feature-store needs
+# the jwtSecret too — as a VERIFICATION key, sourced from the SAME managed secret
+# as auth in prod so the signing/verifying halves can never drift. It ALSO carries
+# a redisUrl, because the Redis online store DSN carries an auth token in prod
+# (ElastiCache) — see deploy/secrets/external-secrets, which maps FP_REDIS_URL and
+# FP_JWT_SECRET from a managed store exactly like FP_DATABASE_URL.
 # ----------------------------------------------------------------------------
 secrets:
   create: true
@@ -111,6 +114,13 @@ secrets:
   # Defaults to the chart's fullname when empty (see _helpers "secretName").
   existingSecret: ""
   # DEV-ONLY values. Override via --set or a non-committed -f secrets.local.yaml.
+  # HMAC-SHA256 VERIFICATION key for inbound JWTs (FP_JWT_SECRET). The shared auth
+  # interceptor refuses to start if unset, and pkg/auth rejects a key < 32 bytes
+  # (RFC 7518 §3.2). MUST be byte-identical to the auth service's jwtSecret — they
+  # are the same managed secret in prod (auth signs with it, feature-store verifies
+  # with it). Never commit a real key; this dev placeholder is >= 32 bytes so the
+  # validator accepts it locally.
+  jwtSecret: "dev-only-change-me-in-prod-min-32-bytes-of-entropy"
   # Full Postgres DSN the service reads as FP_DATABASE_URL — backs the EventLog
   # (write model) and the OfflineViewStore. Database "fp_featurestore" on the
   # shared Postgres in fp-infra. In prod the password comes from a managed store.

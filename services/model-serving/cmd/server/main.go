@@ -70,6 +70,7 @@ import (
 	"time"
 
 	servingv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/serving/v1"
+	fpauth "github.com/abd-ulbasit/forgepoint/pkg/auth"
 	"github.com/abd-ulbasit/forgepoint/pkg/config"
 	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/health"
@@ -141,6 +142,27 @@ type ServingConfig struct {
 	EventMaxRetries       int    `env:"EVENT_MAX_RETRIES" default:"5"`
 	EventDLQSubject       string `env:"EVENT_DLQ_SUBJECT" default:"fp.dlq.model-serving"`
 	EventHandlerTimeoutMs int    `env:"EVENT_HANDLER_TIMEOUT_MS" default:"30000"`
+
+	// JWTSecret is the HMAC-SHA256 signing key used to VERIFY (never mint) the JWTs
+	// on incoming gRPC calls. The auth interceptor wired in main rejects any RPC
+	// whose bearer token is not signed by this key (design D2: LOCAL verify — every
+	// service holds the shared secret and validates in-process, with NO per-request
+	// round-trip to the auth service, so there is no hot-path dependency on auth's
+	// availability and no added latency).
+	//
+	// SECURITY: required:"true" — the service refuses to start without it. There is
+	// no safe default for a signing key, so fail-fast at boot beats silently running
+	// an unauthenticated (or always-deny) data plane. pkg/auth.NewJWTValidator
+	// additionally rejects a secret shorter than 32 bytes (RFC 7518 §3.2: the HMAC
+	// key must be at least the hash output width — 256 bits for SHA-256).
+	//
+	// SAME KEY ACROSS SERVICES: this is the SAME FP_JWT_SECRET the auth service signs
+	// with. HS256 is symmetric, so every verifier needs the identical secret. In K8s
+	// it is mounted from a Secret (never a ConfigMap — plaintext config is readable by
+	// anyone with get on ConfigMaps), and the platform-wide rotation story is "roll
+	// the shared Secret, restart the fleet" (or asymmetric RS256 with a JWKS endpoint
+	// as the future upgrade, which would replace this field with a public-key URL).
+	JWTSecret string `env:"JWT_SECRET" required:"true"`
 }
 
 func main() {
@@ -323,17 +345,63 @@ func main() {
 	// 8. BUILD gRPC SERVER + REGISTER THE REAL HANDLER (not nil)
 	// ================================================================
 	// grpcutil.NewServer applies the standard interceptor chain (recovery →
-	// logging → …). The serving pod is auth-agnostic on the data plane by design
-	// (the gateway owns identity); control-plane auth (operator-only LoadModel)
-	// is a later concern, added here as an auth validator when implemented.
+	// logging → tracing → AUTH). We now wire the AUTHENTICATION interceptor via
+	// WithAuthValidator so EVERY serving RPC requires a valid JWT and the verified
+	// claims are placed in the request context for any handler authZ check.
+	//
+	// authN vs authZ — the division of labor (interview-critical):
+	//   - AUTHENTICATION (this interceptor, fpauth.NewJWTValidator): "WHO are you?"
+	//     It verifies the bearer token's HS256 signature against FP_JWT_SECRET
+	//     LOCALLY (design D2: in-process verify, no round-trip to the auth service),
+	//     rejects an absent/invalid/expired token with Unauthenticated, and on
+	//     success populates *grpcutil.Claims into the context. It does NOT decide
+	//     what the caller may do.
+	//   - AUTHORIZATION (the handlers' per-RPC permission checks): "MAY you do THIS?"
+	//     A handler reads the claims the interceptor injected (grpcutil.ClaimsFromContext)
+	//     and makes the permission decision — e.g. only an operator/admin identity may
+	//     LoadModel/UnloadModel, only the gateway's identity drives Predict. The
+	//     interceptor guarantees claims are PRESENT; the handler decides if they SUFFICE.
+	//
+	// WHY publicMethods is EMPTY here (default-deny):
+	//   Every RPC on ModelServingService operates on this pod's platform resources —
+	//   the data plane (Predict/StreamPredict) is called by the Inference Gateway,
+	//   a trusted in-cluster service that carries its OWN identity, and the control
+	//   plane (LoadModel/UnloadModel/GetModelStatus/GetModelInfo/ListLoadedModels/
+	//   GetServingMetrics/HealthCheck) is operator/controller-only. NONE of them are
+	//   meant to be reachable WITHOUT a credential (the proto itself states
+	//   "Authorization is enforced by the interceptor chain"). So there are no
+	//   genuinely-public business RPCs to exempt: we skip ONLY the gRPC health +
+	//   reflection infrastructure methods (which the kubelet probe and grpcurl call
+	//   with no token). Adding a new RPC to the proto therefore requires a token by
+	//   default — the secure posture (a new public RPC must be a conscious choice).
+	//
+	//   NOTE: the pod-local HTTP /healthz + /readyz probes are a SEPARATE plaintext
+	//   HTTP/1.1 server (step 10), never touched by this gRPC interceptor — so K8s
+	//   liveness/readiness is unaffected by requiring auth on the gRPC API.
+	validator, err := fpauth.NewJWTValidator([]byte(cfg.JWTSecret))
+	if err != nil {
+		// A bad/short secret is a fatal misconfiguration: starting with a broken
+		// verifier would either reject all traffic or (worse) accept forgeable
+		// tokens. Fail fast at boot so the deploy surfaces the problem loudly.
+		logger.Error("failed to construct JWT validator", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	// publicMethods: this service's genuinely-PUBLIC business RPCs. There are NONE
+	// (see the rationale above) — every serving RPC requires authentication. We
+	// append only the shared health+reflection infra exemptions so the kubelet gRPC
+	// probe and grpcurl/grpcui still work without a token.
+	var publicMethods []string
 	srv := grpcutil.NewServer(
 		grpcutil.WithLogger(logger),
+		grpcutil.WithAuthValidator(validator, append(publicMethods, grpcutil.HealthAndReflectionMethods()...)...),
 		grpcutil.WithReflection(),
 	)
 	// THE REPLACEMENT: the handler now holds the fully-wired domain service, not
 	// nil. Every RPC executes real business logic against the runtime registry.
 	servingv1.RegisterModelServingServiceServer(srv.GRPC, handler.NewServingHandler(svc))
-	logger.Info("serving handler registered with live domain service")
+	logger.Info("serving handler registered with live domain service (auth required on all RPCs)",
+		slog.Any("public_methods", publicMethods), // empty: no unauthenticated business RPCs
+	)
 
 	// ================================================================
 	// 9. EVENT SUBSCRIBERS — the reconcile controller over the bus

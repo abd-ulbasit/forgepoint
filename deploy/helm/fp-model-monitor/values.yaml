@@ -9,9 +9,10 @@
 #   - image.repository → fp-model-monitor
 #   - config: adds retrainCooldown + orchestratorEndpoint (non-secret knobs of
 #     the closed loop); the live-window/retrain-gate store is Redis.
-#   - secrets: NO jwtSecret (this service has no signing key — it VALIDATES JWTs
-#     via the shared auth interceptor, it doesn't mint them). It DOES carry the
-#     Postgres DSN (fp_monitor) and the Redis URL (which may embed a password).
+#   - secrets: carries jwtSecret (the shared auth interceptor VERIFIES incoming
+#     JWTs against it — design D2 local verify; the SAME key the auth service
+#     signs with, this service does NOT mint tokens), plus the Postgres DSN
+#     (fp_monitor) and the Redis URL (which may embed a password).
 #   - networkPolicy egress: adds Redis (live windows + retrain gate) and the
 #     Pipeline Orchestrator in fp-system (the loop-closer gRPC call).
 #
@@ -117,8 +118,10 @@ config:
 #                           Secrets / Sealed Secrets / kubectl). The Deployment
 #                           still envFrom's it.
 #
-# NOTE vs fp-auth: model-monitor has NO jwtSecret (it does not mint tokens). Its
-# secret surface is the Postgres DSN and the Redis URL (both may embed creds).
+# NOTE vs fp-auth: model-monitor does NOT mint tokens, but it MUST verify them — so
+# it DOES carry a jwtSecret (the shared auth interceptor's HS256 verify key, design
+# D2), which must equal the auth service's signing key. Its other secret surface is
+# the Postgres DSN and the Redis URL (both may embed creds).
 # ----------------------------------------------------------------------------
 secrets:
   create: true
@@ -126,6 +129,12 @@ secrets:
   # Defaults to the chart's fullname when empty (see _helpers "secretName").
   existingSecret: ""
   # DEV-ONLY values. Override via --set or a non-committed -f secrets.local.yaml.
+  # JWT verify key the service reads as FP_JWT_SECRET. The shared auth interceptor
+  # validates every incoming JWT against it (local HS256 verify — no call to the auth
+  # service). MUST be the SAME value the fp-auth chart sets for its jwtSecret and >= 32
+  # bytes of entropy (HMAC-SHA256 key floor); the service fails fast otherwise. In prod
+  # this comes from a managed secret store (shared across services), never from git.
+  jwtSecret: "dev-only-change-me-in-prod-min-32-bytes-of-entropy"
   # Full Postgres DSN the service reads as FP_DATABASE_URL. Database is fp_monitor
   # (this service owns it — "database per service"). In prod the password
   # component comes from a managed secret store, not from this file.

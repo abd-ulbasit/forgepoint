@@ -10,9 +10,11 @@
 #   - image.repository → the registry image.
 #   - config adds redisUrl (the CQRS READ projection) and otelInsecure
 #     (registry reads FP_OTEL_INSECURE from config; auth hard-coded it).
-#   - secrets has NO jwtSecret — the registry does NOT sign JWTs; it will
-#     VALIDATE them via the auth-service client (added in the handler phase),
-#     so it carries only the DB DSN as a secret.
+#   - secrets carries jwtSecret — NOT to SIGN tokens (that's auth's job) but to
+#     VERIFY them: under design D2 (local JWT verification, pkg/auth) the registry
+#     checks the HS256 signature IN-PROCESS with the SAME shared key auth signed
+#     with, so the gRPC auth interceptor can authenticate every caller without a
+#     network hop to auth. It must be byte-identical to auth's FP_JWT_SECRET.
 #   - networkPolicy egress adds redis (and keeps postgres + nats + otlp).
 #     The registry does NOT egress to MinIO: artifact BYTES go to object
 #     storage out of band; the registry only records artifact path/digest in
@@ -112,14 +114,23 @@ config:
 #                           named `secrets.existingSecret` out-of-band (External
 #                           Secrets / Sealed Secrets / kubectl). The Deployment
 #                           still envFrom's it.
-# Registry has NO jwtSecret (it does not SIGN tokens — that's auth's job). Its
-# only secret is the Postgres DSN, whose password is the sensitive part.
+# Registry carries TWO secrets: the Postgres DSN (password is the sensitive part)
+# and the shared jwtSecret it uses to VERIFY inbound JWTs (design D2 local verify —
+# it does NOT sign tokens; that's auth's job). The jwtSecret MUST equal auth's
+# FP_JWT_SECRET byte-for-byte, or tokens auth mints fail verification here.
 # ----------------------------------------------------------------------------
 secrets:
   create: true
   # When create=false, the Deployment envFrom's this externally-managed Secret.
   # Defaults to the chart's fullname when empty (see _helpers "secretName").
   existingSecret: ""
+  # Shared HMAC-SHA256 VERIFICATION key (FP_JWT_SECRET). The registry verifies the
+  # signature of inbound JWTs locally with this key (pkg/auth.NewJWTValidator), so
+  # it must be IDENTICAL to auth's jwtSecret. Must be >= 32 bytes of high-entropy
+  # data (RFC 7518 §3.2 — NewJWTValidator rejects a shorter key at startup).
+  # DEV-ONLY placeholder; in prod this comes from the SAME external secret store
+  # entry auth reads, never from this committed file.
+  jwtSecret: "dev-only-change-me-in-prod-min-32-bytes-of-entropy"
   # Full Postgres DSN the service reads as FP_DATABASE_URL. The database is
   # "fp_registry" (database-per-service). In prod the password component comes
   # from a managed secret store, not from this file.

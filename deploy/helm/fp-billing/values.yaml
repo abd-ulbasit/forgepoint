@@ -10,8 +10,11 @@
 #   - DATA STORES: Postgres (the per-service `fp_billing` DB — also home to the
 #     OUTBOX table) + NATS (the relay publishes outbox events; a consumer meters
 #     inference events). NO Redis, NO MinIO for billing.
-#   - SECRET: only FP_DATABASE_URL. Billing VALIDATES JWT claims (via an auth
-#     interceptor) but never SIGNS tokens, so it has no FP_JWT_SECRET like auth.
+#   - SECRET: FP_DATABASE_URL + FP_JWT_SECRET. Billing VALIDATES JWT claims (via
+#     the auth interceptor, design D2 local verify) but never SIGNS tokens — it
+#     still needs the SAME shared HMAC key the auth service signs with in order to
+#     verify signatures, so FP_JWT_SECRET is a billing secret too (a verify key, not
+#     a signing key).
 #   - CONFIG: adds FP_DEFAULT_CURRENCY (ISO-4217 settlement currency).
 #
 # SECURITY CONTRACT (read this before touching `secrets:` below):
@@ -113,7 +116,9 @@ config:
 #                           Secrets / Sealed Secrets / kubectl). The Deployment
 #                           still envFrom's it.
 #
-# Billing has ONE secret: the Postgres DSN. (No JWT signing key — see the header.)
+# Billing has TWO secrets: the Postgres DSN and the JWT VERIFY key (FP_JWT_SECRET,
+# the shared HMAC key the auth interceptor uses to verify token signatures — see
+# the header). Neither is a JWT SIGNING key; billing never mints tokens.
 # ----------------------------------------------------------------------------
 secrets:
   create: true
@@ -126,6 +131,14 @@ secrets:
   # cross-service DB access). In prod the password comes from a managed secret
   # store, not from this file.
   databaseUrl: "postgres://billing:dev-only-change-me@postgres.fp-infra.svc.cluster.local:5432/fp_billing?sslmode=disable"
+  # FP_JWT_SECRET — the shared HMAC-SHA256 key the auth interceptor uses to VERIFY
+  # JWT signatures (design D2 local verify). It MUST be the SAME value the auth
+  # service signs with (fp-auth's secrets.jwtSecret), or billing will reject every
+  # token auth issued. Must be >= 32 bytes of high-entropy data in prod (the service
+  # refuses to start on a shorter secret). DEV-ONLY placeholder here; in prod this is
+  # synced from a managed secret store (External Secrets / Sealed Secrets) so the
+  # cluster's services share one key without it touching git.
+  jwtSecret: "dev-only-change-me-in-prod-min-32-bytes-of-entropy"
 
 # ----------------------------------------------------------------------------
 # Migrations — self-contained schema migrations via a migrate initContainer.
