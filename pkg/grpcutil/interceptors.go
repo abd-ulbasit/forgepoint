@@ -542,6 +542,63 @@ func AuthStreamInterceptor(validator TokenValidator, opts ...AuthOption) grpc.St
 	}
 }
 
+// ============================================================================
+// HEALTH + REFLECTION SKIP LIST (CANONICAL, SHARED ACROSS ALL SERVICES)
+// ============================================================================
+
+// HealthAndReflectionMethods returns the gRPC full-method strings that every
+// Forgepoint service MUST exempt from authentication.
+//
+// WHY these four methods (and nothing else):
+//
+//   - /grpc.health.v1.Health/Check: Kubernetes liveness/readiness probes call
+//     this from the kubelet — no credential. If auth intercepts it the pod never
+//     becomes Ready (fails its own probe → restarts → fails again, forever).
+//
+//   - /grpc.health.v1.Health/Watch: The streaming variant of Check. A K8s probe
+//     may use either form; both must be open.
+//
+//   - /grpc.reflection.v1.ServerReflection/ServerReflectionInfo: grpcurl and
+//     grpcui call this to discover services and methods in dev/staging. When
+//     reflection is enabled (WithReflection()), it must be exempt or discovery
+//     breaks entirely (you'd need a token just to list available RPCs).
+//
+//   - /grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo: The
+//     older v1alpha reflection endpoint. Some clients (older grpcurl, Postman)
+//     still use this. Both must be exempt for full compatibility.
+//
+// WHERE THIS FUNCTION LIVES (and why here, not in services/auth/internal/authn):
+//
+//   services/auth/internal/authn/skip.go defines an identical HealthAndReflection-
+//   Methods() locally. That was the right place BEFORE this shared package
+//   existed — but it means every service would need to either import auth's
+//   internal package (a Clean Architecture violation) or duplicate the list.
+//
+//   By moving the canonical copy here, into the package that already owns
+//   the skip-list mechanism (WithSkipMethods, AuthOption), we give every
+//   service a single import-free source of truth:
+//
+//     grpcutil.WithAuthValidator(validator,
+//         append(servicePublicMethods, grpcutil.HealthAndReflectionMethods()...)...,
+//     )
+//
+//   The auth service will adopt this in a follow-up (the local copy in authn/
+//   can delegate to or be replaced by this function without any call-site change).
+//
+// INTERVIEW: "Why don't you require a token to check the health endpoint?"
+//   K8s probes originate from the kubelet process on the node — there is no
+//   mechanism to pass a credential. The health endpoint's threat model is
+//   availability (anyone can see SERVING/NOT_SERVING), not confidentiality.
+//   Requiring auth there would make the service undeployable in Kubernetes.
+func HealthAndReflectionMethods() []string {
+	return []string{
+		"/grpc.health.v1.Health/Check",
+		"/grpc.health.v1.Health/Watch",
+		"/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
+		"/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo",
+	}
+}
+
 // logLevelForCode maps a gRPC status code to a slog level. Shared by the unary
 // and stream logging interceptors so their log levels stay consistent.
 //
