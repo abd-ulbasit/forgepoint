@@ -388,13 +388,23 @@ func (s *experimentService) GetRun(ctx context.Context, actor Actor, id string) 
 	return s.loadRunForTeam(ctx, id, actor.Team)
 }
 
-// ListRuns returns a team-scoped page of runs in an experiment, optionally
-// filtered by status. The experiment's team is verified first.
+// ListRuns returns a team-scoped page of runs, optionally filtered by status.
+//
+// experimentID is an OPTIONAL filter:
+//   - non-empty: the experiment's team is verified first (the per-experiment
+//     ownership gate), then its runs are listed.
+//   - empty: ALL of the caller team's runs are listed across every experiment
+//     (the unscoped runs view). Here the TEAM filter on the join IS the tenancy
+//     boundary — there is no experiment to ownership-check, so we never return
+//     another team's runs and never need (or have) an id to gate on.
 func (s *experimentService) ListRuns(ctx context.Context, actor Actor, experimentID string, statusFilter RunStatus, opts ListOptions) ([]Run, string, error) {
+	opts.PageSize = clampPageSize(opts.PageSize, DefaultPageSize, MaxPageSize)
+	if experimentID == "" {
+		return s.runRepo.ListRunsByTeam(ctx, actor.Team, statusFilter, opts)
+	}
 	if _, err := s.fetchExperimentForTeam(ctx, experimentID, actor.Team); err != nil {
 		return nil, "", err
 	}
-	opts.PageSize = clampPageSize(opts.PageSize, DefaultPageSize, MaxPageSize)
 	return s.runRepo.ListRuns(ctx, experimentID, statusFilter, opts)
 }
 

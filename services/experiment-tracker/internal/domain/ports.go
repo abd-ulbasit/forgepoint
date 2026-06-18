@@ -124,6 +124,11 @@ type RunRepository interface {
 	// ListRuns returns a page of runs in an experiment, optionally filtered by
 	// status (RunStatusUnspecified = no filter), plus a nextToken cursor.
 	ListRuns(ctx context.Context, experimentID string, statusFilter RunStatus, opts ListOptions) (runs []Run, nextToken string, err error)
+	// ListRunsByTeam returns a page of ALL runs owned by a team (across every
+	// experiment), newest-first, optionally status-filtered. Used by the unscoped
+	// runs view (no experiment_id). Team is the tenancy boundary: runs join their
+	// parent experiment and only that team's runs are returned.
+	ListRunsByTeam(ctx context.Context, team string, statusFilter RunStatus, opts ListOptions) (runs []Run, nextToken string, err error)
 	// UpdateRunStatus transitions a run to a terminal state and stamps EndedAt
 	// and the computed FinalMetrics in ONE write. The service has already
 	// validated the transition and computed the finals. Returns the updated Run.

@@ -632,10 +632,10 @@ func (h *ExperimentHandler) ListRuns(ctx context.Context, req *experimentv1.List
 		return nil, err
 	}
 
-	if req.GetExperimentId() == "" {
-		return nil, status.Error(codes.InvalidArgument, "experiment_id is required")
-	}
-
+	// experiment_id is an OPTIONAL filter, NOT required: an empty value lists ALL
+	// of the caller team's runs across every experiment (the unscoped runs view
+	// the UI opens by default). The domain scopes that listing by the caller team,
+	// so an empty filter is a team-bounded list-all, never an open one.
 	opts, ok := listOptionsFromProto(req.GetPagination(), defaultPageSize, maxPageSize)
 	if !ok {
 		return nil, status.Error(codes.InvalidArgument, "page_size must not be negative")

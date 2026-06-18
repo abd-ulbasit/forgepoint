@@ -1289,13 +1289,29 @@ func TestListRuns_UnspecifiedFilter_MeansNoFilter(t *testing.T) {
 	}
 }
 
-func TestListRuns_Validation_EmptyExperimentID(t *testing.T) {
-	mock := &mockService{}
+// An empty experiment_id is the UNSCOPED runs view (list all of the caller
+// team's runs) — NOT an error. The handler must forward the empty filter to the
+// domain (which scopes by team), not reject it. Regression test for the live-UI
+// finding where GET /runs (no experiment_id) returned 400 and the Experiments
+// page could not render.
+func TestListRuns_EmptyExperimentID_ListsAllTeamRuns(t *testing.T) {
+	var gotExpID string
+	mock := &mockService{
+		listRunsFn: func(ctx context.Context, actor domain.Actor, experimentID string, statusFilter domain.RunStatus, opts domain.ListOptions) ([]domain.Run, string, error) {
+			gotExpID = experimentID
+			return nil, "", nil
+		},
+	}
 	client := newTestClient(t, mock, testClaims)
 	_, err := client.ListRuns(authCtx(), &experimentv1.ListRunsRequest{})
-	requireCode(t, err, codes.InvalidArgument)
-	if mock.calls != 0 {
-		t.Fatalf("domain called %d times; want 0", mock.calls)
+	if err != nil {
+		t.Fatalf("empty experiment_id should list all team runs, got error: %v", err)
+	}
+	if mock.calls != 1 {
+		t.Fatalf("domain called %d times; want 1", mock.calls)
+	}
+	if gotExpID != "" {
+		t.Fatalf("experimentID forwarded to domain = %q; want empty (list-all)", gotExpID)
 	}
 }
 

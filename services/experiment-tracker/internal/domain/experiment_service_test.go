@@ -117,6 +117,20 @@ func (m *mockRunRepo) ListRuns(ctx context.Context, experimentID string, statusF
 	}
 	return out, "", nil
 }
+
+// ListRunsByTeam returns every run the mock holds (status-filtered), standing in
+// for the real join-by-team. The unscoped-listing path is exercised by passing an
+// empty experimentID to the service.
+func (m *mockRunRepo) ListRunsByTeam(ctx context.Context, team string, statusFilter domain.RunStatus, opts domain.ListOptions) ([]domain.Run, string, error) {
+	var out []domain.Run
+	for _, r := range m.runs {
+		if statusFilter != domain.RunStatusUnspecified && r.Status != statusFilter {
+			continue
+		}
+		out = append(out, r)
+	}
+	return out, "", nil
+}
 func (m *mockRunRepo) UpdateRunStatus(ctx context.Context, runID string, status domain.RunStatus, endedAt time.Time, finalMetrics []domain.MetricPoint) (domain.Run, error) {
 	r, ok := m.runs[runID]
 	if !ok {

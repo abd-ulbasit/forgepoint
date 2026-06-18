@@ -242,6 +242,72 @@ func (r *RunRepository) ListRuns(ctx context.Context, experimentID string, statu
 	return runs, nextToken, nil
 }
 
+// ListRunsByTeam returns ALL runs owned by a team across every experiment,
+// newest-first, optionally status-filtered (the unscoped runs view).
+//
+// TENANCY: runs carry no team of their own — team lives on the parent
+// experiment — so we JOIN runs to experiments and filter on experiments.team.
+// That join predicate IS the tenancy boundary: a team can never page another
+// team's runs. Same keyset cursor as ListRuns, keyed on the runs row
+// (rn.started_at, rn.id). The SELECT list is runColumns with the `rn` alias so
+// the bare `id` is unambiguous against experiments.id; column ORDER mirrors
+// runColumns/scanRun exactly.
+func (r *RunRepository) ListRunsByTeam(ctx context.Context, team string, statusFilter domain.RunStatus, opts domain.ListOptions) ([]domain.Run, string, error) {
+	pageSize := opts.PageSize
+	if pageSize <= 0 {
+		pageSize = defaultPageSize
+	}
+	cur, err := decodeListCursor(opts.PageToken)
+	if err != nil {
+		return nil, "", fmt.Errorf("list runs by team: %w", err)
+	}
+
+	args := []any{team}
+	where := "WHERE e.team = $1"
+	if statusFilter != domain.RunStatusUnspecified {
+		args = append(args, string(statusFilter))
+		where += fmt.Sprintf(" AND rn.status = $%d", len(args))
+	}
+	if cur != nil {
+		args = append(args, cur.TS, cur.ID)
+		where += fmt.Sprintf(" AND (rn.started_at, rn.id) < ($%d, $%d)", len(args)-1, len(args))
+	}
+	args = append(args, pageSize+1)
+	q := fmt.Sprintf(`
+		SELECT rn.id, rn.experiment_id, rn.display_name, rn.status, rn.source, rn.model_version_id, rn.owner_id, rn.final_metrics, rn.artifacts, rn.started_at, rn.ended_at
+		FROM runs rn
+		JOIN experiments e ON e.id = rn.experiment_id
+		%s
+		ORDER BY rn.started_at DESC, rn.id DESC
+		LIMIT $%d`, where, len(args))
+
+	rows, err := r.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, "", fmt.Errorf("list runs by team: %w", err)
+	}
+	defer rows.Close()
+
+	runs := make([]domain.Run, 0, pageSize)
+	for rows.Next() {
+		run, err := scanRun(rows)
+		if err != nil {
+			return nil, "", err
+		}
+		runs = append(runs, run)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", fmt.Errorf("iterate runs: %w", err)
+	}
+
+	nextToken := ""
+	if len(runs) > pageSize {
+		runs = runs[:pageSize]
+		last := runs[len(runs)-1]
+		nextToken = encodeListCursor(listCursor{TS: last.StartedAt, ID: last.ID})
+	}
+	return runs, nextToken, nil
+}
+
 // UpdateRunStatus stamps the terminal transition: status, ended_at, and the
 // computed final_metrics in ONE write. The service has already validated the
 // transition (CanTransitionTo) and computed the finals. Persisting all three in a
