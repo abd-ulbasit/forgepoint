@@ -7,7 +7,7 @@
 // password lives; we never log it and never put credentials in the URL.
 
 import { useState, type FormEvent } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { Navigate, useNavigate, useSearchParams } from 'react-router-dom'
 import { useAuth } from '@/auth/AuthContext'
 import { ApiError } from '@/api/client'
 import { Spinner } from '@/components/states'
@@ -27,9 +27,13 @@ export function LoginPage() {
   const from = rawFrom && rawFrom.startsWith('/') && !rawFrom.startsWith('//') ? rawFrom : '/'
 
   // Already logged in (e.g. navigated to /login manually) -> go home.
-  if (isAuthenticated) {
-    navigate(from, { replace: true })
-  }
+  // WHY <Navigate> instead of navigate(): calling navigate() during render is
+  // a React anti-pattern — it triggers a Router state update as a side-effect
+  // of rendering, which React 18 Strict Mode flags and which can cause double
+  // renders / infinite loops in transitions. <Navigate> is declarative: it
+  // returns a redirect element that React Router handles cleanly via its own
+  // renderer, with no side-effects in the component's render phase.
+  if (isAuthenticated) return <Navigate to={from} replace />
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault()

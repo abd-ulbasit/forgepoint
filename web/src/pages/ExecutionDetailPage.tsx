@@ -182,6 +182,17 @@ function StepRow({ step, highlight }: { step: StepExecution; highlight: boolean 
   )
 }
 
+// LiveBadge truth table — every state the hook can surface:
+//
+//   closed / isTerminal → "Finished"    (grey)
+//   open                → "Live"        (blue, pulsing dot)
+//   connecting          → "Connecting…" (blue, pulsing dot)
+//   reconnecting        → "Reconnecting…" (amber, pulsing) — REAL backoff retry
+//   error               → "Stream error"  (red, static dot) — retries exhausted
+//
+// Previously 'error' rendered as "Reconnecting" even though no reconnect was
+// happening. Now the badge is honest: 'reconnecting' is a real transient retry
+// state, and 'error' is only shown when all attempts are exhausted.
 function LiveBadge({ connState, isTerminal }: { connState: string; isTerminal: boolean }) {
   if (isTerminal || connState === 'closed') {
     return (
@@ -198,9 +209,17 @@ function LiveBadge({ connState, isTerminal }: { connState: string; isTerminal: b
       </span>
     )
   }
+  if (connState === 'reconnecting') {
+    return (
+      <span className="pill bg-amber-50 text-amber-700 ring-amber-200">
+        <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-current" /> Reconnecting…
+      </span>
+    )
+  }
+  // connState === 'error': all reconnect attempts exhausted — show the truth.
   return (
-    <span className="pill bg-amber-50 text-amber-700 ring-amber-200">
-      <span className="h-1.5 w-1.5 rounded-full bg-current" /> Reconnecting
+    <span className="pill bg-red-50 text-red-700 ring-red-200">
+      <span className="h-1.5 w-1.5 rounded-full bg-current" /> Stream error
     </span>
   )
 }
