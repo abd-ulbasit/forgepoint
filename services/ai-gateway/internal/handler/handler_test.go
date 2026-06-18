@@ -289,7 +289,11 @@ func TestListProviders_MapsRegistryWithCircuitState(t *testing.T) {
 
 func TestPromptRPCs_Unimplemented(t *testing.T) {
 	t.Parallel()
-	// The four prompt RPCs return Unimplemented (L3 fills them) via the embedded base.
+	// newClient wires via NewHandler (NO prompt service), the chat-only / no-database
+	// path. The four prompt RPCs (now IMPLEMENTED in prompt_rpcs.go) SELF-GATE: with a
+	// nil prompt service they return Unimplemented — the same contract the embedded
+	// base gave. This is the regression guard for the DB self-gating behavior; the
+	// wired path is covered by prompt_rpcs_test.go.
 	svc := &fakeService{}
 	client := newClient(t, svc, "team-x")
 

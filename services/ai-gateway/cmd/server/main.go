@@ -26,12 +26,18 @@
 //  10. Graceful shutdown — deferred LIFO: drain gRPC → drain NATS → close Redis →
 //     close health → flush OTel.
 //
-// DATA STORES — WHY REDIS + NATS, NO POSTGRES (like the inference gateway): the
-// gateway is on the hot path of every completion; its state is ephemeral, high-
-// churn, latency-critical, and NOT a system of record (token-budget buckets,
+// DATA STORES — WHY REDIS + NATS for the CORE, and OPTIONAL POSTGRES for L3: the
+// gateway is on the hot path of every completion; its hot-path state is ephemeral,
+// high-churn, latency-critical, and NOT a system of record (token-budget buckets,
 // breaker counters). That is Redis's profile. The durable cost ledger lives in
 // Billing (fed by our fp.ai.completion.served events); the warm-signal lag lives in
-// NATS. The prompt registry (L3) WILL add Postgres; this core does not.
+// NATS. The PROMPT REGISTRY (L3) adds an OPTIONAL Postgres database — its only
+// relational, system-of-record concern (versioned, team-scoped prompt templates).
+// It SELF-GATES on FP_DATABASE_URL: absent → the gateway runs chat-only and the
+// prompt RPCs return Unimplemented; present → the prompt registry is wired live. A
+// failed prompt-DB connect DEGRADES the prompt surface, it never fails the gateway
+// (Redis/NATS are hot-path-critical and DO fail fast; the prompt DB does not). See
+// step 6b below.
 // ============================================================================
 package main
 
@@ -58,7 +64,9 @@ import (
 	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/embed"
 	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/events"
 	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/handler"
+	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/prompt"
 	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/providers"
+	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/repository/postgres"
 	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/usage"
 	goredis "github.com/redis/go-redis/v9"
 )
@@ -275,6 +283,48 @@ func main() {
 	})
 	logger.Info("ai-gateway domain service constructed (ollama + stub, failover order)")
 
+	// 6b. PROMPT REGISTRY (L3) — Postgres-backed, SELF-GATING on FP_DATABASE_URL.
+	//
+	// THE SELF-GATING CONTRACT: the gateway's CORE is Redis-only and must run
+	// chat-only WITHOUT a database. The prompt registry is an OPTIONAL, Postgres-
+	// backed add-on. So:
+	//   - No FP_DATABASE_URL set  → we skip the DB entirely, leave promptSvc nil, and
+	//     the four prompt RPCs return codes.Unimplemented (the embedded base). The
+	//     gateway still serves ChatCompletion/ListProviders/GetUsage normally.
+	//   - FP_DATABASE_URL set     → we connect a pgx pool (fail-fast ping in the
+	//     constructor) and wire the PromptService. The prompt RPCs become live.
+	//
+	// WHY a failed connect does NOT os.Exit: a transient DB outage must not take down
+	// the whole gateway (which can serve completions without a prompt DB). On a connect
+	// error we LOG it and proceed with promptSvc nil — the prompt RPCs degrade to
+	// Unimplemented, everything else keeps working. This is graceful degradation, not a
+	// hard dependency. (Contrast Redis/NATS above, which ARE hot-path-critical and DO
+	// fail fast — the gateway is useless without them.)
+	var promptSvc prompt.PromptService
+	var promptStore *postgres.PromptStore
+	if cfg.DatabaseURL == "" {
+		logger.Info("prompt registry DISABLED: no FP_DATABASE_URL set; prompt RPCs return Unimplemented (chat-only mode)")
+	} else {
+		dbCtx, dbCancel := context.WithTimeout(ctx, 10*time.Second)
+		store, dbErr := postgres.NewPromptStore(dbCtx, cfg.DatabaseURL)
+		dbCancel()
+		if dbErr != nil {
+			// DEGRADE, don't die: the gateway runs chat-only; prompt RPCs stay Unimplemented.
+			logger.Error("prompt registry DB connect failed; continuing WITHOUT prompt registry (prompt RPCs return Unimplemented)",
+				slog.String("error", dbErr.Error()))
+		} else {
+			promptStore = store
+			promptSvc = prompt.NewPromptService(store, prompt.UUIDGenerator{}, prompt.RealClock{})
+			logger.Info("prompt registry ENABLED (Postgres-backed, versioned, team-scoped)")
+		}
+	}
+	// Close the pool at shutdown (only when we actually opened one).
+	defer func() {
+		if promptStore != nil {
+			promptStore.Close()
+		}
+	}()
+
 	// 7. gRPC SERVER + AUTH.
 	//
 	// authN ("WHO are you?") is the shared JWT interceptor (local HMAC verification,
@@ -298,8 +348,13 @@ func main() {
 		grpcutil.WithAuthValidator(validator, append(publicMethods, grpcutil.HealthAndReflectionMethods()...)...),
 		grpcutil.WithReflection(),
 	)
-	aiv1.RegisterAIGatewayServiceServer(srv.GRPC, handler.NewHandler(svc))
-	logger.Info("ai-gateway handler registered (real service wired)", slog.Any("public_methods", publicMethods))
+	// Wire BOTH services into the handler. promptSvc may be nil (no database) — then
+	// NewHandlerWithPrompts is equivalent to NewHandler and the prompt RPCs stay
+	// Unimplemented. One construction path regardless of whether the DB is present.
+	aiv1.RegisterAIGatewayServiceServer(srv.GRPC, handler.NewHandlerWithPrompts(svc, promptSvc))
+	logger.Info("ai-gateway handler registered (real service wired)",
+		slog.Any("public_methods", publicMethods),
+		slog.Bool("prompt_registry_enabled", promptSvc != nil))
 
 	// 8. HEALTH SERVER (separate port; real dep checks for readiness).
 	healthHandler := health.New()

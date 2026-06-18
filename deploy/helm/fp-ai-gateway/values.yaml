@@ -164,19 +164,50 @@ secrets:
   # short (<32B), or the old dev-only placeholder key, so `helm install` ERRORS
   # until you supply a real key (--set, a non-committed -f, or secrets.existingSecret).
   jwtSecret: ""
+  # OPTIONAL (L3 PROMPT REGISTRY) — the Postgres DSN the service reads as
+  # FP_DATABASE_URL. The prompt registry is a versioned, team-scoped prompt-template
+  # store; it is the ONLY relational concern the gateway owns. EMPTY BY DEFAULT: with
+  # no DSN the secret omits FP_DATABASE_URL, the app self-gates to chat-only (prompt
+  # RPCs return Unimplemented), and the migrate initContainer is gated off. SET this
+  # (to a "fp_ai_gateway" database DSN) to enable the prompt registry — the migrate
+  # initContainer then applies the schema before the app starts. In prod the password
+  # comes from a managed secret store, never this committed file.
+  databaseUrl: ""
 
 # ----------------------------------------------------------------------------
-# Migrations — DISABLED: this service has NO Postgres database.
+# Migrations — the self-contained prompt-registry schema migration (L3).
 # ----------------------------------------------------------------------------
-# The platform's migrate initContainer pattern (a golang-migrate initContainer
-# that applies schema migrations before the app starts) only applies to
-# Postgres-backed services. This service owns no relational schema — there is
-# nothing to migrate — so we explicitly turn the step off. The Deployment also
-# self-gates on a DSN being present (secrets.databaseUrl / existingSecret), which
-# this chart never sets, so even if flipped on by mistake no initContainer would
-# render. Kept here as an explicit, documented opt-out rather than an absent key.
+# The gateway's CORE owns no Postgres; the L3 PROMPT REGISTRY does. When
+# `migrations.enabled` is true AND a DSN is available (secrets.databaseUrl set, or an
+# existingSecret), the Deployment runs a golang-migrate initContainer BEFORE the app
+# container, applying deploy/helm/fp-ai-gateway/migrations/*.sql (a byte-identical
+# copy of services/ai-gateway/migrations/) so the prompt schema is ready before any
+# traffic. The step is IDEMPOTENT (golang-migrate records the applied version).
+#
+# DOUBLE-GATE: enabling this WITHOUT a database renders no initContainer (the
+# Deployment self-gates on the DSN), and the APP independently self-gates on
+# FP_DATABASE_URL — so "migrations.enabled: true, databaseUrl: ''" is a safe no-op:
+# the gateway simply runs chat-only. Set databaseUrl to turn the prompt registry on.
 migrations:
-  enabled: false
+  # Default true so that the MOMENT a databaseUrl is supplied the schema is applied.
+  # With databaseUrl empty (the default) this is a no-op — the DSN gate keeps the
+  # initContainer from rendering, so a chat-only gateway is unaffected.
+  enabled: true
+  image:
+    # golang-migrate official image. Alpine-based, so it has /bin/sh (needed to
+    # expand the DSN from env without baking it into the pod spec) and the `migrate`
+    # binary on PATH. Pinned to an immutable tag for reproducible rollouts.
+    repository: migrate/migrate
+    tag: v4.18.3
+    pullPolicy: IfNotPresent
+  # Modest resources: the migrate step is short-lived and IO-light.
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
 
 # ----------------------------------------------------------------------------
 # Resources — requests AND limits both set (a "Guaranteed" QoS-friendly shape).
@@ -415,6 +446,15 @@ networkPolicy:
       enabled: true
       namespace: fp-infra
       port: 6379
+    # Postgres (fp-infra:5432) — the L3 PROMPT REGISTRY store. Enabled by default so
+    # that the moment a databaseUrl is supplied the app (and the migrate initContainer)
+    # can reach Postgres. Harmless when the prompt registry is off: the app never dials
+    # Postgres without FP_DATABASE_URL, so the open egress is simply unused. Disable it
+    # explicitly if your policy forbids opening a port the chat-only mode won't use.
+    postgres:
+      enabled: true
+      namespace: fp-infra
+      port: 5432
     nats:
       enabled: true
       namespace: fp-infra

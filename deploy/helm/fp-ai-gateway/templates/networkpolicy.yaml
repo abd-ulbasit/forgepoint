@@ -75,7 +75,7 @@ spec:
           port: 53
     {{- end }}
     {{- if .Values.networkPolicy.egress.redis.enabled }}
-    # Redis (the gateway's ONLY datastore: rate-limit token buckets, the route
+    # Redis (the gateway's hot-path datastore: rate-limit token buckets, the route
     # table mirror, the quota cache, and shared circuit-breaker state).
     - to:
         - namespaceSelector:
@@ -84,6 +84,20 @@ spec:
       ports:
         - protocol: TCP
           port: {{ .Values.networkPolicy.egress.redis.port }}
+    {{- end }}
+    {{- if .Values.networkPolicy.egress.postgres.enabled }}
+    # Postgres (fp-infra:5432) — the L3 PROMPT REGISTRY store. The app dials it ONLY
+    # when FP_DATABASE_URL is configured (chat-only mode never opens this connection),
+    # and the migrate initContainer needs it to apply the prompt schema before startup.
+    # Opening the egress is harmless when the prompt registry is off — it is simply
+    # unused. This is the egress the reference chart (fp-registry) also carries.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.egress.postgres.namespace }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.egress.postgres.port }}
     {{- end }}
     {{- if .Values.networkPolicy.egress.nats.enabled }}
     # NATS JetStream (async event bus): publishes Inference{Completed,Failed} and

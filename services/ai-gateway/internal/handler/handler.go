@@ -32,25 +32,49 @@
 // ============================================================================
 //
 // We embed aiv1.UnimplementedAIGatewayServiceServer so the handler satisfies the
-// full server interface immediately and is forward-compatible: the four prompt RPCs
-// (CreatePrompt/GetPrompt/ListPrompts/RenderPrompt) are L3 work and return the
-// embedded base's codes.Unimplemented until then — a real, correct gRPC error, never
-// a panic. ChatCompletion/ListProviders/GetUsage are implemented below.
+// full server interface immediately and is forward-compatible. The four prompt RPCs
+// (CreatePrompt/GetPrompt/ListPrompts/RenderPrompt) are now IMPLEMENTED (L3,
+// prompt_rpcs.go) but remain conditionally available: when the prompt registry is
+// wired (a database is configured) they serve real responses; when it is NOT wired
+// (h.prompts == nil), each overriding method returns codes.Unimplemented itself —
+// the SAME contract the embedded base would give. So the embed still buys forward-
+// compatibility for any future RPC, while the prompt RPCs self-gate on the registry
+// being present. ChatCompletion/ListProviders/GetUsage are implemented in rpcs.go.
 package handler
 
 import (
 	aiv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/ai/v1"
 	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/domain"
+	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/prompt"
 )
 
 // AIGatewayHandler is the gRPC server implementation for the AI Gateway.
+//
+// It carries TWO domain services, each independently optional:
+//   - svc (GatewayService): the hot-path chat/usage/providers logic. Always wired.
+//   - prompts (prompt.PromptService): the L3 PROMPT REGISTRY, Postgres-backed. It is
+//     wired ONLY when a database is configured (FP_DATABASE_URL). When nil, the four
+//     prompt RPCs fall back to the embedded UnimplementedAIGatewayServiceServer base
+//     (a real codes.Unimplemented), so the gateway runs chat-only with no database.
+//     This is the DB SELF-GATING contract: a missing prompt DB degrades the prompt
+//     surface, it never takes down the whole gateway.
 type AIGatewayHandler struct {
 	aiv1.UnimplementedAIGatewayServiceServer // embedded by value (forward-compat base).
 	svc                                      domain.GatewayService
+	prompts                                  prompt.PromptService // nil → prompt RPCs stay Unimplemented
 }
 
-// NewHandler builds the handler over a domain service. svc must be non-nil for the
-// implemented RPCs; the embedded base answers the unimplemented prompt RPCs.
+// NewHandler builds the handler over the gateway service ONLY (no prompt registry).
+// The four prompt RPCs return codes.Unimplemented via the embedded base. main.go uses
+// this when no database is configured.
 func NewHandler(svc domain.GatewayService) *AIGatewayHandler {
 	return &AIGatewayHandler{svc: svc}
+}
+
+// NewHandlerWithPrompts builds the handler with BOTH the gateway service and the
+// prompt registry live. main.go uses this when a database is configured. A nil
+// prompts argument is equivalent to NewHandler (the prompt RPCs stay Unimplemented),
+// so the wiring site can pass whatever it constructed without a branch.
+func NewHandlerWithPrompts(svc domain.GatewayService, prompts prompt.PromptService) *AIGatewayHandler {
+	return &AIGatewayHandler{svc: svc, prompts: prompts}
 }
