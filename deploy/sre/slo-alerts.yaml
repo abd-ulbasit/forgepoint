@@ -1,0 +1,469 @@
+# =============================================================================
+# SLO ALERT RULES — Forgepoint Platform (Phase 15)
+# =============================================================================
+#
+# PATTERN: Multi-window, multi-burn-rate (Google SRE Workbook Chapter 5/6).
+#
+# WHY THIS IS BETTER THAN THRESHOLD ALERTS:
+#   "error_rate > 1% for 5m" has two failure modes:
+#     - False-positive: a 30-second spike of bad requests never affects the SLO
+#       meaningfully but still pages the on-call engineer at 3am.
+#     - False-negative: a steady 0.5% error rate will miss the monthly SLO but
+#       never triggers the alert.
+#
+#   Burn-rate alerts fix both:
+#     - They care about ERROR BUDGET CONSUMPTION RATE, not raw rate.
+#     - The DUAL WINDOW (short confirms the event is real; long confirms it
+#       persists) eliminates transient spikes from pages.
+#
+# ALERT TIERS (both tiers must fire for the dual-window rule):
+#   FAST-BURN  (severity: critical → PagerDuty/wake someone up):
+#     Both windows fire: burn_rate > 14.4 for 1h AND > 14.4 for 5m
+#     → budget exhausted in ~2 hours at this rate
+#
+#   SLOW-BURN  (severity: warning → create a ticket, no page):
+#     Both windows fire: burn_rate > 6 for 6h AND > 6 for 30m
+#     → budget exhausted in ~5 days at this rate
+#
+# RECORDING RULE DEPENDENCY:
+#   All alert expressions reference pre-computed recording rules from
+#   slo-recording-rules.yaml (fp:<service>:burn_rate:<window>).
+#   Both files MUST be loaded for these alerts to evaluate correctly.
+#
+# RUNBOOK LINKS:
+#   Each alert carries a runbook_url annotation pointing to the specific
+#   runbook in docs/runbooks/. The URL is relative to the Git repo root so
+#   it works both locally and on GitHub Pages once published (Phase 26).
+#
+# HOW TO TEST AN ALERT WITHOUT PROD LOAD:
+#   kubectl port-forward -n fp-infra svc/prometheus 9090:9090
+#   # In the Prometheus UI → Alerts tab — watch for PENDING → FIRING state.
+#   # To force-fire a specific alert for drill purposes, temporarily set the
+#   # recording rule expression to a constant > threshold, e.g.:
+#   #   fp:inference_gateway:burn_rate:5m = 20
+#   # then revert after the drill.
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: forgepoint-slo-alerts
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: forgepoint-slo
+    app.kubernetes.io/component: sre
+    app.kubernetes.io/part-of: forgepoint
+    prometheus: forgepoint
+    role: alert-rules
+spec:
+  groups:
+
+    # =========================================================================
+    # INFERENCE GATEWAY — SLO Alerts (99.9% availability)
+    # =========================================================================
+    - name: slo:inference_gateway:alerts
+      rules:
+
+        # FAST-BURN: error budget exhausted in < 2 hours. Wake the on-call.
+        # Both windows (1h long + 5m short) must exceed 14.4× burn rate.
+        # 14.4 = 1% budget / (1h/720h) — burning in 1h means 720× monthly rate;
+        # normalized to 2h-to-exhaustion: (720h/30days) * (1/24) * 2 = 14.4×.
+        - alert: InferenceGatewayFastBurn
+          expr: |
+            fp:inference_gateway:burn_rate:1h > 14.4
+            and
+            fp:inference_gateway:burn_rate:5m > 14.4
+          for: 2m
+          # `for: 2m` — the PENDING grace period. Both burn rates must stay
+          # above the threshold for 2 minutes before FIRING. This handles
+          # metric ingestion jitter. Keep this short (2-5m) for fast burns —
+          # you want to page quickly.
+          labels:
+            severity: critical
+            team: platform
+            service: inference-gateway
+            slo: availability
+            burn_tier: fast
+          annotations:
+            summary: "Inference gateway burning error budget at >14.4× (fast burn)"
+            description: |
+              Inference gateway is returning errors at a rate that will exhaust
+              the monthly 99.9% SLO error budget in under 2 hours.
+              Current 1h burn rate: {{ $value | humanize }}×.
+              Any sustained prediction failures directly impact end-users and
+              downstream billing metering.
+            runbook_url: "https://github.com/abd-ulbasit/forgepoint/blob/main/docs/runbooks/high-error-rate.md"
+            dashboard_url: "http://grafana.fp-infra.svc.cluster.local:3000/d/fp-gateway"
+
+        # SLOW-BURN: error budget will be exhausted in ~5 days. Create a ticket.
+        # 6× burn rate over 6h + 30m dual window = reliable slow-leak detection.
+        - alert: InferenceGatewaySlowBurn
+          expr: |
+            fp:inference_gateway:burn_rate:6h > 6
+            and
+            fp:inference_gateway:burn_rate:30m > 6
+          for: 15m
+          # `for: 15m` — longer grace for slow burn; a 15m blip at 6× is
+          # not a slow burn, it's a transient incident. If it's still >6× after
+          # 15m of the dual-window condition being true, it's a real trend.
+          labels:
+            severity: warning
+            team: platform
+            service: inference-gateway
+            slo: availability
+            burn_tier: slow
+          annotations:
+            summary: "Inference gateway burning error budget at >6× (slow burn)"
+            description: |
+              Inference gateway sustained error rate will exhaust the monthly
+              99.9% SLO budget in approximately 5 days.
+              Current 6h burn rate: {{ $value | humanize }}×.
+              No immediate user impact, but the SLO will be missed if unaddressed.
+            runbook_url: "https://github.com/abd-ulbasit/forgepoint/blob/main/docs/runbooks/high-error-rate.md"
+
+        # LATENCY SLO: p99 > 500ms sustained — not budget-based, because we
+        # haven't yet defined a latency SLO with formal budget. This is a
+        # threshold alert that feeds Phase 10's alerting contract until a
+        # latency SLO is formally adopted in a future ADR.
+        - alert: InferenceGatewayHighLatency
+          expr: fp:inference_gateway:latency_p99:5m > 500
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+            service: inference-gateway
+          annotations:
+            summary: "Inference gateway p99 latency exceeds 500ms"
+            description: |
+              p99 latency over the last 5 minutes is {{ $value | humanize }}ms.
+              The informal latency target is 300ms for the prediction hot path.
+              Check backend model serving instances and circuit breaker state.
+            runbook_url: "https://github.com/abd-ulbasit/forgepoint/blob/main/docs/runbooks/high-latency.md"
+
+    # =========================================================================
+    # MODEL REGISTRY — SLO Alerts (99.9% availability)
+    # =========================================================================
+    - name: slo:registry:alerts
+      rules:
+
+        - alert: RegistryFastBurn
+          expr: |
+            fp:registry:burn_rate:1h > 14.4
+            and
+            fp:registry:burn_rate:5m > 14.4
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+            service: registry
+            slo: availability
+            burn_tier: fast
+          annotations:
+            summary: "Model registry burning error budget at >14.4× (fast burn)"
+            description: |
+              Model registry gRPC error rate will exhaust the 99.9% monthly SLO
+              budget in under 2 hours.
+              Registry failures cascade: inference-gateway cannot look up models,
+              and pipeline deployments fail at the validation step.
+            runbook_url: "https://github.com/abd-ulbasit/forgepoint/blob/main/docs/runbooks/high-error-rate.md"
+
+        - alert: RegistrySlowBurn
+          expr: |
+            fp:registry:burn_rate:6h > 6
+            and
+            fp:registry:burn_rate:30m > 6
+          for: 15m
+          labels:
+            severity: warning
+            team: platform
+            service: registry
+            slo: availability
+            burn_tier: slow
+          annotations:
+            summary: "Model registry burning error budget at >6× (slow burn)"
+            description: |
+              Registry sustained error rate will exhaust the 99.9% monthly budget
+              in approximately 5 days. Check Redis read projection lag and
+              Postgres write health.
+            runbook_url: "https://github.com/abd-ulbasit/forgepoint/blob/main/docs/runbooks/high-error-rate.md"
+
+    # =========================================================================
+    # AUTH — SLO Alerts (99.9% availability)
+    # =========================================================================
+    - name: slo:auth:alerts
+      rules:
+
+        - alert: AuthFastBurn
+          expr: |
+            fp:auth:burn_rate:1h > 14.4
+            and
+            fp:auth:burn_rate:5m > 14.4
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+            service: auth
+            slo: availability
+            burn_tier: fast
+          annotations:
+            summary: "Auth service burning error budget at >14.4× (fast burn)"
+            description: |
+              Auth service failures are PLATFORM-WIDE: every gRPC interceptor
+              chain calls ValidateToken. Auth fast-burn means ALL services are
+              returning Unauthenticated errors to every request.
+              Treat this as a P0 incident. Check Postgres auth DB first.
+            runbook_url: "https://github.com/abd-ulbasit/forgepoint/blob/main/docs/runbooks/service-down.md"
+
+        - alert: AuthSlowBurn
+          expr: |
+            fp:auth:burn_rate:6h > 6
+            and
+            fp:auth:burn_rate:30m > 6
+          for: 15m
+          labels:
+            severity: warning
+            team: platform
+            service: auth
+            slo: availability
+            burn_tier: slow
+          annotations:
+            summary: "Auth service burning error budget at >6× (slow burn)"
+            description: |
+              Auth service sustained error rate will exhaust the 99.9% monthly
+              budget in ~5 days. Investigate JWT key validity and API key table
+              health in fp_auth Postgres DB.
+            runbook_url: "https://github.com/abd-ulbasit/forgepoint/blob/main/docs/runbooks/high-error-rate.md"
+
+    # =========================================================================
+    # PIPELINE ORCHESTRATOR — SLO Alerts (99.5% availability)
+    # =========================================================================
+    - name: slo:pipeline_orchestrator:alerts
+      rules:
+
+        - alert: PipelineOrchestratorFastBurn
+          expr: |
+            fp:pipeline_orchestrator:burn_rate:1h > 14.4
+            and
+            fp:pipeline_orchestrator:burn_rate:5m > 14.4
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+            service: pipeline-orchestrator
+            slo: availability
+            burn_tier: fast
+          annotations:
+            summary: "Pipeline orchestrator burning error budget at >14.4× (fast burn)"
+            description: |
+              Pipeline orchestrator API error rate will exhaust the 99.5% monthly
+              budget in under 2 hours. Active sagas may be stuck.
+              Check saga state in Postgres (fp_pipeline) and compensating
+              transaction status.
+            runbook_url: "https://github.com/abd-ulbasit/forgepoint/blob/main/docs/runbooks/service-down.md"
+
+        - alert: PipelineOrchestratorSlowBurn
+          expr: |
+            fp:pipeline_orchestrator:burn_rate:6h > 6
+            and
+            fp:pipeline_orchestrator:burn_rate:30m > 6
+          for: 15m
+          labels:
+            severity: warning
+            team: platform
+            service: pipeline-orchestrator
+            slo: availability
+            burn_tier: slow
+          annotations:
+            summary: "Pipeline orchestrator burning error budget at >6× (slow burn)"
+            description: |
+              Pipeline orchestrator slow burn — model deployments and training
+              pipelines will be unreliable if unaddressed. Check for stuck sagas
+              via GetExecution and look for compensation loops in logs.
+            runbook_url: "https://github.com/abd-ulbasit/forgepoint/blob/main/docs/runbooks/high-error-rate.md"
+
+        # SAGA STUCK: an execution has been RUNNING for > 10 minutes without
+        # completing a step. This is not a burn-rate alert — it detects a
+        # specific operational pathology (deadlock, lost K8s Job, hanging step).
+        # This metric must be custom-emitted by the pipeline-orchestrator service
+        # via pkg/observability: a gauge `fp_pipeline_execution_age_seconds` with
+        # label `status=running`. See docs/runbooks/service-down.md.
+        - alert: SagaStuck
+          expr: |
+            max by (execution_id) (
+              fp_pipeline_execution_age_seconds{status="running"}
+            ) > 600
+          for: 2m
+          labels:
+            severity: warning
+            team: platform
+            service: pipeline-orchestrator
+          annotations:
+            summary: "Saga execution {{ $labels.execution_id }} stuck for >10 minutes"
+            description: |
+              A pipeline execution has been in RUNNING state for over 10 minutes.
+              This usually means a K8s Job was killed, a gRPC call to an executor
+              timed out and the step was not retried, or the saga state machine
+              loop is blocked on a lock. The orchestrator's crash-recovery should
+              have resumed it — if it hasn't, manual intervention is required.
+            runbook_url: "https://github.com/abd-ulbasit/forgepoint/blob/main/docs/runbooks/service-down.md"
+
+    # =========================================================================
+    # INFRASTRUCTURE ALERTS — non-SLO but page-worthy
+    # =========================================================================
+    - name: infra:platform:alerts
+      rules:
+
+        # SERVICE DOWN: a Forgepoint service pod has had 0 ready replicas for
+        # 2 minutes. The `kube_deployment_status_replicas_available` metric
+        # comes from kube-state-metrics (required for K8s-aware Prometheus setups).
+        # For k3s/homelab without kube-state-metrics, replace with:
+        #   up{job="kubernetes-pods", namespace=~"fp-system|fp-models"} == 0
+        - alert: ForgepointServiceDown
+          expr: |
+            kube_deployment_status_replicas_available{
+              namespace=~"fp-system|fp-models|fp-jobs",
+              label_app_kubernetes_io_part_of="forgepoint"
+            } == 0
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Forgepoint service {{ $labels.deployment }} has 0 ready replicas"
+            description: |
+              Deployment {{ $labels.namespace }}/{{ $labels.deployment }} has had
+              zero available pods for over 2 minutes.
+              Check: kubectl get pods -n {{ $labels.namespace }} -l app={{ $labels.deployment }}
+              Check: kubectl describe deployment {{ $labels.deployment }} -n {{ $labels.namespace }}
+            runbook_url: "https://github.com/abd-ulbasit/forgepoint/blob/main/docs/runbooks/service-down.md"
+
+        # HIGH RESTART RATE: a container is crash-looping. Five restarts in 15m
+        # is a reliable crash-loop signal without false-positives from one-time
+        # init errors.
+        - alert: HighContainerRestartRate
+          expr: |
+            increase(kube_pod_container_status_restarts_total{
+              namespace=~"fp-system|fp-models|fp-infra"
+            }[15m]) > 5
+          for: 0m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Container {{ $labels.container }} in {{ $labels.namespace }} restarting frequently"
+            description: |
+              Container {{ $labels.container }} (pod: {{ $labels.pod }}) has
+              restarted {{ $value }} times in the last 15 minutes.
+              Check: kubectl logs {{ $labels.pod }} -c {{ $labels.container }} -n {{ $labels.namespace }} --previous
+            runbook_url: "https://github.com/abd-ulbasit/forgepoint/blob/main/docs/runbooks/service-down.md"
+
+        # POD OOM KILLED: container was killed by OOM killer. OOMKilled containers
+        # restart (so HighContainerRestartRate may also fire) but OOM is a distinct
+        # root cause requiring a memory limit increase or a memory leak investigation.
+        - alert: PodOOMKilled
+          expr: |
+            kube_pod_container_status_last_terminated_reason{
+              reason="OOMKilled",
+              namespace=~"fp-system|fp-models|fp-infra"
+            } == 1
+          for: 0m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Pod {{ $labels.pod }} container {{ $labels.container }} OOM killed"
+            description: |
+              Container was terminated by the kernel OOM killer, meaning it
+              exceeded its memory limit. Either the limit is too low (raise it in
+              the Helm values) or there is a memory leak in the service.
+              Check: kubectl describe pod {{ $labels.pod }} -n {{ $labels.namespace }}
+              Look for: "OOMKilled" in last terminated state and the memory usage
+              graph in Grafana before the kill.
+
+        # NATS CONSUMER LAG: a JetStream consumer is falling behind. High lag
+        # means events are being produced faster than consumed — back-pressure
+        # is building. This does NOT mean messages are lost (JetStream persists
+        # them) but it does mean delayed processing for billing, experiment
+        # tracking, and notifications.
+        - alert: NATSConsumerLagHigh
+          expr: fp:nats:max_consumer_lag:5m > 10000
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "NATS consumer {{ $labels.consumer_name }} lag exceeds 10k messages"
+            description: |
+              JetStream consumer {{ $labels.consumer_name }} on stream
+              {{ $labels.stream_name }} has {{ $value }} pending messages.
+              The consumer is not keeping up with producers. Common causes:
+              - Consumer service is down or crash-looping (check pods)
+              - Consumer is processing too slowly (check latency metrics)
+              - NATS storage is full (check nats_server_varz_used_bytes)
+              Backlogged events: billing under-metering, experiment metrics delayed,
+              notifications delayed. NO DATA LOSS — JetStream retains messages.
+            runbook_url: "https://github.com/abd-ulbasit/forgepoint/blob/main/docs/runbooks/nats-consumer-lag-high.md"
+
+        # POSTGRES DOWN: a service cannot reach its database. This relies on a
+        # custom gauge `fp_db_up{service_name="..."}` emitted by each service's
+        # readiness check — when /readyz fails a DB ping, the service emits 0.
+        # Alternative: use pg_up from postgres_exporter if deployed in fp-infra.
+        - alert: PostgresDown
+          expr: fp_db_up == 0
+          for: 1m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Service {{ $labels.service_name }} cannot reach its Postgres DB"
+            description: |
+              The {{ $labels.service_name }} service's database health check has
+              been failing for over 1 minute. The service is reporting NOT ready
+              and should be pulled from Service endpoints by Kubernetes.
+              All writes and consistent reads for {{ $labels.service_name }} are
+              failing while the database is unreachable.
+            runbook_url: "https://github.com/abd-ulbasit/forgepoint/blob/main/docs/runbooks/postgres-down.md"
+
+        # MODEL DRIFT STORM: the model-monitor service is publishing drift events
+        # at an unusual rate — more than 5 drift detections across all models in
+        # 15 minutes. This could mean a genuine data distribution shift (a real
+        # drift event worth investigating) or a monitoring misconfiguration
+        # causing false positives (thresholds set too tight).
+        - alert: ModelDriftStorm
+          expr: |
+            sum(increase(fp_drift_detections_total[15m])) > 5
+          for: 2m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Unusual number of model drift detections: {{ $value }} in 15m"
+            description: |
+              The model-monitor service has detected drift in {{ $value }} windows
+              across all models in the last 15 minutes. If auto-retrain is enabled
+              this will trigger multiple simultaneous pipeline executions, which
+              may overload the pipeline orchestrator and the training infra.
+              Check: whether a genuine data distribution shift occurred (check
+              feature store for recent ingestion pattern changes) vs. a false
+              storm from a misconfigured threshold.
+            runbook_url: "https://github.com/abd-ulbasit/forgepoint/blob/main/docs/runbooks/model-drift-storm.md"
+
+        # CIRCUIT BREAKER OPEN: the inference gateway's circuit breaker for a
+        # model backend has transitioned to OPEN state. The gateway is no longer
+        # forwarding requests to that backend — users hitting that model get
+        # fast-fail 503s. This is INTENTIONAL behavior (circuit breaker working
+        # as designed) but requires investigation of the failing backend.
+        - alert: CircuitBreakerOpen
+          expr: fp_gateway_circuit_breaker_state{state="open"} == 1
+          for: 2m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Circuit breaker open for model {{ $labels.model }} version {{ $labels.version }}"
+            description: |
+              The inference gateway has opened the circuit breaker for
+              model {{ $labels.model }} version {{ $labels.version }}.
+              Requests to this backend are fast-failing with 503.
+              Check the model-serving pod health for this version.
+              Check: kubectl get pods -n fp-models -l model={{ $labels.model }},version={{ $labels.version }}
+            runbook_url: "https://github.com/abd-ulbasit/forgepoint/blob/main/docs/runbooks/high-error-rate.md"

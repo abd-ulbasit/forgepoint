@@ -1,0 +1,241 @@
+# =============================================================================
+# VELERO — Cluster-State and PV Backup Schedules
+# =============================================================================
+#
+# WHAT VELERO BACKS UP (and what it does NOT):
+#
+#   Velero backs up Kubernetes API objects (Deployments, Services, ConfigMaps,
+#   Secrets, PVCs, CRDs, RBAC, etc.) and PersistentVolume data via volume
+#   snapshots or file-system backup (restic/kopia).
+#
+#   It does NOT back up Postgres DATA directly — that is the pg_dump CronJob's
+#   job (postgres-backup-cronjob.yaml). Velero backs up the PVC *reference* so
+#   that after a cluster restore the PVC is recreated — but the Postgres data
+#   inside it comes from the pg_dump restore.
+#
+#   EXCEPTION: MinIO's PVC (model artifacts). MinIO object storage IS backed up
+#   by Velero via volume snapshot because there is no pg_dump equivalent —
+#   binary artifacts (ONNX models) are stored in MinIO, not Postgres.
+#
+# OBJECT STORE (BackupStorageLocation):
+#   Homelab: MinIO in-cluster (fp-infra namespace, bucket: fp-velero)
+#   AWS: S3 bucket provisioned by the Terraform S3 module (Phase 12)
+#   Switch by changing the BackupStorageLocation spec below.
+#
+# INSTALL (run once before applying these manifests):
+#   # Install Velero CLI:
+#   curl -L https://github.com/vmware-tanzu/velero/releases/download/v1.14.0/velero-v1.14.0-linux-amd64.tar.gz | tar xz
+#   sudo mv velero-v1.14.0-linux-amd64/velero /usr/local/bin/
+#
+#   # Install Velero server in cluster with MinIO backend (homelab):
+#   velero install \
+#     --provider aws \
+#     --plugins velero/velero-plugin-for-aws:v1.10.0 \
+#     --bucket fp-velero \
+#     --secret-file ./velero-credentials \
+#     --use-volume-snapshots=false \
+#     --backup-location-config region=us-east-1,s3ForcePathStyle=true,s3Url=http://minio.fp-infra.svc.cluster.local:9000 \
+#     --namespace velero
+#
+#   # velero-credentials file format (MinIO):
+#   [default]
+#   aws_access_key_id=minioadmin
+#   aws_secret_access_key=minioadmin
+#
+#   # For AWS (Phase 12) — use IRSA instead of static credentials:
+#   velero install \
+#     --provider aws \
+#     --plugins velero/velero-plugin-for-aws:v1.10.0 \
+#     --bucket forgepoint-velero-<account-id> \
+#     --no-secret \
+#     --pod-annotations iam.amazonaws.com/role=<velero-irsa-role-arn> \
+#     --backup-location-config region=us-east-1 \
+#     --namespace velero
+#
+# RESTORE PROCEDURE: see docs/runbooks/dr.md
+# =============================================================================
+
+# --- BackupStorageLocation: MinIO (homelab) ----------------------------------
+# Switch to the S3 variant for AWS. The provider is "aws" in both cases because
+# MinIO implements the S3 API exactly — same plugin, different endpoint.
+apiVersion: velero.io/v1
+kind: BackupStorageLocation
+metadata:
+  name: default
+  namespace: velero
+  labels:
+    app.kubernetes.io/name: velero
+    app.kubernetes.io/component: backup
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  provider: aws
+  objectStorage:
+    bucket: fp-velero
+  config:
+    # MinIO in-cluster endpoint. Change to your S3 bucket region for AWS:
+    #   s3Url: "" (omit — AWS SDK uses the region to resolve the endpoint)
+    #   region: us-east-1
+    s3Url: "http://minio.fp-infra.svc.cluster.local:9000"
+    # Force path-style access — required for MinIO (it doesn't support
+    # virtual-hosted-style URLs that AWS S3 uses by default).
+    # Set to "false" for real S3.
+    s3ForcePathStyle: "true"
+    region: "us-east-1"   # MinIO ignores this; S3 requires it.
+---
+# --- VolumeSnapshotLocation --------------------------------------------------
+# For homelab we use restic (file-system backup) rather than volume snapshots
+# because local-path PVs do not support CSI snapshots. Restic backs up the
+# actual data files inside the PVC.
+# For AWS (Phase 12): EBS volumes support CSI snapshots — switch to the EBS
+# VolumeSnapshotLocation and remove the `--use-volume-snapshots=false` flag.
+#
+# NOTE: restic backup requires the annotation:
+#   backup.velero.io/backup-volumes: <volume-name>
+# on the pod. This is pre-annotated on the MinIO StatefulSet pod template.
+# Postgres PVCs are backed up by pg_dump; the annotation is NOT added to the
+# Postgres StatefulSet pods to avoid redundant backups.
+apiVersion: velero.io/v1
+kind: VolumeSnapshotLocation
+metadata:
+  name: default
+  namespace: velero
+  labels:
+    app.kubernetes.io/name: velero
+    app.kubernetes.io/component: backup
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  provider: aws
+  config:
+    region: "us-east-1"
+---
+# =============================================================================
+# SCHEDULE 1: Daily cluster-state backup (all namespaces, no PV data)
+# =============================================================================
+#
+# This schedule captures the full Kubernetes API state: every Deployment,
+# Service, ConfigMap, Secret, PVC definition, CRD, RBAC binding, Helm release
+# metadata, and ArgoCD Application object across ALL forgepoint namespaces.
+#
+# WHY this is sufficient for cluster recreation without PV data:
+#   For services backed by CloudNativePG/RDS (production) and pg_dump (homelab),
+#   the Postgres DATA comes from the pg_dump restore, not from Velero.
+#   What Velero gives you is the *wiring* — the Kubernetes objects that define
+#   how the platform is connected — so you don't have to manually recreate 40+
+#   K8s manifests after a cluster wipe.
+#
+# GitOps note (Phase 20 / ArgoCD):
+#   Once ArgoCD is managing all services (Phase 20), the cluster-state is
+#   ALREADY in Git. Velero's cluster-state backup becomes a secondary safety net
+#   for objects ArgoCD might not manage (custom NATS streams, runtime state).
+#   The primary cluster recreation path is: git clone → ArgoCD sync.
+#   Velero is the escape hatch for objects that fell out of GitOps.
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: forgepoint-cluster-state-daily
+  namespace: velero
+  labels:
+    app.kubernetes.io/name: velero
+    app.kubernetes.io/component: backup
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  # 01:00 UTC daily — before the pg_dump CronJob at 02:00 so that if the
+  # cluster-state backup captures a PVC that the pg_dump backup then also
+  # captures, the pg_dump is the authoritative data source.
+  schedule: "0 1 * * *"
+
+  # Retain 14 days of daily cluster-state backups.
+  # Cluster state is small (JSON/YAML objects) — 14 copies is negligible storage.
+  ttl: 336h   # 14 days in hours
+
+  template:
+    # Include all forgepoint namespaces plus the velero namespace itself
+    # (so the BackupStorageLocation and Schedule CRDs are backed up too).
+    includedNamespaces:
+      - fp-system
+      - fp-models
+      - fp-jobs
+      - fp-infra
+      - velero
+      - argocd      # Phase 20 — ArgoCD Application objects and AppProjects
+
+    # Exclude namespaces that are fully managed by the cluster (kube-system)
+    # or that are vendor-managed (cert-manager, istio-system).
+    # These are reinstalled from their Helm charts, not from Velero.
+    excludedNamespaces:
+      - kube-system
+      - kube-public
+      - kube-node-lease
+
+    # Do NOT back up PV data in this schedule — PV data is handled by
+    # the PV schedule below (for MinIO) and pg_dump (for Postgres).
+    # Setting this to false prevents accidental restic backup of Postgres PVCs.
+    defaultVolumesToFsBackup: false
+
+    # Include cluster-scoped resources needed for a full restore:
+    # ClusterRoles, ClusterRoleBindings, CRDs, StorageClasses.
+    includeClusterResources: true
+
+    storageLocation: default
+
+    # Labels on the backup object (useful for Velero UI / queries)
+    labels:
+      schedule: daily
+      tier: cluster-state
+---
+# =============================================================================
+# SCHEDULE 2: Daily MinIO PV backup (model artifacts, restic file-system backup)
+# =============================================================================
+#
+# MinIO stores model artifacts (ONNX files uploaded via the Registry service's
+# GetUploadURL presigned URL flow). These are binary files — there is no
+# structured dump tool (unlike pg_dump for Postgres). Velero + restic (file-
+# system backup) is the correct tool here.
+#
+# WHAT IS BACKED UP: the MinIO PVC data directory (/data inside the MinIO pod).
+#   This includes all fp-models/*, fp-backups/* (ironic: we're backing up the
+#   backup bucket too, but it's the right call for a full DR scenario).
+#
+# RESTIC ANNOTATION REQUIREMENT:
+#   The MinIO StatefulSet pod template must have:
+#     annotations:
+#       backup.velero.io/backup-volumes: minio-data
+#   This tells Velero's restic daemonset to back up the volume named "minio-data".
+#   See deploy/k8s/infra/minio.yaml for where this annotation is placed.
+#
+# RETENTION: 7 days (model artifacts change less frequently than DB data).
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: forgepoint-minio-pv-daily
+  namespace: velero
+  labels:
+    app.kubernetes.io/name: velero
+    app.kubernetes.io/component: backup
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  # 03:00 UTC — after the pg_dump CronJob (02:00) and cluster-state (01:00).
+  schedule: "0 3 * * *"
+  ttl: 168h   # 7 days
+
+  template:
+    # ONLY back up the fp-infra namespace in this schedule, scoped to MinIO.
+    includedNamespaces:
+      - fp-infra
+
+    # Back up only the MinIO StatefulSet and its associated resources.
+    # Label selector: only pods/PVCs with the minio app label.
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: minio
+
+    # Enable file-system (restic) backup for volumes in matched pods.
+    defaultVolumesToFsBackup: true
+
+    includeClusterResources: false
+
+    storageLocation: default
+
+    labels:
+      schedule: daily
+      tier: pv-minio

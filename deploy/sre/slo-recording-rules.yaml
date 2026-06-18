@@ -1,0 +1,483 @@
+# =============================================================================
+# SLO RECORDING RULES — Forgepoint Platform (Phase 15)
+# =============================================================================
+#
+# WHY RECORDING RULES BEFORE ALERTS:
+#   PrometheusRule recording rules pre-compute expensive PromQL expressions and
+#   store the result as a new time-series. The alert expressions then reference
+#   these cheap pre-computed series instead of re-running the full computation
+#   on every evaluation tick. For multi-window burn-rate alerts (which join
+#   three time-ranges simultaneously) this is not optional — it is what makes
+#   the alerting evaluation stay under Prometheus's query budget.
+#
+# METRIC SOURCE:
+#   All service metrics flow: service → OTLP push → otel-collector → Prometheus
+#   scrape of otel-collector:8889/metrics. The OTel SDK (pkg/observability) uses
+#   the gRPC server interceptor chain (pkg/grpcutil) which emits standard
+#   OpenTelemetry gRPC metrics:
+#
+#     rpc_server_duration_milliseconds_bucket   — latency histogram
+#     rpc_server_duration_milliseconds_count    — total requests
+#     rpc_server_requests_per_rpc_count         — (alternative total counter)
+#
+#   The OTel semantic convention for gRPC status is the `rpc_grpc_status_code`
+#   label: 0 = OK. Everything ≠ 0 is an error.
+#
+#   HTTP services (inference-gateway's external HTTP API) use:
+#     http_server_duration_milliseconds_bucket
+#     http_server_duration_milliseconds_count
+#     http_response_status_code label (5xx = error)
+#
+# SLO COVERAGE:
+#   User-facing critical path (paging-worthy SLOs):
+#     1. inference-gateway  — the external prediction API
+#     2. registry           — model registration + read path
+#     3. auth               — token validation on every request
+#     4. pipeline-orchestrator — deployment saga execution
+#
+#   Internal/infra (non-SLO but alerted):
+#     NATS consumer lag, Postgres down, pod OOM, high restart rate
+#
+# GOOGLE SRE WORKBOOK — MULTI-WINDOW, MULTI-BURN-RATE ALERTING:
+#   A single threshold alert ("error rate > 1% for 5m") is noisy and mis-shaped:
+#   - A brief spike triggers it even though you've barely dented your error budget.
+#   - A steady slow leak (0.5%) misses it even though you'll exhaust the budget.
+#
+#   The workbook solution is to alert on BURN RATE relative to the error budget:
+#
+#     burn_rate = actual_error_rate / (1 - SLO_target)
+#     e.g. for 99.9% SLO: budget = 0.1%; burn_rate=1 burns the budget in 30 days
+#
+#   Two alert tiers:
+#     FAST-BURN (page now): burn_rate > 14.4 sustained over BOTH 1h AND 5m windows
+#       → you'll exhaust the monthly budget in ~2 hours if nothing changes
+#     SLOW-BURN (ticket): burn_rate > 6 sustained over BOTH 6h AND 30m windows
+#       → you'll exhaust the budget in ~5 days
+#
+#   WHY two windows per tier (short + long):
+#     The short window catches the event quickly; the long window confirms it's
+#     not a transient blip. Both must fire simultaneously — this dual-window
+#     pattern dramatically reduces false positives vs a single window.
+#
+# ERROR BUDGET MATH (99.9% target over 30-day window):
+#   Allowed errors = (1 - 0.999) = 0.001 = 0.1% of requests
+#   burn_rate thresholds → alert tiers (from Google SRE Workbook table 6.1):
+#     14.4× burn → 2h to exhaustion  → page (fast burn: 1h + 5m windows)
+#      6×  burn → 5d to exhaustion  → ticket (slow burn: 6h + 30m windows)
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: forgepoint-slo-recording-rules
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: forgepoint-slo
+    app.kubernetes.io/component: sre
+    app.kubernetes.io/part-of: forgepoint
+    # This label causes the Prometheus Operator to load this rule into Prometheus.
+    # If running without the Operator (bare Prometheus), mount this file via a
+    # ConfigMap and add a rule_files: entry in prometheus.yml instead.
+    prometheus: forgepoint
+    role: alert-rules
+spec:
+  groups:
+
+    # -------------------------------------------------------------------------
+    # inference-gateway — the external HTTP prediction API
+    # SLI:  availability = (non-5xx requests) / (total requests)
+    # SLO:  99.9% availability over 30 days
+    # -------------------------------------------------------------------------
+    - name: slo:inference_gateway:availability
+      interval: 30s   # recording rules eval'd more frequently than default 1m
+      rules:
+
+        # Raw error ratio: fraction of requests that returned HTTP 5xx.
+        # Label `service.name` comes from OTel resource attribute, emitted as a
+        # Prometheus label because otel-collector has resource_to_telemetry_conversion
+        # enabled (otel-collector.yaml). The gateway uses the HTTP path for its
+        # external API; gRPC calls to internal services use rpc_server_* below.
+        - record: fp:inference_gateway:http_error_ratio:5m
+          expr: |
+            sum(rate(http_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="inference-gateway",
+              http_response_status_code=~"5.."
+            }[5m]))
+            /
+            sum(rate(http_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="inference-gateway"
+            }[5m]))
+
+        - record: fp:inference_gateway:http_error_ratio:1h
+          expr: |
+            sum(rate(http_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="inference-gateway",
+              http_response_status_code=~"5.."
+            }[1h]))
+            /
+            sum(rate(http_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="inference-gateway"
+            }[1h]))
+
+        - record: fp:inference_gateway:http_error_ratio:6h
+          expr: |
+            sum(rate(http_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="inference-gateway",
+              http_response_status_code=~"5.."
+            }[6h]))
+            /
+            sum(rate(http_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="inference-gateway"
+            }[6h]))
+
+        - record: fp:inference_gateway:http_error_ratio:30m
+          expr: |
+            sum(rate(http_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="inference-gateway",
+              http_response_status_code=~"5.."
+            }[30m]))
+            /
+            sum(rate(http_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="inference-gateway"
+            }[30m]))
+
+        # AVAILABILITY recording rule (used in dashboards + error-budget gauge).
+        # availability = 1 - error_ratio. We record the 5m version as the
+        # canonical "current availability" signal.
+        - record: fp:inference_gateway:availability:5m
+          expr: 1 - fp:inference_gateway:http_error_ratio:5m
+
+        # LATENCY quantile recording rules — p50/p95/p99 over 5m.
+        # histogram_quantile requires the _bucket series; we record the result
+        # so dashboards and slow-burn latency alerts reference a cheap scalar.
+        - record: fp:inference_gateway:latency_p99:5m
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le) (
+                rate(http_server_duration_milliseconds_bucket{
+                  job="otel-collector-app-metrics",
+                  service_name="inference-gateway"
+                }[5m])
+              )
+            )
+
+        - record: fp:inference_gateway:latency_p95:5m
+          expr: |
+            histogram_quantile(0.95,
+              sum by (le) (
+                rate(http_server_duration_milliseconds_bucket{
+                  job="otel-collector-app-metrics",
+                  service_name="inference-gateway"
+                }[5m])
+              )
+            )
+
+        # Burn rate — how fast are we consuming the error budget?
+        # error_budget = 1 - SLO_target = 1 - 0.999 = 0.001
+        # burn_rate = error_ratio / error_budget
+        # burn_rate = 1.0 means we burn exactly as fast as the budget allows.
+        # burn_rate = 14.4 means we exhaust 30-day budget in ~2 hours.
+        - record: fp:inference_gateway:burn_rate:5m
+          expr: fp:inference_gateway:http_error_ratio:5m / 0.001
+
+        - record: fp:inference_gateway:burn_rate:1h
+          expr: fp:inference_gateway:http_error_ratio:1h / 0.001
+
+        - record: fp:inference_gateway:burn_rate:30m
+          expr: fp:inference_gateway:http_error_ratio:30m / 0.001
+
+        - record: fp:inference_gateway:burn_rate:6h
+          expr: fp:inference_gateway:http_error_ratio:6h / 0.001
+
+    # -------------------------------------------------------------------------
+    # model-registry — gRPC service (RegisterModel, GetModel, ListModels)
+    # SLI:  availability = (non-error gRPC calls) / (total calls)
+    # SLO:  99.9% availability over 30 days
+    # -------------------------------------------------------------------------
+    - name: slo:registry:availability
+      interval: 30s
+      rules:
+
+        # gRPC error ratio: rpc_grpc_status_code != 0 are errors.
+        # Status 0 = OK; everything else (NotFound is debatable — we INCLUDE it
+        # here because a consumer calling GetModel should get a model, and a 404
+        # from the registry means the data plane is broken for that caller).
+        # Adjust if you want to exclude NOT_FOUND (code=5) for the registry.
+        - record: fp:registry:grpc_error_ratio:5m
+          expr: |
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="registry",
+              rpc_grpc_status_code!="0"
+            }[5m]))
+            /
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="registry"
+            }[5m]))
+
+        - record: fp:registry:grpc_error_ratio:1h
+          expr: |
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="registry",
+              rpc_grpc_status_code!="0"
+            }[1h]))
+            /
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="registry"
+            }[1h]))
+
+        - record: fp:registry:grpc_error_ratio:30m
+          expr: |
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="registry",
+              rpc_grpc_status_code!="0"
+            }[30m]))
+            /
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="registry"
+            }[30m]))
+
+        - record: fp:registry:grpc_error_ratio:6h
+          expr: |
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="registry",
+              rpc_grpc_status_code!="0"
+            }[6h]))
+            /
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="registry"
+            }[6h]))
+
+        - record: fp:registry:availability:5m
+          expr: 1 - fp:registry:grpc_error_ratio:5m
+
+        - record: fp:registry:latency_p99:5m
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le) (
+                rate(rpc_server_duration_milliseconds_bucket{
+                  job="otel-collector-app-metrics",
+                  service_name="registry"
+                }[5m])
+              )
+            )
+
+        - record: fp:registry:burn_rate:5m
+          expr: fp:registry:grpc_error_ratio:5m / 0.001
+
+        - record: fp:registry:burn_rate:1h
+          expr: fp:registry:grpc_error_ratio:1h / 0.001
+
+        - record: fp:registry:burn_rate:30m
+          expr: fp:registry:grpc_error_ratio:30m / 0.001
+
+        - record: fp:registry:burn_rate:6h
+          expr: fp:registry:grpc_error_ratio:6h / 0.001
+
+    # -------------------------------------------------------------------------
+    # auth — gRPC service (ValidateToken sits on every request's hot path)
+    # SLI:  availability = (OK responses) / (total calls)
+    # SLO:  99.9% (auth failures cascade to ALL other services)
+    # -------------------------------------------------------------------------
+    - name: slo:auth:availability
+      interval: 30s
+      rules:
+
+        - record: fp:auth:grpc_error_ratio:5m
+          expr: |
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="auth",
+              rpc_grpc_status_code!="0"
+            }[5m]))
+            /
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="auth"
+            }[5m]))
+
+        - record: fp:auth:grpc_error_ratio:1h
+          expr: |
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="auth",
+              rpc_grpc_status_code!="0"
+            }[1h]))
+            /
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="auth"
+            }[1h]))
+
+        - record: fp:auth:grpc_error_ratio:30m
+          expr: |
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="auth",
+              rpc_grpc_status_code!="0"
+            }[30m]))
+            /
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="auth"
+            }[30m]))
+
+        - record: fp:auth:grpc_error_ratio:6h
+          expr: |
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="auth",
+              rpc_grpc_status_code!="0"
+            }[6h]))
+            /
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="auth"
+            }[6h]))
+
+        - record: fp:auth:availability:5m
+          expr: 1 - fp:auth:grpc_error_ratio:5m
+
+        - record: fp:auth:latency_p99:5m
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le) (
+                rate(rpc_server_duration_milliseconds_bucket{
+                  job="otel-collector-app-metrics",
+                  service_name="auth"
+                }[5m])
+              )
+            )
+
+        - record: fp:auth:burn_rate:5m
+          expr: fp:auth:grpc_error_ratio:5m / 0.001
+
+        - record: fp:auth:burn_rate:1h
+          expr: fp:auth:grpc_error_ratio:1h / 0.001
+
+        - record: fp:auth:burn_rate:30m
+          expr: fp:auth:grpc_error_ratio:30m / 0.001
+
+        - record: fp:auth:burn_rate:6h
+          expr: fp:auth:grpc_error_ratio:6h / 0.001
+
+    # -------------------------------------------------------------------------
+    # pipeline-orchestrator — saga execution success rate
+    # SLI:  availability = (non-error TriggerExecution + GetExecution calls) /
+    #                       (total calls)
+    # SLO:  99.5% (lower than gateway/auth — pipeline ops are async-heavy and
+    #       infra-dependent; a tighter SLO would generate noise from saga
+    #       failures that are the upstream model's problem, not the orchestrator)
+    # error_budget for 99.5% = 0.005
+    # -------------------------------------------------------------------------
+    - name: slo:pipeline_orchestrator:availability
+      interval: 30s
+      rules:
+
+        - record: fp:pipeline_orchestrator:grpc_error_ratio:5m
+          expr: |
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="pipeline-orchestrator",
+              rpc_grpc_status_code!="0"
+            }[5m]))
+            /
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="pipeline-orchestrator"
+            }[5m]))
+
+        - record: fp:pipeline_orchestrator:grpc_error_ratio:1h
+          expr: |
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="pipeline-orchestrator",
+              rpc_grpc_status_code!="0"
+            }[1h]))
+            /
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="pipeline-orchestrator"
+            }[1h]))
+
+        - record: fp:pipeline_orchestrator:grpc_error_ratio:30m
+          expr: |
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="pipeline-orchestrator",
+              rpc_grpc_status_code!="0"
+            }[30m]))
+            /
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="pipeline-orchestrator"
+            }[30m]))
+
+        - record: fp:pipeline_orchestrator:grpc_error_ratio:6h
+          expr: |
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="pipeline-orchestrator",
+              rpc_grpc_status_code!="0"
+            }[6h]))
+            /
+            sum(rate(rpc_server_duration_milliseconds_count{
+              job="otel-collector-app-metrics",
+              service_name="pipeline-orchestrator"
+            }[6h]))
+
+        - record: fp:pipeline_orchestrator:availability:5m
+          expr: 1 - fp:pipeline_orchestrator:grpc_error_ratio:5m
+
+        - record: fp:pipeline_orchestrator:latency_p99:5m
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le) (
+                rate(rpc_server_duration_milliseconds_bucket{
+                  job="otel-collector-app-metrics",
+                  service_name="pipeline-orchestrator"
+                }[5m])
+              )
+            )
+
+        # error_budget = 0.005 (99.5% SLO)
+        - record: fp:pipeline_orchestrator:burn_rate:5m
+          expr: fp:pipeline_orchestrator:grpc_error_ratio:5m / 0.005
+
+        - record: fp:pipeline_orchestrator:burn_rate:1h
+          expr: fp:pipeline_orchestrator:grpc_error_ratio:1h / 0.005
+
+        - record: fp:pipeline_orchestrator:burn_rate:30m
+          expr: fp:pipeline_orchestrator:grpc_error_ratio:30m / 0.005
+
+        - record: fp:pipeline_orchestrator:burn_rate:6h
+          expr: fp:pipeline_orchestrator:grpc_error_ratio:6h / 0.005
+
+    # -------------------------------------------------------------------------
+    # NATS JetStream consumer lag — used by infra alerts (not SLO recording)
+    # NATS exports consumer_pending_count (messages waiting unconsumed) on its
+    # Prometheus endpoint (nats:8222/metrics, scraped by the "nats" job).
+    # -------------------------------------------------------------------------
+    - name: infra:nats:consumer_lag
+      interval: 30s
+      rules:
+        # Max lag across all consumers — the worst-case backlog signal.
+        - record: fp:nats:max_consumer_lag:5m
+          expr: |
+            max by (stream_name, consumer_name) (
+              nats_consumer_num_pending
+            )

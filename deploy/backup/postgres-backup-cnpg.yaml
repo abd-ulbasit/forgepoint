@@ -1,0 +1,181 @@
+# =============================================================================
+# CloudNativePG (CNPG) — Production Postgres Backup Configuration
+# =============================================================================
+#
+# THIS FILE IS THE PRODUCTION BACKUP STRATEGY (AWS / Phase 12).
+# For homelab, use postgres-backup-cronjob.yaml (pg_dump to MinIO).
+#
+# WHY CLOUDNATIVEPG OVER pg_dump IN PRODUCTION:
+#
+#   pg_dump (homelab CronJob):
+#   + Simple: no operator, no CRDs, no extra cluster components.
+#   + Sufficient for a portfolio project (homelab RPO = 24h is acceptable).
+#   - Snapshot-only: you can restore to dump time, not to an arbitrary second.
+#   - No WAL archiving: a crash between two dumps loses those hours of data.
+#
+#   CloudNativePG WAL archiving (production):
+#   + Continuous WAL streaming to S3: PITR to ANY second within the retention
+#     window (typically 7–30 days). Same as what RDS Automated Backups does.
+#   + Operator-managed: scheduled base backups (full or incremental) every N
+#     hours; WAL segments shipped to S3 continuously.
+#   + Replica failover: CNPG manages primary/standby promotion automatically.
+#   + Consistent with the CNPG ecosystem: monitoring, metrics, kubectl plugin.
+#
+#   RDS Automated Backups (AWS managed alternative to CNPG):
+#   + Even simpler: AWS manages the Postgres instance entirely.
+#   + PITR within the retention window (up to 35 days).
+#   + Multi-AZ failover built in.
+#   - Not Kubernetes-native: services address RDS by DNS hostname, not a K8s
+#     Service, making local/cloud parity harder.
+#   - Phase 12 (Terraform) uses RDS for the production environment.
+#
+#   DECISION: CNPG for the K8s-native path (interviewed as "how I'd run Postgres
+#   on EKS"); RDS for the managed cloud path (Phase 12 Terraform). Both are
+#   documented here so an interviewer can ask about either.
+#
+# INSTALL CNPG OPERATOR (run once per cluster):
+#   kubectl apply --server-side -f \
+#     https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.23/releases/cnpg-1.23.0.yaml
+#
+# VERIFY:
+#   kubectl get pods -n cnpg-system
+#   kubectl cnpg status --all-namespaces   # requires the cnpg kubectl plugin
+#
+# THIS FILE DEFINES:
+#   - A CNPG Cluster resource for the auth service DB (as an example).
+#     Replicate this pattern for each of the 8 service databases.
+#   - A ScheduledBackup resource for daily base backups.
+#   - Annotations pointing to the S3 bucket for WAL archiving.
+#
+# =============================================================================
+
+# --- CNPG Cluster: fp_auth database (production example) --------------------
+# For each of the 8 services (auth, registry, pipeline, features, experiments,
+# billing, notifications, monitor), create a separate CNPG Cluster resource
+# in fp-infra. This maintains the "database per service" isolation contract.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: fp-auth-db
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: fp-auth-db
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: forgepoint
+    fp-service: auth
+spec:
+  # 1 primary + 1 synchronous standby — RPO = 0 for committed transactions.
+  # Use 3 (1 primary + 2 standby) in production for HA during maintenance.
+  instances: 2
+
+  postgresql:
+    # Pinned Postgres version. Bump deliberately — test the upgrade in staging first.
+    version: "17"
+    parameters:
+      # Tune for WAL archiving throughput:
+      max_wal_senders: "10"
+      wal_level: "logical"   # Required for logical replication if ever needed
+      # Shared memory for the auth workload (small DB, mostly key lookups):
+      shared_buffers: "128MB"
+      effective_cache_size: "384MB"
+
+  bootstrap:
+    # On first deployment, initialize the database from scratch.
+    # For disaster recovery, change this to `recovery:` pointing to the S3 backup.
+    # See the ScheduledBackup below and docs/runbooks/dr.md for the recovery procedure.
+    initdb:
+      database: fp_auth
+      owner: fp
+      # Secret with the `fp` user password. Managed by External Secrets Operator
+      # in Phase 17 (backed by AWS Secrets Manager).
+      secret:
+        name: fp-auth-db-credentials
+
+  # --- WAL archiving + base backup → S3 ------------------------------------
+  # This is the core of PITR: every WAL segment (16MB of transaction log) is
+  # shipped to S3 as it fills. Combined with scheduled base backups, this
+  # enables restore to any point within the retention window.
+  backup:
+    # Retention: keep 7 days of base backups + WAL.
+    # Combine with the ScheduledBackup resource below which triggers the base backups.
+    retentionPolicy: "7d"
+
+    # barmanObjectStore: CNPG uses Barman (the upstream Postgres backup tool)
+    # under the hood. The `destinationPath` is the S3 bucket/prefix.
+    barmanObjectStore:
+      # For AWS: use the S3 bucket from the Terraform S3 module (Phase 12).
+      # Format: s3://<bucket-name>/<optional-prefix>
+      destinationPath: "s3://forgepoint-postgres-backups/fp-auth"
+
+      # AWS: use IRSA (IAM Role for Service Accounts) — no static credentials.
+      # The ServiceAccount annotation wires the OIDC identity to an IAM role
+      # that has s3:PutObject/GetObject/ListBucket on the backup bucket.
+      s3Credentials:
+        # For AWS with IRSA, leave this block empty and set the ServiceAccount
+        # annotation instead (see the CNPG docs for IRSA configuration).
+        # For MinIO (homelab testing of CNPG):
+        accessKeyId:
+          name: backup-credentials
+          key: MINIO_ACCESS_KEY
+        secretAccessKey:
+          name: backup-credentials
+          key: MINIO_SECRET_KEY
+        # Uncomment for MinIO homelab testing:
+        # endpointURL: "http://minio.fp-infra.svc.cluster.local:9000"
+
+      wal:
+        # Compress WAL segments before uploading (reduces S3 storage costs).
+        compression: gzip
+        # Encrypt using AWS SSE-S3. For higher compliance requirements, use SSE-KMS.
+        encryption: AES256
+        # How many WAL segments to upload in parallel (increases throughput on write-heavy DBs):
+        maxParallel: 2
+
+      data:
+        # Compress base backup data:
+        compression: gzip
+        encryption: AES256
+        # Parallelize base backup uploads:
+        jobs: 2
+
+  # --- Storage for the Postgres data volume ---------------------------------
+  storage:
+    storageClass: gp3        # AWS EBS gp3; use local-path for homelab testing
+    size: 10Gi               # Start small; CNPG supports online volume expansion
+
+  # --- Monitoring integration -----------------------------------------------
+  monitoring:
+    # CNPG automatically creates a PodMonitor for the cluster if the Prometheus
+    # Operator is present. This exposes cnpg_* metrics (replication lag,
+    # transaction rate, buffer hit ratio) to the Prometheus scrape pipeline.
+    enablePodMonitor: true
+---
+# --- ScheduledBackup: daily base backup for fp-auth-db ----------------------
+# A base backup is a full snapshot of the Postgres data directory at a point
+# in time. CNPG requires periodic base backups for WAL archiving to be useful:
+# without them, PITR would require replaying ALL WAL since the cluster was
+# initialized (which could be months of logs).
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: fp-auth-db-daily
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: fp-auth-db
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  # Run at 00:30 UTC daily — offset from midnight to avoid contention with
+  # other CNPG clusters if all 8 service DBs have the same schedule.
+  # Stagger each service's backup by 5 minutes:
+  #   auth: 00:30, registry: 00:35, pipeline: 00:40, etc.
+  schedule: "0 30 0 * * *"   # CNPG uses 6-field cron (seconds included)
+
+  backupOwnerReference: self
+
+  cluster:
+    name: fp-auth-db
+
+  # IMMEDIATE: take a base backup now when this resource is first created.
+  # Ensures there is always at least one base backup before WAL archiving relies on it.
+  immediate: true

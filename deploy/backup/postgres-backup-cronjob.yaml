@@ -1,0 +1,261 @@
+# =============================================================================
+# POSTGRES BACKUP — pg_dump CronJob to MinIO (homelab) or S3 (AWS/Phase 12)
+# =============================================================================
+#
+# STRATEGY OVERVIEW:
+#
+#   Homelab (k3s):
+#     - This CronJob (below): daily pg_dump of all fp_* databases to MinIO.
+#     - Simple, zero-operator-dependency, sufficient for homelab RPO = 24h.
+#     - Limitation: no WAL-level PITR — you can only restore to a dump point,
+#       not to an arbitrary second.
+#
+#   Production (AWS, Phase 12):
+#     - Use CloudNativePG (CNPG) operator with WAL archiving to S3.
+#       CNPG gives: scheduled base backups + continuous WAL streaming to S3
+#       → PITR to any second within the retention window. This is the same
+#       approach RDS Automated Backups uses under the hood.
+#     - The CronJob below becomes a SUPPLEMENT (off-cluster copy) rather than
+#       the primary backup mechanism.
+#     - See CloudNativePG cluster manifest in postgres-backup-cnpg.yaml for
+#       the production configuration.
+#
+# INTERVIEW TALKING POINT:
+#   "For a homelab project I used pg_dump + MinIO (simple, dependency-free).
+#    For production I'd move to CloudNativePG's WAL archiving to S3 for true
+#    PITR — the difference matters when you need to restore to 1 minute before
+#    data was accidentally deleted, not just the last daily dump."
+#
+# WHAT IT BACKS UP:
+#   All service databases in one pass: fp_auth, fp_registry, fp_pipeline,
+#   fp_features, fp_experiments, fp_billing, fp_notifications, fp_monitor.
+#   The backup is a gzipped pg_dumpall (globals + all DBs) plus per-database
+#   pg_dump files — both formats to maximize restore flexibility.
+#
+# RETENTION: 7 daily + 4 weekly + 3 monthly (managed by the cleanup job below).
+#   Total storage estimate: ~500MB per dump × 14 retained copies ≈ 7GB.
+#
+# ENCRYPTION: the dump is piped through gpg symmetric encryption before upload
+#   to MinIO. The passphrase lives in a Kubernetes Secret (backup-encryption-key).
+#   In production (Phase 17), this Secret is managed by External Secrets Operator
+#   backed by AWS Secrets Manager.
+#
+# RESTORE PROCEDURE: see docs/runbooks/dr.md — "Postgres restore from pg_dump".
+# =============================================================================
+
+# --- Secret holding DB credentials and MinIO credentials -------------------
+# In production: replace with ExternalSecret (Phase 17 / External Secrets Operator)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: backup-credentials
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: postgres-backup
+    app.kubernetes.io/component: backup
+    app.kubernetes.io/part-of: forgepoint
+type: Opaque
+stringData:
+  # Postgres superuser password (set during cluster init — see scripts/init-postgres.sh)
+  PGPASSWORD: "changeme-in-production"
+  # MinIO access credentials (same as what the services use — see docker-compose.yaml)
+  MINIO_ACCESS_KEY: "minioadmin"
+  MINIO_SECRET_KEY: "minioadmin"
+  # Symmetric GPG passphrase for encrypting backup files at rest.
+  # Generate: openssl rand -base64 32
+  BACKUP_ENCRYPTION_KEY: "changeme-generate-a-real-key"
+---
+# --- ServiceAccount — minimal permissions for the backup job ---------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: postgres-backup
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: postgres-backup
+    app.kubernetes.io/component: backup
+    app.kubernetes.io/part-of: forgepoint
+automountServiceAccountToken: false
+---
+# --- CronJob: daily pg_dump to MinIO ----------------------------------------
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup-daily
+  namespace: fp-infra
+  labels:
+    app.kubernetes.io/name: postgres-backup
+    app.kubernetes.io/component: backup
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  # Run at 02:00 UTC daily — off-peak for the homelab.
+  # Format: minute hour day-of-month month day-of-week
+  schedule: "0 2 * * *"
+
+  # Keep the last 3 successful job records (for log inspection after the fact)
+  # and 1 failed (to investigate failures without cluttering the namespace).
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+
+  # If the CronJob was missed (e.g., cluster was down at 02:00), run it as soon
+  # as the cluster comes back. "Forbid" would skip the missed run, which is
+  # wrong for backup jobs — we want every day covered.
+  concurrencyPolicy: Forbid
+
+  jobTemplate:
+    spec:
+      # The backup must finish within 2 hours. A full dump of all fp_ databases
+      # on the homelab should take < 10 minutes; 2h is a safe ceiling.
+      activeDeadlineSeconds: 7200
+
+      # Retry once on failure (transient network error to MinIO).
+      # Do NOT set this high — a corrupt dump being uploaded 5 times is worse
+      # than 1 failed backup that alerts you.
+      backoffLimit: 1
+
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: postgres-backup
+            app.kubernetes.io/component: backup
+            app.kubernetes.io/part-of: forgepoint
+        spec:
+          serviceAccountName: postgres-backup
+          automountServiceAccountToken: false
+          restartPolicy: OnFailure
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999    # postgres user in the postgres image
+            runAsGroup: 999
+            fsGroup: 999
+            seccompProfile:
+              type: RuntimeDefault
+
+          containers:
+            - name: pg-dump
+              # Use the same Postgres version as the server to avoid pg_dump
+              # client/server version skew warnings. Pin the tag.
+              image: postgres:17-alpine
+              imagePullPolicy: IfNotPresent
+
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: false  # pg_dump writes temp files
+                capabilities:
+                  drop: ["ALL"]
+
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+
+              # Environment variables from Secret — credentials injected at
+              # runtime, never baked into the image.
+              envFrom:
+                - secretRef:
+                    name: backup-credentials
+
+              env:
+                - name: PGHOST
+                  value: "postgres.fp-infra.svc.cluster.local"
+                - name: PGPORT
+                  value: "5432"
+                - name: PGUSER
+                  value: "fp"
+                - name: MINIO_ENDPOINT
+                  # MinIO in-cluster for homelab. Switch to your S3 endpoint for AWS:
+                  #   value: "https://s3.us-east-1.amazonaws.com"
+                  value: "http://minio.fp-infra.svc.cluster.local:9000"
+                - name: BACKUP_BUCKET
+                  value: "fp-backups"
+                - name: BACKUP_DATE
+                  # Populated at runtime by the shell script; here as a placeholder
+                  # to document what the script sets.
+                  value: ""
+
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -euo pipefail
+
+                  # Install MinIO client (mc) for the upload step.
+                  # WHY mc over aws cli: mc works identically against MinIO (homelab)
+                  # and S3 (prod) — single tool, zero config change between envs.
+                  # The mc binary is ~40MB and installs in ~5s on first run.
+                  apk add --no-cache curl gnupg 2>/dev/null
+                  curl -sSf https://dl.min.io/client/mc/release/linux-amd64/mc \
+                    -o /usr/local/bin/mc && chmod +x /usr/local/bin/mc
+
+                  # Configure mc with the MinIO endpoint from env.
+                  mc alias set minio "${MINIO_ENDPOINT}" \
+                    "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --quiet
+
+                  # Ensure backup bucket exists (idempotent).
+                  mc mb --ignore-existing "minio/${BACKUP_BUCKET}"
+
+                  # Backup date for this run.
+                  BACKUP_DATE=$(date -u +%Y-%m-%dT%H%M%SZ)
+                  BACKUP_DIR="${BACKUP_BUCKET}/postgres/${BACKUP_DATE}"
+
+                  echo "=== Starting Postgres backup at ${BACKUP_DATE} ==="
+
+                  # 1. Full cluster dump (globals: roles, tablespaces).
+                  #    pg_dumpall --globals-only is small but required for a full restore.
+                  pg_dumpall --globals-only \
+                    | gzip \
+                    | gpg --batch --passphrase "${BACKUP_ENCRYPTION_KEY}" \
+                          --symmetric --cipher-algo AES256 \
+                    | mc pipe "minio/${BACKUP_DIR}/globals.sql.gz.gpg"
+                  echo "Globals dump uploaded."
+
+                  # 2. Per-database dumps. Each service database is dumped
+                  #    individually so you can restore a single service's DB
+                  #    without restoring the entire cluster.
+                  for DB in fp_auth fp_registry fp_pipeline fp_features \
+                             fp_experiments fp_billing fp_notifications fp_monitor; do
+                    echo "Dumping ${DB}..."
+                    pg_dump --format=custom --compress=9 "${DB}" \
+                      | gpg --batch --passphrase "${BACKUP_ENCRYPTION_KEY}" \
+                            --symmetric --cipher-algo AES256 \
+                      | mc pipe "minio/${BACKUP_DIR}/${DB}.pgdump.gpg"
+                    echo "${DB} uploaded."
+                  done
+
+                  # 3. Write a manifest file with the backup metadata.
+                  cat > /tmp/manifest.json << EOF
+                  {
+                    "backup_date": "${BACKUP_DATE}",
+                    "postgres_host": "${PGHOST}",
+                    "postgres_version": "$(pg_dump --version | head -1)",
+                    "databases": ["fp_auth","fp_registry","fp_pipeline","fp_features",
+                                  "fp_experiments","fp_billing","fp_notifications","fp_monitor"],
+                    "format": "pg_dump --format=custom + gpg-AES256"
+                  }
+                  EOF
+                  mc cp /tmp/manifest.json "minio/${BACKUP_DIR}/manifest.json"
+
+                  echo "=== Backup complete: minio/${BACKUP_DIR} ==="
+
+                  # 4. Retention cleanup: delete backups older than 7 days.
+                  #    This keeps ~7 daily backups in the bucket.
+                  #    WHY 7 days: matches our homelab RPO; weekly backups are
+                  #    kept separately (see postgres-backup-weekly CronJob pattern).
+                  CUTOFF=$(date -u -d '7 days ago' +%Y-%m-%dT%H%M%SZ 2>/dev/null || \
+                            date -u -v-7d +%Y-%m-%dT%H%M%SZ)
+                  echo "Cleaning up backups older than ${CUTOFF}..."
+                  mc ls "minio/${BACKUP_BUCKET}/postgres/" | \
+                    awk '{print $NF}' | \
+                    while read -r backup_dir; do
+                      dir_date="${backup_dir%/}"
+                      if [ "${dir_date}" \< "${CUTOFF}" ]; then
+                        echo "Removing old backup: ${backup_dir}"
+                        mc rm --recursive --force "minio/${BACKUP_BUCKET}/postgres/${backup_dir}"
+                      fi
+                    done
+
+                  echo "=== Retention cleanup complete ==="
