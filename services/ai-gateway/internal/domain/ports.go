@@ -124,6 +124,7 @@ type BudgetStore interface {
 //   - the budget REFILLS over a rolling window (it's a rate cap that goes back up);
 //   - usage ACCUMULATES (a lifetime/window counter that only goes up) and must keep
 //     prompt vs completion distinct for the GetUsage breakdown.
+//
 // Conflating them is exactly what zeroed the breakdown.
 type UsageStore interface {
 	// Add records one served completion's prompt + completion tokens for `team`
@@ -168,8 +169,24 @@ type EventPublisher interface {
 // CompletionServed is the domain payload for the cost/audit event. It carries the
 // billing facts the gateway alone authoritatively knows — team, model, the provider
 // that ACTUALLY served (post-failover), the token counts, the computed cost, the
-// cache-hit flag, and the latency — and NO message content (PII discipline: the
-// prompt/completion text never leaves the gateway on an event).
+// cache-hit flag, and the latency.
+//
+// PII DISCIPLINE — the optional text fields (M7/L4 quality evaluation):
+//
+//	By DEFAULT this event carries NO message content (PromptText/ResponseText empty)
+//	— prompt/completion text never leaves the gateway on an event. That is the right
+//	default: the cost/audit event is consumed by Billing (metering) which has no
+//	business seeing raw prompts, and an event bus is a poor place for PII.
+//
+//	The two text fields exist ONLY for the model-monitor's LLM-as-judge quality
+//	evaluation (L4): an OFFLINE judge cannot score relevance/coherence/safety without
+//	the actual prompt+response. They are populated ONLY when the gateway is started
+//	with FP_AI_EVAL_INCLUDE_TEXT=true (a deliberate, operator-owned opt-in for the
+//	homelab quality-eval pipeline). When the flag is off the monitor's judge degrades
+//	gracefully: it records the completion as UNSCORED and notes the limitation rather
+//	than judging blind. Keeping the fields OPTIONAL (and the flag default-off) means
+//	the privacy-preserving posture is the default and turning on quality eval is a
+//	conscious decision, exactly the tradeoff a reviewer expects.
 type CompletionServed struct {
 	RequestID    string
 	Team         string
@@ -181,6 +198,12 @@ type CompletionServed struct {
 	CostMicroUSD int64
 	CacheHit     bool
 	LatencyMs    int64
+
+	// PromptText / ResponseText are the raw turn content, populated ONLY when the
+	// gateway's EvalIncludeText flag is on (see the PII note above). Empty otherwise.
+	// They feed the model-monitor LLM-as-judge; no other consumer reads them.
+	PromptText   string
+	ResponseText string
 }
 
 // WarmSignal is the minimal payload that wakes Ollama. It only needs to create lag

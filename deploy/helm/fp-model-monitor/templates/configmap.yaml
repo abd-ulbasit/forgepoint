@@ -37,6 +37,25 @@ data:
   # FP_ORCHESTRATOR_ENDPOINT: FIXED gRPC target of the Pipeline Orchestrator the
   # loop calls. Operator config, NOT derived from event data (anti-SSRF).
   FP_ORCHESTRATOR_ENDPOINT: {{ .Values.config.orchestratorEndpoint | quote }}
+  # ----------------------------------------------------------------------
+  # M7/L4 — LLM QUALITY EVAL + QUALITY DRIFT (model-monitor specific).
+  # Non-secret: a feature flag, a model name, an in-cluster Ollama URL, and
+  # numeric drift thresholds — none carry credentials. SELF-GATED on
+  # FP_EVAL_ENABLED: when "false" the consumer is never started and the service
+  # runs tabular data-drift only (the egress NetworkPolicy to Ollama is also
+  # gated, so a disabled deployment opens no path to fp-ml).
+  # ----------------------------------------------------------------------
+  FP_EVAL_ENABLED: {{ .Values.config.eval.enabled | quote }}
+  FP_OLLAMA_URL: {{ .Values.config.eval.ollamaUrl | quote }}
+  FP_EVAL_JUDGE_MODEL: {{ .Values.config.eval.judgeModel | quote }}
+  FP_EVAL_SAMPLE_RATE: {{ .Values.config.eval.sampleRate | quote }}
+  FP_EVAL_WINDOW: {{ .Values.config.eval.window | quote }}
+  FP_EVAL_MIN_SAMPLES: {{ .Values.config.eval.minSamples | quote }}
+  FP_EVAL_FLOOR_SCORE: {{ .Values.config.eval.floorScore | quote }}
+  FP_EVAL_BASELINE_SCORE: {{ .Values.config.eval.baselineScore | quote }}
+  FP_EVAL_BASELINE_DROP: {{ .Values.config.eval.baselineDrop | quote }}
+  FP_EVAL_WARN_DROP: {{ .Values.config.eval.warnDrop | quote }}
+  FP_EVAL_CRITICAL_DROP: {{ .Values.config.eval.criticalDrop | quote }}
   {{- with .Values.config.extraEnv }}
   # Free-form additional non-secret env. Keys used verbatim.
   {{- range $key, $val := . }}

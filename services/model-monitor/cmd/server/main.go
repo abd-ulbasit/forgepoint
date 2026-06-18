@@ -125,6 +125,7 @@ import (
 	"github.com/abd-ulbasit/forgepoint/services/model-monitor/internal/domain"
 	"github.com/abd-ulbasit/forgepoint/services/model-monitor/internal/events"
 	"github.com/abd-ulbasit/forgepoint/services/model-monitor/internal/handler"
+	"github.com/abd-ulbasit/forgepoint/services/model-monitor/internal/judge"
 	pgrepo "github.com/abd-ulbasit/forgepoint/services/model-monitor/internal/repository/postgres"
 	redisrepo "github.com/abd-ulbasit/forgepoint/services/model-monitor/internal/repository/redis"
 )
@@ -427,6 +428,95 @@ func main() {
 	logger.Info("event subscribers started (inference.completed/failed, models.promoted, features.written)")
 
 	// ================================================================
+	// 6c. START THE L4 QUALITY-EVAL CONSUMER (the LLM-as-judge data plane)
+	// ================================================================
+	//
+	// SELF-GATE: the whole L4 pipeline is OFF unless FP_EVAL_ENABLED is true AND an
+	// Ollama URL is configured. When off we start NO consumer and model-monitor runs
+	// its tabular data-drift function exactly as before — the task's explicit
+	// requirement. When on, we wire a SECOND data-plane consumer on the gateway's AI
+	// stream (fp.ai.completion.served) that samples completions, judges them with the
+	// local Ollama model, records the eval, and raises a QUALITY-drift report into the
+	// SAME alert + retrain loop the tabular drift uses (reusing reports/publisher/gate/
+	// orch — see internal/domain/quality_eval_service.go).
+	var aiEvalConsumer *events.AIEvalConsumer
+	if cfg.EvalEnabled && cfg.OllamaURL != "" {
+		// Ensure the AI stream exists (gateway-owned; we ensure the IDENTICAL subject so a
+		// monitor-first boot can attach — never fp.ai.>, which would overlap the gateway's
+		// AI + AI_REQUESTS streams; see events.EnsureAIStream + the billing fix).
+		aiStreamCtx, cancelAIStream := context.WithTimeout(ctx, 10*time.Second)
+		if aiStreamErr := events.EnsureAIStream(aiStreamCtx, js); aiStreamErr != nil {
+			cancelAIStream()
+			logger.Error("failed to ensure AI stream for quality eval", slog.String("error", aiStreamErr.Error()))
+			os.Exit(1)
+		}
+		cancelAIStream()
+
+		// The LLM-as-judge adapter (domain.Judge) over the local Ollama. Bounded timeout +
+		// cold-start retry are baked into NewOllamaJudge; the judge model + URL are config.
+		judgeAdapter := judge.NewOllamaJudge(cfg.OllamaURL, cfg.EvalJudgeModel)
+
+		// The QualityEvalService COMPOSES the eval-specific ports (judge + eval store) with
+		// the SHARED closed-loop ports already wired above (reports, publisher, orch, gate,
+		// monitors). So a quality-drift verdict travels the EXACT SAME emit + retrain path
+		// as data/prediction/performance drift — zero new event, proto, or schema for the
+		// alert side. The eval store is store.Evals() (the new eval_scores Postgres table).
+		qualitySvc := domain.NewQualityEvalService(domain.QualityEvalDeps{
+			Judge:     judgeAdapter,
+			Evals:     store.Evals(),
+			Monitors:  monitors,
+			Reports:   reports,
+			Publisher: publisher,
+			Orch:      orch,
+			Gate:      gate,
+			Config: domain.QualityDriftConfig{
+				Window:           cfg.EvalWindow,
+				MinSamples:       cfg.EvalMinSamples,
+				FloorScore:       cfg.EvalFloorScore,
+				Baseline:         cfg.EvalBaselineScore,
+				DropFromBaseline: cfg.EvalBaselineDrop,
+			},
+			WarnDrop:     cfg.EvalWarnDrop,
+			CriticalDrop: cfg.EvalCriticalDrop,
+			Cooldown:     cfg.RetrainCooldown,
+			Now:          nil, // production wall-clock
+		})
+
+		// 1-in-N sampler bounds the judge's Ollama load. rate<=1 ⇒ judge every monitored
+		// completion (the homelab default).
+		sampler := domain.NewCountingSampler(cfg.EvalSampleRate)
+
+		// The consumer reuses the SAME monitor resolver (model → authorized binding) the
+		// drift consumers use, and the SAME shared idempotency/DLQ/timeout posture (its own
+		// durable name is appended inside Start). A distinct DLQ subject keeps L4 poison
+		// events separate from the drift-consumer DLQ for clean ops triage.
+		aiEvalConsumer = events.NewAIEvalConsumer(
+			qualitySvc,
+			resolver,
+			sampler,
+			js,
+			logger,
+			natsutil.WithIdempotencyStore(natsutil.NewMemoryProcessedStore()),
+			natsutil.WithDLQSubject("fp.dlq.model-monitor-eval"),
+			natsutil.WithMaxRetries(5),
+			natsutil.WithMessageTimeout(35*time.Second), // > the judge's 30s client timeout so a slow judge times out INSIDE the handler (→ Unscored), not as a NAK
+		)
+		if aiErr := aiEvalConsumer.Start(ctx); aiErr != nil {
+			logger.Error("failed to start AI quality-eval consumer", slog.String("error", aiErr.Error()))
+			os.Exit(1)
+		}
+		logger.Info("L4 quality-eval consumer started (fp.ai.completion.served → LLM-as-judge → quality drift)",
+			slog.String("ollama_url", cfg.OllamaURL),
+			slog.String("judge_model", cfg.EvalJudgeModel),
+			slog.Int("sample_rate", cfg.EvalSampleRate),
+			slog.Int("window", cfg.EvalWindow),
+			slog.Float64("floor_score", cfg.EvalFloorScore),
+		)
+	} else {
+		logger.Info("L4 quality-eval DISABLED (FP_EVAL_ENABLED off or no OLLAMA_URL) — tabular data-drift only")
+	}
+
+	// ================================================================
 	// 7. HEALTH SERVER (HTTP) — readiness checks the REAL dependencies
 	// ================================================================
 	// gRPC is HTTP/2; kubelet probes are HTTP/1.1 — they can't share a plain listener,
@@ -478,6 +568,13 @@ func main() {
 	// belt-and-suspenders never double-frees. Registered AFTER the store/redis/nats
 	// defers so it fires BEFORE them (LIFO) — subscribers down, THEN their datastores.
 	defer subscriber.Close()
+	// The L4 quality-eval consumer (nil when disabled) shares the same lifecycle: stop
+	// its consume loop before the stores close. Close() is nil-safe and idempotent.
+	defer func() {
+		if aiEvalConsumer != nil {
+			aiEvalConsumer.Close()
+		}
+	}()
 
 	// ================================================================
 	// 8. START gRPC SERVER (mark SERVING only now that all deps are up)
@@ -507,6 +604,9 @@ func main() {
 	// postgres close → otel flush → health shutdown.
 	logger.Info("stopping event subscribers")
 	subscriber.Close()
+	if aiEvalConsumer != nil {
+		aiEvalConsumer.Close()
+	}
 
 	if serveErr != nil {
 		logger.Error("gRPC server error", slog.String("error", serveErr.Error()))

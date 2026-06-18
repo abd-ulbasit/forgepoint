@@ -130,6 +130,16 @@ type AIConfig struct {
 	// CacheTTLSeconds is the per-team cache key TTL (idle eviction + answer-staleness
 	// bound). 0 → adapter default (24h).
 	CacheTTLSeconds int64 `env:"AI_CACHE_TTL_SECONDS" default:"86400"`
+
+	// --- L4 QUALITY EVAL (M7) -----------------------------------------------
+	// EvalIncludeText opts the gateway into attaching the raw prompt+response TEXT to
+	// the fp.ai.completion.served event so the model-monitor's LLM-as-judge can score
+	// it. DEFAULT false (PII discipline): the cost/audit event carries NO message
+	// content unless an operator deliberately enables the homelab quality-eval
+	// pipeline. With it off, model-monitor's judge degrades gracefully (records the
+	// completion UNSCORED, notes the limitation) rather than judging blind. Off keeps
+	// the served event byte-identical to its pre-L4 shape (omitempty on the wire).
+	EvalIncludeText bool `env:"AI_EVAL_INCLUDE_TEXT" default:"false"`
 }
 
 func main() {
@@ -271,15 +281,16 @@ func main() {
 	}
 
 	svc := domain.NewGatewayService(domain.ServiceDeps{
-		Providers:      registry,
-		Breakers:       breakers,
-		Budget:         budgetStore,
-		Usage:          usageStore,
-		Embedder:       embedder,
-		Cache:          semanticCache,
-		CacheThreshold: cfg.CacheSimilarityThreshold,
-		Publisher:      publisher,
-		Now:            time.Now,
+		Providers:       registry,
+		Breakers:        breakers,
+		Budget:          budgetStore,
+		Usage:           usageStore,
+		Embedder:        embedder,
+		Cache:           semanticCache,
+		CacheThreshold:  cfg.CacheSimilarityThreshold,
+		Publisher:       publisher,
+		EvalIncludeText: cfg.EvalIncludeText,
+		Now:             time.Now,
 	})
 	logger.Info("ai-gateway domain service constructed (ollama + stub, failover order)")
 

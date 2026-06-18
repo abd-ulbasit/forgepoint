@@ -103,6 +103,46 @@ config:
   # footgun). The loop's target is operator config, full stop. Lives in fp-system
   # alongside this service — hence the orchestrator egress rule in networkPolicy.
   orchestratorEndpoint: "fp-pipeline-orchestrator.fp-system.svc.cluster.local:9090"
+  # ----------------------------------------------------------------------
+  # M7/L4 — LLM QUALITY EVAL + QUALITY DRIFT (see internal/config/config.go).
+  # ----------------------------------------------------------------------
+  # A SECOND data-plane pipeline: an AI-completion consumer
+  # (fp.ai.completion.served) that SAMPLES completions, sends them to a local
+  # LLM-as-judge (Ollama in fp-ml), records the 1–5 scores, and raises a
+  # QUALITY-drift report into the SAME alert + retrain loop as data drift.
+  #
+  # SELF-GATE: enabled=false (the default) means the consumer is NEVER started
+  # and model-monitor runs its tabular data-drift function exactly as before —
+  # AND the Ollama egress NetworkPolicy rule is also gated off, so a disabled
+  # deployment opens no network path to fp-ml. Turn this on (and the matching
+  # networkPolicy.egress.ollama.enabled) only where a judge model is served.
+  eval:
+    enabled: false
+    # The in-cluster Ollama serving endpoint the judge calls (the SAME endpoint
+    # the ai-gateway uses). The NetworkPolicy egress.ollama rule must allow this.
+    ollamaUrl: "http://ollama.fp-ml.svc.cluster.local:11434"
+    # The small local model that grades completions. A larger judge → cleaner
+    # JSON output, higher cost; the robust parser absorbs a tiny model's mess.
+    judgeModel: "smollm2:135m"
+    # 1-in-N sampling that bounds the judge's Ollama load. 1 = judge every
+    # monitored completion (homelab default — low volume). Raise to N>1 at scale.
+    sampleRate: 1
+    # Rolling window of recent SCORED evals to average per (team, model) for the
+    # quality-drift check. 0 ⇒ judge+record only (no drift alert).
+    window: 30
+    # Floor below which we don't judge drift (averaging a couple scores is noise).
+    minSamples: 10
+    # Absolute quality floor on the 1–5 scale: a rolling average below this is
+    # drift regardless of baseline. 0 disables the floor rule.
+    floorScore: 3.0
+    # Healthy baseline + relative-drop rule (drift even above the floor when the
+    # average regresses this far below baseline). baselineScore 0 = floor-only.
+    baselineScore: 0
+    baselineDrop: 0.5
+    # Map the quality DROP (below floor/baseline) onto WARNING/CRITICAL. CRITICAL
+    # arms auto-retrain (if the monitor has auto_retrain + a pipeline). warn<=crit.
+    warnDrop: 0.5
+    criticalDrop: 1.0
   # Extra free-form non-secret env keys (rendered into the ConfigMap as-is).
   # Keys are used verbatim — DO NOT prefix with FP_ here unless the service
   # actually reads that prefix; mirror existing FP_* naming.
@@ -454,3 +494,12 @@ networkPolicy:
       enabled: true
       namespace: fp-system
       port: 9090
+    # M7/L4 — the LLM-as-judge calls Ollama in fp-ml (port 11434). This egress is
+    # GATED on the eval feature: keep it DISABLED unless config.eval.enabled is
+    # true, so a deployment that doesn't run quality eval opens no path to fp-ml
+    # (least privilege — the judge is the ONLY reason model-monitor reaches the
+    # model-serving namespace). Enable BOTH together.
+    ollama:
+      enabled: false
+      namespace: fp-ml
+      port: 11434

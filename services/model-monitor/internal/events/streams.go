@@ -52,3 +52,26 @@ func EnsureStreams(ctx context.Context, js jetstream.JetStream) error {
 	}
 	return nil
 }
+
+// EnsureAIStream reconciles the AI stream the L4 quality-eval consumer binds to. It
+// is SEPARATE from EnsureStreams (and called only when L4 is enabled) because the AI
+// stream is OWNED by the ai-gateway — we ensure it only to allow a monitor-first boot
+// to attach the consumer even if the gateway hasn't booted yet (graceful degrade).
+//
+// CRITICAL — IDENTICAL SUBJECT, NOT fp.ai.>: the gateway binds StreamAI to the single
+// completion subject (SubjectAICompletionServed) and keeps its warm-signal stream
+// (AI_REQUESTS=fp.ai.warm.requested) separate so KEDA's scaling lag is clean. If we
+// declared fp.ai.> here it would OVERLAP the gateway's AI + AI_REQUESTS streams and
+// JetStream would reject it (err_code=10065 subjects overlap) — a fatal boot crash.
+// Declaring the IDENTICAL subject makes the two ensure calls idempotent: whoever boots
+// first creates it, the other sees the same config (CreateOrUpdateStream is convergent).
+// This is the exact billing fix the L4 task references.
+func EnsureAIStream(ctx context.Context, js jetstream.JetStream) error {
+	if _, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:     StreamAI,
+		Subjects: []string{SubjectAICompletionServed},
+	}); err != nil {
+		return fmt.Errorf("events: ensure stream %s (%s): %w", StreamAI, SubjectAICompletionServed, err)
+	}
+	return nil
+}

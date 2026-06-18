@@ -72,6 +72,17 @@ type completionServedPayload struct {
 	CostMicroUSD int64  `json:"costMicroUsd"`
 	CacheHit     bool   `json:"cacheHit"`
 	LatencyMs    int64  `json:"latencyMs"`
+
+	// promptText / responseText are the raw turn content for the model-monitor
+	// LLM-as-judge (M7/L4). PII DISCIPLINE: `omitempty` so when the gateway runs with
+	// FP_AI_EVAL_INCLUDE_TEXT off (the default) these are absent from the wire entirely
+	// — the event is byte-identical to the pre-L4 cost/audit shape, so Billing and every
+	// other consumer are unaffected. They are present ONLY when an operator opted into
+	// quality eval. The lowerCamelCase tags keep the proto3-JSON convention the rest of
+	// the events use, so a future events.v1.AiCompletionServed proto can adopt them
+	// unchanged.
+	PromptText   string `json:"promptText,omitempty"`
+	ResponseText string `json:"responseText,omitempty"`
 }
 
 // warmSignalPayload is the minimal wire form of the warm request. The KEDA scaler
@@ -97,6 +108,10 @@ func (p *Publisher) PublishCompletionServed(ctx context.Context, ev domain.Compl
 		CostMicroUSD: ev.CostMicroUSD,
 		CacheHit:     ev.CacheHit,
 		LatencyMs:    ev.LatencyMs,
+		// Empty unless the service populated them (EvalIncludeText on); omitempty keeps
+		// the wire identical to the pre-L4 shape when off.
+		PromptText:   ev.PromptText,
+		ResponseText: ev.ResponseText,
 	}
 	if err := p.pub.Publish(ctx, SubjectCompletionServed, payload); err != nil {
 		return fmt.Errorf("events: publish CompletionServed (request_id=%s): %w", ev.RequestID, err)

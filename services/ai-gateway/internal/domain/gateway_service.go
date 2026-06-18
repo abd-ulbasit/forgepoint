@@ -136,6 +136,12 @@ type ServiceDeps struct {
 	CacheThreshold float64
 	// Publisher emits the served event + the warm signal. Best-effort, off the path.
 	Publisher EventPublisher
+	// EvalIncludeText opts the gateway INTO attaching the raw prompt+response text to
+	// the fp.ai.completion.served event (M7/L4 LLM-as-judge quality eval). DEFAULT
+	// false (PII discipline): the cost/audit event carries NO content unless an
+	// operator turns this on for the quality-eval pipeline. See CompletionServed's PII
+	// note. When false, the monitor's judge degrades to UNSCORED rather than blind.
+	EvalIncludeText bool
 	// Now is the injected clock for latency measurement (tests pass a fake).
 	Now func() time.Time
 }
@@ -147,15 +153,16 @@ const defaultCacheThreshold = 0.95
 
 // gatewayService is the concrete use-case.
 type gatewayService struct {
-	providers      *ProviderRegistry
-	breakers       BreakerRegistry
-	budget         BudgetStore
-	usage          UsageStore
-	embedder       Embedder
-	cache          SemanticCache
-	cacheThreshold float64
-	publisher      EventPublisher
-	now            func() time.Time
+	providers       *ProviderRegistry
+	breakers        BreakerRegistry
+	budget          BudgetStore
+	usage           UsageStore
+	embedder        Embedder
+	cache           SemanticCache
+	cacheThreshold  float64
+	publisher       EventPublisher
+	evalIncludeText bool
+	now             func() time.Time
 }
 
 // Compile-time proof we satisfy the port.
@@ -173,15 +180,16 @@ func NewGatewayService(deps ServiceDeps) GatewayService {
 		threshold = defaultCacheThreshold
 	}
 	return &gatewayService{
-		providers:      deps.Providers,
-		breakers:       deps.Breakers,
-		budget:         deps.Budget,
-		usage:          deps.Usage,
-		embedder:       deps.Embedder,
-		cache:          deps.Cache,
-		cacheThreshold: threshold,
-		publisher:      deps.Publisher,
-		now:            now,
+		providers:       deps.Providers,
+		breakers:        deps.Breakers,
+		budget:          deps.Budget,
+		usage:           deps.Usage,
+		embedder:        deps.Embedder,
+		cache:           deps.Cache,
+		cacheThreshold:  threshold,
+		publisher:       deps.Publisher,
+		evalIncludeText: deps.EvalIncludeText,
+		now:             now,
 	}
 }
 
@@ -283,18 +291,21 @@ func (s *gatewayService) ChatCompletion(ctx context.Context, team string, req Ch
 		return Completion{FinishReason: FinishReasonError}, ErrNoProvider
 	}
 
-	// CAPTURE-FOR-STORE: when the cache is eligible we need the FULL response text to
-	// store on a miss, but the response only exists as it STREAMS through the sink. So
-	// we wrap the caller's sink to ALSO accumulate each non-terminal delta's text into
-	// responseText. The wrapper is transparent (it forwards the delta and propagates the
-	// sink's error unchanged), so the failover invariants are untouched — it only
-	// observes. When the cache is off we use the caller's sink directly (zero overhead).
+	// CAPTURE-FOR-STORE / CAPTURE-FOR-EVAL: we need the FULL response text in two
+	// cases — to store it on a cache miss (cacheEligible), and to attach it to the
+	// served event for the L4 quality judge (evalIncludeText). Either way the response
+	// only exists as it STREAMS through the sink, so we wrap the caller's sink to ALSO
+	// accumulate each non-terminal delta's text into responseText. The wrapper is
+	// transparent (it forwards the delta and propagates the sink's error unchanged), so
+	// the failover invariants are untouched — it only observes. When NEITHER consumer
+	// needs the text we use the caller's sink directly (zero overhead / no buffering).
 	// NOTE on mid-stream failure: if a provider streams partial tokens and then aborts
-	// (errStreamAborted), we never reach the store block (the loop returns terminal),
-	// so a partial answer is never cached — only a CLEAN completion is stored.
+	// (errStreamAborted), we never reach the publish/store block (the loop returns
+	// terminal), so a partial answer is never captured — only a CLEAN completion is.
+	captureText := cacheEligible || s.evalIncludeText
 	var responseText string
 	streamSink := sink
-	if cacheEligible {
+	if captureText {
 		var b strings.Builder
 		streamSink = func(d Delta) error {
 			if err := sink(d); err != nil {
@@ -437,7 +448,7 @@ func (s *gatewayService) ChatCompletion(ctx context.Context, team string, req Ch
 
 	// Publish the canonical cost/audit event (best-effort, off the response path).
 	if s.publisher != nil {
-		_ = s.publisher.PublishCompletionServed(ctx, CompletionServed{ //nolint:errcheck // best-effort
+		ev := CompletionServed{
 			RequestID:    req.RequestID,
 			Team:         team,
 			Model:        req.Model,
@@ -448,7 +459,21 @@ func (s *gatewayService) ChatCompletion(ctx context.Context, team string, req Ch
 			CostMicroUSD: usage.CostMicroUSD,
 			CacheHit:     false,
 			LatencyMs:    latency.Milliseconds(),
-		})
+		}
+		// L4 QUALITY EVAL: attach the raw prompt+response ONLY when explicitly opted in
+		// (evalIncludeText). promptText may already be set by the cache stage; if not
+		// (cache off, eval on) we compute it here from the same concatenation the cache
+		// would use. PII discipline: with the flag off, both stay "" and omitempty drops
+		// them from the wire entirely (event identical to the pre-L4 shape).
+		if s.evalIncludeText {
+			pt := promptText
+			if pt == "" {
+				pt = promptForEmbedding(req.Messages)
+			}
+			ev.PromptText = pt
+			ev.ResponseText = responseText
+		}
+		_ = s.publisher.PublishCompletionServed(ctx, ev) //nolint:errcheck // best-effort
 	}
 
 	return completion, nil

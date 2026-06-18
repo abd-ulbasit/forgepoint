@@ -45,6 +45,14 @@ const (
 	// Feature stream (producer: feature-store). FeaturesWritten scopes drift
 	// checks / cache invalidation to the changed entities (thin event).
 	SubjectFeaturesWritten = "fp.features.written"
+
+	// AI stream (producer: ai-gateway). SubjectAICompletionServed is the cost/audit
+	// event the gateway emits after EVERY LLM completion (M7/L4). The model-monitor
+	// consumes it to drive LLM-as-judge quality evaluation + quality drift. It is a
+	// PLAIN JSON struct (NOT a proto message — the events proto predates the AI events
+	// and the hard rule forbids regen), so the consumer decodes it with encoding/json
+	// (see ai_eval_consumer.go), exactly the codec the billing AIConsumer uses.
+	SubjectAICompletionServed = "fp.ai.completion.served"
 )
 
 // ============================================================================
@@ -66,6 +74,17 @@ const (
 	StreamInference = "INFERENCE"
 	// StreamFeatures owns fp.features.> — the feature-write stream.
 	StreamFeatures = "FEATURES"
+
+	// StreamAI is the ai-gateway's cost/audit log. The gateway OWNS and produces into
+	// it; the model-monitor's L4 quality-eval consumer READS fp.ai.completion.served
+	// from it. Named exactly "AI" as the gateway names it so the two services bind to
+	// the SAME stream. CRITICAL: it is bound to the IDENTICAL single completion subject
+	// (SubjectAICompletionServed), NOT fp.ai.> — the gateway deliberately avoids the
+	// fp.ai.> wildcard so its cost log and its KEDA warm-signal stream
+	// (AI_REQUESTS=fp.ai.warm.requested) don't collide. Declaring fp.ai.> here would
+	// OVERLAP the gateway's AI + AI_REQUESTS streams and JetStream would reject it
+	// (err_code=10065 subjects overlap). See EnsureAIStream + the billing fix.
+	StreamAI = "AI"
 
 	// The capture filters: a stream stores EVERYTHING under its tree even though
 	// our consumers filter to specific subjects. This means an event published

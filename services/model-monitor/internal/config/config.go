@@ -71,4 +71,73 @@ type MonitorConfig struct {
 	// works out of the box on the chart's wiring; still env-overridable for other
 	// topologies (a different namespace/release name, or a local/test target).
 	OrchestratorEndpoint string `env:"ORCHESTRATOR_ENDPOINT" default:"fp-pipeline-orchestrator.fp-system.svc.cluster.local:9090"`
+
+	// ========================================================================
+	// M7/L4 — LLM QUALITY EVALUATION + QUALITY DRIFT
+	// ========================================================================
+	//
+	// L4 adds a SECOND data-plane pipeline: an AI-completion consumer
+	// (fp.ai.completion.served) that SAMPLES completions, sends them to a local
+	// LLM-as-judge (Ollama), records the scores, and raises a QUALITY-drift report
+	// into the EXISTING alert + retrain loop. The whole feature SELF-GATES on
+	// EvalEnabled: when off (or OllamaURL empty), the consumer is never started and
+	// model-monitor runs its tabular data-drift function exactly as before.
+
+	// EvalEnabled is the kill-switch for the L4 quality-eval pipeline. DEFAULT false:
+	// quality eval depends on a local judge model being served by Ollama, so it is
+	// opt-in (a deployment without the judge must not start a consumer that judges
+	// every sampled completion against an absent backend). When false the AI consumer
+	// is a NO-OP (not started) and the rest of model-monitor is unaffected.
+	EvalEnabled bool `env:"EVAL_ENABLED" default:"false"`
+
+	// OllamaURL is the in-cluster Ollama serving endpoint the LLM-as-judge calls — the
+	// SAME endpoint the ai-gateway serves from. Defaulted to the fp-ml Service FQDN
+	// (the task's specified endpoint). Only used when EvalEnabled.
+	OllamaURL string `env:"OLLAMA_URL" default:"http://ollama.fp-ml.svc.cluster.local:11434"`
+
+	// EvalJudgeModel is the local model that grades completions. A SMALL model keeps
+	// judge latency/cost low; the robust parser absorbs its messy output. Overridable
+	// per deployment (a larger judge → cleaner JSON, higher cost).
+	EvalJudgeModel string `env:"EVAL_JUDGE_MODEL" default:"smollm2:135m"`
+
+	// EvalSampleRate is the 1-in-N sampling rate that bounds the judge's Ollama load.
+	// DEFAULT 1 = judge EVERY monitored completion (the homelab default — volume is
+	// low). Set to N>1 to judge ~1-in-N when traffic grows. The CountingSampler makes
+	// this deterministic (every Nth monitored event), not random.
+	EvalSampleRate int `env:"EVAL_SAMPLE_RATE" default:"1"`
+
+	// EvalWindow is how many of the most-recent SCORED evals to average for the rolling
+	// quality drift check, per (team, model). Too small = noisy; too large = slow to
+	// react. A few dozen is a reasonable homelab default. 0 ⇒ quality-DRIFT detection
+	// OFF (the consumer still judges + records evals as an eval log, but never alerts).
+	EvalWindow int `env:"EVAL_WINDOW" default:"30"`
+
+	// EvalMinSamples is the floor below which we don't judge drift (averaging a couple
+	// of scores is noise, not signal — mirrors the tabular MinSamples discipline).
+	EvalMinSamples int `env:"EVAL_MIN_SAMPLES" default:"10"`
+
+	// EvalFloorScore is the absolute quality floor on the 1–5 scale: if the rolling
+	// average drops BELOW this, that is drift regardless of any baseline. Default 3.0
+	// (a model averaging below "3/5" is producing poor answers). 0 disables the floor
+	// rule (baseline-drop only).
+	EvalFloorScore float64 `env:"EVAL_FLOOR_SCORE" default:"3.0"`
+
+	// EvalBaselineScore is the expected/healthy average (the LLM's "known good"
+	// quality). With EvalBaselineDrop it triggers a RELATIVE-regression drift even when
+	// still above the floor. 0 disables the baseline rule (floor-only). Default 0
+	// (floor-only out of the box; an operator sets a baseline once they know the model's
+	// healthy average).
+	EvalBaselineScore float64 `env:"EVAL_BASELINE_SCORE" default:"0"`
+
+	// EvalBaselineDrop is how far BELOW EvalBaselineScore the rolling average must fall
+	// to count as drift (points on the 1–5 scale). Only used when EvalBaselineScore>0.
+	EvalBaselineDrop float64 `env:"EVAL_BASELINE_DROP" default:"0.5"`
+
+	// EvalWarnDrop / EvalCriticalDrop map the quality DROP (how far the average fell
+	// below the floor/baseline reference) onto the severity ladder — exactly like a
+	// data-drift ThresholdConfig's warn/critical. WarnDrop <= CriticalDrop. CRITICAL is
+	// the rung that ARMS auto-retrain (if the monitor has auto_retrain + a pipeline).
+	// Defaults: warn at a 0.5-point drop, critical at a 1.0-point drop below reference.
+	EvalWarnDrop     float64 `env:"EVAL_WARN_DROP" default:"0.5"`
+	EvalCriticalDrop float64 `env:"EVAL_CRITICAL_DROP" default:"1.0"`
 }
