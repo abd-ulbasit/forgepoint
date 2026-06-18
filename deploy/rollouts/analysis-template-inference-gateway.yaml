@@ -1,0 +1,135 @@
+# =============================================================================
+# AnalysisTemplate: fp-inference-gateway-success-rate
+# Phase 21 — Progressive Delivery (metric-based auto-rollback gate)
+# =============================================================================
+#
+# WHAT IS AN ANALYSISTEMPLATE?
+# ------------------------------
+# An AnalysisTemplate defines HOW to query a metrics provider (Prometheus here)
+# to determine if a canary is healthy. The Rollout references it at each `pause`
+# step via an `analysis` step. Argo Rollouts creates an AnalysisRun (an
+# instance of the template) for each analysis step, runs the queries on an
+# interval, and reports Successful / Failed / Inconclusive based on the results.
+#
+# If an AnalysisRun reports Failed, the Rollout controller:
+#   1. Aborts the canary (Rollout.status.phase → Degraded).
+#   2. Resets the canary traffic weight to 0%.
+#   3. Scales the canary ReplicaSet to 0 replicas.
+#   4. Leaves the stable ReplicaSet intact and serving 100% of traffic.
+# Net result: automatic rollback with no human intervention required.
+#
+# METRIC: SUCCESS RATE
+# ---------------------
+# We define success rate as:
+#   1 - (HTTP 5xx errors / total requests) over the last 5 minutes.
+# Threshold: >= 99% success rate. A canary serving more than 1% errors fails
+# the gate. This maps to the platform's RED (Rate/Errors/Duration) metric set
+# exported via OpenTelemetry → Prometheus.
+#
+# The Prometheus query uses the `service` argument (injected from the Rollout's
+# `analysis.args`) to scope the query to canary pods only, using the
+# `forgepoint.io/track: canary` label that the Rollout injects via canaryMetadata.
+#
+# PLACEHOLDER NOTE
+# -----------------
+# The Prometheus metric names below (http_requests_total, http_request_errors_total)
+# are REPRESENTATIVE. The actual metric names depend on what the OpenTelemetry
+# SDK + Prometheus exporter emit for the inference-gateway service. The real
+# names will be something like:
+#   - forgepoint_gateway_requests_total{service="fp-inference-gateway",track="canary"}
+#   - forgepoint_gateway_errors_total{service="fp-inference-gateway",track="canary"}
+# Update the queries once the service's Prometheus metrics are instrumented
+# (Phase 10 observability). The template structure and auto-rollback mechanics
+# are fully functional; only the metric name strings need updating.
+#
+# INTERVIEW FRAMING
+# ------------------
+# Q: "How do you prevent a bad deploy from taking down production?"
+# A: "We use Argo Rollouts with Prometheus AnalysisTemplates as automatic gates.
+#     A new version gets 20% of traffic. If its error rate exceeds 1% or p99
+#     latency exceeds the SLO threshold, the AnalysisRun marks the canary as
+#     Failed, the controller resets traffic to 0%, scales the canary down,
+#     and pages the on-call. The stable ReplicaSet never stopped running — there
+#     is no downtime, just a bounded incident at 20% blast radius."
+# =============================================================================
+
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: fp-inference-gateway-success-rate
+  namespace: fp-system
+  labels:
+    app.kubernetes.io/name: fp-inference-gateway
+    app.kubernetes.io/part-of: forgepoint
+    app.kubernetes.io/component: inference-gateway
+  annotations:
+    forgepoint.io/phase: "21"
+    forgepoint.io/pattern: "progressive-delivery-analysis"
+spec:
+  # args: values passed in from the Rollout's analysis step.
+  # The `service` arg lets a single template be reused for both the stable and
+  # canary tracks (though in practice we always pass the canary service name).
+  args:
+    - name: service
+      # No default — the Rollout MUST supply this via analysis.args; failing
+      # to do so will make the AnalysisRun fail immediately (safe default).
+
+  metrics:
+    # -------------------------------------------------------------------------
+    # Metric 1: success-rate
+    # Measures the fraction of requests that did NOT result in a 5xx error.
+    # successCondition: result >= 0.99  → ≥ 99% success required to pass.
+    # failureLimit: 0                   → zero consecutive failures allowed.
+    #   The AnalysisRun fails (and triggers rollback) on the first bad interval.
+    # -------------------------------------------------------------------------
+    - name: success-rate
+      interval: 1m         # evaluate every minute
+      count: 5             # run 5 evaluations; all must pass
+      failureLimit: 0      # zero failures tolerated → strict gate
+
+      provider:
+        prometheus:
+          # Prometheus endpoint — the in-cluster address of the Prometheus
+          # server deployed in Phase 10 (or the OTel Collector's Prometheus
+          # remote-write receiver).
+          address: http://prometheus-operated.fp-infra.svc.cluster.local:9090
+
+          # Query: 1 - (error_rate). Uses the `service` arg from the Rollout.
+          # PLACEHOLDER: replace metric names with actual OTel-emitted names.
+          # The `track="canary"` label is injected by canaryMetadata in the Rollout.
+          query: |
+            sum(rate(http_requests_total{service="{{args.service}}",status=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total{service="{{args.service}}"}[5m]))
+
+      # successCondition: the metric value must satisfy this Go expression.
+      # result is the scalar returned by the Prometheus query above.
+      # A value of 0.01 means 1% error rate; we require ≤ 1% errors (≥ 99% success).
+      successCondition: result <= 0.01
+
+    # -------------------------------------------------------------------------
+    # Metric 2: p99-latency
+    # Measures the 99th percentile request latency in seconds.
+    # SLO: p99 < 500ms for the inference-gateway.
+    # PLACEHOLDER metric name — update to actual histogram metric after Phase 10.
+    # -------------------------------------------------------------------------
+    - name: p99-latency
+      interval: 1m
+      count: 5
+      failureLimit: 1     # allow 1 bad interval (brief spikes are acceptable)
+
+      provider:
+        prometheus:
+          address: http://prometheus-operated.fp-infra.svc.cluster.local:9090
+
+          # histogram_quantile over the grpc/http duration histogram.
+          # PLACEHOLDER: replace with the actual OTel duration histogram metric name.
+          query: |
+            histogram_quantile(0.99,
+              sum(rate(http_request_duration_seconds_bucket{service="{{args.service}}"}[5m]))
+              by (le)
+            )
+
+      # 500ms SLO for the inference-gateway p99 (tight — it's on the user's
+      # critical path). Lower to 0.2 (200ms) once the baseline is established.
+      successCondition: result < 0.5

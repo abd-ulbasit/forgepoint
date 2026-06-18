@@ -1,0 +1,138 @@
+# =============================================================================
+# ScaledObject: fp-model-monitor
+# Phase 22 — Event-Driven Autoscaling (KEDA on NATS JetStream lag)
+# =============================================================================
+#
+# WHY NATS LAG, NOT CPU?
+# ----------------------
+# CPU-based HPA reacts to a *symptom* (hot processor) not the *cause* (unread
+# messages). For event consumers the right signal is the work backlog — the
+# number of unacknowledged messages the consumer hasn't processed yet. A queue
+# backed up by 10 000 events means pods should scale up *now*, even if they're
+# sitting at 5 % CPU waiting on Redis round-trips or DB writes.
+#
+# NATS JetStream exposes this backlog as "consumer lag" — the difference between
+# the stream's last sequence number and the consumer's acked sequence. KEDA's
+# `nats-jetstream` trigger polls the NATS monitoring API (:8222/jsz) for that
+# number and drives HPA-like scaling from it.
+#
+# SCALE-TO-ZERO TRADEOFF
+# ----------------------
+# minReplicaCount: 0 lets idle consumers evaporate completely (zero cost at
+# rest). The tradeoff is a *cold-start lag*: the first event after a zero period
+# must wait for a pod to schedule + start (~5–15 s on a warm node). For
+# model-monitor this is acceptable — drift detection is near-real-time but
+# inference events are never on the millisecond path; the consumer is decoupled
+# by NATS. If cold starts are unacceptable, set minReplicaCount: 1.
+#
+# CONSUMER DETAILS (model-monitor)
+# ---------------------------------
+# Stream  : INFERENCE     (fp.inference.> events from inference-gateway)
+# Consumer: model-monitor (durable push consumer, ack explicit)
+# Subject filter: fp.inference.completed, fp.inference.failed
+# The consumer folds each event into a live sliding window (Redis) and, on
+# window close, runs PSI/KL/KS drift math. Heavy-ish per-event but bounded.
+#
+# KEDA INSTALL PREREQUISITE
+# -------------------------
+# KEDA must be installed via its Helm chart before these ScaledObjects take
+# effect. Without the controller the CRD exists but no reconciler acts on it.
+#
+#   helm repo add kedacore https://kedacore.github.io/charts
+#   helm install keda kedacore/keda \
+#     --namespace keda --create-namespace \
+#     --version 2.16.0
+#
+# Verify: kubectl get pods -n keda
+# CRD:    kubectl get crd scaledobjects.keda.sh
+# =============================================================================
+
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: fp-model-monitor
+  namespace: fp-system
+  labels:
+    # Standard Forgepoint labels — match the Helm chart's selectorLabels so
+    # dashboards and kubectl selectors work uniformly across all resources.
+    app.kubernetes.io/name: fp-model-monitor
+    app.kubernetes.io/part-of: forgepoint
+    app.kubernetes.io/component: model-monitor
+    app.kubernetes.io/managed-by: keda
+  annotations:
+    # Document which phase introduced this resource for cross-referencing.
+    forgepoint.io/phase: "22"
+    forgepoint.io/pattern: "event-driven-autoscaling"
+spec:
+  # -------------------------------------------------------------------------
+  # scaleTargetRef — the Deployment KEDA manages.
+  # KEDA creates/owns an HPA object that targets this Deployment. The Helm
+  # chart's autoscaling.enabled should stay FALSE for these services; if both
+  # a chart HPA and a KEDA ScaledObject target the same Deployment, they will
+  # fight each other for replica count ownership.
+  # -------------------------------------------------------------------------
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: fp-model-monitor     # must match the Helm release's Deployment name
+
+  # -------------------------------------------------------------------------
+  # Replica bounds.
+  #   minReplicaCount: 0 → scale-to-zero when the stream is fully drained.
+  #   maxReplicaCount: 6 → matches the Helm chart's autoscaling.maxReplicas.
+  #
+  # KEDA enforces the min; if the trigger metric is above activationLagThreshold
+  # (see below) at least one replica spins up. The HPA then uses lagThreshold
+  # to decide the exact count between min and max.
+  # -------------------------------------------------------------------------
+  minReplicaCount: 0
+  maxReplicaCount: 6
+
+  # -------------------------------------------------------------------------
+  # Timing knobs.
+  #   pollingInterval: how often KEDA polls the NATS monitoring endpoint (s).
+  #     30 s is a reasonable balance — fast enough to react to a burst, slow
+  #     enough not to hammer the NATS /jsz endpoint.
+  #   cooldownPeriod: once lag drops to zero, wait this many seconds before
+  #     scaling to zero. Prevents thrashing when events arrive in bursts
+  #     separated by short lulls. 300 s (5 min) is the same as the Helm
+  #     chart's scaleDown stabilizationWindowSeconds.
+  # -------------------------------------------------------------------------
+  pollingInterval: 30
+  cooldownPeriod: 300
+
+  triggers:
+    - type: nats-jetstream
+      metadata:
+        # natsServerMonitoringEndpoint: the NATS monitoring HTTP API.
+        # Port 8222 is the http_port configured in nats.yaml; it exposes /jsz,
+        # /varz, /healthz etc. KEDA reads /jsz?acc=&consumer=<name>&stream=<name>.
+        natsServerMonitoringEndpoint: "nats.fp-infra.svc.cluster.local:8222"
+
+        # account: the NATS account name. "$G" is the default global account
+        # used when no multi-tenancy account separation is configured (our setup).
+        account: "$G"
+
+        # stream: the JetStream stream name that model-monitor consumes.
+        # INFERENCE stream holds fp.inference.> events.
+        stream: "INFERENCE"
+
+        # consumer: the durable consumer name registered by model-monitor.
+        # Must match what services/model-monitor/internal/events/subscriber.go
+        # uses when calling js.Subscribe or js.PullSubscribe (the durable name).
+        consumer: "model-monitor"
+
+        # lagThreshold: target unprocessed messages per replica.
+        # At 50 pending events per pod, KEDA will compute:
+        #   desired_replicas = ceil(total_lag / lagThreshold)
+        # So 200 pending events → 4 replicas; 1 event → 1 replica.
+        # Tune this based on the per-event processing time (drift math ~10ms)
+        # and the acceptable end-to-end latency budget for drift detection.
+        lagThreshold: "50"
+
+        # activationLagThreshold: the minimum lag that must exist before KEDA
+        # wakes any replica at all (scale from 0 → 1). Setting this to "1"
+        # means a single unprocessed message wakes a pod. Keep it low for
+        # near-real-time drift detection; raise it if cold-start cost is too
+        # high and you want to batch a few events before waking.
+        activationLagThreshold: "1"

@@ -1,0 +1,55 @@
+# =============================================================================
+# Kustomization — deploy/keda/
+# Phase 22: Event-Driven Autoscaling (KEDA ScaledObjects)
+# =============================================================================
+#
+# HOW TO APPLY
+# -------------
+# Prerequisite: KEDA controller must be installed first (see README.md).
+#
+#   # Dry-run (verify manifests parse + server-side validate):
+#   kubectl apply -k deploy/keda/ --dry-run=server
+#
+#   # Apply all ScaledObjects:
+#   kubectl apply -k deploy/keda/
+#
+# HOW THIS FITS INTO GITOPS (Phase 20)
+# --------------------------------------
+# The ArgoCD app-of-apps root.yaml in deploy/argocd/ should reference this
+# directory as an Application source once KEDA is installed in the cluster.
+# Example Application fragment (add to deploy/argocd/apps/keda-scaled-objects.yaml):
+#
+#   spec:
+#     source:
+#       repoURL: https://github.com/abd-ulbasit/forgepoint
+#       path: deploy/keda
+#       targetRevision: HEAD
+#     destination:
+#       server: https://kubernetes.default.svc
+#       namespace: fp-system
+#     syncPolicy:
+#       automated:
+#         prune: true
+#         selfHeal: true
+# =============================================================================
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# All ScaledObjects live in fp-system where the Deployments they target reside.
+namespace: fp-system
+
+resources:
+  # Event consumers scaled on NATS JetStream consumer lag.
+  # Order is by consumer criticality (financial → monitoring → analytical → UX).
+  - scaled-object-billing.yaml
+  - scaled-object-model-monitor.yaml
+  - scaled-object-experiment-tracker.yaml
+  - scaled-object-notification.yaml
+
+# Common labels added to every resource produced by this kustomization.
+# These complement the per-resource labels already set in each file.
+# Note: `labels` (not deprecated `commonLabels`) is used per kustomize v5+.
+labels:
+  - pairs:
+      forgepoint.io/managed-by-phase: "22"

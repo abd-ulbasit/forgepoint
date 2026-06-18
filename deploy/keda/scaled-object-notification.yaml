@@ -1,0 +1,81 @@
+# =============================================================================
+# ScaledObject: fp-notification
+# Phase 22 — Event-Driven Autoscaling (KEDA on NATS JetStream lag)
+# =============================================================================
+#
+# NOTIFICATION SERVICE CONSUMER PROFILE
+# ---------------------------------------
+# Notification is a pure choreography reactor — it subscribes to a wide fan-in
+# of subjects across multiple streams (fp.models.>, fp.pipelines.>, fp.billing.>,
+# fp.experiments.>, fp.inference.failed, fp.notifications.>) and delivers
+# messages over external channels (email/Slack/webhook). I/O-bound per event
+# (one or two outbound HTTP calls to a delivery provider). Scales well
+# horizontally; messages are routed by consumer group so each event is processed
+# by exactly one pod.
+#
+# NATS consumer details:
+#   Stream   : NOTIFICATIONS  (fp.notifications.> — events notification PUBLISHES)
+#   Trigger  : We scale on the inbound FANIN stream (EVENTS) that notification
+#              *consumes* — this is the unified event stream the service reads.
+#              Name: PLATFORM_EVENTS (fp.models.>, fp.pipelines.>, fp.billing.>,
+#              fp.experiments.>), consumer: "notification"
+#
+# SCALE-TO-ZERO: Acceptable here — notifications are user-facing but not on the
+# latency-critical path. A 10-15 s cold start on the first event after a quiet
+# period (overnight) is fine vs. the permanent pod cost.
+#
+# lagThreshold: 20 events/replica — lower than model-monitor because each
+# delivery involves an external HTTP call (high latency per event); fewer events
+# per pod prevents the queue from growing during slow deliveries.
+# =============================================================================
+
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: fp-notification
+  namespace: fp-system
+  labels:
+    app.kubernetes.io/name: fp-notification
+    app.kubernetes.io/part-of: forgepoint
+    app.kubernetes.io/component: notification
+    app.kubernetes.io/managed-by: keda
+  annotations:
+    forgepoint.io/phase: "22"
+    forgepoint.io/pattern: "event-driven-autoscaling"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: fp-notification
+
+  # Notification sees lower and spikier load than model-monitor. It's quiet
+  # overnight; scale to zero to save resources. Max 4 pods is enough for the
+  # event fan-in volume; raise if external delivery latency becomes the
+  # bottleneck (e.g. Slack rate-limits causing backlog).
+  minReplicaCount: 0
+  maxReplicaCount: 4
+
+  # notification events are user-visible; poll frequently so the lag reacts
+  # quickly. Cooldown is shorter (120 s) because bursts are short-lived (a
+  # pipeline failure → N notifications → silence).
+  pollingInterval: 20
+  cooldownPeriod: 120
+
+  triggers:
+    - type: nats-jetstream
+      metadata:
+        natsServerMonitoringEndpoint: "nats.fp-infra.svc.cluster.local:8222"
+        account: "$G"
+
+        # PLATFORM_EVENTS stream carries fp.models.>, fp.pipelines.>,
+        # fp.billing.>, fp.experiments.> — all subjects notification reacts to.
+        # This single stream fan-in is why we scale on it rather than individual
+        # subject-level consumers.
+        stream: "PLATFORM_EVENTS"
+        consumer: "notification"
+
+        # Lower threshold because each event involves an outbound HTTP call —
+        # processing time is dominated by delivery latency, not compute.
+        # 20 pending / pod keeps the queue draining at a steady pace.
+        lagThreshold: "20"
+        activationLagThreshold: "1"

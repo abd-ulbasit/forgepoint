@@ -1,0 +1,268 @@
+# =============================================================================
+# Rollout: fp-model-serving
+# Phase 21 — Progressive Delivery (Argo Rollouts canary)
+# =============================================================================
+#
+# MODEL SERVING CANARY — ADDITIONAL CONSIDERATIONS
+# --------------------------------------------------
+# model-serving is DIFFERENT from inference-gateway in one critical way:
+# it runs a sidecar-based ONNX serving pattern where the sidecar (the model
+# file downloader + ONNX runtime) and the main container are tightly coupled.
+# A "new version" of model-serving may mean:
+#   (a) a new service binary (Go code change), OR
+#   (b) a new model version artifact (model weights change), OR
+#   (c) both.
+#
+# For case (a) the canary strategy here applies directly — route a fraction of
+# inference traffic to pods running the new binary.
+#
+# For case (b), the platform's canonical path for a new model version is via
+# the Pipeline Orchestrator saga (fp.pipelines.model.deployed event), which
+# updates the inference-gateway's routing table (weight_bps). That's an
+# application-level canary *above* the infra layer. The Rollout here is the
+# *infra layer* canary for the serving binary itself.
+#
+# This distinction is worth knowing in an interview: Forgepoint has two canary
+# layers:
+#   1. Application-level (Pipeline Orchestrator saga weight_bps, Phase 5) —
+#      routes traffic between *model versions* (e.g. v1 vs v2 weights).
+#   2. Infra-level (Argo Rollouts, Phase 21) — routes traffic between *service
+#      binary versions* (e.g. a code fix in model-serving itself).
+# Both layers are needed; neither replaces the other.
+#
+# ANALYSIS TEMPLATE for model-serving focuses on:
+#   - ONNX inference error rate (serving-specific metric)
+#   - p99 inference latency (model-serving SLO is tighter than gateway — the
+#     model is on the critical path for every end-user request)
+#   - drift signal: if model-monitor's drift score for pods in the canary
+#     track spikes (the new model binary distorts feature representations),
+#     auto-rollback fires before users notice. This is the closed loop between
+#     Phase 16 (model-monitor) and Phase 21 (progressive delivery).
+# =============================================================================
+
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: fp-model-serving
+  namespace: fp-system
+  labels:
+    app.kubernetes.io/name: fp-model-serving
+    app.kubernetes.io/part-of: forgepoint
+    app.kubernetes.io/component: model-serving
+  annotations:
+    forgepoint.io/phase: "21"
+    forgepoint.io/pattern: "progressive-delivery-canary"
+spec:
+  replicas: 2
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fp-model-serving
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fp-model-serving
+        app.kubernetes.io/part-of: forgepoint
+        app.kubernetes.io/component: model-serving
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: fp-model-serving
+      automountServiceAccountToken: false
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      # -----------------------------------------------------------------------
+      # Sidecar pattern: model-artifact-fetcher runs first (initContainer) to
+      # download model weights into a shared emptyDir; the ONNX runtime in the
+      # main container reads from that volume. This matches the Phase 3 design
+      # (Model Serving — Sidecar, HPA on custom metrics).
+      # The sidecar image tag is separately versioned from the main container;
+      # update them independently via `kubectl argo rollouts set image`.
+      # -----------------------------------------------------------------------
+      initContainers:
+        - name: model-artifact-fetcher
+          image: ghcr.io/abd-ulbasit/forgepoint/model-artifact-fetcher:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /fetcher
+            - --artifact-path=$(MODEL_ARTIFACT_PATH)
+            - --output-dir=/models
+          envFrom:
+            - configMapRef:
+                name: fp-model-serving
+            - secretRef:
+                name: fp-model-serving
+          volumeMounts:
+            - name: model-weights
+              mountPath: /models
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+
+      containers:
+        - name: model-serving
+          image: ghcr.io/abd-ulbasit/forgepoint/model-serving:latest
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: grpc
+              containerPort: 9090
+              protocol: TCP
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: fp-model-serving
+            - secretRef:
+                name: fp-model-serving
+
+          volumeMounts:
+            - name: model-weights
+              mountPath: /models
+              readOnly: true
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop:
+                - ALL
+
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 0
+            periodSeconds: 5
+            # 60 * 5s = 300s budget — model artifact download can be slow.
+            failureThreshold: 60
+            timeoutSeconds: 3
+
+      volumes:
+        - name: model-weights
+          emptyDir: {}
+
+  strategy:
+    canary:
+      stableService: fp-model-serving-stable
+      canaryService: fp-model-serving-canary
+
+      steps:
+        # ------------------------------------------------------------------
+        # Step 1: 20% canary — one in five requests hit the new serving binary.
+        # Low enough to limit blast radius for a latency-sensitive service.
+        # ------------------------------------------------------------------
+        - setWeight: 20
+
+        # ------------------------------------------------------------------
+        # Step 2: analysis gate at 20%.
+        # Queries Prometheus for inference error rate AND p99 latency on the
+        # canary track. The drift AnalysisTemplate also checks model-monitor's
+        # drift score for model-serving-canary pods.
+        # ------------------------------------------------------------------
+        - analysis:
+            templates:
+              - templateName: fp-model-serving-success-rate
+              - templateName: fp-model-serving-latency
+            args:
+              - name: service
+                value: fp-model-serving-canary
+
+        # ------------------------------------------------------------------
+        # Step 3: manual pause. Operator reviews canary dashboards in Grafana,
+        # checks the drift panel (fp.models.drift.detected events), then:
+        #   kubectl argo rollouts promote fp-model-serving
+        # ------------------------------------------------------------------
+        - pause: {}
+
+        # ------------------------------------------------------------------
+        # Step 4: 50% — half of inference requests hit the canary. By now
+        # both analysis gates have passed; this step is about confidence, not
+        # discovery.
+        # ------------------------------------------------------------------
+        - setWeight: 50
+
+        # ------------------------------------------------------------------
+        # Step 5: second analysis at 50%. Latency metrics are now derived from
+        # a larger traffic sample — statistically stronger.
+        # ------------------------------------------------------------------
+        - analysis:
+            templates:
+              - templateName: fp-model-serving-success-rate
+              - templateName: fp-model-serving-latency
+            args:
+              - name: service
+                value: fp-model-serving-canary
+
+        # ------------------------------------------------------------------
+        # Step 6: final pause before 100% cutover.
+        # ------------------------------------------------------------------
+        - pause: {}
+
+      antiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          weight: 100
+
+      canaryMetadata:
+        labels:
+          forgepoint.io/track: canary
+        annotations:
+          forgepoint.io/rollout-stage: canary
+
+      stableMetadata:
+        labels:
+          forgepoint.io/track: stable
+        annotations:
+          forgepoint.io/rollout-stage: stable

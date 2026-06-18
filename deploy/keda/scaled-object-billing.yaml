@@ -1,0 +1,99 @@
+# =============================================================================
+# ScaledObject: fp-billing
+# Phase 22 — Event-Driven Autoscaling (KEDA on NATS JetStream lag)
+# =============================================================================
+#
+# BILLING SERVICE CONSUMER PROFILE
+# ---------------------------------
+# Billing implements the Outbox Pattern — it consumes fp.inference.completed
+# events to record usage, and publishes its own billing events (usage.recorded,
+# quota.exceeded, invoice.generated) via a transactional outbox (Postgres INSERT
+# + outbox row in the same transaction → relay worker publishes to NATS).
+#
+# Two consumption surfaces:
+#   1. INFERENCE stream consumer ("billing") — reads fp.inference.completed to
+#      record per-request usage. This is the primary scaling signal.
+#   2. Outbox relay — a lightweight internal goroutine; not a separate consumer,
+#      so not a separate ScaledObject.
+#
+# CORRECTNESS CONCERN WITH SCALE-TO-ZERO
+# ----------------------------------------
+# The Outbox Pattern requires the relay goroutine to run continuously to flush
+# the outbox table. If billing scales to zero, the relay stops and published
+# billing events are delayed until the next pod starts (triggered by a new
+# inference event). For a financial system this delay may be unacceptable.
+#
+# Decision here: minReplicaCount: 1 (NOT zero) for billing.
+#
+# This is the KEY TRADEOFF between KEDA and application correctness:
+#   scale-to-zero is free for stateless consumers (notification, experiment-
+#   tracker) but wrong for services with side-channel duties (outbox relay,
+#   cron-style polling) that must run continuously. The correct answer for
+#   billing is scale-to-zero=false; keep ≥1 replica always hot.
+#
+# Interview framing: "Why doesn't billing scale to zero?"
+# → Because the Outbox relay is a duty-cycle background goroutine, not a
+#   pure event consumer. A zero-replica billing service would stop flushing
+#   its outbox table, leaving billing events stuck indefinitely. The safety
+#   property (at-least-once publish) requires the relay to be running. We
+#   pay for one always-on pod; KEDA still saves us from over-provisioning
+#   during traffic spikes by adding replicas when the inference backlog grows.
+#
+# NATS consumer details:
+#   Stream  : INFERENCE
+#   Consumer: billing
+# =============================================================================
+
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: fp-billing
+  namespace: fp-system
+  labels:
+    app.kubernetes.io/name: fp-billing
+    app.kubernetes.io/part-of: forgepoint
+    app.kubernetes.io/component: billing
+    app.kubernetes.io/managed-by: keda
+  annotations:
+    forgepoint.io/phase: "22"
+    forgepoint.io/pattern: "event-driven-autoscaling"
+    # Document the deliberate decision not to scale to zero.
+    forgepoint.io/scale-to-zero: "false — outbox relay must run continuously"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: fp-billing
+
+  # minReplicaCount: 1 — see CORRECTNESS CONCERN above. The outbox relay
+  # goroutine must always have at least one running pod. KEDA adds replicas
+  # above this floor when lag grows; it will never scale below 1.
+  minReplicaCount: 1
+  maxReplicaCount: 5
+
+  # Billing events are financial records — react quickly to backlog growth.
+  # Poll every 20 s; 180 s cooldown (usage spikes are short-lived around
+  # peak inference traffic windows).
+  pollingInterval: 20
+  cooldownPeriod: 180
+
+  triggers:
+    - type: nats-jetstream
+      metadata:
+        natsServerMonitoringEndpoint: "nats.fp-infra.svc.cluster.local:8222"
+        account: "$G"
+
+        # Billing reads fp.inference.completed from the INFERENCE stream.
+        # Each event → one Postgres INSERT (usage_records) + outbox row.
+        stream: "INFERENCE"
+        consumer: "billing"
+
+        # 30 events/pod — lower than experiment-tracker (financial records
+        # should be written promptly) but higher than notification (DB writes
+        # are faster than external HTTP). Keeps end-to-end usage recording
+        # latency well under 1 s even at peak.
+        lagThreshold: "30"
+
+        # activationLagThreshold: 1 so billing never lags on the first
+        # inference event after a quiet period (prevents invoice gaps).
+        activationLagThreshold: "1"

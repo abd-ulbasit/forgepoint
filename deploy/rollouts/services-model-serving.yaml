@@ -1,0 +1,75 @@
+# =============================================================================
+# Services: fp-model-serving (stable + canary)
+# Phase 21 — Progressive Delivery
+# =============================================================================
+# Same two-service pattern as inference-gateway. See services-inference-gateway.yaml
+# for the full explanation of why two Services are required.
+#
+# model-serving's stable Service is typically reached via the inference-gateway,
+# not directly from the Ingress. The internal routing path is:
+#
+#   External → Ingress → fp-inference-gateway-stable (ClusterIP)
+#                 │
+#                 └─ gRPC → fp-model-serving-stable (ClusterIP)
+#                                   │
+#                              (canary: fp-model-serving-canary)
+#
+# The stable Service selector is managed by the Rollout controller;
+# operators interact with the canary via the canary Service for smoke tests.
+# =============================================================================
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fp-model-serving-stable
+  namespace: fp-system
+  labels:
+    app.kubernetes.io/name: fp-model-serving
+    app.kubernetes.io/part-of: forgepoint
+    app.kubernetes.io/component: model-serving
+    forgepoint.io/track: stable
+  annotations:
+    forgepoint.io/phase: "21"
+    forgepoint.io/role: "stable-service"
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: fp-model-serving
+  ports:
+    - name: grpc
+      port: 9090
+      targetPort: grpc
+      protocol: TCP
+    - name: health
+      port: 8080
+      targetPort: health
+      protocol: TCP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fp-model-serving-canary
+  namespace: fp-system
+  labels:
+    app.kubernetes.io/name: fp-model-serving
+    app.kubernetes.io/part-of: forgepoint
+    app.kubernetes.io/component: model-serving
+    forgepoint.io/track: canary
+  annotations:
+    forgepoint.io/phase: "21"
+    forgepoint.io/role: "canary-service"
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: fp-model-serving
+  ports:
+    - name: grpc
+      port: 9090
+      targetPort: grpc
+      protocol: TCP
+    - name: health
+      port: 8080
+      targetPort: health
+      protocol: TCP

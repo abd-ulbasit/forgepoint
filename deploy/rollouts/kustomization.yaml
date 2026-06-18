@@ -1,0 +1,62 @@
+# =============================================================================
+# Kustomization — deploy/rollouts/
+# Phase 21: Progressive Delivery (Argo Rollouts)
+# =============================================================================
+#
+# HOW TO APPLY
+# -------------
+# Prerequisite: Argo Rollouts controller must be installed first (see README.md).
+#
+#   # Dry-run (verify manifests parse + validate; requires Rollout CRDs present):
+#   kubectl apply -k deploy/rollouts/ --dry-run=server
+#
+#   # Apply all Rollouts, Services, and AnalysisTemplates:
+#   kubectl apply -k deploy/rollouts/
+#
+# HOW THIS FITS INTO GITOPS (Phase 20)
+# --------------------------------------
+# Add a deploy/argocd/apps/rollouts.yaml Application pointing at deploy/rollouts/
+# once the Argo Rollouts controller is installed. Example Application fragment:
+#
+#   spec:
+#     source:
+#       repoURL: https://github.com/abd-ulbasit/forgepoint
+#       path: deploy/rollouts
+#       targetRevision: HEAD
+#     destination:
+#       server: https://kubernetes.default.svc
+#       namespace: fp-system
+#     syncPolicy:
+#       automated:
+#         prune: true
+#         selfHeal: true
+#
+# IMPORTANT: The Helm chart Deployment for inference-gateway and model-serving
+# must be disabled (deployment.enabled: false in chart values) before applying
+# these Rollouts. Two owners of the same pod template will fight each other.
+# The Rollout replaces the Deployment; all other chart resources remain.
+# =============================================================================
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: fp-system
+
+resources:
+  # Canary Rollouts (replace the Helm chart Deployments).
+  - rollout-inference-gateway.yaml
+  - rollout-model-serving.yaml
+
+  # Stable + canary Service pairs (one set per Rollout).
+  - services-inference-gateway.yaml
+  - services-model-serving.yaml
+
+  # AnalysisTemplates — metric gate definitions.
+  # inference-gateway: success-rate + latency.
+  - analysis-template-inference-gateway.yaml
+  # model-serving: success-rate + latency + drift-score (closed-loop gate).
+  - analysis-template-model-serving.yaml
+
+labels:
+  - pairs:
+      forgepoint.io/managed-by-phase: "21"

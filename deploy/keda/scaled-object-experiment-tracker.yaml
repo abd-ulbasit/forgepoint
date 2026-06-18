@@ -1,0 +1,73 @@
+# =============================================================================
+# ScaledObject: fp-experiment-tracker
+# Phase 22 — Event-Driven Autoscaling (KEDA on NATS JetStream lag)
+# =============================================================================
+#
+# EXPERIMENT TRACKER CONSUMER PROFILE
+# ------------------------------------
+# Experiment Tracker implements the "event-driven, async batch consumer" pattern.
+# It subscribes to a broad event set (models, pipelines, features, billing,
+# notifications) and builds experiment run timelines + metric histories from
+# them. Per-event work is a Postgres INSERT — cheap compute, moderate DB I/O.
+#
+# Unlike notification (external I/O) and model-monitor (drift math), experiment
+# tracker is primarily database-write-bound. The bottleneck at scale is Postgres
+# connection pool exhaustion, not CPU or NATS throughput. MaxReplicas is capped
+# at 6 to prevent connection storm; lagThreshold is set moderately high (100)
+# because a slight backlog is acceptable — experiment data is analytical, not
+# operational.
+#
+# NATS consumer details:
+#   Stream  : PLATFORM_EVENTS  (fp.models.>, fp.pipelines.>, fp.features.>,
+#                                fp.billing.>, fp.experiments.>, fp.notifications.>)
+#   Consumer: experiment-tracker
+#
+# SCALE-TO-ZERO: yes — experiment tracking is background analytical work; a
+# brief cold-start delay on the first event is completely acceptable.
+# =============================================================================
+
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: fp-experiment-tracker
+  namespace: fp-system
+  labels:
+    app.kubernetes.io/name: fp-experiment-tracker
+    app.kubernetes.io/part-of: forgepoint
+    app.kubernetes.io/component: experiment-tracker
+    app.kubernetes.io/managed-by: keda
+  annotations:
+    forgepoint.io/phase: "22"
+    forgepoint.io/pattern: "event-driven-autoscaling"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: fp-experiment-tracker
+
+  minReplicaCount: 0
+  maxReplicaCount: 6
+
+  # Batch consumer — poll every 30 s; 5-minute cooldown prevents churn from
+  # the typical "pipeline finishes, 50 events arrive in 10 s, then quiet" burst.
+  pollingInterval: 30
+  cooldownPeriod: 300
+
+  triggers:
+    - type: nats-jetstream
+      metadata:
+        natsServerMonitoringEndpoint: "nats.fp-infra.svc.cluster.local:8222"
+        account: "$G"
+        stream: "PLATFORM_EVENTS"
+        consumer: "experiment-tracker"
+
+        # Higher threshold than notification because experiment-tracker inserts
+        # are cheap and can process a larger backlog per pod without falling
+        # behind. Postgres connection limit is the real ceiling; 100/pod keeps
+        # total connections well within pool bounds even at maxReplicas.
+        lagThreshold: "100"
+
+        # activationLagThreshold: 5 — don't wake a pod for 1-2 stray events
+        # (e.g. a single inference.completed while the platform is idle). Wait
+        # for a small batch to accumulate before paying cold-start cost.
+        activationLagThreshold: "5"

@@ -1,0 +1,312 @@
+# =============================================================================
+# Rollout: fp-inference-gateway
+# Phase 21 — Progressive Delivery (Argo Rollouts canary)
+# =============================================================================
+#
+# WHY A ROLLOUT INSTEAD OF A DEPLOYMENT?
+# ----------------------------------------
+# A Kubernetes Deployment's built-in rolling update is "optimistic" — it
+# replaces old pods with new ones without any traffic or metric gate. If the
+# new version has a regression, 100 % of traffic is already serving the bug
+# by the time you notice. Argo Rollouts replaces the Deployment object with a
+# Rollout CRD that adds:
+#
+#   1. Canary traffic splitting — route a *fraction* of real traffic to the
+#      new version while keeping the rest on stable (old) version.
+#   2. Analysis gates — query Prometheus (or Datadog, etc.) between steps.
+#      If metrics breach thresholds, the Rollout is automatically aborted and
+#      traffic shifts back to stable. No human wake-up required.
+#   3. Manual promotion checkpoints — `pause: {}` stops the canary at a
+#      weight and waits for an operator (or a CI/CD system) to approve.
+#
+# CANARY vs BLUE-GREEN
+# ---------------------
+# Blue-green: two full-size identical environments. Traffic switches 0 % → 100 %
+# in one step. Fast rollback (repoint the Service selector). Cost: double the
+# resources for the switch window. No gradual traffic ramp.
+#
+# Canary: same resource footprint — one extra pod or a fraction. Traffic ramps
+# gradually: 20 % → 50 % → 100 %. Bugs are caught at 20 % blast radius, not
+# 100 %. Rollback is slower (traffic must ramp back) but the SLO blast radius
+# is bounded. This is the right choice for inference-gateway because:
+#   - It serves real user traffic; a 100 % blast radius bug would be a full
+#     outage, not just a canary incident.
+#   - RED metrics (request rate, error rate, duration) are already exported to
+#     Prometheus via the OpenTelemetry pipeline — perfect for analysis gates.
+#   - The inference-gateway is the most latency-sensitive service in the
+#     platform; even a p99 regression of 50 ms is meaningful.
+#
+# AUTO-ROLLBACK MECHANICS
+# ------------------------
+# Each `pause` step is preceded by a `setAnalysis` that runs the
+# AnalysisTemplate defined in analysis-template-inference-gateway.yaml.
+# If the AnalysisRun reports Failure, the controller:
+#   1. Sets the Rollout status to Degraded.
+#   2. Shifts traffic weight back to 0 % canary.
+#   3. Scales the canary ReplicaSet to 0.
+#   4. (Optionally) fires a KEDA/alert event.
+#
+# The stable ReplicaSet is never deleted during a canary; it absorbs 100 %
+# traffic the moment the canary is aborted. Recovery is instant.
+#
+# HOW THIS OVERLAYS ON HELM CHARTS
+# ----------------------------------
+# The Helm chart (deploy/helm/fp-inference-gateway/) still owns the ConfigMap,
+# Secret, Service, ServiceAccount, NetworkPolicy, and PDB resources. The
+# Deployment template in the chart is REPLACED by this Rollout. In practice:
+#   1. Set `deployment.enabled: false` in the chart values (or delete the chart
+#      Deployment after first install).
+#   2. Manage replica count and image tag via this Rollout manifest.
+#   3. ArgoCD syncs both the chart (via its Application) and deploy/rollouts/
+#      (via the rollouts Application); they coexist in fp-system.
+#
+# PREREQUISITE
+# ------------
+# Argo Rollouts controller must be installed:
+#
+#   kubectl create namespace argo-rollouts
+#   kubectl apply -n argo-rollouts \
+#     -f https://github.com/argoproj/argo-rollouts/releases/latest/download/install.yaml
+#
+# Verify: kubectl get pods -n argo-rollouts
+# kubectl plugin: kubectl argo rollouts version
+# =============================================================================
+
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: fp-inference-gateway
+  namespace: fp-system
+  labels:
+    # These labels MUST match the stable Service's selector (see service-
+    # inference-gateway-stable.yaml). The Rollout controller dynamically adds
+    # a rollouts-pod-template-hash label to route canary vs stable traffic;
+    # these base labels identify the workload across both ReplicaSets.
+    app.kubernetes.io/name: fp-inference-gateway
+    app.kubernetes.io/part-of: forgepoint
+    app.kubernetes.io/component: inference-gateway
+  annotations:
+    forgepoint.io/phase: "21"
+    forgepoint.io/pattern: "progressive-delivery-canary"
+spec:
+  # replicas: 2 is the minimum for a rolling canary. During a step the
+  # controller may run stable=2 + canary=1 (50 % of desired) before shifting
+  # weights. Set to match the Helm chart's replicaCount.
+  replicas: 2
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fp-inference-gateway
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fp-inference-gateway
+        app.kubernetes.io/part-of: forgepoint
+        app.kubernetes.io/component: inference-gateway
+      annotations:
+        # Prometheus scrape annotations (used when ServiceMonitor is disabled).
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: fp-inference-gateway
+      automountServiceAccountToken: false
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: inference-gateway
+          # Image tag is overridden per deploy via:
+          #   kubectl argo rollouts set image fp-inference-gateway \
+          #     inference-gateway=ghcr.io/abd-ulbasit/forgepoint/inference-gateway:<sha>
+          # or via ArgoCD image updater.
+          image: ghcr.io/abd-ulbasit/forgepoint/inference-gateway:latest
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: grpc
+              containerPort: 9090
+              protocol: TCP
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: fp-inference-gateway
+            - secretRef:
+                name: fp-inference-gateway
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities:
+              drop:
+                - ALL
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 0
+            periodSeconds: 3
+            failureThreshold: 30
+            timeoutSeconds: 2
+
+  # ---------------------------------------------------------------------------
+  # Canary strategy — the heart of progressive delivery.
+  #
+  # Traffic flow:
+  #
+  #   stable Service  (fp-inference-gateway-stable)
+  #          │
+  #          ├── 100% → stable ReplicaSet     (before rollout)
+  #          │
+  #   canary Service  (fp-inference-gateway-canary)
+  #          │
+  #          └── 100% → canary ReplicaSet     (always, regardless of weight)
+  #
+  # The weight in each `setWeight` step is the percentage of traffic the
+  # STABLE service routes to the canary pods (via pod label manipulation).
+  # At weight 0, ALL traffic goes to stable. At weight 100, ALL traffic goes
+  # to the canary (which then becomes the new stable on promotion).
+  #
+  # Step sequence:
+  #   1. setWeight:20  → 20% canary traffic
+  #   2. analysis:...  → run AnalysisRun; abort if unhealthy
+  #   3. pause:{}      → wait for manual approval (or CI/CD gate)
+  #   4. setWeight:50  → 50% canary traffic
+  #   5. analysis:...  → second analysis gate
+  #   6. pause:{}      → final human sign-off
+  #   7. (implicit)    → setWeight:100 on promotion — full cutover
+  # ---------------------------------------------------------------------------
+  strategy:
+    canary:
+      # stableService: the Service that always points at the current stable
+      # (old) ReplicaSet. External traffic enters through the Ingress/Gateway
+      # pointing at this Service during a canary; the Rollout progressively
+      # shifts its selector to include canary pods at each setWeight step.
+      stableService: fp-inference-gateway-stable
+
+      # canaryService: always points at the canary (new) ReplicaSet.
+      # Useful for targeted testing (point a test client at the canary
+      # directly without touching stable traffic).
+      canaryService: fp-inference-gateway-canary
+
+      steps:
+        # ------------------------------------------------------------------
+        # Step 1: send 20% of real traffic to the canary.
+        # Low enough to limit blast radius while still generating real signal.
+        # An inference-gateway handles auth + circuit-breaking + rate-limiting
+        # — bugs here affect 20% of requests, not 100%.
+        # ------------------------------------------------------------------
+        - setWeight: 20
+
+        # ------------------------------------------------------------------
+        # Step 2: run the first analysis gate at 20% traffic.
+        # The AnalysisTemplate queries Prometheus for error rate + p99 latency.
+        # If either metric breaches threshold, the AnalysisRun fails, the
+        # Rollout controller aborts, and traffic reverts to 0% canary instantly.
+        # ------------------------------------------------------------------
+        - analysis:
+            templates:
+              - templateName: fp-inference-gateway-success-rate
+            args:
+              - name: service
+                value: fp-inference-gateway-canary
+
+        # ------------------------------------------------------------------
+        # Step 3: manual pause — operator inspects dashboards, runs smoke tests,
+        # approves with:  kubectl argo rollouts promote fp-inference-gateway
+        # CI/CD systems can call the Argo Rollouts API to auto-promote.
+        # ------------------------------------------------------------------
+        - pause: {}
+
+        # ------------------------------------------------------------------
+        # Step 4: widen canary to 50%. The blast radius increases, but the
+        # 20%-gate analysis already validated basic health. This step confirms
+        # the new version holds up under ~2x the traffic.
+        # ------------------------------------------------------------------
+        - setWeight: 50
+
+        # ------------------------------------------------------------------
+        # Step 5: second analysis gate at 50%. Metrics are now based on half
+        # the production traffic — a statistically stronger signal than the
+        # 20% gate.
+        # ------------------------------------------------------------------
+        - analysis:
+            templates:
+              - templateName: fp-inference-gateway-success-rate
+            args:
+              - name: service
+                value: fp-inference-gateway-canary
+
+        # ------------------------------------------------------------------
+        # Step 6: final pause before full cutover. Last chance for human review.
+        # After this pause, a `promote` triggers step 7 (implicit setWeight:100).
+        # ------------------------------------------------------------------
+        - pause: {}
+
+        # Step 7 is implicit: on the final `promote`, the Rollout shifts to
+        # 100% canary, scales down the old stable ReplicaSet, and the canary
+        # becomes the new stable. No explicit setWeight:100 needed.
+
+      # ----------------------------------------------------------------------
+      # antiAffinity: spread stable and canary pods across different nodes so
+      # a node failure doesn't take out both ReplicaSets simultaneously.
+      # ----------------------------------------------------------------------
+      antiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          weight: 100
+
+      # ----------------------------------------------------------------------
+      # canaryMetadata / stableMetadata: additional labels/annotations injected
+      # into canary/stable pod templates. Useful for Prometheus label matchers
+      # and Grafana dashboards to distinguish canary from stable traffic.
+      # ----------------------------------------------------------------------
+      canaryMetadata:
+        labels:
+          forgepoint.io/track: canary
+        annotations:
+          forgepoint.io/rollout-stage: canary
+
+      stableMetadata:
+        labels:
+          forgepoint.io/track: stable
+        annotations:
+          forgepoint.io/rollout-stage: stable

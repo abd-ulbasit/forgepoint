@@ -1,0 +1,173 @@
+# =============================================================================
+# AnalysisTemplates: fp-model-serving (success-rate + latency + drift)
+# Phase 21 — Progressive Delivery
+# =============================================================================
+#
+# model-serving has a RICHER analysis surface than inference-gateway:
+#
+#   1. success-rate: same gate as gateway (error rate ≤ 1%).
+#   2. p99-latency:  tighter SLO (200ms vs 500ms) — model serving is the
+#      inner RPC called by gateway; its latency budget is smaller.
+#   3. drift-score:  UNIQUE TO MODEL-SERVING. The model-monitor service
+#      (Phase 16) publishes a drift score metric to Prometheus for each model
+#      version. If the canary serving binary distorts feature distributions
+#      (e.g., a preprocessing bug in a new Go version), the drift score for
+#      canary pods rises. This metric gates the canary on model health, not
+#      just HTTP health — closing the loop between Phase 16 and Phase 21.
+#
+# This multi-metric gate is what the platform README calls the "closed loop":
+#   serve → monitor (Phase 16 drift detection)
+#         → auto-retrain trigger (closed loop)
+#         → Rollout analysis gate (Phase 21 prevents bad retrain from shipping)
+#
+# PLACEHOLDER NOTE: metric names are representative. Update after Phase 10
+# (observability) instruments the actual metric names.
+# =============================================================================
+
+---
+# AnalysisTemplate 1: success-rate for model-serving
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: fp-model-serving-success-rate
+  namespace: fp-system
+  labels:
+    app.kubernetes.io/name: fp-model-serving
+    app.kubernetes.io/part-of: forgepoint
+    app.kubernetes.io/component: model-serving
+  annotations:
+    forgepoint.io/phase: "21"
+    forgepoint.io/pattern: "progressive-delivery-analysis"
+spec:
+  args:
+    - name: service
+
+  metrics:
+    - name: success-rate
+      interval: 1m
+      count: 5
+      failureLimit: 0
+
+      provider:
+        prometheus:
+          address: http://prometheus-operated.fp-infra.svc.cluster.local:9090
+
+          # PLACEHOLDER: replace with actual OTel-emitted metric name for
+          # model-serving gRPC errors (e.g. grpc_server_handled_total with
+          # grpc_code != "OK").
+          query: |
+            sum(rate(grpc_server_handled_total{service="{{args.service}}",grpc_code!="OK"}[5m]))
+            /
+            sum(rate(grpc_server_handled_total{service="{{args.service}}"}[5m]))
+
+      successCondition: result <= 0.01
+
+---
+# AnalysisTemplate 2: p99 latency for model-serving
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: fp-model-serving-latency
+  namespace: fp-system
+  labels:
+    app.kubernetes.io/name: fp-model-serving
+    app.kubernetes.io/part-of: forgepoint
+    app.kubernetes.io/component: model-serving
+  annotations:
+    forgepoint.io/phase: "21"
+    forgepoint.io/pattern: "progressive-delivery-analysis"
+spec:
+  args:
+    - name: service
+
+  metrics:
+    - name: p99-latency-ms
+      interval: 1m
+      count: 5
+      # 1 bad interval allowed — ONNX startup on first request is slow;
+      # subsequent requests are cache-warm. The second bad result fails the gate.
+      failureLimit: 1
+
+      provider:
+        prometheus:
+          address: http://prometheus-operated.fp-infra.svc.cluster.local:9090
+
+          # PLACEHOLDER: replace with the actual gRPC server duration histogram.
+          # grpc_server_handling_seconds_bucket is the typical name from the
+          # go-grpc-prometheus or OTel gRPC instrumentation.
+          query: |
+            histogram_quantile(0.99,
+              sum(rate(grpc_server_handling_seconds_bucket{service="{{args.service}}"}[5m]))
+              by (le)
+            ) * 1000
+
+      # 200ms p99 SLO for model-serving. model-serving is the inner RPC;
+      # its latency budget is tighter than gateway (gateway has 500ms, and
+      # model-serving consumes most of that budget).
+      successCondition: result < 200
+
+---
+# AnalysisTemplate 3: drift-score gate (UNIQUE TO MODEL-SERVING)
+# ---------------------------------------------------------------
+# Queries the drift score metric published by model-monitor (Phase 16).
+# model-monitor publishes a gauge per model version per monitor:
+#   forgepoint_drift_score{model_version="...", monitor_id="...", track="canary"}
+#
+# If the canary serving binary introduces a preprocessing regression, feature
+# distributions will shift → drift score rises → this gate fires auto-rollback
+# BEFORE the drift is visible to end users as wrong predictions.
+#
+# This is the closed-loop payoff: Phase 16 (monitoring) + Phase 21 (rollout
+# gates) together provide automated detection AND automated rollback.
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: fp-model-serving-drift-score
+  namespace: fp-system
+  labels:
+    app.kubernetes.io/name: fp-model-serving
+    app.kubernetes.io/part-of: forgepoint
+    app.kubernetes.io/component: model-serving
+  annotations:
+    forgepoint.io/phase: "21"
+    forgepoint.io/pattern: "progressive-delivery-analysis"
+    forgepoint.io/closed-loop: "true — gates rollout on Phase 16 drift metrics"
+spec:
+  args:
+    - name: service
+
+  metrics:
+    - name: drift-score
+      # Check every 2 minutes — drift scores are averaged over sliding windows
+      # (model-monitor window size is configurable; default 5m). Checking more
+      # frequently than the window size yields redundant results.
+      interval: 2m
+      count: 3
+      failureLimit: 1
+
+      provider:
+        prometheus:
+          address: http://prometheus-operated.fp-infra.svc.cluster.local:9090
+
+          # PLACEHOLDER: replace with the actual Prometheus metric name that
+          # model-monitor exposes for drift score. This is a gauge that
+          # model-monitor writes to Prometheus via the OTel SDK.
+          # The `track` label is injected by canaryMetadata in the Rollout
+          # (forgepoint.io/track: canary).
+          #
+          # Alternative: query the model-monitor gRPC API directly using the
+          # `web` provider type (Argo Rollouts can POST to any HTTP endpoint).
+          # Using Prometheus is simpler and consistent with the RED-metric gate.
+          query: |
+            max(forgepoint_drift_score{
+              service="{{args.service}}",
+              track="canary",
+              severity!="none"
+            })
+
+      # Drift score 0.0 = no drift, 1.0 = maximum drift.
+      # Threshold 0.3 = "WARNING" severity (see model-monitor PSI thresholds).
+      # If the canary's drift score exceeds 0.3, auto-rollback fires.
+      # PLACEHOLDER: tune this threshold based on the model-monitor's severity
+      # scale once Phase 16 is instrumented.
+      successCondition: result < 0.3

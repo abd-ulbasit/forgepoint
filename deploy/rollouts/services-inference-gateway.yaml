@@ -1,0 +1,109 @@
+# =============================================================================
+# Services: fp-inference-gateway (stable + canary)
+# Phase 21 — Progressive Delivery
+# =============================================================================
+#
+# WHY TWO SERVICES?
+# -----------------
+# Argo Rollouts' canary strategy with traffic splitting requires two Services:
+#   - stable Service: selector tracks the *current stable* ReplicaSet.
+#     The main Ingress/API Gateway routes production traffic here.
+#   - canary Service: selector always tracks the *new canary* ReplicaSet.
+#     Used for: (1) targeted smoke testing against the canary directly, and
+#     (2) the AnalysisTemplate's Prometheus query label-selector
+#        (`service="fp-inference-gateway-canary"`) to isolate canary metrics.
+#
+# HOW THE ROLLOUT CONTROLLER MANAGES THESE
+# ------------------------------------------
+# The controller injects a `rollouts-pod-template-hash` label into pod
+# templates. It then patches the stable Service's selector to point at the
+# stable hash, and the canary Service's selector at the canary hash.
+# The `setWeight` step is implemented via *replica counts*: at weight=20 with
+# replicas=2, the controller runs 2 stable + 1 canary pod (3 total), which
+# gives roughly 33% canary; true percentage-weight splitting requires a
+# traffic management plugin (Istio, AWS ALB, etc.) installed alongside Argo
+# Rollouts. Without a traffic management plugin, weight is approximated by
+# replica ratios — document this for your interview.
+#
+# TRAFFIC MANAGEMENT (OPTIONAL)
+# --------------------------------
+# For exact weight-based splitting (not replica-ratio approximation), configure
+# the Argo Rollouts Istio plugin (or AWS ALB plugin) in the Rollout controller
+# config. With Istio installed (Phase 10), add to the strategy.canary block:
+#
+#   trafficRouting:
+#     istio:
+#       virtualService:
+#         name: fp-inference-gateway-vs
+#       destinationRule:
+#         name: fp-inference-gateway-dr
+#         stableSubsetName: stable
+#         canarySubsetName: canary
+#
+# This is left as a follow-on for Phase 10 Istio mesh integration.
+# =============================================================================
+
+---
+# Stable Service — receives production traffic from the Ingress.
+# The Rollout controller keeps this Service's selector pointing at the stable
+# (previous-good) ReplicaSet during a canary rollout. After a successful full
+# promotion, it points at the new (now-stable) ReplicaSet.
+apiVersion: v1
+kind: Service
+metadata:
+  name: fp-inference-gateway-stable
+  namespace: fp-system
+  labels:
+    app.kubernetes.io/name: fp-inference-gateway
+    app.kubernetes.io/part-of: forgepoint
+    app.kubernetes.io/component: inference-gateway
+    forgepoint.io/track: stable
+  annotations:
+    forgepoint.io/phase: "21"
+    forgepoint.io/role: "stable-service"
+spec:
+  type: ClusterIP
+  # Selector: the Rollout controller dynamically patches
+  # rollouts-pod-template-hash onto this selector. The app.kubernetes.io/name
+  # label is the base; the hash discriminates stable vs canary pods.
+  selector:
+    app.kubernetes.io/name: fp-inference-gateway
+  ports:
+    - name: grpc
+      port: 9090
+      targetPort: grpc
+      protocol: TCP
+    - name: health
+      port: 8080
+      targetPort: health
+      protocol: TCP
+
+---
+# Canary Service — always points at the canary (new) ReplicaSet.
+# Traffic is routed here by test clients and the AnalysisTemplate queries.
+apiVersion: v1
+kind: Service
+metadata:
+  name: fp-inference-gateway-canary
+  namespace: fp-system
+  labels:
+    app.kubernetes.io/name: fp-inference-gateway
+    app.kubernetes.io/part-of: forgepoint
+    app.kubernetes.io/component: inference-gateway
+    forgepoint.io/track: canary
+  annotations:
+    forgepoint.io/phase: "21"
+    forgepoint.io/role: "canary-service"
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: fp-inference-gateway
+  ports:
+    - name: grpc
+      port: 9090
+      targetPort: grpc
+      protocol: TCP
+    - name: health
+      port: 8080
+      targetPort: health
+      protocol: TCP
