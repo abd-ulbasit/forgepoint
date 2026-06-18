@@ -1,0 +1,97 @@
+# ============================================================================
+# Forgepoint Python SDK — packaging metadata
+# ============================================================================
+#
+# WHY hatchling: it is a modern, PEP 517 build backend that handles the src/
+# layout and non-.py package data (the generated *.pyi stubs and the py.typed
+# marker) with minimal config. Setuptools would work too; hatchling is lighter.
+#
+# DEPENDENCY CHOICES:
+#   grpcio   — the gRPC runtime (channels, stubs, interceptors). Required.
+#   protobuf — message serialization for the generated *_pb2 classes. The pin is
+#              a floor compatible with the protobuf runtime the buf plugins target
+#              (proto3 edition output uses the 5.x/6.x runtime line).
+#   grpcio is NOT pinned tightly so it can resolve a wheel for the local CPython.
+#
+# We deliberately do NOT depend on grpcio-tools at runtime — code is generated
+# offline via `buf generate`, not at install time. (grpcio-tools is only needed
+# by a developer regenerating without buf, which we don't do here.)
+# ============================================================================
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "forgepoint"
+version = "0.1.0"
+description = "Typed, secure Python SDK for the Forgepoint ML platform (gRPC)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Forgepoint" }]
+keywords = ["forgepoint", "mlops", "grpc", "model-registry", "ml-platform"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+
+# Runtime deps. grpcio + protobuf are all the SDK needs to talk to the platform.
+dependencies = [
+    "grpcio>=1.60",
+    "protobuf>=5.26",
+]
+
+[project.optional-dependencies]
+# Dev tooling — install with `pip install -e '.[dev]'`. Optional; the SDK itself
+# needs none of these at runtime.
+dev = [
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "grpcio-tools>=1.60",   # only if regenerating without buf
+    "types-protobuf",       # extra stubs for the protobuf runtime
+]
+
+[project.urls]
+Homepage = "https://github.com/abd-ulbasit/forgepoint"
+Documentation = "https://github.com/abd-ulbasit/forgepoint/tree/main/sdk/python"
+Source = "https://github.com/abd-ulbasit/forgepoint/tree/main/sdk/python"
+
+# ----------------------------------------------------------------------------
+# Hatch build configuration: the package lives under src/ and includes the
+# generated stubs + the py.typed marker as package data.
+# ----------------------------------------------------------------------------
+[tool.hatch.build.targets.wheel]
+packages = ["src/forgepoint"]
+
+[tool.hatch.build.targets.wheel.force-include]
+# Nothing extra to force-include; the generated tree lives inside src/forgepoint
+# and is picked up by the packages entry above.
+
+[tool.hatch.build]
+# Ship the typing marker and ALL generated stubs/modules so type checkers and the
+# runtime both find them. *_pb2.py / *_pb2_grpc.py are normal modules (auto-
+# included); we must explicitly include the non-module data files (.pyi, py.typed).
+artifacts = [
+    "src/forgepoint/py.typed",
+    "src/forgepoint/_proto/**/*.pyi",
+]
+
+# ----------------------------------------------------------------------------
+# Lint / type-check config (used only with the [dev] extra).
+# ----------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+# The generated _proto tree is machine-authored; don't lint it.
+extend-exclude = ["src/forgepoint/_proto"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_unused_ignores = true
+# Don't type-check the generated tree itself; we consume its .pyi stubs instead.
+exclude = ["src/forgepoint/_proto/"]

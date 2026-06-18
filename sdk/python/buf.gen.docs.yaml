@@ -1,0 +1,33 @@
+# ============================================================================
+# Forgepoint API Reference Docs — ISOLATED Buf generation template
+# ============================================================================
+#
+# WHY a SEPARATE docs template (not folded into buf.gen.yaml):
+#   buf.gen.yaml emits the Python SDK code; this one emits human-readable API
+#   reference docs from the SAME protos. Keeping them separate means generating
+#   docs never regenerates code and vice-versa. Like the SDK template, this writes
+#   ONLY outside gen/go (into docs/api), so it can never disturb the Go build.
+#
+# RUN (from the repo root):
+#   cd proto && buf generate --template ../sdk/python/buf.gen.docs.yaml
+#
+#   `out:` is resolved relative to buf's working dir (proto/), hence `../docs/api`.
+#
+# PLUGIN:
+#   buf.build/community/pseudomuto-doc — the protoc-gen-doc remote plugin. It
+#   renders every message, enum, field, service and RPC (with their leading
+#   comments) into a single reference document. We emit Markdown so it renders on
+#   GitHub and sits next to the SDK docs.
+#
+#   opt: markdown,proto-reference.md
+#     - first opt  = output format (markdown | html | json | docbook)
+#     - second opt = output filename within `out:`
+# ============================================================================
+
+version: v2
+
+plugins:
+  - remote: buf.build/community/pseudomuto-doc
+    out: ../docs/api
+    opt:
+      - markdown,proto-reference.md

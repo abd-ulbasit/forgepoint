@@ -1,0 +1,71 @@
+# ============================================================================
+# Forgepoint Python SDK — ISOLATED Buf Code Generation Template
+# ============================================================================
+#
+# WHY THIS FILE IS SEPARATE FROM proto/buf.gen.yaml:
+#   proto/buf.gen.yaml is the Go template: it runs the Go + grpc-go plugins and
+#   writes to ../gen/go. This file is the PYTHON template and it writes ONLY to
+#   sdk/python/src/forgepoint/_proto. The two never overlap, so regenerating the
+#   Python SDK can NEVER touch, add, or delete a single file under gen/go.
+#
+#   Run it explicitly with the --template flag so buf NEVER auto-discovers it:
+#
+#     cd proto && buf generate --template ../sdk/python/buf.gen.yaml
+#
+#   IMPORTANT — `out:` is resolved relative to buf's WORKING DIRECTORY (proto/),
+#   NOT relative to this template file. Because we run buf from proto/, the out
+#   paths below are `../sdk/python/src/...` so the generated code lands inside the
+#   SDK package, never inside proto/. (The repo Makefile target `sdk-python-proto`
+#   wraps this exact invocation.)
+#
+#   buf reads buf.yaml from the input dir (proto/) for the module set, but uses
+#   THIS template for plugins+outputs. gen/go is untouched because no plugin here
+#   writes there. (Verify after: `git status gen/go` shows nothing.)
+#
+# WHY REMOTE PLUGINS (buf.build/...):
+#   No local protoc / protoc-gen-* installs needed; versions are pinned and
+#   reproducible across machines and CI. Same rationale as the Go template.
+#
+# THE THREE PLUGINS (and why each):
+#   1. protocolbuffers/python  -> *_pb2.py   : message classes (serialization).
+#   2. grpc/python             -> *_pb2_grpc.py : the service Stub + Servicer.
+#   3. protocolbuffers/pyi     -> *_pb2.pyi   : type stubs so mypy / IDEs see the
+#                                  generated message fields (PEP 561 typing).
+#
+# OUTPUT LAYOUT:
+#   All three write to src/forgepoint/_proto with paths=source_relative, so e.g.
+#   proto/forgepoint/auth/v1/auth.proto becomes:
+#     src/forgepoint/_proto/forgepoint/auth/v1/auth_pb2.py
+#     src/forgepoint/_proto/forgepoint/auth/v1/auth_pb2_grpc.py
+#     src/forgepoint/_proto/forgepoint/auth/v1/auth_pb2.pyi
+#
+# THE grpc-python ABSOLUTE-IMPORT QUIRK (important):
+#   The Python protobuf/grpc plugins emit ABSOLUTE imports like
+#   `from forgepoint.auth.v1 import auth_pb2` — they assume `forgepoint.auth.v1`
+#   is importable as a top-level package path. Our generated tree lives nested at
+#   src/forgepoint/_proto/forgepoint/..., so out of the box that import fails. We
+#   solve it WITHOUT editing any generated file: src/forgepoint/_proto/__init__.py
+#   extends the hand-written `forgepoint` package's __path__ to ALSO include the
+#   generated `forgepoint/` dir, so `forgepoint.auth.v1.auth_pb2` resolves there
+#   while `forgepoint.client` stays hand-written. See that file's long comment.
+#   The generated subdirs need NO __init__.py (PEP 420 namespace packages), so a
+#   fresh `buf generate` is directly usable with zero post-processing.
+# ============================================================================
+
+version: v2
+
+managed:
+  enabled: true
+
+plugins:
+  # 1) Message classes (*_pb2.py)
+  - remote: buf.build/protocolbuffers/python
+    out: ../sdk/python/src/forgepoint/_proto
+
+  # 2) gRPC service stubs (*_pb2_grpc.py)
+  - remote: buf.build/grpc/python
+    out: ../sdk/python/src/forgepoint/_proto
+
+  # 3) Type stubs (*_pb2.pyi) for mypy / editors (PEP 561 typing)
+  - remote: buf.build/protocolbuffers/pyi
+    out: ../sdk/python/src/forgepoint/_proto
