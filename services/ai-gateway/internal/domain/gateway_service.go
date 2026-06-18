@@ -578,7 +578,7 @@ func (s *gatewayService) finishCacheHit(ctx context.Context, team string, req Ch
 	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
 
 	if s.publisher != nil {
-		_ = s.publisher.PublishCompletionServed(ctx, CompletionServed{ //nolint:errcheck // best-effort
+		ev := CompletionServed{
 			RequestID:    req.RequestID,
 			Team:         team,
 			Model:        req.Model,
@@ -589,7 +589,18 @@ func (s *gatewayService) finishCacheHit(ctx context.Context, team string, req Ch
 			CostMicroUSD: usage.CostMicroUSD,
 			CacheHit:     true, // the served-event signal that this incurred no provider cost.
 			LatencyMs:    latency.Milliseconds(),
-		})
+		}
+		// L4 QUALITY EVAL: a cache HIT still SERVED an answer to the user, so it must be
+		// judgeable — the cached entry already holds both the prompt and the response
+		// TEXT, so attach them (same opt-in + PII discipline as the miss path). Without
+		// this, every cache hit reaches the monitor with empty text and is recorded
+		// UNSCORED — silently blinding quality monitoring exactly for the popular
+		// (cache-hot) prompts that matter most.
+		if s.evalIncludeText {
+			ev.PromptText = entry.Prompt
+			ev.ResponseText = entry.Response
+		}
+		_ = s.publisher.PublishCompletionServed(ctx, ev) //nolint:errcheck // best-effort
 	}
 
 	return Completion{
