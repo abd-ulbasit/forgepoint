@@ -36,9 +36,11 @@
 go 1.26.0
 
 use (
+	./cli
 	./gen/go
 	./pkg
 	./services/auth
+	./services/bff
 	./services/billing
 	./services/experiment-tracker
 	./services/feature-store
