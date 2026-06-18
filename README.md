@@ -41,7 +41,7 @@ A **Backend‑for‑Frontend (BFF)** + web UI and an `fp` **CLI** sit in front o
 
 ## Status
 
-All 10 services are **code‑complete across every layer** — built test‑first with adversarial bug/security verification, and validated with the race detector against real Postgres/Redis/NATS (testcontainers).
+All 10 services are **code‑complete across every layer** — built test‑first with adversarial bug/security verification, and validated with the race detector against real Postgres/Redis/NATS (testcontainers). **All 10 are deployed and running on Kubernetes (k3s) — JWT-authenticated end to end** — with a live cross-service E2E + k6 load suite, a Web UI / `fp` CLI / Python SDK product surface, and SRE / service-mesh / audit / backup operability. See the table.
 
 | Area | State |
 |---|---|
@@ -50,11 +50,14 @@ All 10 services are **code‑complete across every layer** — built test‑firs
 | Service **domains** (one pattern each) | ✅ All 10 — TDD + adversarial review |
 | Service **handlers** (gRPC, proto↔domain) | ✅ All 10 — bufconn component tests |
 | **Persistence** (Postgres/Redis adapters + migrations) | ✅ All 10 — testcontainers `-race` |
-| **Events** (NATS pub/sub, idempotent, DLQ) + `main.go` wiring | ✅ All 10 — testcontainers `-race` |
+| **Events** (NATS pub/sub, idempotent, DLQ, **protojson** wire format) + wiring | ✅ All 10 — testcontainers `-race` |
 | Helm charts + ArgoCD app‑of‑apps | ✅ All 10 |
 | k8s data infra (NATS/Postgres/Redis/MinIO) | ✅ Deployed to k3s `fp-infra` |
 | Observability stack · CI/CD + supply‑chain · M6 (Kyverno/GitOps/secrets) · Terraform (AWS) | ✅ Authored |
-| Deploy smoke (image → k3s → Helm) · E2E · Web UI (BFF) · `fp` CLI | 🚧 In progress |
+| **Deployed & running** (image → k3s → Helm) | ✅ 10/10 services + BFF + infra; JWT-auth end to end |
+| Cross-service **E2E** + **k6** load | ✅ Live (login → register → read-back → cross-service event propagation; CQRS read model + DLQ-clean; thresholds green) |
+| **Web UI** (BFF + React SPA) · **`fp` CLI** · **Python SDK** + API docs | ✅ M4 product surface |
+| **SRE** (SLOs · burn-rate alerts · runbooks) · **Istio** mesh (STRICT mTLS · deny-by-default authz) · tamper-evident **audit log** · **Backup/DR** | ✅ M3 / M6 / M5 |
 
 See the [implementation plan](docs/plans/forgepoint-implementation-plan.md) for the full phased roadmap and the [ADRs](docs/adr/) for the key decisions.
 
@@ -102,7 +105,7 @@ Common targets (see the [Makefile](Makefile)): `make proto`, `make build SVC=<sv
 proto/        Source of truth for all APIs (Buf)
 gen/go/       Generated proto code (do not edit)
 pkg/          Shared libraries (built & tested)
-services/     The 10 microservices (in progress)
+services/     The 10 microservices + BFF (deployed & running)
 deploy/       Helm, K8s manifests, Terraform, Skaffold
 docs/
   plans/      Platform design + phased implementation plan
