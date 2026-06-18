@@ -1,0 +1,103 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ==========================================================================
+   GLOBAL BASE
+   ========================================================================== */
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-ink-100 text-ink-800 antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* A consistent, branded focus ring for keyboard users (accessibility). We
+     only show it for :focus-visible so mouse clicks don't get a ring. */
+  :focus-visible {
+    @apply outline-none ring-2 ring-brand-500 ring-offset-2 ring-offset-white;
+  }
+
+  * {
+    scrollbar-width: thin;
+  }
+}
+
+/* ==========================================================================
+   REUSABLE COMPONENT CLASSES
+   These give every page the SAME card / button / input / table styling without
+   repeating long Tailwind strings. They are the concrete embodiment of the
+   design system declared in tailwind.config.js.
+   ========================================================================== */
+@layer components {
+  .card {
+    @apply rounded-xl border border-ink-200 bg-white shadow-card;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold
+      transition-colors disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  .btn-primary {
+    @apply btn bg-brand-600 text-white hover:bg-brand-700 active:bg-brand-800;
+  }
+
+  .btn-secondary {
+    @apply btn border border-ink-300 bg-white text-ink-700 hover:bg-ink-50 active:bg-ink-100;
+  }
+
+  .btn-ghost {
+    @apply btn text-ink-600 hover:bg-ink-100 hover:text-ink-900;
+  }
+
+  .btn-danger {
+    @apply btn bg-red-600 text-white hover:bg-red-700 active:bg-red-800;
+  }
+
+  .input {
+    @apply block w-full rounded-lg border border-ink-300 bg-white px-3 py-2 text-sm text-ink-900
+      placeholder:text-ink-400 focus:border-brand-500 focus:ring-2 focus:ring-brand-200;
+  }
+
+  .label {
+    @apply mb-1.5 block text-sm font-medium text-ink-700;
+  }
+
+  /* Status pill base — color variants are applied inline by the StatusPill
+     component using a tone map. */
+  .pill {
+    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-semibold
+      ring-1 ring-inset;
+  }
+
+  .nav-link {
+    @apply flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium text-ink-300
+      transition-colors hover:bg-white/5 hover:text-white;
+  }
+
+  .nav-link-active {
+    @apply bg-brand-600/90 text-white shadow-sm hover:bg-brand-600 hover:text-white;
+  }
+
+  /* Skeleton shimmer block used by loading states. */
+  .skeleton {
+    @apply relative overflow-hidden rounded-md bg-ink-200/70;
+  }
+  .skeleton::after {
+    @apply absolute inset-0 -translate-x-full;
+    content: '';
+    background-image: linear-gradient(
+      90deg,
+      rgba(255, 255, 255, 0) 0,
+      rgba(255, 255, 255, 0.5) 50%,
+      rgba(255, 255, 255, 0) 100%
+    );
+    animation: shimmer 1.5s infinite;
+  }
+}
