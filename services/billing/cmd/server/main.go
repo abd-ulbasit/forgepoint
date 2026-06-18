@@ -308,7 +308,7 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("jetstream streams ensured",
-		slog.String("streams", "BILLING, INFERENCE, MODELS, DLQ"))
+		slog.String("streams", "BILLING, INFERENCE, MODELS, AI, DLQ"))
 
 	// ================================================================
 	// 5. BUILD ADAPTERS → DOMAIN SERVICE → REAL HANDLER (real svc, NOT nil)
@@ -431,6 +431,7 @@ func main() {
 	// registered) and the shutdown nil-guards on that.
 	var inferenceConsumer *events.InferenceConsumer
 	var storageConsumer *events.StorageConsumer
+	var aiConsumer *events.AIConsumer
 
 	// TeamResolver: resolving api_key_id → owning team is an AUTH/identity concern
 	// billing does not own; the production resolver is an Auth gRPC client (a later
@@ -491,6 +492,26 @@ func main() {
 		}
 		storageConsumer = storage
 		logger.Info("storage consumer registered (meters fp.models.version.ready → STORAGE_BYTES)")
+
+		// AI CONSUMER: meter AI tokens by reacting to fp.ai.completion.served — the THIRD
+		// money axis (M7/L2). UNLIKE the inference/storage consumers, it needs NO
+		// TeamResolver: the AI Gateway is a trusted platform service that ALREADY resolved
+		// the team server-side (from the caller's api key) and stamps it on the event, so
+		// the consumer meters that team directly (see ai_consumer.go's "TEAM ATTRIBUTION").
+		// That is why, even while the inference/storage resolvers are the fail-closed
+		// placeholders above (every inference/storage event DLQs), the AI axis meters
+		// NORMALLY — its team is on the wire, not behind an unwired resolver. We still gate
+		// it on FP_BILLING_METERING_ENABLED so the one kill-switch disables ALL consumers.
+		ai := events.NewAIConsumer(js, svc, processed, events.SubConfig{})
+		if err := ai.Register(ctx); err != nil {
+			_ = rdb.Close()
+			pgPool.Close()
+			_ = natsConn.Drain()
+			logger.Error("failed to register AI consumer", slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+		aiConsumer = ai
+		logger.Info("AI consumer registered (meters fp.ai.completion.served → INFERENCE_TOKENS)")
 	} else {
 		logger.Warn("BILLING METERING DISABLED (FP_BILLING_METERING_ENABLED=false): "+
 			"the inference + storage consumers are NOT registered; billing meters ZERO usage. "+
@@ -573,6 +594,9 @@ func main() {
 		if storageConsumer != nil {
 			storageConsumer.Close()
 		}
+		if aiConsumer != nil {
+			aiConsumer.Close()
+		}
 
 		// (c) DRAIN NATS (not Close): Drain flushes any buffered publishes (the
 		//     relay's in-flight UsageRecorded events) and lets in-flight consume
@@ -651,6 +675,13 @@ func ensureStreams(ctx context.Context, js jetstream.JetStream) error {
 		// standalone. Without this stream, billing's storage-metering consumer could not
 		// attach and STORAGE_BYTES would never be metered.
 		{Name: events.StreamModels, Subjects: []string{"fp.models.>"}},
+		// The AI consumer READS fp.ai.completion.served from here. In production the AI
+		// stream is OWNED by the ai-gateway's bootstrap (it produces into it); we
+		// reconcile it idempotently so a billing-FIRST boot can attach the consumer even
+		// if the gateway hasn't booted yet (graceful degrade). Without this stream,
+		// billing's AI-token-metering consumer could not attach and AI spend would never
+		// reach GetUsage or the invoice — the third money axis silently un-metered.
+		{Name: events.StreamAI, Subjects: []string{"fp.ai.>"}},
 		// The DLQ stream captures poison events the consumers dead-letter
 		// (fp.dlq.billing, default in SubConfig). Without a stream binding fp.dlq.>,
 		// the subscriber's DLQ publish would vanish (core-NATS drop) and a poison

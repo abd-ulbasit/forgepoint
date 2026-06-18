@@ -138,17 +138,23 @@ func (h *AIGatewayHandler) GetUsage(ctx context.Context, _ *aiv1.GetUsageRequest
 	if err != nil {
 		return nil, err
 	}
-	consumed, budget, remaining, err := h.svc.Usage(ctx, team)
+	summary, err := h.svc.Usage(ctx, team)
 	if err != nil {
 		return nil, status.Error(codes.Internal, "failed to read team usage")
 	}
+	// Populate the FULL breakdown — prompt + completion + total — not just the total.
+	// This is the GetUsage breakdown fix: the prompt/completion split comes from the
+	// domain's UsageStore accumulator (via UsageSummary), so the response no longer
+	// reports prompt=0/completion=0 the way it did when only the budget total existed.
 	return &aiv1.GetUsageResponse{
 		Team: team,
 		Total: &aiv1.TokenUsage{
-			TotalTokens: int32(consumed), //nolint:gosec // consumed is a bounded token count
+			PromptTokens:     int32(summary.PromptTokens),     //nolint:gosec // bounded token count
+			CompletionTokens: int32(summary.CompletionTokens), //nolint:gosec // bounded token count
+			TotalTokens:      int32(summary.TotalTokens),      //nolint:gosec // bounded token count
 		},
-		BudgetTokens:    budget,
-		RemainingTokens: remaining,
+		BudgetTokens:    summary.BudgetTokens,
+		RemainingTokens: summary.RemainingTokens,
 	}, nil
 }
 

@@ -43,7 +43,7 @@ type fakeService struct {
 	streamErr  error // returned from ChatCompletion (e.g. ErrBudgetExceeded)
 	deltas     []domain.Delta
 	completion domain.Completion
-	usage      struct{ consumed, budget, remaining int64 }
+	usage      domain.UsageSummary
 }
 
 func (f *fakeService) ChatCompletion(_ context.Context, team string, _ domain.ChatRequest, sink domain.Sink) (domain.Completion, error) {
@@ -66,8 +66,8 @@ func (f *fakeService) Providers() []domain.ProviderSnapshot {
 	}
 }
 
-func (f *fakeService) Usage(_ context.Context, _ string) (int64, int64, int64, error) {
-	return f.usage.consumed, f.usage.budget, f.usage.remaining, nil
+func (f *fakeService) Usage(_ context.Context, _ string) (domain.UsageSummary, error) {
+	return f.usage, nil
 }
 
 // --- auth stub --------------------------------------------------------------
@@ -237,7 +237,12 @@ func TestChatCompletion_UnauthenticatedWhenNoClaims(t *testing.T) {
 func TestGetUsage_ReturnsTeamBudget(t *testing.T) {
 	t.Parallel()
 	svc := &fakeService{}
-	svc.usage.consumed, svc.usage.budget, svc.usage.remaining = 250, 1000, 750
+	// The breakdown (prompt 150 + completion 100 = total 250) comes from the usage
+	// accumulator; budget 1000 / remaining 750 from the budget bucket.
+	svc.usage = domain.UsageSummary{
+		PromptTokens: 150, CompletionTokens: 100, TotalTokens: 250,
+		BudgetTokens: 1000, RemainingTokens: 750,
+	}
 	client := newClient(t, svc, "team-x")
 
 	resp, err := client.GetUsage(authCtx(), &aiv1.GetUsageRequest{})
@@ -251,7 +256,12 @@ func TestGetUsage_ReturnsTeamBudget(t *testing.T) {
 		t.Fatalf("budget=%d remaining=%d, want 1000/750", resp.GetBudgetTokens(), resp.GetRemainingTokens())
 	}
 	if resp.GetTotal().GetTotalTokens() != 250 {
-		t.Fatalf("consumed total = %d, want 250", resp.GetTotal().GetTotalTokens())
+		t.Fatalf("total tokens = %d, want 250", resp.GetTotal().GetTotalTokens())
+	}
+	// THE BREAKDOWN FIX: prompt/completion must be the real split, not 0/0.
+	if resp.GetTotal().GetPromptTokens() != 150 || resp.GetTotal().GetCompletionTokens() != 100 {
+		t.Fatalf("breakdown prompt=%d completion=%d, want 150/100 (the bug fix)",
+			resp.GetTotal().GetPromptTokens(), resp.GetTotal().GetCompletionTokens())
 	}
 }
 

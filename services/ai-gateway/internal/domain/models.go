@@ -30,6 +30,23 @@ const (
 	RoleAssistant        // a prior model turn (multi-turn context).
 )
 
+// label is the stable lowercase role tag used when concatenating messages for the
+// semantic-cache embedding (promptForEmbedding). It is intentionally separate from
+// the provider-specific role strings (e.g. roleToOllama) so the cache key is a stable
+// domain concern that a provider wire-format change can never silently shift.
+func (r Role) label() string {
+	switch r {
+	case RoleSystem:
+		return "system"
+	case RoleUser:
+		return "user"
+	case RoleAssistant:
+		return "assistant"
+	default:
+		return "user"
+	}
+}
+
 // Message is one turn in a conversation. The smallest unit a provider consumes.
 type Message struct {
 	Role    Role

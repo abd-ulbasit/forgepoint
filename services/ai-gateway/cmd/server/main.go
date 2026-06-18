@@ -53,10 +53,13 @@ import (
 	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/observability"
 	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/budget"
+	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/cache"
 	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/domain"
+	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/embed"
 	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/events"
 	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/handler"
 	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/providers"
+	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/usage"
 	goredis "github.com/redis/go-redis/v9"
 )
 
@@ -99,6 +102,26 @@ type AIConfig struct {
 	// drives failover. These are the CIRCUIT BREAKER knobs.
 	CircuitFailureThreshold int `env:"CIRCUIT_FAILURE_THRESHOLD" default:"3"`
 	CircuitResetSeconds     int `env:"CIRCUIT_RESET_SECONDS" default:"30"`
+
+	// --- SEMANTIC CACHE (L2) knobs -------------------------------------------
+	// CacheEnabled is the kill-switch for the L2 semantic cache. DEFAULT false: the
+	// cache is an optimization that depends on an embedding model being available, so
+	// it is opt-in (a deployment without all-minilm served by Ollama must not silently
+	// fail-open on every request). When false we leave Embedder/Cache nil → the domain
+	// skips the cache stage entirely (the nil-Embedder/Cache = cache OFF path).
+	CacheEnabled bool `env:"AI_CACHE_ENABLED" default:"false"`
+	// CacheEmbeddingModel is the Ollama model used to vectorize prompts (default
+	// all-minilm — a tiny CPU model). Must be pulled/available on the Ollama server.
+	CacheEmbeddingModel string `env:"AI_CACHE_EMBEDDING_MODEL" default:"all-minilm"`
+	// CacheSimilarityThreshold is the minimum cosine similarity for a HIT (0 → the
+	// domain's 0.95 default). Higher = stricter (fewer, more-exact hits).
+	CacheSimilarityThreshold float64 `env:"AI_CACHE_SIMILARITY_THRESHOLD" default:"0.95"`
+	// CacheMaxEntriesPerTeam caps a team's stored completions (the LTRIM bound that
+	// keeps the per-team cache from growing unbounded). 0 → adapter default (256).
+	CacheMaxEntriesPerTeam int `env:"AI_CACHE_MAX_ENTRIES_PER_TEAM" default:"256"`
+	// CacheTTLSeconds is the per-team cache key TTL (idle eviction + answer-staleness
+	// bound). 0 → adapter default (24h).
+	CacheTTLSeconds int64 `env:"AI_CACHE_TTL_SECONDS" default:"86400"`
 }
 
 func main() {
@@ -209,12 +232,46 @@ func main() {
 
 	publisher := events.NewPublisher(natsutil.NewPublisher(js, events.Source))
 
+	// USAGE ACCUMULATOR (the GetUsage breakdown fix): a Redis-backed per-team
+	// prompt/completion counter, ALWAYS wired (over the same Redis client as the
+	// budget). The budget bucket only ever saw the TOTAL via Deduct, which zeroed the
+	// breakdown; this accumulator records the SPLIT so GetUsage reports a real
+	// prompt/completion breakdown.
+	usageStore := usage.NewRedisUsage(rdb, usage.Config{})
+
+	// SEMANTIC CACHE (L2), behind AI_CACHE_ENABLED. When disabled we leave both ports
+	// nil → the domain skips the cache stage entirely (nil Embedder/Cache = cache OFF).
+	// When enabled we wire BOTH (the domain treats either being nil as off):
+	//   - the Ollama embeddings adapter (text → vector), and
+	//   - the Redis per-team bounded+TTL'd cache (LTRIM cap + EXPIRE so it can't grow
+	//     unbounded, namespaced ai:cache:<team> so Team A never reads Team B's answer).
+	var embedder domain.Embedder
+	var semanticCache domain.SemanticCache
+	if cfg.CacheEnabled {
+		embedder = embed.NewOllamaEmbedder(cfg.OllamaURL, cfg.CacheEmbeddingModel)
+		semanticCache = cache.NewRedisCache(rdb, cache.Config{
+			MaxEntries: cfg.CacheMaxEntriesPerTeam,
+			TTL:        time.Duration(cfg.CacheTTLSeconds) * time.Second,
+		})
+		logger.Info("semantic cache ENABLED (L2)",
+			slog.String("embedding_model", cfg.CacheEmbeddingModel),
+			slog.Float64("similarity_threshold", cfg.CacheSimilarityThreshold),
+			slog.Int("max_entries_per_team", cfg.CacheMaxEntriesPerTeam),
+			slog.Int64("ttl_seconds", cfg.CacheTTLSeconds))
+	} else {
+		logger.Info("semantic cache DISABLED (AI_CACHE_ENABLED=false); serving every request via providers")
+	}
+
 	svc := domain.NewGatewayService(domain.ServiceDeps{
-		Providers: registry,
-		Breakers:  breakers,
-		Budget:    budgetStore,
-		Publisher: publisher,
-		Now:       time.Now,
+		Providers:      registry,
+		Breakers:       breakers,
+		Budget:         budgetStore,
+		Usage:          usageStore,
+		Embedder:       embedder,
+		Cache:          semanticCache,
+		CacheThreshold: cfg.CacheSimilarityThreshold,
+		Publisher:      publisher,
+		Now:            time.Now,
 	})
 	logger.Info("ai-gateway domain service constructed (ollama + stub, failover order)")
 

@@ -109,6 +109,32 @@ type BudgetStore interface {
 }
 
 // ============================================================================
+// USAGE STORE PORT — the per-team prompt/completion/total accumulator (the FIX)
+// ============================================================================
+//
+// THE BUG THIS PORT FIXES: GetUsage reported a correct TOTAL but prompt=0,
+// completion=0 in the breakdown (observed live: total 27, prompt/completion 0). WHY:
+// the only per-team counter was the BudgetStore, whose Deduct takes a single
+// `tokens int64` (the total) — it never saw the prompt/completion SPLIT, so the
+// breakdown was always zero. The budget bucket is the right shape for a REFILLING
+// rate cap, but the wrong shape for an accurate cumulative breakdown.
+//
+// THE FIX: a dedicated, MONOTONIC per-team usage accumulator that records BOTH parts
+// of every served completion. It is separate from the budget on purpose:
+//   - the budget REFILLS over a rolling window (it's a rate cap that goes back up);
+//   - usage ACCUMULATES (a lifetime/window counter that only goes up) and must keep
+//     prompt vs completion distinct for the GetUsage breakdown.
+// Conflating them is exactly what zeroed the breakdown.
+type UsageStore interface {
+	// Add records one served completion's prompt + completion tokens for `team`
+	// (total is derived = prompt + completion). Best-effort, post-serve: a record
+	// failure is logged, not surfaced (the client already has its answer).
+	Add(ctx context.Context, team string, promptTokens, completionTokens int32) error
+	// Get returns the team's accumulated prompt/completion/total tokens for GetUsage.
+	Get(ctx context.Context, team string) (promptTokens, completionTokens, totalTokens int64, err error)
+}
+
+// ============================================================================
 // EVENT PUBLISHER PORT — the async outcome of every completion + the warm signal
 // ============================================================================
 

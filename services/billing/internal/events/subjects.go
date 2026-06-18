@@ -100,6 +100,15 @@ const (
 	// size_bytes. This is the SECOND axis the event contract requires billing to
 	// consume; omitting it leaves STORAGE_BYTES un-metered (silent revenue gap).
 	SubjectModelVersionReady = "fp.models.version.ready"
+
+	// fp.ai.completion.served → the THIRD money axis (M7/L2): AI token metering. Owned
+	// by the AI Gateway (services/ai-gateway), which emits one event per served LLM
+	// completion carrying the gateway-resolved team and the prompt/completion/total
+	// token counts. Billing's AIConsumer meters those tokens through INFERENCE_TOKENS.
+	// This string is IDENTICAL to the producer's events.SubjectCompletionServed in
+	// services/ai-gateway/internal/events/subjects.go — the two must match byte-for-byte
+	// (a subject is the wire contract); the AIConsumer test asserts against this const.
+	SubjectAICompletionServed = "fp.ai.completion.served"
 )
 
 // Source is the value stamped into EventEnvelope.source for every event billing
@@ -133,4 +142,12 @@ const (
 	// the model-lifecycle tree bind the SAME shared stream rather than each creating
 	// a conflicting one. Provisioned at bootstrap (and reconciled in ensureStreams).
 	StreamModels = "MODELS" // owns fp.models.>   (the storage-metering consumer reads here)
+	// StreamAI owns fp.ai.> — the AI Gateway's cost/audit log (it OWNS and produces
+	// into this stream; see services/ai-gateway/internal/events/subjects.go). Billing's
+	// AIConsumer reads fp.ai.completion.served from it. Named exactly as the producer
+	// names it ("AI") so the consumer binds the SAME stream the gateway publishes to.
+	// In production the gateway's bootstrap provisions it; billing also reconciles it in
+	// ensureStreams so a billing-first boot doesn't fail subscribing to a missing stream
+	// (graceful degrade — the consumer can attach even if the gateway hasn't booted yet).
+	StreamAI = "AI" // owns fp.ai.>   (the AI-token-metering consumer reads here)
 )
