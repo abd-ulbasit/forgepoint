@@ -1,0 +1,124 @@
+# =============================================================================
+# 50-virtualservice-model-serving.yaml — canary traffic splitting (90/10) via
+# subsets, the Istio-native realization of progressive delivery.
+# Phase 10 — Istio Service Mesh
+# =============================================================================
+# WHAT THIS DOES
+#   A DestinationRule defines named SUBSETS of a host (here: `stable` and `canary`,
+#   selected by pod labels), and a VirtualService routes a WEIGHTED split of traffic
+#   across those subsets. 90% → stable, 10% → canary is the canonical first canary
+#   step. This is HOW Istio realizes progressive delivery: shift weight gradually
+#   (10 → 25 → 50 → 100) while watching metrics, and roll back instantly by setting
+#   canary weight to 0 — no redeploy, just a config change Envoy applies live.
+#
+# HOW THIS RELATES TO Argo Rollouts (deploy/rollouts) — THE THREE-LAYER CANARY STORY
+#   Forgepoint has canary at THREE distinct layers; naming them is the interview win:
+#     1. APPLICATION (Pipeline Orchestrator saga + inference-gateway weight_bps,
+#        ADR 0007): routes between MODEL VERSIONS (v1 weights vs v2 weights) inside
+#        the serving fleet. Business-aware, model-specific.
+#     2. INFRA / WORKLOAD (Argo Rollouts, deploy/rollouts/rollout-model-serving.yaml):
+#        routes between SERVICE VERSIONS (old serving BINARY vs new serving binary)
+#        using stable/canary ReplicaSets. Argo Rollouts manages the pod tracks and the
+#        analysis gates (AnalysisTemplate checks drift/latency).
+#     3. MESH (THIS FILE): the DATA-PLANE mechanism that actually SPLITS the bytes by
+#        weight at L7. Argo Rollouts' SMI/replica weighting is approximate (weight ≈
+#        replica ratio); Istio gives EXACT request-percentage weighting.
+#
+#   TODAY deploy/rollouts uses replica-ratio weighting (no `trafficRouting.istio`
+#   block — verified). This VirtualService is the Istio-native upgrade path: point the
+#   Rollout's `spec.strategy.canary.trafficRouting.istio.virtualService` at THIS
+#   object and Argo Rollouts will REWRITE the weights here automatically at each step,
+#   giving exact L7 splitting + automated analysis-gated promotion. We author the
+#   static 90/10 here as the standalone, demonstrable artifact; the README documents
+#   wiring it to the Rollout.
+#
+# SUBSET LABELING — MUST MATCH THE ROLLOUT'S TRACK LABELS
+#   deploy/rollouts/services-model-serving.yaml labels the two tracks with
+#   `forgepoint.io/track: stable` and `forgepoint.io/track: canary`. The SUBSETS this
+#   VirtualService routes to are DECLARED on the single host DestinationRule in
+#   20-destinationrules.yaml (see "WHY ONE DR PER HOST" there); they select on that
+#   SAME track label so this VirtualService composes with the existing Rollout track
+#   Services without relabeling pods. (Argo Rollouts stamps the
+#   rollouts-pod-template-hash too; track is the stable, human-named selector.)
+#
+# WHERE THE TRACK LABEL COMES FROM IN EACH DEPLOY PATH (read this before trusting the
+# 90/10 split — it is NOT what it looks like at rest):
+#   • ARGO ROLLOUTS path: Rollouts stamps `track=stable` on stable-track pods and
+#     `track=canary` on canary-track pods, so BOTH subsets get endpoints — but ONLY
+#     while a rollout is in progress. Crucially, Rollouts also OWNS the weights: with
+#     `trafficRouting.istio` wired (see README), it REWRITES the `weight:` fields in
+#     THIS VirtualService at each canary step and drives canary weight back to 0 when
+#     no rollout is active. So at steady state the runtime split is 100/0, not 90/10.
+#   • PLAIN HELM path (no Rollouts): the fp-model-serving chart now defaults
+#     `forgepoint.io/track: stable` on its pod template (values.yaml podLabels), so the
+#     `stable` subset always has endpoints. The `canary` subset has NONE (nothing
+#     stamps track=canary without Rollouts). With no Rollouts controller to add canary
+#     weight, the canary route resolves to zero healthy endpoints and Envoy serves
+#     effectively 100% from `stable` — no blackhole. (Before the default label, BOTH
+#     subsets matched zero pods and ALL predict traffic blackholed — the bug this fixes.)
+#
+#   THEREFORE: the static `weight: 90 / weight: 10` authored below is an ILLUSTRATIVE
+#   INITIAL STATE — a demonstrable standalone artifact showing the canary shape. It is
+#   NOT the runtime truth: Argo Rollouts overwrites it via trafficRouting.istio when
+#   wired, and plain Helm has no canary endpoints to receive the 10% anyway.
+#
+# WHY THE SUBSETS ARE NOT DEFINED HERE
+#   A previous version of this file shipped a SECOND DestinationRule
+#   (`fp-model-serving-subsets`) carrying the subsets, alongside the resilience DR in
+#   20-*.yaml — TWO DRs for the identical host. That is an Istio footgun: multiple
+#   specific-host DRs do NOT reliably merge (KIA0204), so the outlier-detection
+#   circuit breaker could silently not apply. The subsets now live ON the single host
+#   DR in 20-*.yaml; this file is pure VirtualService routing.
+#
+# COMPOSES WITH AUTHZ + mTLS
+#   This file is pure ROUTING. Whether a caller may reach serving AT ALL is decided by
+#   31-authorizationpolicy-fp-models.yaml; the transport is mTLS'd by the STRICT
+#   PeerAuthentication. Routing ⟂ authz ⟂ encryption — three independent concerns,
+#   each in its own object. A request is: authorized? → encrypted? → THEN weighted to
+#   a subset.
+# =============================================================================
+
+---
+# ── VirtualService: 90/10 weighted split across the subsets ─────────────────
+# The `stable`/`canary` subsets this references are declared on the single host
+# DestinationRule in 20-destinationrules.yaml (one DR per host — see that file).
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: fp-model-serving
+  namespace: fp-models
+  labels:
+    app.kubernetes.io/part-of: forgepoint
+    forgepoint.io/phase: "10"
+spec:
+  # `hosts` is the destination clients address. In-mesh callers (the inference
+  # gateway) dialing this FQDN get this routing applied by their sidecar.
+  hosts:
+    - fp-model-serving.fp-models.svc.cluster.local
+  # gRPC is HTTP/2 → matched by the `http` route block (Istio treats gRPC as HTTP/2).
+  http:
+    - name: canary-split
+      route:
+        # ILLUSTRATIVE INITIAL WEIGHTS (see header "WHERE THE TRACK LABEL COMES FROM"):
+        # Argo Rollouts REWRITES these at runtime via trafficRouting.istio (canary → 0
+        # at rest); under plain Helm the `canary` subset has no endpoints, so traffic is
+        # effectively 100% stable. 90/10 is the demonstrable initial canary shape, not a
+        # promise about the live split.
+        - destination:
+            host: fp-model-serving.fp-models.svc.cluster.local
+            subset: stable
+          weight: 90
+        - destination:
+            host: fp-model-serving.fp-models.svc.cluster.local
+            subset: canary
+          weight: 10
+      # A modest per-try timeout + retries on transient gRPC failures. Retries here
+      # COMPLEMENT outlier detection (20-*.yaml): outlier ejects a bad pod; retry gives
+      # THIS request a second chance on a (probably different, healthy) endpoint. We
+      # retry only on idempotent-safe conditions to avoid amplifying load on a sick
+      # fleet (no retry on resource-exhausted — that would worsen overload).
+      retries:
+        attempts: 2
+        perTryTimeout: 2s
+        retryOn: connect-failure,refused-stream,unavailable
+      timeout: 5s

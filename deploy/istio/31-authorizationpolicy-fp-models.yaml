@@ -1,0 +1,84 @@
+# =============================================================================
+# 31-authorizationpolicy-fp-models.yaml — model-serving authz (cross-namespace).
+# Phase 10 — Istio Service Mesh
+# =============================================================================
+# CONTEXT
+#   fp-models hosts the model-serving workloads (fp-model-serving). It is a
+#   high-value, high-blast-radius namespace: a serving pod runs model weights and
+#   answers predictions. The ONLY legitimate inbound callers are:
+#     1. inference-gateway (fp-system) — forwards every prediction to a server-resolved
+#        serving endpoint (fp-model-serving.fp-models:9090). This is the gateway's
+#        whole job (ADR 0007 inference-gateway pattern). The endpoint is SERVER-
+#        resolved (anti-SSRF) in the gateway domain — see inference-gateway
+#        domain/models.go `Endpoint`.
+#     2. pipeline-orchestrator (fp-system) — the saga's DEPLOY/CANARY/health-check
+#        steps may probe or warm a serving deployment. Edge is architectural (executor
+#        registry empty today) but intended; encoded so the mesh is ready.
+#
+#   NOTE ON NAMESPACE: serving's AUTHORITATIVE namespace is fp-models, and every
+#   consumer agrees: the CLAUDE.md namespace map ("fp-models → model-serving"), the
+#   00-namespaces.yaml mesh injection note, the BFF config (FP_MODEL_SERVING_ADDR=
+#   fp-model-serving.fp-models…), and the inference-gateway + BFF NetworkPolicy egress
+#   allow-lists (egress.modelServing.namespace: fp-models) all target fp-models.
+#
+#   The model-serving Helm chart is NAMESPACE-AGNOSTIC — every template uses
+#   metadata.namespace: {{ .Release.Namespace }}, so the chart does NOT itself pin a
+#   namespace; the INSTALL target decides. Previously the install path resolved serving
+#   to fp-SYSTEM (the Makefile forced `--namespace fp-system` for ALL charts, and the
+#   Argo Rollouts manifests hardcoded fp-system) — a bug, because then THIS policy's
+#   selector and the fp-models DestinationRule selected ZERO pods while serving ran in
+#   fp-system under the deny-all baseline with no allow for the predict edge. That has
+#   been fixed: the Makefile now derives fp-models for model-serving and the Rollouts
+#   manifests pin fp-models, so the install target matches what this mesh layer (and
+#   every caller) expects. (See README "Assumptions".)
+#
+# CROSS-NAMESPACE PRINCIPALS
+#   The callers live in fp-system but the policy lives in fp-models (authz is enforced
+#   at the DESTINATION sidecar). The `source.principals` therefore reference the
+#   callers' fp-SYSTEM SPIFFE identities — cross-namespace by construction. mTLS makes
+#   that safe: the cert proves the caller is genuinely that fp-system SA.
+# =============================================================================
+
+---
+# ── DENY-ALL BASELINE for fp-models ─────────────────────────────────────────
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: deny-all-default
+  namespace: fp-models
+  labels:
+    app.kubernetes.io/part-of: forgepoint
+    forgepoint.io/phase: "10"
+spec: {}
+
+---
+# ── ALLOW inference-gateway + pipeline-orchestrator → model-serving ─────────
+# Pinned to the two legitimate fp-system caller SAs on the gRPC port only. A random
+# pod in fp-models (or anywhere) cannot reach a serving pod — exactly the isolation a
+# model-serving namespace wants. The canary subsets (50-*.yaml) ride ON TOP of this:
+# authz decides IF you may call; the VirtualService decides WHICH subset (stable vs
+# canary) you land on.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-callers-to-model-serving
+  namespace: fp-models
+  labels:
+    app.kubernetes.io/part-of: forgepoint
+    forgepoint.io/phase: "10"
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fp-model-serving
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              # The inference gateway — the front door to every model (predict path).
+              - cluster.local/ns/fp-system/sa/fp-inference-gateway
+              # The orchestrator saga — deploy/canary/health-check steps on serving.
+              - cluster.local/ns/fp-system/sa/fp-pipeline-orchestrator
+      to:
+        - operation:
+            ports: ["9090"]

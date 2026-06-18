@@ -1,0 +1,103 @@
+# =============================================================================
+# 10-peerauthentication.yaml — STRICT mTLS (the zero-trust transport layer).
+# Phase 10 — Istio Service Mesh
+# =============================================================================
+# WHAT PeerAuthentication CONTROLS
+#   PeerAuthentication governs the SERVER side of mTLS: "what kind of peer connection
+#   will a workload's sidecar ACCEPT?" Three modes:
+#     - PERMISSIVE → accept BOTH mTLS and plaintext. The migration default: meshed
+#                    callers get mTLS, not-yet-meshed callers still work in plaintext.
+#     - STRICT     → accept ONLY mTLS. Any plaintext connection is REJECTED at L4.
+#                    This is the zero-trust posture: every accepted byte is from a
+#                    cryptographically-identified, in-mesh peer.
+#     - DISABLE    → accept only plaintext (used to carve out a specific non-mTLS port).
+#
+#   The CLIENT side (whether a sidecar ORIGINATES mTLS) is set by DestinationRule
+#   `trafficPolicy.tls.mode: ISTIO_MUTUAL` — and Istio defaults client traffic to
+#   mTLS automatically when the destination has a sidecar, so with STRICT servers +
+#   auto mTLS clients, the whole mesh is encrypted with NO per-client config.
+#
+# WHY STRICT (not PERMISSIVE) FOR FORGEPOINT
+#   Forgepoint's threat model is "assume the network is hostile" — a compromised pod
+#   in fp-system should NOT be able to sniff or spoof traffic to auth/registry. STRICT
+#   gives:
+#     - ENCRYPTION in transit for every east-west hop (defeats packet capture).
+#     - CRYPTOGRAPHIC IDENTITY: every connection carries a SPIFFE identity
+#       (spiffe://cluster.local/ns/<ns>/sa/<serviceaccount>) derived from the pod's
+#       ServiceAccount and minted by istiod as a short-lived X.509 cert (SDS, rotated
+#       ~every 24h, never written to disk). That identity is what the
+#       AuthorizationPolicies (30-*.yaml) match on — STRICT mTLS is the PREREQUISITE
+#       that makes principal-based authz trustworthy. Without mTLS, `source.principal`
+#       would be unauthenticated and spoofable.
+#
+#   This is the SPIFFE/SPIRE model (Istio ships its own SPIFFE-compliant CA). Compare
+#   Linkerd (same idea, its own identity), and the cloud-native zero-trust pattern
+#   generally: identity is the new perimeter.
+#
+# MIGRATION PATH (how you get to STRICT safely on a live cluster)
+#   You do NOT flip a running platform straight to STRICT — that would instantly drop
+#   any not-yet-meshed caller. The standard rollout:
+#     1. Install Istio, label namespaces, roll all workloads so EVERY pod has a
+#        sidecar (PeerAuthentication absent → mesh default PERMISSIVE).
+#     2. Verify with `istioctl x describe pod <p>` / Kiali that all traffic is already
+#        mTLS (it will be, because auto-mTLS upgrades meshed↔meshed automatically even
+#        under PERMISSIVE).
+#     3. THEN apply this STRICT policy. Because everything is already mTLS, flipping to
+#        STRICT only changes behavior for any straggler plaintext path — which you've
+#        verified is none.
+#   Because Forgepoint is authored-not-applied here, we ship the END STATE (STRICT) and
+#   document the ramp. The README's verify step shows the `tls-check` you'd run between
+#   steps 2 and 3.
+#
+# ───────────────────────────────────────────────────────────────────────────────
+# KUBELET PROBES UNDER STRICT mTLS — THE CLASSIC GOTCHA (interview-critical)
+# ───────────────────────────────────────────────────────────────────────────────
+#   PROBLEM: kubelet liveness/readiness/startup probes originate from the NODE, which
+#   is NOT in the mesh and has NO client certificate. Under naive STRICT mTLS, every
+#   HTTP probe to a pod would be a plaintext connection → REJECTED → the kubelet marks
+#   the pod Unhealthy → CrashLoopBackOff. A whole platform can be taken down this way.
+#
+#   WHY FORGEPOINT IS IMMUNE — TWO INDEPENDENT REASONS, EITHER ALONE SUFFICES:
+#
+#   (1) ISTIO PROBE REWRITE (on by default: `sidecarInjectorWebhook.rewriteAppHTTPProbe
+#       =true`). At injection time Istio REWRITES each httpGet probe in the pod spec to
+#       instead hit the SIDECAR'S pilot-agent on port 15020 at
+#       `/app-health/<container>/<probe>`. The pilot-agent then calls the app's real
+#       probe path LOCALLY over the pod's loopback (127.0.0.1), which BYPASSES the
+#       mTLS-enforcing inbound listener entirely. So `httpGet /healthz on port health`
+#       in our Helm Deployments keeps working untouched — Istio transparently reroutes
+#       the kubelet→pod probe through the agent. We change NOTHING in the charts.
+#
+#   (2) HEALTH PORT IS A SEPARATE LISTENER. Even WITHOUT rewrite, Forgepoint runs
+#       /healthz, /readyz, /metrics on a DISTINCT HTTP port (health=8080) from the gRPC
+#       API (grpc=9090) — see every chart's values.yaml `ports:`. The health port could
+#       be excluded from mesh capture (`traffic.sidecar.istio.io/excludeInboundPorts:
+#       "8080"`) so probes hit it in plaintext, untouched by mTLS, while the gRPC port
+#       stays STRICT. We rely on mechanism (1) (the default) and keep (2) as the
+#       fallback the README documents — belt and suspenders, exactly the project's
+#       posture elsewhere (cf. the charts' double automountServiceAccountToken=false).
+#
+#   NET: our existing probes (httpGet /healthz, /readyz on the `health` port) survive
+#   STRICT mTLS with ZERO changes to the Helm charts. That is by design — the two-port
+#   split the platform already uses is what makes the mesh drop-in.
+# =============================================================================
+
+---
+# Mesh-wide STRICT mTLS.
+# SCOPE RULE (the one fact people get wrong): a PeerAuthentication with NO `selector`
+# is MESH-WIDE *only* when it lives in the ISTIO ROOT NAMESPACE (istio-system by
+# default — `meshConfig.rootNamespace`). The same object in any other namespace would
+# apply to that namespace only. So this MUST be created in istio-system.
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: istio-system   # the mesh root namespace → this is the MESH-WIDE default
+  labels:
+    app.kubernetes.io/part-of: forgepoint
+    forgepoint.io/phase: "10"
+spec:
+  # No selector + root namespace = applies to EVERY workload in the mesh
+  # (fp-system + fp-models; fp-infra is unmeshed so it is unaffected).
+  mtls:
+    mode: STRICT

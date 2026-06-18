@@ -1,0 +1,99 @@
+# =============================================================================
+# 40-gateway-bff.yaml — the public INGRESS edge into the mesh (BFF only).
+# Phase 10 — Istio Service Mesh
+# =============================================================================
+# WHAT A Gateway + ingress VirtualService DO
+#   A `Gateway` configures the ISTIO INGRESS GATEWAY (a standalone Envoy at the mesh
+#   edge, in istio-system) — which ports/protocols/hosts it accepts from OUTSIDE the
+#   cluster. A `VirtualService` bound to that Gateway then routes the accepted traffic
+#   to an in-mesh destination. Together they are the controlled doorway: external
+#   bytes terminate at the ingress Envoy, which is IN the mesh, so from the BFF inward
+#   EVERY hop is mTLS'd and authorized.
+#
+# WHY ONLY THE BFF IS EXPOSED (ADR 0001)
+#   The BFF is the SINGLE public surface (ADR 0001 — BFF for the Web UI). The 10
+#   backend services are NEVER reachable from outside; they only accept the ingress
+#   gateway's identity (for the edge) or specific peer SAs (east-west). This Gateway
+#   exposes exactly ONE host → the BFF's HTTP API. (Raw external gRPC for predictions,
+#   if ever needed, would be a SEPARATE Gateway server block to the inference-gateway;
+#   omitted here because the platform's public contract is the BFF's HTTP/JSON+SSE
+#   API, and the gateway's authz already lists the ingress principal for predict.)
+#
+# WHERE TLS TERMINATES (the honest homelab note)
+#   In production the Gateway terminates HTTPS with a real cert (server block on 443,
+#   `tls.mode: SIMPLE`, credentialName → a TLS Secret managed by cert-manager). On the
+#   homelab there is no public DNS/cert, so we author the HTTP (port 80) server here
+#   AND include the production HTTPS server commented in the README with the exact
+#   `tls` block, plus the HTTP→HTTPS redirect (`tls.httpsRedirect: true`). Shipping the
+#   HTTP server keeps the manifest installable/demoable; the README shows the one-block
+#   change for a real domain (ties to M5 Terraform's ACM/Route53).
+# =============================================================================
+
+---
+# ── Gateway: the ingress Envoy's listener config ────────────────────────────
+# Bound to the DEFAULT istio ingressgateway via the selector
+# `istio: ingressgateway` (the label Istio's demo/default ingress Deployment carries).
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: fp-ingress
+  namespace: istio-system   # co-located with the ingress gateway workload it configures
+  labels:
+    app.kubernetes.io/part-of: forgepoint
+    forgepoint.io/phase: "10"
+spec:
+  selector:
+    # Targets the istio ingress gateway pods (the standalone edge Envoy).
+    istio: ingressgateway
+  servers:
+    - port:
+        number: 80
+        name: http
+        protocol: HTTP
+      hosts:
+        # The public hostname for the SPA/API. `*` would accept any Host header; we
+        # pin a name so the gateway only answers for the Forgepoint domain (and so the
+        # VirtualService host match is meaningful). Replace with the real domain on a
+        # cluster with DNS; on the homelab, set this in /etc/hosts or curl --resolve.
+        - "forgepoint.local"
+      # PRODUCTION (documented in README, not active here): add a 443 server with
+      #   tls: { mode: SIMPLE, credentialName: fp-ingress-tls }
+      # and set this http server's tls.httpsRedirect: true to force HTTPS.
+
+---
+# ── VirtualService: route ingress traffic → the BFF ─────────────────────────
+# This VirtualService is bound to the `fp-ingress` Gateway (via `gateways:`), which is
+# what distinguishes an INGRESS route (external → mesh) from an EAST-WEST route
+# (in-mesh → in-mesh, which would use `gateways: [mesh]`). It lives in fp-system next
+# to the BFF it targets (a common, clean placement; the Gateway it references is
+# addressed by namespace/name).
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: fp-bff-ingress
+  namespace: fp-system
+  labels:
+    app.kubernetes.io/part-of: forgepoint
+    forgepoint.io/phase: "10"
+spec:
+  hosts:
+    - "forgepoint.local"
+  gateways:
+    # Reference the Gateway by `<namespace>/<name>` since it lives in istio-system but
+    # this VirtualService lives in fp-system. Forgetting the namespace prefix is the
+    # #1 "my route does nothing" bug — the binding silently fails to match.
+    - istio-system/fp-ingress
+  http:
+    - name: to-bff
+      match:
+        - uri:
+            prefix: "/"
+      route:
+        - destination:
+            # The BFF's stable Service (the Helm chart's fullname, fp-system).
+            host: fp-bff.fp-system.svc.cluster.local
+            port:
+              number: 8081   # the BFF's SPA-facing HTTP API port (NOT gRPC)
+      # Edge-level timeout so a hung backend fan-out doesn't pin an ingress worker.
+      # The BFF's own per-call gRPC timeouts are tighter; this is the outer bound.
+      timeout: 30s

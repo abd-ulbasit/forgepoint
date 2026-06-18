@@ -1,0 +1,399 @@
+# =============================================================================
+# 30-authorizationpolicy-fp-system.yaml — DENY-BY-DEFAULT + the real call graph.
+# Phase 10 — Istio Service Mesh
+# =============================================================================
+# WHAT AuthorizationPolicy DOES (and WHY it complements, not replaces, app JWT)
+#   AuthorizationPolicy is L7 authz enforced by the Envoy sidecar BEFORE a request
+#   reaches the app container. It matches on the mTLS-verified SPIFFE identity of the
+#   CALLER (`source.principals`), the destination workload (`selector`), and request
+#   attributes (port, path, method). This is the MESH-LEVEL complement to Forgepoint's
+#   APPLICATION-level JWT auth:
+#
+#       ┌─────────────────────── DEFENSE IN DEPTH ───────────────────────┐
+#       │ L7 mesh authz (HERE):  "WHICH WORKLOAD may open a connection?"  │
+#       │   identity = SPIFFE cert from the pod's ServiceAccount, minted  │
+#       │   by istiod, unspoofable. Answers: may fp-bff's SA call         │
+#       │   fp-registry at all?                                          │
+#       │                                                                 │
+#       │ App JWT authz (pkg/auth, unchanged): "WHICH USER, with WHICH    │
+#       │   role/scope, may run THIS RPC?" identity = the end-user's      │
+#       │   bearer token the BFF forwards. Answers: may THIS user delete  │
+#       │   a model?                                                     │
+#       └─────────────────────────────────────────────────────────────────┘
+#
+#   Two ORTHOGONAL identities (workload vs. user), checked at two layers. A stolen
+#   user JWT replayed FROM A POD THAT ISN'T THE BFF is still blocked here (wrong
+#   workload identity); a compromised BFF pod replaying to registry is allowed by the
+#   mesh but the RPC still needs a valid user JWT + role. Neither layer alone is
+#   sufficient; together they are the zero-trust posture.
+#
+# THE DENY-BY-DEFAULT MODEL (Istio's specific, subtle semantics)
+#   Istio authz is ADDITIVE-ALLOW with a deny-all TRIGGER:
+#     - If NO AuthorizationPolicy selects a workload → ALLOW all (open by default).
+#     - The MOMENT any ALLOW policy selects a workload → everything NOT explicitly
+#       allowed for it is DENIED (allow-list semantics kick in for that workload).
+#     - A policy with `spec: {}` (empty — no rules) and action ALLOW selects ALL
+#       workloads in the namespace and matches NOTHING → it DENIES ALL traffic in the
+#       namespace. That is the canonical "deny-all baseline".
+#   We use that baseline (policy #1) so fp-system is CLOSED by default, then layer
+#   explicit ALLOW policies (the real graph) on top. Note Istio evaluates DENY before
+#   ALLOW, but here we rely on the empty-ALLOW deny-all + targeted ALLOWs, which is the
+#   recommended, least-surprising construction.
+#
+# ───────────────────────────────────────────────────────────────────────────────
+# THE REAL CALL GRAPH (derived from source, NOT guessed)
+# ───────────────────────────────────────────────────────────────────────────────
+#   Verified in code:
+#     • services/bff/cmd/server/main.go + internal/clients/clients.go:
+#         BFF dials 7 services over gRPC:9090 — auth, registry,
+#         pipeline-orchestrator, experiment-tracker, model-monitor, billing,
+#         notification.  (NOT inference-gateway, NOT model-serving, NOT feature-store.)
+#     • services/model-monitor/internal/config/config.go (OrchestratorEndpoint) +
+#       cmd/server/main.go: model-monitor → pipeline-orchestrator (closed-loop retrain,
+#       ADR 0003). Adapter is a stub today but the edge is real & intended.
+#     • registry/billing/notification/experiment-tracker/feature-store have ZERO
+#       outbound gRPC client constructors → they are sinks/reactors, callers only.
+#   Architectural (port exists, adapter pending — encoded so authz is ready when wired):
+#     • inference-gateway → model-serving (fp-models) — see 31-*.yaml. domain port
+#       `ModelServerClient`; the gateway forwards predictions to fp-models:9090.
+#     • pipeline-orchestrator → registry (+ inference-gateway, + model-serving) — the
+#       saga's DEPLOY/CANARY/TRAIN step executors. Executor registry is empty today
+#       (services/pipeline-orchestrator/cmd/server/main.go) but the saga's reason for
+#       existing is to drive these. Encoded so the mesh doesn't block the wiring.
+#   Edge of the mesh:
+#     • external → BFF (ingress, ADR 0001). Allowed via the ingress gateway principal
+#       in policy #2; the BFF itself is the ONLY public surface today. There is NO
+#       external → inference-gateway edge yet — no predict Gateway/VirtualService
+#       exists (40-gateway-bff.yaml routes only to the BFF), so policy #6 below does
+#       NOT list the ingress principal. See policy #6 for the re-add steps.
+#
+#   ASCII (fp-system intra-namespace gRPC; → = allowed caller→callee on :9090):
+#
+#     ingressgateway ─→ bff
+#                        │
+#         ┌──────┬───────┼────────┬─────────────┬──────────┬───────────────┐
+#         ▼      ▼       ▼        ▼             ▼          ▼               ▼
+#       auth  registry  pipeline  experiment  monitor   billing      notification
+#                          ▲          (sink)             (sink)        (sink/reactor)
+#                          │
+#       monitor ───────────┘  (closed-loop retrain)
+#       pipeline ─→ registry  (saga DEPLOY step: register/promote)
+#       pipeline ─→ inference-gateway (saga CANARY step: set weight_bps)
+#         (NB: no ingressgateway ─→ inference-gateway edge — external predict not wired)
+#       pipeline ─→ (fp-models) model-serving   [cross-namespace, see 31-*.yaml]
+#       inference-gateway ─→ (fp-models) model-serving  [cross-namespace, 31-*.yaml]
+#
+# WHY RESTRICT TO THE gRPC PORT (9090)
+#   Each ALLOW pins `to.operation.ports: ["9090"]` — the gRPC API port. The health
+#   port (8080) is intentionally NOT opened to peers: probes reach it via the Istio
+#   probe-rewrite path (loopback), and no service should be calling another's
+#   /healthz. Scoping to 9090 is least privilege at the port grain.
+#
+# SERVICE ACCOUNTS / PRINCIPALS
+#   Each chart creates its own SA named after the release fullname (`fp-<svc>` — the
+#   Makefile installs release `fp-<svc>`, and _helpers `serviceAccountName` defaults to
+#   the fullname). Under STRICT mTLS the SPIFFE principal is therefore:
+#       cluster.local/ns/fp-system/sa/fp-<svc>
+#   (Istio strips the `spiffe://` scheme in `source.principals`.) These are matched
+#   below. If a chart's SA name is ever overridden, update the principal here — the
+#   principal is the SA, not the workload name.
+# =============================================================================
+
+---
+# ── POLICY 1: DENY-ALL BASELINE ─────────────────────────────────────────────
+# Empty-spec ALLOW = selects every workload in fp-system, matches no source → the
+# namespace becomes CLOSED. Every permitted edge must be explicitly added below.
+# (This is the mesh-level equivalent of the charts' default-deny NetworkPolicy — but
+# enforced on cryptographic identity, not IP/namespace, and at L7.)
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: deny-all-default
+  namespace: fp-system
+  labels:
+    app.kubernetes.io/part-of: forgepoint
+    forgepoint.io/phase: "10"
+spec:
+  # No selector → applies to ALL workloads in fp-system.
+  # No `rules` → ALLOW nothing → effective DENY-ALL for the namespace.
+  {}
+
+---
+# ── POLICY 2: external → BFF (the public edge, ADR 0001) ────────────────────
+# The BFF is the ONLY workload reachable from outside the mesh. Traffic enters via the
+# Istio ingress gateway (40-gateway.yaml), so the CALLER principal is the ingress
+# gateway's SA. We allow that principal to reach the BFF on its HTTP API port (8081)
+# AND the health port is left to probe-rewrite. We pin the ingressgateway SA principal
+# rather than "any source" so a random in-mesh pod cannot impersonate the edge.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-ingress-to-bff
+  namespace: fp-system
+  labels:
+    app.kubernetes.io/part-of: forgepoint
+    forgepoint.io/phase: "10"
+spec:
+  selector:
+    matchLabels:
+      # Matches the BFF pods. The chart's selectorLabels are name+instance; the stable
+      # `app.kubernetes.io/name` is the right key for an authz selector (instance can
+      # vary by release name, name is the workload identity).
+      app.kubernetes.io/name: fp-bff
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              # The default Istio ingress gateway runs as this SA in istio-system.
+              - cluster.local/ns/istio-system/sa/istio-ingressgateway
+      to:
+        - operation:
+            ports:
+              - "8081"   # the BFF's SPA-facing HTTP/JSON+SSE API (NOT a gRPC port)
+
+---
+# ── POLICY 3: BFF → the 7 backend services it dials (verified edges) ────────
+# One policy per DESTINATION (the cleanest model: each callee declares who may call
+# it). All seven share the same single allowed caller — the BFF's SA — on gRPC:9090.
+# We could collapse these into fewer objects, but one-policy-per-destination keeps the
+# allow-list READABLE and lets each service's authz evolve independently.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-bff-to-auth
+  namespace: fp-system
+  labels: { app.kubernetes.io/part-of: forgepoint, forgepoint.io/phase: "10" }
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fp-auth
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/fp-system/sa/fp-bff
+      to:
+        - operation:
+            ports: ["9090"]
+
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-bff-to-registry
+  namespace: fp-system
+  labels: { app.kubernetes.io/part-of: forgepoint, forgepoint.io/phase: "10" }
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fp-registry
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              # registry is called by BOTH the BFF (read/list/get for the UI) AND the
+              # pipeline-orchestrator saga (register/promote during a deploy). Both
+              # principals are listed in this single rule's `from`.
+              - cluster.local/ns/fp-system/sa/fp-bff
+              - cluster.local/ns/fp-system/sa/fp-pipeline-orchestrator
+      to:
+        - operation:
+            ports: ["9090"]
+
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-bff-to-experiment-tracker
+  namespace: fp-system
+  labels: { app.kubernetes.io/part-of: forgepoint, forgepoint.io/phase: "10" }
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fp-experiment-tracker
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/fp-system/sa/fp-bff
+      to:
+        - operation:
+            ports: ["9090"]
+
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-bff-to-billing
+  namespace: fp-system
+  labels: { app.kubernetes.io/part-of: forgepoint, forgepoint.io/phase: "10" }
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fp-billing
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/fp-system/sa/fp-bff
+      to:
+        - operation:
+            ports: ["9090"]
+
+---
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-bff-to-notification
+  namespace: fp-system
+  labels: { app.kubernetes.io/part-of: forgepoint, forgepoint.io/phase: "10" }
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fp-notification
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/fp-system/sa/fp-bff
+      to:
+        - operation:
+            ports: ["9090"]
+
+---
+# ── POLICY 4: pipeline-orchestrator — called by BFF AND model-monitor ───────
+# Two callers:
+#   • BFF (the UI lists/triggers pipelines) — verified gRPC client edge.
+#   • model-monitor → orchestrator.TriggerRetrain — the CLOSED-LOOP retrain edge
+#     (ADR 0003). This is THE edge that closes serve→monitor→retrain; without it the
+#     loop is open. Even though the orchestrator client in model-monitor is a stub
+#     today, this allow makes the mesh ready the instant the adapter lands.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-pipeline-orchestrator-callers
+  namespace: fp-system
+  labels: { app.kubernetes.io/part-of: forgepoint, forgepoint.io/phase: "10" }
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fp-pipeline-orchestrator
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/fp-system/sa/fp-bff
+              - cluster.local/ns/fp-system/sa/fp-model-monitor
+      to:
+        - operation:
+            ports: ["9090"]
+
+---
+# ── POLICY 5: model-monitor — called by the BFF ─────────────────────────────
+# The UI reads drift reports / monitor status. (model-monitor is also an EVENT
+# consumer off NATS — that path is fp-infra, unmeshed, and not an authz concern here.)
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-bff-to-model-monitor
+  namespace: fp-system
+  labels: { app.kubernetes.io/part-of: forgepoint, forgepoint.io/phase: "10" }
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fp-model-monitor
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - cluster.local/ns/fp-system/sa/fp-bff
+      to:
+        - operation:
+            ports: ["9090"]
+
+---
+# ── POLICY 6: inference-gateway — called by the pipeline-orchestrator saga ──
+# The CANARY step of a deploy saga calls the gateway to set the traffic weight
+# (weight_bps) between model versions — the APPLICATION-level traffic split
+# (ADR 0007, inference-gateway pattern). It is NOT called by the BFF (verified: no
+# BFF gateway client).
+#
+# WHY NO istio-ingressgateway PRINCIPAL HERE (honest scoping — the edge isn't wired):
+#   External predict ingress is NOT yet wired. The ONLY public edge today is the BFF
+#   (40-gateway-bff.yaml + ADR 0001): the Gateway/VirtualService there route
+#   forgepoint.local:80 → BFF and NOTHING to the inference-gateway. There is no predict
+#   Gateway or VirtualService, so no external traffic ever arrives at this workload via
+#   the ingress gateway — allowing that principal would encode a phantom edge that
+#   doesn't exist. We therefore list ONLY the real in-mesh caller (the saga). The
+#   deny-all baseline (policy #1) already covers everything else, including the
+#   now-removed ingress edge.
+#
+#   WHEN external predict IS exposed: add a predict Gateway + VirtualService (alongside
+#   40-gateway-bff.yaml) AND re-add the principal
+#   `cluster.local/ns/istio-system/sa/istio-ingressgateway` to the `from` list below.
+#   Do both together so the edge and its authz land in the same change.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-inference-gateway-callers
+  namespace: fp-system
+  labels: { app.kubernetes.io/part-of: forgepoint, forgepoint.io/phase: "10" }
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fp-inference-gateway
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              # The saga sets canary weights on the gateway. (External predict ingress
+              # is not wired yet — see the comment above; re-add the ingressgateway
+              # principal when a predict Gateway+VirtualService exists.)
+              - cluster.local/ns/fp-system/sa/fp-pipeline-orchestrator
+      to:
+        - operation:
+            ports: ["9090"]
+
+---
+# ── POLICY 7: feature-store — intra-platform reads, within-namespace allow ──
+# feature-store has NO inbound gRPC client wired in the code we inspected, and the BFF
+# does NOT dial it. Its online-read path is reached by model-serving / training jobs
+# in real deployments, but that precise edge is NOT yet wired in this tree. Per the
+# task's rule ("if a precise edge is unclear, allow within-namespace gRPC and note
+# it"), we allow any fp-system workload identity to reach feature-store on :9090 — a
+# DELIBERATELY BROADER grain than the others, scoped to the namespace's own
+# identities (still NOT open to fp-models or external). This is the one assumed edge;
+# tighten it to the real caller SA once the feature-read client is wired.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-fp-system-to-feature-store
+  namespace: fp-system
+  labels:
+    app.kubernetes.io/part-of: forgepoint
+    forgepoint.io/phase: "10"
+    forgepoint.io/authz-grain: namespace-broad-assumed-edge
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fp-feature-store
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            # `namespaces` (not `principals`) = any meshed identity FROM fp-system.
+            # Broader than a single SA, but still namespace-scoped + mTLS-required.
+            namespaces:
+              - fp-system
+      to:
+        - operation:
+            ports: ["9090"]

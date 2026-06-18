@@ -1,0 +1,139 @@
+# =============================================================================
+# 00-namespaces.yaml — Sidecar injection enablement (the mesh's "front door").
+# Phase 10 — Istio Service Mesh
+# =============================================================================
+# WHAT THIS DOES
+#   Istio's data plane is an Envoy "sidecar" proxy injected into every pod. A pod
+#   only joins the mesh if its NAMESPACE carries the label `istio-injection=enabled`
+#   (the classic injection model) — the mutating admission webhook
+#   `sidecar-injector.istio.io` watches for that label and rewrites the pod spec to
+#   add the `istio-proxy` container + the `istio-init` container that programs the
+#   pod's iptables so ALL inbound/outbound TCP is transparently routed through Envoy.
+#
+#   We OWN these namespaces already (CLAUDE.md K8s namespace map):
+#     fp-system  → the 10 platform services (auth, registry, bff, gateway, ...)
+#     fp-models  → model-serving workloads (fp-model-serving)
+#     fp-infra   → NATS / Postgres / Redis / MinIO / OTel collector (DELIBERATELY
+#                  NOT meshed — see the long note below)
+#     fp-jobs    → training / batch K8s Jobs (left out for now — short-lived Jobs +
+#                  a sidecar that never exits is a known footgun; see note)
+#
+# WHY LABEL THE NAMESPACE AND NOT EACH POD
+#   Namespace-level injection means a NEW service added to fp-system is meshed
+#   automatically — no per-Deployment annotation to forget. It is the GitOps-friendly
+#   default: the mesh boundary is declared once, here, and every workload inherits it.
+#   (A single pod can still opt OUT with `sidecar.istio.io/inject: "false"` on its
+#   pod template — used below conceptually for the migrate initContainer caveat.)
+#
+# INJECTION MODEL NOTE (interview-critical)
+#   Two injection models exist:
+#     1. `istio-injection=enabled`        → the legacy/stable label, pins to the
+#                                           SINGLE default control-plane revision.
+#     2. `istio.io/rev=<revision>`        → revision-based, required for canary
+#                                           upgrades of Istio ITSELF (run two control
+#                                           planes, migrate namespaces one rev at a
+#                                           time). The two labels are mutually
+#                                           exclusive on a namespace.
+#   We use the simple `istio-injection=enabled` form because this is a single-
+#   control-plane install (demo profile). The README documents the `istio.io/rev`
+#   migration path for a real cluster that needs zero-downtime Istio upgrades.
+#
+# WHY THESE ARE `metadata.labels` PATCHES, NOT Namespace CREATEs
+#   The namespaces are created by deploy/k8s (raw manifests) / Helm already. Here we
+#   only declare the LABEL that turns injection on. Re-declaring the Namespace object
+#   with just the injection label is the idempotent, declarative way to express
+#   "ensure this label exists" under `kubectl apply` / Argo CD (server-side apply
+#   merges the label in without clobbering other namespace metadata). Apply order in
+#   the README puts this FIRST so that when services are (re)deployed they get a
+#   sidecar.
+# =============================================================================
+
+---
+# fp-system — the 10 platform services. Every east-west gRPC hop here must be
+# mTLS-encrypted and identity-checked, so the whole namespace joins the mesh.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fp-system
+  labels:
+    # THE injection switch. With this set, every pod created in fp-system gets an
+    # istio-proxy sidecar and its traffic is captured by Envoy. PeerAuthentication
+    # (10-peerauthentication.yaml) then upgrades that traffic to STRICT mTLS, and the
+    # AuthorizationPolicies (30-*.yaml) gate who may call whom.
+    istio-injection: enabled
+    # Pod Security Admission baseline kept here so the namespace's security posture is
+    # self-documented alongside the mesh switch. Istio's sidecar needs no privileges
+    # beyond the init container's NET_ADMIN (granted via the CNI plugin or the init
+    # container), so "restricted" enforcement is compatible with the istio-cni install
+    # documented in the README.
+    pod-security.kubernetes.io/enforce: baseline
+    app.kubernetes.io/part-of: forgepoint
+
+---
+# fp-models — model-serving workloads (fp-model-serving). Meshed because the
+# inference-gateway forwards predictions here over gRPC and we want that hop mTLS'd
+# AND authorized (only the gateway's identity may reach a serving pod — see
+# 31-authorizationpolicy-fp-models.yaml). Canary subsets for progressive delivery
+# (50-virtualservice-model-serving.yaml) also require the sidecar to do L7 weighting.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fp-models
+  labels:
+    istio-injection: enabled
+    pod-security.kubernetes.io/enforce: baseline
+    app.kubernetes.io/part-of: forgepoint
+
+---
+# fp-infra — NATS / Postgres / Redis / MinIO / OTel collector.
+# ────────────────────────────────────────────────────────────────────────────
+# DELIBERATELY **NOT** MESHED (no istio-injection label). This is the single most
+# important judgment call in the injection plan, so it gets the long comment.
+#
+# WHY EXCLUDE STATEFUL INFRA FROM THE MESH:
+#
+#   1. NON-HTTP / NON-mTLS-AWARE PROTOCOLS. Postgres (its own TLS handshake), Redis
+#      (RESP), NATS (its own protocol), MinIO (S3/HTTP but often with its own TLS)
+#      all do their OWN transport security. Wrapping a Postgres connection in Istio
+#      mTLS means a DOUBLE TLS handshake (Envoy mTLS *over* Postgres TLS) — wasteful
+#      and a frequent source of "works in app, breaks in mesh" connection bugs.
+#      Istio CAN proxy raw TCP, but it adds no value here and adds failure modes.
+#
+#   2. NON-MESH CLIENTS EXIST. Infra is reached not only by meshed services but by
+#      out-of-mesh actors: kubectl port-forwards, a DBA's psql, the migrate
+#      initContainer that runs BEFORE the app, backup/restore Jobs, and operators.
+#      Under STRICT mTLS a non-mesh client has NO sidecar → no client cert →
+#      every such connection is REJECTED. Keeping fp-infra out of the mesh means
+#      these legitimate clients keep working. (If we ever mesh it, those clients need
+#      a PERMISSIVE PeerAuthentication carve-out per port — extra complexity for no
+#      real gain on a homelab.)
+#
+#   3. STATEFUL POD LIFECYCLE. A sidecar that is slow to start or slow to drain
+#      interferes with StatefulSet ordering and clean DB shutdown. Stateful systems
+#      want minimal moving parts in the network path.
+#
+#   THE TRADE-OFF WE ACCEPT: app↔infra traffic (service→Postgres, service→NATS) is
+#   then secured by the INFRA's own auth/TLS + NetworkPolicy, not by mesh mTLS. That
+#   is the standard, sane boundary: mesh = service-to-service (east-west) zero trust;
+#   infra security = the datastore's native mechanisms. The mesh's mTLS still covers
+#   every SERVICE-to-SERVICE hop, which is where the zero-trust value is.
+#
+#   (Advanced alternative, noted not used: mesh fp-infra too but add ServiceEntry +
+#   per-port PERMISSIVE PeerAuthentication + DestinationRule DISABLE for the infra
+#   ports so the sidecar passes those through in plaintext. Only worth it if you want
+#   L7 telemetry on infra calls. Out of scope for the homelab.)
+#
+# This object is here ONLY to DOCUMENT the exclusion and assert the absence of the
+# injection label (server-side apply will not add it). It is intentionally label-free
+# w.r.t. injection.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fp-infra
+  labels:
+    # NOTE: NO istio-injection label here — that is the whole point. The label below
+    # is a marker so an operator reading the mesh manifests sees the exclusion is
+    # INTENTIONAL, not forgotten.
+    forgepoint.io/mesh: excluded-stateful-infra
+    pod-security.kubernetes.io/enforce: baseline
+    app.kubernetes.io/part-of: forgepoint

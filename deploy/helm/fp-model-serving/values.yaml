@@ -372,7 +372,25 @@ affinity: {}
 
 # Extra pod annotations/labels (merged into pod template metadata).
 podAnnotations: {}
-podLabels: {}
+# podLabels are ADDITIONAL pod-template labels — they are NOT part of the
+# Deployment's immutable selector.matchLabels (that comes from selectorLabels in
+# _helpers.tpl). So it is safe to default a label here without forcing a
+# delete+recreate of the Deployment.
+#
+# WHY a default `forgepoint.io/track: stable`:
+#   The Istio canary DestinationRule (deploy/istio/20-destinationrules.yaml)
+#   partitions model-serving endpoints into `stable`/`canary` subsets selected by
+#   `forgepoint.io/track`. That track label is normally stamped by Argo Rollouts
+#   (deploy/rollouts/rollout-model-serving.yaml) on each track's pods. But under a
+#   PLAIN Helm install (no Argo Rollouts), pods would carry NO track label, so the
+#   `stable` subset would match ZERO endpoints — and the 90/10 VirtualService would
+#   blackhole all predict traffic. Defaulting `track: stable` here guarantees the
+#   `stable` subset always has endpoints in the Helm-only path. (When Argo Rollouts
+#   manages serving it sets the track per-track itself and also dynamically rewrites
+#   the VS weights; the `canary` subset only gets endpoints during an active
+#   rollout.)
+podLabels:
+  forgepoint.io/track: stable
 
 # terminationGracePeriodSeconds — must exceed the gRPC drain timeout (25s in
 # pkg/grpcutil) so in-flight predicts finish before SIGKILL. 30s gives 5s slack.
@@ -404,8 +422,11 @@ serviceMonitor:
 # NetworkPolicy — default-deny ingress, allow only what the service needs.
 # Zero-trust east-west: only fp-system callers (the Inference Gateway, which
 # fronts every model and does traffic splitting) and fp-models peers reach a
-# serving pod — this chart deploys into fp-models so the gateway's egress
-# allow-list (fp-models:9090) and the intra-namespace permit both apply.
+# serving pod. This chart is namespace-AGNOSTIC (every template renders
+# metadata.namespace: {{ .Release.Namespace }}); serving's authoritative install
+# target is fp-models (the Makefile derives it for SVC=model-serving, the Rollouts
+# manifests pin it), so the gateway's egress allow-list (fp-models:9090) and the
+# intra-namespace permit both apply once installed there.
 # A serving pod may only egress to DNS, the OTel collector, and MinIO (object
 # storage) — NOT Postgres and NOT NATS, because it uses neither (see header).
 # Disable on clusters whose CNI doesn't enforce NetworkPolicy (silent no-op there).
@@ -420,8 +441,9 @@ networkPolicy:
   #               version sidecar or a co-located monitor probe) may reach the
   #               serving pod without leaving the namespace boundary. Also
   #               required so the NetworkPolicy doesn't block the gateway's
-  #               packets once this chart correctly deploys into fp-models (the
-  #               gateway's egress allow-list targets fp-models:9090).
+  #               packets when this chart is installed into fp-models (its
+  #               authoritative target — the gateway's egress allow-list targets
+  #               fp-models:9090).
   ingressNamespaces:
     - fp-system
     - fp-models

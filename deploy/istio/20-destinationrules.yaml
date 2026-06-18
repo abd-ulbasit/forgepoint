@@ -1,0 +1,221 @@
+# =============================================================================
+# 20-destinationrules.yaml — connection pools + OUTLIER DETECTION (mesh circuit
+# breaking) for the hot destinations.
+# Phase 10 — Istio Service Mesh
+# =============================================================================
+# WHAT A DestinationRule CONTROLS
+#   A DestinationRule configures the CLIENT-side Envoy's behavior toward a given
+#   destination host: TLS mode, load-balancing, connection-pool LIMITS, and OUTLIER
+#   DETECTION (passive health checking that EJECTS bad endpoints). It is the mesh's
+#   resilience primitive — the transport-level twin of a circuit breaker.
+#
+# ───────────────────────────────────────────────────────────────────────────────
+# MESH CIRCUIT BREAKING vs. THE APP-LEVEL CIRCUIT BREAKER — WHY BOTH EXIST
+# (interview-critical: this is the layering question an interviewer WILL probe)
+# ───────────────────────────────────────────────────────────────────────────────
+#   Forgepoint ALREADY has an application-level circuit breaker, in the
+#   inference-gateway: services/inference-gateway/internal/domain/circuit_breaker.go —
+#   a 3-state breaker (CLOSED→OPEN→HALF_OPEN, Nygard "Release It!"). The mesh's
+#   outlier detection below is NOT a duplicate; the two operate at DIFFERENT layers
+#   and answer DIFFERENT questions:
+#
+#   ┌──────────────────────┬────────────────────────────┬───────────────────────────┐
+#   │                      │ MESH (outlier detection)   │ APP (gateway breaker)     │
+#   ├──────────────────────┼────────────────────────────┼───────────────────────────┤
+#   │ Granularity          │ per ENDPOINT (pod IP)      │ per BACKEND (model+version)│
+#   │ Signal               │ 5xx / gRPC errors / timeouts│ business-aware: bad model │
+#   │                      │ at the TRANSPORT layer     │ result, upstream failure  │
+#   │ Action               │ EJECT the pod from the LB  │ trip OPEN → serve FALLBACK │
+#   │                      │ pool for baseEjectionTime  │ (cached / shadow / 503 w/  │
+#   │                      │ (other pods still serve)   │ Retry-After), business rule│
+#   │ Scope of knowledge   │ knows NOTHING about models │ knows the routing table,  │
+#   │                      │ — pure L4/L7 health        │ weights, per-tenant quotas│
+#   │ Recovery             │ probabilistic re-admit     │ HALF_OPEN trial requests  │
+#   └──────────────────────┴────────────────────────────┴───────────────────────────┘
+#
+#   ANALOGY: the mesh breaker is like Envoy/Istio kicking a sick SERVER out of the
+#   rotation (infrastructure self-healing); the app breaker is the gateway DECIDING
+#   what to do when a whole MODEL is unhealthy (serve stale, shed load, fail a tenant
+#   gracefully). One is "is this pod responding?"; the other is "is this product
+#   feature safe to call, and what's plan B?". You want both: outlier detection stops
+#   hammering a crashed pod even before the app breaker notices; the app breaker
+#   provides the business-correct fallback the mesh can't know about.
+#
+#   This is the same split Istio's own docs draw vs. resilience4j/Hystrix: the mesh
+#   gives you "free" transport-level breaking with zero app code; the app breaker is
+#   where domain-aware degradation lives. Forgepoint deliberately keeps the app
+#   breaker (ADR 0007 headline pattern for the gateway) AND adds mesh outlier
+#   detection here — defense in depth for resilience, mirroring the defense-in-depth
+#   we do for authz (mesh mTLS + app JWT).
+#
+# WHY ONLY THE "HOT" DESTINATIONS GET TUNED LIMITS
+#   model-serving and registry are the throughput-critical, fan-in destinations
+#   (every prediction hits serving; the BFF + saga hammer registry). They get explicit
+#   connection-pool ceilings + outlier detection. A mesh-wide default DestinationRule
+#   sets ISTIO_MUTUAL TLS + sane pools for everything else so we don't have to write
+#   one per service. (Per-service tuning beyond these is a follow-up once RED metrics
+#   exist — same discipline as the charts' "tune from real metrics" note.)
+# =============================================================================
+
+---
+# ── MESH-WIDE DEFAULT: enforce client mTLS + baseline connection pools ──────
+# Lives in istio-system (root ns) so it applies to ALL hosts unless a more specific
+# DestinationRule overrides. `tls.mode: ISTIO_MUTUAL` is the CLIENT half of mTLS that
+# pairs with the STRICT PeerAuthentication SERVER half — Istio auto-mTLS would do this
+# anyway, but stating it explicitly documents intent and survives any future
+# meshConfig change to disable auto-mTLS.
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: default-mtls
+  namespace: istio-system
+  labels:
+    app.kubernetes.io/part-of: forgepoint
+    forgepoint.io/phase: "10"
+spec:
+  # `host: "*.local"` matches every in-cluster service FQDN (…svc.cluster.local).
+  host: "*.local"
+  trafficPolicy:
+    tls:
+      # Originate mTLS using the workload's Istio-issued SPIFFE cert. The pair to
+      # STRICT in 10-peerauthentication.yaml.
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      tcp:
+        # Cap concurrent upstream TCP conns from one client sidecar to one host. A
+        # ceiling, not a target — protects a callee from connection storms.
+        maxConnections: 256
+        connectTimeout: 2s
+      http:
+        # gRPC is HTTP/2 (multiplexed), so per-host concurrent REQUESTS matter more
+        # than connections. These are generous platform defaults; the hot hosts below
+        # tighten them.
+        http2MaxRequests: 1000
+        maxRequestsPerConnection: 0   # 0 = unlimited reuse (good for long-lived gRPC)
+
+---
+# ── HOT DESTINATION: model-serving (fp-models) — tight pools + outlier ──────
+# Every prediction funnels here. Mesh circuit breaking here protects the platform
+# from a single wedged serving pod dragging down predict latency BEFORE the gateway's
+# app breaker trips, and complements the gateway breaker's per-MODEL view with a
+# per-POD view.
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: fp-model-serving
+  namespace: fp-models
+  labels:
+    app.kubernetes.io/part-of: forgepoint
+    forgepoint.io/phase: "10"
+spec:
+  # The stable Service FQDN. This is the SINGLE DestinationRule for this host: it
+  # owns BOTH the host-level resilience policy (pools + outlier detection) AND the
+  # canary subsets the VirtualService routes to. They MUST live together —
+  # see "WHY ONE DR PER HOST" below.
+  host: fp-model-serving.fp-models.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      tcp:
+        maxConnections: 512        # serving is the highest-fan-in host
+        connectTimeout: 1s         # fail-fast on a dead serving pod
+      http:
+        http2MaxRequests: 2000     # high concurrency for the predict path
+        maxRequestsPerConnection: 0
+    # ── OUTLIER DETECTION = the mesh circuit breaker ──────────────────────────
+    # Passive health check: Envoy watches real responses and EJECTS an endpoint that
+    # misbehaves, removing it from the LB pool so subsequent requests skip it.
+    outlierDetection:
+      # A pod that returns 5 consecutive gRPC/HTTP errors (5xx, gRPC non-OK mapped via
+      # the gateway's status) is ejected. Low threshold because a serving pod that
+      # errors is usually wedged (bad model load / OOM), not flaky.
+      consecutive5xxErrors: 5
+      # Also eject on consecutive gateway-level errors (connect failures, timeouts) —
+      # catches a pod that's unreachable, not just erroring.
+      consecutiveGatewayErrors: 5
+      # Evaluate the ejection rule every interval.
+      interval: 5s
+      # Eject for this long, then probabilistically re-admit (mesh's "half-open":
+      # one trial of traffic returns; if it fails again, ejection time grows).
+      baseEjectionTime: 30s
+      # Never eject more than half the pool — keep capacity even during a bad deploy
+      # (prevents outlier detection from emptying the pool and causing an outage,
+      # which would defeat the purpose).
+      maxEjectionPercent: 50
+      # Require a minimum of healthy hosts before honoring ejections (panic-threshold
+      # behavior): if fewer than 50% are healthy, Envoy ignores ejection and load-
+      # balances across ALL hosts — better to send traffic to maybe-degraded pods than
+      # to have zero endpoints.
+      minHealthPercent: 50
+  # ── CANARY SUBSETS — partition the host's endpoints by track label ──────────
+  # WHY ONE DR PER HOST (interview-critical correctness point):
+  #   Istio does NOT reliably merge multiple DestinationRules that target the SAME
+  #   specific host in the same namespace. With two such DRs (one carrying
+  #   trafficPolicy, one carrying subsets) the behavior is order-dependent/undefined
+  #   and `istioctl analyze` flags it (KIA0204, "conflicting DestinationRule"). In
+  #   practice ONE wins for the host-level fields — so the headline outlier-detection
+  #   circuit breaker above could SILENTLY not apply if the subsets-only DR were the
+  #   effective one. The fix is to keep resilience AND subsets in this one rule.
+  #   (Note: a WILDCARD host DR like `*.local` in 20-*/default-mtls DOES layer with a
+  #   specific-host DR — wildcard vs specific is fine; the footgun is two *specific*
+  #   DRs for the *identical* host.)
+  #
+  # The subset labels MUST match the Argo Rollouts track labels
+  # (deploy/rollouts/rollout-model-serving.yaml stamps forgepoint.io/track on the
+  # stable/canary pod tracks). A request routed to subset `canary` only load-balances
+  # over pods carrying forgepoint.io/track=canary; the 90/10 weighting lives in the
+  # VirtualService (50-virtualservice-model-serving.yaml).
+  #
+  # WHICH SUBSET HAS ENDPOINTS, PER DEPLOY PATH (do not assume both are always live):
+  #   • Argo Rollouts: stamps track=stable AND track=canary, so both subsets fill —
+  #     but the `canary` subset only has endpoints DURING an active rollout, and
+  #     Rollouts dynamically rewrites the VS weights (canary → 0 at rest).
+  #   • Plain Helm (no Rollouts): the fp-model-serving chart defaults
+  #     `forgepoint.io/track: stable` on its pod template (values.yaml podLabels), so
+  #     the `stable` subset always has endpoints; the `canary` subset has NONE (nothing
+  #     stamps track=canary). This makes the 90/10 VS safe — canary's 10% has no
+  #     endpoints, so Envoy serves effectively 100% from stable instead of blackholing.
+  #     (Without that default label both subsets matched zero pods and predict traffic
+  #     blackholed — the bug this default fixes.)
+  subsets:
+    - name: stable
+      labels:
+        forgepoint.io/track: stable
+    - name: canary
+      labels:
+        forgepoint.io/track: canary
+
+---
+# ── HOT DESTINATION: registry (fp-system) — CQRS write/read, high fan-in ────
+# The registry is hit by the BFF (reads/lists for the UI) and the orchestrator saga
+# (register/promote). Its CQRS read path (Redis-backed projection) is fast but the
+# write path touches Postgres; outlier detection ejects a registry pod whose DB
+# connection has gone bad so the healthy replica keeps serving.
+apiVersion: networking.istio.io/v1
+kind: DestinationRule
+metadata:
+  name: fp-registry
+  namespace: fp-system
+  labels:
+    app.kubernetes.io/part-of: forgepoint
+    forgepoint.io/phase: "10"
+spec:
+  host: fp-registry.fp-system.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      tcp:
+        maxConnections: 256
+        connectTimeout: 2s
+      http:
+        http2MaxRequests: 1000
+        maxRequestsPerConnection: 0
+    outlierDetection:
+      consecutive5xxErrors: 5
+      consecutiveGatewayErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+      minHealthPercent: 50

@@ -77,11 +77,17 @@ helm upgrade fp-inference-gateway deploy/helm/fp-inference-gateway \
   --namespace fp-system \
   --set deployment.enabled=false
 
-# For model-serving:
+# For model-serving (NOTE: fp-models, NOT fp-system — serving's authoritative
+# namespace; see deploy/rollouts/rollout-model-serving.yaml):
 helm upgrade fp-model-serving deploy/helm/fp-model-serving \
-  --namespace fp-system \
+  --namespace fp-models \
   --set deployment.enabled=false
 ```
+
+> **Namespaces:** `fp-inference-gateway` lives in `fp-system`; `fp-model-serving` lives
+> in `fp-models`. The `kubectl argo rollouts …` examples below use `-n fp-system` because
+> they target the gateway — swap to `-n fp-models` for the `fp-model-serving` rollout
+> (e.g. `kubectl argo rollouts status fp-model-serving -n fp-models`).
 
 All other chart resources (ConfigMap, Secret, Service, ServiceAccount, NetworkPolicy,
 PDB, ServiceMonitor) remain managed by Helm. The Rollout owns only the pod template.

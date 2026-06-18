@@ -23,7 +23,12 @@ apiVersion: v1
 kind: Service
 metadata:
   name: fp-model-serving-stable
-  namespace: fp-system
+  # fp-models — serving's authoritative namespace (see rollout-model-serving.yaml's
+  # namespace note). The stable Service FQDN is therefore
+  # fp-model-serving-stable.fp-models.svc.cluster.local; the canary VirtualService and
+  # host DestinationRule (deploy/istio) target the fp-models host. Previously fp-system
+  # — the namespace bug.
+  namespace: fp-models
   labels:
     app.kubernetes.io/name: fp-model-serving
     app.kubernetes.io/part-of: forgepoint
@@ -51,7 +56,8 @@ apiVersion: v1
 kind: Service
 metadata:
   name: fp-model-serving-canary
-  namespace: fp-system
+  # fp-models — same authoritative namespace as the stable Service above.
+  namespace: fp-models
   labels:
     app.kubernetes.io/name: fp-model-serving
     app.kubernetes.io/part-of: forgepoint

@@ -22,6 +22,14 @@
 #
 # PLACEHOLDER NOTE: metric names are representative. Update after Phase 10
 # (observability) instruments the actual metric names.
+#
+# NAMESPACE: fp-models. These are namespaced AnalysisTemplates (not
+# ClusterAnalysisTemplates), and a Rollout resolves `templateName` IN ITS OWN
+# NAMESPACE. The fp-model-serving Rollout lives in fp-models (serving's authoritative
+# home — see rollout-model-serving.yaml), so its analysis templates MUST live in
+# fp-models too, or the analysis step fails with "AnalysisTemplate not found". They
+# previously sat in fp-system alongside the (then-misplaced) Rollout — the same
+# namespace bug.
 # =============================================================================
 
 ---
@@ -30,7 +38,7 @@ apiVersion: argoproj.io/v1alpha1
 kind: AnalysisTemplate
 metadata:
   name: fp-model-serving-success-rate
-  namespace: fp-system
+  namespace: fp-models
   labels:
     app.kubernetes.io/name: fp-model-serving
     app.kubernetes.io/part-of: forgepoint
@@ -68,7 +76,7 @@ apiVersion: argoproj.io/v1alpha1
 kind: AnalysisTemplate
 metadata:
   name: fp-model-serving-latency
-  namespace: fp-system
+  namespace: fp-models
   labels:
     app.kubernetes.io/name: fp-model-serving
     app.kubernetes.io/part-of: forgepoint
@@ -123,7 +131,7 @@ apiVersion: argoproj.io/v1alpha1
 kind: AnalysisTemplate
 metadata:
   name: fp-model-serving-drift-score
-  namespace: fp-system
+  namespace: fp-models
   labels:
     app.kubernetes.io/name: fp-model-serving
     app.kubernetes.io/part-of: forgepoint

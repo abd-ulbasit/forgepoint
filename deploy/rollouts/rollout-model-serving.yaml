@@ -44,7 +44,17 @@ apiVersion: argoproj.io/v1alpha1
 kind: Rollout
 metadata:
   name: fp-model-serving
-  namespace: fp-system
+  # NAMESPACE: fp-models — model-serving's authoritative home (see the namespace note
+  # below). UNLIKE inference-gateway (fp-system), the serving workload deploys to
+  # fp-models: the CLAUDE.md namespace map, the Helm chart's NetworkPolicy, the BFF
+  # config (FP_MODEL_SERVING_ADDR=fp-model-serving.fp-models…), the gateway/BFF egress
+  # allow-lists, and the Istio mesh objects (deploy/istio/*-fp-models.yaml) ALL target
+  # fp-models. This file previously pinned fp-system — a bug that put serving outside
+  # the namespace every caller and the mesh authz expected, leaving the predict edge
+  # unprotected/misrouted. The chart is namespace-agnostic (metadata.namespace:
+  # {{ .Release.Namespace }}); the Makefile helm-install now pins fp-models for this
+  # one chart, and these Rollouts manifests match.
+  namespace: fp-models
   labels:
     app.kubernetes.io/name: fp-model-serving
     app.kubernetes.io/part-of: forgepoint

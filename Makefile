@@ -35,6 +35,20 @@ SERVICES := auth
 REGISTRY ?= fp
 IMAGE_TAG ?= dev
 
+# Helm install namespace, DERIVED from SVC.
+# ----------------------------------------------------------------------------
+# Almost every service lives in fp-system, but model-serving deploys to fp-models
+# (the CLAUDE.md namespace map, the chart's NetworkPolicy, the BFF config
+# FP_MODEL_SERVING_ADDR=fp-model-serving.fp-models…, the gateway/BFF egress
+# allow-lists, and the Istio mesh objects in deploy/istio/*-fp-models.yaml ALL
+# target fp-models). The chart itself is namespace-agnostic (every template uses
+# metadata.namespace: {{ .Release.Namespace }}), so the INSTALL must pass the right
+# `--namespace`. Forcing `--namespace fp-system` for ALL services (the prior bug) put
+# serving in the wrong namespace, where the mesh authz/DestinationRule selected zero
+# pods and the predict edge was unprotected/misrouted. Override with NAMESPACE=… if
+# you need a different target (e.g. a per-env namespace).
+NAMESPACE ?= $(if $(filter model-serving,$(SVC)),fp-models,fp-system)
+
 # Go build flags
 # -s: omit symbol table  -w: omit DWARF debug info  → smaller binary
 LDFLAGS := -ldflags="-s -w"
@@ -69,6 +83,30 @@ proto-generate: ## Generate Go code from proto files
 proto-breaking: ## Check for breaking proto changes against main
 	@echo "==> Checking for breaking changes..."
 	cd proto && buf breaking --against '../.git#subdir=proto'
+
+# ============================================================================
+# Python SDK (sdk/python) — ISOLATED generation; never touches gen/go
+# ============================================================================
+# These targets use an EXPLICIT --template so buf runs ONLY the Python/docs
+# plugins writing under sdk/python and docs/api. The default `make proto` (Go)
+# is unaffected, and gen/go is never altered by these.
+
+.PHONY: sdk-python-proto
+sdk-python-proto: ## Generate Python SDK gRPC stubs into sdk/python (isolated from gen/go)
+	@echo "==> Generating Python SDK stubs (isolated template)..."
+	cd proto && buf generate --template ../sdk/python/buf.gen.yaml
+	@echo "==> Verifying gen/go is untouched..."
+	@test -z "$$(git status --porcelain gen/go)" && echo "    gen/go clean" || (echo "    ERROR: gen/go changed!"; exit 1)
+
+.PHONY: api-docs
+api-docs: ## Generate proto API reference docs into docs/api (isolated from gen/go)
+	@echo "==> Generating API reference docs (isolated template)..."
+	cd proto && buf generate --template ../sdk/python/buf.gen.docs.yaml
+
+.PHONY: sdk-python-install
+sdk-python-install: ## Editable-install the Python SDK with deps (uses /opt/homebrew/bin/python3)
+	@echo "==> Installing Python SDK (editable)..."
+	cd sdk/python && /opt/homebrew/bin/python3 -m venv .venv && .venv/bin/python -m pip install -e .
 
 # ============================================================================
 # Build
@@ -269,9 +307,9 @@ kind-load: ## Load Docker image into Kind: make kind-load SVC=auth
 .PHONY: helm-install
 helm-install: ## Install service via Helm: make helm-install SVC=auth
 	@if [ -z "$(SVC)" ]; then echo "ERROR: specify SVC=<service>"; exit 1; fi
-	@echo "==> Installing $(SVC) via Helm..."
+	@echo "==> Installing $(SVC) via Helm into namespace $(NAMESPACE)..."
 	helm install fp-$(SVC) deploy/helm/fp-$(SVC)/ \
-		--namespace fp-system \
+		--namespace $(NAMESPACE) \
 		--create-namespace \
 		--set image.repository=$(REGISTRY)-$(SVC) \
 		--set image.tag=$(IMAGE_TAG)
@@ -279,9 +317,9 @@ helm-install: ## Install service via Helm: make helm-install SVC=auth
 .PHONY: helm-upgrade
 helm-upgrade: ## Upgrade service via Helm: make helm-upgrade SVC=auth
 	@if [ -z "$(SVC)" ]; then echo "ERROR: specify SVC=<service>"; exit 1; fi
-	@echo "==> Upgrading $(SVC) via Helm..."
+	@echo "==> Upgrading $(SVC) via Helm in namespace $(NAMESPACE)..."
 	helm upgrade fp-$(SVC) deploy/helm/fp-$(SVC)/ \
-		--namespace fp-system \
+		--namespace $(NAMESPACE) \
 		--set image.repository=$(REGISTRY)-$(SVC) \
 		--set image.tag=$(IMAGE_TAG)
 

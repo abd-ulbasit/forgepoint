@@ -25,6 +25,11 @@
 #       targetRevision: HEAD
 #     destination:
 #       server: https://kubernetes.default.svc
+#       # This bundle spans TWO namespaces (fp-system + fp-models). Each resource
+#       # carries its own metadata.namespace, so the Application destination.namespace
+#       # is only the DEFAULT for any resource that omits one — here every resource
+#       # sets its own, and ArgoCD honors those. Ensure both fp-system and fp-models
+#       # are in the AppProject's destination allow-list.
 #       namespace: fp-system
 #     syncPolicy:
 #       automated:
@@ -40,7 +45,20 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-namespace: fp-system
+# NO global `namespace:` directive ON PURPOSE.
+# ---------------------------------------------------------------------------
+# Kustomize's top-level `namespace:` REWRITES metadata.namespace on EVERY resource
+# unconditionally — it cannot be "fp-system for some, fp-models for others". This
+# bundle is split across TWO namespaces:
+#   * inference-gateway Rollout/Services/AnalysisTemplates → fp-system
+#   * model-serving      Rollout/Services/AnalysisTemplates → fp-models
+#     (serving's authoritative home — see rollout-model-serving.yaml's namespace note;
+#      the mesh authz, BFF config, and gateway egress all target fp-models)
+# A single global `namespace: fp-system` here was the bug: it silently forced the
+# model-serving resources into fp-system regardless of their own metadata. Each
+# resource now carries its OWN explicit metadata.namespace and we let those stand.
+# (If you ever need a namespace transform, use per-component overlays, not a global.)
+# ---------------------------------------------------------------------------
 
 resources:
   # Canary Rollouts (replace the Helm chart Deployments).
