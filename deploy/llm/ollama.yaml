@@ -66,10 +66,14 @@ spec:
             - name: http
               containerPort: 11434
           env:
-            # Unload the model the instant a request finishes -> resident only
-            # during inference (the whole point on a RAM-starved, TTS-shared node).
+            # Keep a model warm for 2m between requests so rapid embed/judge/chat
+            # calls don't each cold-load from disk (which timed out the cache embed
+            # under load). SAFE for the co-tenant TTS: the container memory LIMIT
+            # (1800Mi) caps Ollama regardless, so the kernel OOM-kills Ollama — never
+            # the TTS/Postgres — under pressure. Use "0" again if the node must give
+            # every spare byte back to the TTS between calls.
             - name: OLLAMA_KEEP_ALIVE
-              value: "0"
+              value: "2m"
             - name: OLLAMA_MAX_LOADED_MODELS
               value: "1"
             - name: OLLAMA_NUM_PARALLEL
