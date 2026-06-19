@@ -56,6 +56,19 @@ data:
   # that leaves it empty (wildcard-allow) outside dev.
   FP_AI_ALLOWED_MODELS: {{ .Values.config.allowedModels | quote }}
   FP_AI_ALLOWED_PROVIDERS: {{ .Values.config.allowedProviders | quote }}
+  # ----- L2 SEMANTIC CACHE (first-class config; was extraEnv) -----
+  # Embed the prompt -> per-team cosine lookup -> on a HIT replay the cached response,
+  # SKIPPING the LLM call + token deduction. Embeddings come from FP_OLLAMA_URL. The
+  # cache is fail-open (an embedder error just serves uncached). similarityThreshold is
+  # the min cosine for a hit; maxEntriesPerTeam bounds the per-team store.
+  FP_AI_CACHE_ENABLED: {{ .Values.config.cache.enabled | quote }}
+  FP_AI_CACHE_EMBEDDING_MODEL: {{ .Values.config.cache.embeddingModel | quote }}
+  FP_AI_CACHE_SIMILARITY_THRESHOLD: {{ .Values.config.cache.similarityThreshold | quote }}
+  FP_AI_CACHE_MAX_ENTRIES_PER_TEAM: {{ printf "%d" (int64 .Values.config.cache.maxEntriesPerTeam) | quote }}
+  # ----- L4 QUALITY EVAL (first-class config; was extraEnv) -----
+  # Attach the raw prompt/response TEXT to fp.ai.completion.served so the model-monitor
+  # LLM-as-judge can score quality. PII opt-in: default false (event stays text-free).
+  FP_AI_EVAL_INCLUDE_TEXT: {{ .Values.config.eval.includeText | quote }}
   {{- if .Values.config.openaiBaseUrl }}
   # OPTIONAL: override the OpenAI API root (Azure OpenAI / a proxy). Non-secret (no
   # credential), so it lives here, not in the Secret. The KEY itself is in the Secret.

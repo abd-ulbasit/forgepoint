@@ -133,6 +133,18 @@ config:
   allowedModels: ""
   allowedProviders: ""
 
+  # ----- L2 SEMANTIC CACHE (first-class; replaces the extraEnv override) -----
+  cache:
+    enabled: false              # turn the semantic cache on (needs ollamaUrl embeddings)
+    embeddingModel: "all-minilm"
+    similarityThreshold: 0.95   # min cosine similarity for a cache HIT
+    maxEntriesPerTeam: 256      # per-team bound (LTRIM + TTL in the adapter)
+
+  # ----- L4 QUALITY EVAL (first-class; replaces the extraEnv override) -----
+  eval:
+    includeText: false          # attach prompt/response text to the served event (PII opt-in;
+                                # set true so the model-monitor LLM-as-judge can score quality)
+
   # ----- OPTIONAL cloud provider API-root overrides (non-secret) -----
   # Override the public OpenAI / Anthropic roots (Azure OpenAI, an enterprise proxy).
   # Empty = the public default. The KEYS are secrets (see `secrets:`); these URLs are
