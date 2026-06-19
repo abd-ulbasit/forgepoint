@@ -108,6 +108,7 @@ const (
 	MonitorService_ListMonitors_FullMethodName      = "/forgepoint.monitor.v1.MonitorService/ListMonitors"
 	MonitorService_GetDriftReport_FullMethodName    = "/forgepoint.monitor.v1.MonitorService/GetDriftReport"
 	MonitorService_ListDriftReports_FullMethodName  = "/forgepoint.monitor.v1.MonitorService/ListDriftReports"
+	MonitorService_ListEvalScores_FullMethodName    = "/forgepoint.monitor.v1.MonitorService/ListEvalScores"
 	MonitorService_SubmitGroundTruth_FullMethodName = "/forgepoint.monitor.v1.MonitorService/SubmitGroundTruth"
 	MonitorService_StreamDriftEvents_FullMethodName = "/forgepoint.monitor.v1.MonitorService/StreamDriftEvents"
 )
@@ -178,6 +179,10 @@ type MonitorServiceClient interface {
 	// with optional severity and time-range filters. Page size is capped server-
 	// side at 100.
 	ListDriftReports(ctx context.Context, in *ListDriftReportsRequest, opts ...grpc.CallOption) (*ListDriftReportsResponse, error)
+	// ListEvalScores returns the caller team's LLM-as-judge quality evals (newest
+	// first), optionally scoped to one model — the read model behind the eval
+	// dashboard (M7/L4). Page size is capped server-side at 100.
+	ListEvalScores(ctx context.Context, in *ListEvalScoresRequest, opts ...grpc.CallOption) (*ListEvalScoresResponse, error)
 	// SubmitGroundTruth backfills delayed true outcomes (batched) so the monitor
 	// can compute PERFORMANCE DECAY — the lagging, ground-truth confirmation of
 	// drift. Returns how many labels matched an observed prediction.
@@ -271,6 +276,16 @@ func (c *monitorServiceClient) ListDriftReports(ctx context.Context, in *ListDri
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListDriftReportsResponse)
 	err := c.cc.Invoke(ctx, MonitorService_ListDriftReports_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *monitorServiceClient) ListEvalScores(ctx context.Context, in *ListEvalScoresRequest, opts ...grpc.CallOption) (*ListEvalScoresResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListEvalScoresResponse)
+	err := c.cc.Invoke(ctx, MonitorService_ListEvalScores_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -372,6 +387,10 @@ type MonitorServiceServer interface {
 	// with optional severity and time-range filters. Page size is capped server-
 	// side at 100.
 	ListDriftReports(context.Context, *ListDriftReportsRequest) (*ListDriftReportsResponse, error)
+	// ListEvalScores returns the caller team's LLM-as-judge quality evals (newest
+	// first), optionally scoped to one model — the read model behind the eval
+	// dashboard (M7/L4). Page size is capped server-side at 100.
+	ListEvalScores(context.Context, *ListEvalScoresRequest) (*ListEvalScoresResponse, error)
 	// SubmitGroundTruth backfills delayed true outcomes (batched) so the monitor
 	// can compute PERFORMANCE DECAY — the lagging, ground-truth confirmation of
 	// drift. Returns how many labels matched an observed prediction.
@@ -414,6 +433,9 @@ func (UnimplementedMonitorServiceServer) GetDriftReport(context.Context, *GetDri
 }
 func (UnimplementedMonitorServiceServer) ListDriftReports(context.Context, *ListDriftReportsRequest) (*ListDriftReportsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListDriftReports not implemented")
+}
+func (UnimplementedMonitorServiceServer) ListEvalScores(context.Context, *ListEvalScoresRequest) (*ListEvalScoresResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListEvalScores not implemented")
 }
 func (UnimplementedMonitorServiceServer) SubmitGroundTruth(context.Context, *SubmitGroundTruthRequest) (*SubmitGroundTruthResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SubmitGroundTruth not implemented")
@@ -586,6 +608,24 @@ func _MonitorService_ListDriftReports_Handler(srv interface{}, ctx context.Conte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _MonitorService_ListEvalScores_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListEvalScoresRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(MonitorServiceServer).ListEvalScores(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: MonitorService_ListEvalScores_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(MonitorServiceServer).ListEvalScores(ctx, req.(*ListEvalScoresRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _MonitorService_SubmitGroundTruth_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(SubmitGroundTruthRequest)
 	if err := dec(in); err != nil {
@@ -653,6 +693,10 @@ var MonitorService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListDriftReports",
 			Handler:    _MonitorService_ListDriftReports_Handler,
+		},
+		{
+			MethodName: "ListEvalScores",
+			Handler:    _MonitorService_ListEvalScores_Handler,
 		},
 		{
 			MethodName: "SubmitGroundTruth",

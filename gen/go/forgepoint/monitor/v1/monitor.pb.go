@@ -2316,6 +2316,224 @@ func (x *ListDriftReportsResponse) GetPagination() *v1.PaginationResponse {
 	return nil
 }
 
+// EvalScore is one LLM-as-judge quality evaluation of a served LLM completion.
+// The judge scores each axis 1-5; scored=false (axes all 0) means the judge could
+// not produce a usable score (no response text captured, or an unparseable reply).
+type EvalScore struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Model         string                 `protobuf:"bytes,1,opt,name=model,proto3" json:"model,omitempty"`
+	Relevance     int32                  `protobuf:"varint,2,opt,name=relevance,proto3" json:"relevance,omitempty"`
+	Coherence     int32                  `protobuf:"varint,3,opt,name=coherence,proto3" json:"coherence,omitempty"`
+	Safety        int32                  `protobuf:"varint,4,opt,name=safety,proto3" json:"safety,omitempty"`
+	Overall       int32                  `protobuf:"varint,5,opt,name=overall,proto3" json:"overall,omitempty"`
+	Scored        bool                   `protobuf:"varint,6,opt,name=scored,proto3" json:"scored,omitempty"`                       // false => the judge returned no usable score.
+	RequestId     string                 `protobuf:"bytes,7,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"` // the completion this scored (correlation id).
+	CreatedAt     *timestamppb.Timestamp `protobuf:"bytes,8,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *EvalScore) Reset() {
+	*x = EvalScore{}
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *EvalScore) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*EvalScore) ProtoMessage() {}
+
+func (x *EvalScore) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use EvalScore.ProtoReflect.Descriptor instead.
+func (*EvalScore) Descriptor() ([]byte, []int) {
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *EvalScore) GetModel() string {
+	if x != nil {
+		return x.Model
+	}
+	return ""
+}
+
+func (x *EvalScore) GetRelevance() int32 {
+	if x != nil {
+		return x.Relevance
+	}
+	return 0
+}
+
+func (x *EvalScore) GetCoherence() int32 {
+	if x != nil {
+		return x.Coherence
+	}
+	return 0
+}
+
+func (x *EvalScore) GetSafety() int32 {
+	if x != nil {
+		return x.Safety
+	}
+	return 0
+}
+
+func (x *EvalScore) GetOverall() int32 {
+	if x != nil {
+		return x.Overall
+	}
+	return 0
+}
+
+func (x *EvalScore) GetScored() bool {
+	if x != nil {
+		return x.Scored
+	}
+	return false
+}
+
+func (x *EvalScore) GetRequestId() string {
+	if x != nil {
+		return x.RequestId
+	}
+	return ""
+}
+
+func (x *EvalScore) GetCreatedAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.CreatedAt
+	}
+	return nil
+}
+
+// ListEvalScoresRequest lists the caller TEAM's recent quality evals, newest
+// first. model_name is OPTIONAL (empty = all of the team's models) — unlike drift
+// history, an eval dashboard wants a cross-model view by default.
+type ListEvalScoresRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ModelName     string                 `protobuf:"bytes,1,opt,name=model_name,json=modelName,proto3" json:"model_name,omitempty"` // optional: scope to one model (empty = all team models).
+	Since         *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=since,proto3" json:"since,omitempty"`                          // optional lower bound on created_at.
+	Pagination    *v1.PaginationRequest  `protobuf:"bytes,3,opt,name=pagination,proto3" json:"pagination,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListEvalScoresRequest) Reset() {
+	*x = ListEvalScoresRequest{}
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListEvalScoresRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListEvalScoresRequest) ProtoMessage() {}
+
+func (x *ListEvalScoresRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListEvalScoresRequest.ProtoReflect.Descriptor instead.
+func (*ListEvalScoresRequest) Descriptor() ([]byte, []int) {
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *ListEvalScoresRequest) GetModelName() string {
+	if x != nil {
+		return x.ModelName
+	}
+	return ""
+}
+
+func (x *ListEvalScoresRequest) GetSince() *timestamppb.Timestamp {
+	if x != nil {
+		return x.Since
+	}
+	return nil
+}
+
+func (x *ListEvalScoresRequest) GetPagination() *v1.PaginationRequest {
+	if x != nil {
+		return x.Pagination
+	}
+	return nil
+}
+
+type ListEvalScoresResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Scores        []*EvalScore           `protobuf:"bytes,1,rep,name=scores,proto3" json:"scores,omitempty"`
+	Pagination    *v1.PaginationResponse `protobuf:"bytes,2,opt,name=pagination,proto3" json:"pagination,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListEvalScoresResponse) Reset() {
+	*x = ListEvalScoresResponse{}
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListEvalScoresResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListEvalScoresResponse) ProtoMessage() {}
+
+func (x *ListEvalScoresResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListEvalScoresResponse.ProtoReflect.Descriptor instead.
+func (*ListEvalScoresResponse) Descriptor() ([]byte, []int) {
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{25}
+}
+
+func (x *ListEvalScoresResponse) GetScores() []*EvalScore {
+	if x != nil {
+		return x.Scores
+	}
+	return nil
+}
+
+func (x *ListEvalScoresResponse) GetPagination() *v1.PaginationResponse {
+	if x != nil {
+		return x.Pagination
+	}
+	return nil
+}
+
 // SubmitGroundTruthRequest backfills delayed true outcomes so the monitor can
 // compute performance decay. Accepts a BATCH because labels typically arrive in
 // bulk from an upstream labeling/ETL job, and per-label RPCs would be chatty.
@@ -2345,7 +2563,7 @@ type SubmitGroundTruthRequest struct {
 
 func (x *SubmitGroundTruthRequest) Reset() {
 	*x = SubmitGroundTruthRequest{}
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[23]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2357,7 +2575,7 @@ func (x *SubmitGroundTruthRequest) String() string {
 func (*SubmitGroundTruthRequest) ProtoMessage() {}
 
 func (x *SubmitGroundTruthRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[23]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2370,7 +2588,7 @@ func (x *SubmitGroundTruthRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubmitGroundTruthRequest.ProtoReflect.Descriptor instead.
 func (*SubmitGroundTruthRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{23}
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *SubmitGroundTruthRequest) GetModelName() string {
@@ -2411,7 +2629,7 @@ type SubmitGroundTruthResponse struct {
 
 func (x *SubmitGroundTruthResponse) Reset() {
 	*x = SubmitGroundTruthResponse{}
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[24]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2423,7 +2641,7 @@ func (x *SubmitGroundTruthResponse) String() string {
 func (*SubmitGroundTruthResponse) ProtoMessage() {}
 
 func (x *SubmitGroundTruthResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[24]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2436,7 +2654,7 @@ func (x *SubmitGroundTruthResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubmitGroundTruthResponse.ProtoReflect.Descriptor instead.
 func (*SubmitGroundTruthResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{24}
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *SubmitGroundTruthResponse) GetAccepted() int32 {
@@ -2481,7 +2699,7 @@ type StreamDriftEventsRequest struct {
 
 func (x *StreamDriftEventsRequest) Reset() {
 	*x = StreamDriftEventsRequest{}
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[25]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2493,7 +2711,7 @@ func (x *StreamDriftEventsRequest) String() string {
 func (*StreamDriftEventsRequest) ProtoMessage() {}
 
 func (x *StreamDriftEventsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[25]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2506,7 +2724,7 @@ func (x *StreamDriftEventsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamDriftEventsRequest.ProtoReflect.Descriptor instead.
 func (*StreamDriftEventsRequest) Descriptor() ([]byte, []int) {
-	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{25}
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *StreamDriftEventsRequest) GetModelName() string {
@@ -2539,7 +2757,7 @@ type StreamDriftEventsResponse struct {
 
 func (x *StreamDriftEventsResponse) Reset() {
 	*x = StreamDriftEventsResponse{}
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[26]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2551,7 +2769,7 @@ func (x *StreamDriftEventsResponse) String() string {
 func (*StreamDriftEventsResponse) ProtoMessage() {}
 
 func (x *StreamDriftEventsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[26]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2564,7 +2782,7 @@ func (x *StreamDriftEventsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamDriftEventsResponse.ProtoReflect.Descriptor instead.
 func (*StreamDriftEventsResponse) Descriptor() ([]byte, []int) {
-	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{26}
+	return file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *StreamDriftEventsResponse) GetReport() *DriftReport {
@@ -2587,7 +2805,7 @@ type ListMonitorsResponse_Entry struct {
 
 func (x *ListMonitorsResponse_Entry) Reset() {
 	*x = ListMonitorsResponse_Entry{}
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[28]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2599,7 +2817,7 @@ func (x *ListMonitorsResponse_Entry) String() string {
 func (*ListMonitorsResponse_Entry) ProtoMessage() {}
 
 func (x *ListMonitorsResponse_Entry) ProtoReflect() protoreflect.Message {
-	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[28]
+	mi := &file_forgepoint_monitor_v1_monitor_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2790,6 +3008,29 @@ const file_forgepoint_monitor_v1_monitor_proto_rawDesc = "" +
 	"\areports\x18\x01 \x03(\v2\".forgepoint.monitor.v1.DriftReportR\areports\x12H\n" +
 	"\n" +
 	"pagination\x18\x02 \x01(\v2(.forgepoint.common.v1.PaginationResponseR\n" +
+	"pagination\"\x81\x02\n" +
+	"\tEvalScore\x12\x14\n" +
+	"\x05model\x18\x01 \x01(\tR\x05model\x12\x1c\n" +
+	"\trelevance\x18\x02 \x01(\x05R\trelevance\x12\x1c\n" +
+	"\tcoherence\x18\x03 \x01(\x05R\tcoherence\x12\x16\n" +
+	"\x06safety\x18\x04 \x01(\x05R\x06safety\x12\x18\n" +
+	"\aoverall\x18\x05 \x01(\x05R\aoverall\x12\x16\n" +
+	"\x06scored\x18\x06 \x01(\bR\x06scored\x12\x1d\n" +
+	"\n" +
+	"request_id\x18\a \x01(\tR\trequestId\x129\n" +
+	"\n" +
+	"created_at\x18\b \x01(\v2\x1a.google.protobuf.TimestampR\tcreatedAt\"\xb1\x01\n" +
+	"\x15ListEvalScoresRequest\x12\x1d\n" +
+	"\n" +
+	"model_name\x18\x01 \x01(\tR\tmodelName\x120\n" +
+	"\x05since\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\x05since\x12G\n" +
+	"\n" +
+	"pagination\x18\x03 \x01(\v2'.forgepoint.common.v1.PaginationRequestR\n" +
+	"pagination\"\x9c\x01\n" +
+	"\x16ListEvalScoresResponse\x128\n" +
+	"\x06scores\x18\x01 \x03(\v2 .forgepoint.monitor.v1.EvalScoreR\x06scores\x12H\n" +
+	"\n" +
+	"pagination\x18\x02 \x01(\v2(.forgepoint.common.v1.PaginationResponseR\n" +
 	"pagination\"\xa3\x01\n" +
 	"\x18SubmitGroundTruthRequest\x12\x1d\n" +
 	"\n" +
@@ -2825,7 +3066,7 @@ const file_forgepoint_monitor_v1_monitor_proto_rawDesc = "" +
 	"\x1eMONITOR_STATE_PENDING_BASELINE\x10\x01\x12\x1c\n" +
 	"\x18MONITOR_STATE_WARMING_UP\x10\x02\x12\x18\n" +
 	"\x14MONITOR_STATE_ACTIVE\x10\x03\x12\x18\n" +
-	"\x14MONITOR_STATE_PAUSED\x10\x042\x80\t\n" +
+	"\x14MONITOR_STATE_PAUSED\x10\x042\xef\t\n" +
 	"\x0eMonitorService\x12s\n" +
 	"\x10ConfigureMonitor\x12..forgepoint.monitor.v1.ConfigureMonitorRequest\x1a/.forgepoint.monitor.v1.ConfigureMonitorResponse\x12j\n" +
 	"\rDeleteMonitor\x12+.forgepoint.monitor.v1.DeleteMonitorRequest\x1a,.forgepoint.monitor.v1.DeleteMonitorResponse\x12j\n" +
@@ -2834,7 +3075,8 @@ const file_forgepoint_monitor_v1_monitor_proto_rawDesc = "" +
 	"\x10GetMonitorStatus\x12..forgepoint.monitor.v1.GetMonitorStatusRequest\x1a/.forgepoint.monitor.v1.GetMonitorStatusResponse\x12g\n" +
 	"\fListMonitors\x12*.forgepoint.monitor.v1.ListMonitorsRequest\x1a+.forgepoint.monitor.v1.ListMonitorsResponse\x12m\n" +
 	"\x0eGetDriftReport\x12,.forgepoint.monitor.v1.GetDriftReportRequest\x1a-.forgepoint.monitor.v1.GetDriftReportResponse\x12s\n" +
-	"\x10ListDriftReports\x12..forgepoint.monitor.v1.ListDriftReportsRequest\x1a/.forgepoint.monitor.v1.ListDriftReportsResponse\x12v\n" +
+	"\x10ListDriftReports\x12..forgepoint.monitor.v1.ListDriftReportsRequest\x1a/.forgepoint.monitor.v1.ListDriftReportsResponse\x12m\n" +
+	"\x0eListEvalScores\x12,.forgepoint.monitor.v1.ListEvalScoresRequest\x1a-.forgepoint.monitor.v1.ListEvalScoresResponse\x12v\n" +
 	"\x11SubmitGroundTruth\x12/.forgepoint.monitor.v1.SubmitGroundTruthRequest\x1a0.forgepoint.monitor.v1.SubmitGroundTruthResponse\x12x\n" +
 	"\x11StreamDriftEvents\x12/.forgepoint.monitor.v1.StreamDriftEventsRequest\x1a0.forgepoint.monitor.v1.StreamDriftEventsResponse0\x01BJZHgithub.com/abd-ulbasit/forgepoint/gen/go/forgepoint/monitor/v1;monitorv1b\x06proto3"
 
@@ -2851,7 +3093,7 @@ func file_forgepoint_monitor_v1_monitor_proto_rawDescGZIP() []byte {
 }
 
 var file_forgepoint_monitor_v1_monitor_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
-var file_forgepoint_monitor_v1_monitor_proto_msgTypes = make([]protoimpl.MessageInfo, 29)
+var file_forgepoint_monitor_v1_monitor_proto_msgTypes = make([]protoimpl.MessageInfo, 32)
 var file_forgepoint_monitor_v1_monitor_proto_goTypes = []any{
 	(DriftType)(0),                     // 0: forgepoint.monitor.v1.DriftType
 	(DriftMethod)(0),                   // 1: forgepoint.monitor.v1.DriftMethod
@@ -2880,92 +3122,102 @@ var file_forgepoint_monitor_v1_monitor_proto_goTypes = []any{
 	(*GetDriftReportResponse)(nil),     // 24: forgepoint.monitor.v1.GetDriftReportResponse
 	(*ListDriftReportsRequest)(nil),    // 25: forgepoint.monitor.v1.ListDriftReportsRequest
 	(*ListDriftReportsResponse)(nil),   // 26: forgepoint.monitor.v1.ListDriftReportsResponse
-	(*SubmitGroundTruthRequest)(nil),   // 27: forgepoint.monitor.v1.SubmitGroundTruthRequest
-	(*SubmitGroundTruthResponse)(nil),  // 28: forgepoint.monitor.v1.SubmitGroundTruthResponse
-	(*StreamDriftEventsRequest)(nil),   // 29: forgepoint.monitor.v1.StreamDriftEventsRequest
-	(*StreamDriftEventsResponse)(nil),  // 30: forgepoint.monitor.v1.StreamDriftEventsResponse
-	nil,                                // 31: forgepoint.monitor.v1.ModelHealth.SeverityByTypeEntry
-	(*ListMonitorsResponse_Entry)(nil), // 32: forgepoint.monitor.v1.ListMonitorsResponse.Entry
-	(*durationpb.Duration)(nil),        // 33: google.protobuf.Duration
-	(*timestamppb.Timestamp)(nil),      // 34: google.protobuf.Timestamp
-	(*v1.PaginationRequest)(nil),       // 35: forgepoint.common.v1.PaginationRequest
-	(*v1.PaginationResponse)(nil),      // 36: forgepoint.common.v1.PaginationResponse
+	(*EvalScore)(nil),                  // 27: forgepoint.monitor.v1.EvalScore
+	(*ListEvalScoresRequest)(nil),      // 28: forgepoint.monitor.v1.ListEvalScoresRequest
+	(*ListEvalScoresResponse)(nil),     // 29: forgepoint.monitor.v1.ListEvalScoresResponse
+	(*SubmitGroundTruthRequest)(nil),   // 30: forgepoint.monitor.v1.SubmitGroundTruthRequest
+	(*SubmitGroundTruthResponse)(nil),  // 31: forgepoint.monitor.v1.SubmitGroundTruthResponse
+	(*StreamDriftEventsRequest)(nil),   // 32: forgepoint.monitor.v1.StreamDriftEventsRequest
+	(*StreamDriftEventsResponse)(nil),  // 33: forgepoint.monitor.v1.StreamDriftEventsResponse
+	nil,                                // 34: forgepoint.monitor.v1.ModelHealth.SeverityByTypeEntry
+	(*ListMonitorsResponse_Entry)(nil), // 35: forgepoint.monitor.v1.ListMonitorsResponse.Entry
+	(*durationpb.Duration)(nil),        // 36: google.protobuf.Duration
+	(*timestamppb.Timestamp)(nil),      // 37: google.protobuf.Timestamp
+	(*v1.PaginationRequest)(nil),       // 38: forgepoint.common.v1.PaginationRequest
+	(*v1.PaginationResponse)(nil),      // 39: forgepoint.common.v1.PaginationResponse
 }
 var file_forgepoint_monitor_v1_monitor_proto_depIdxs = []int32{
 	0,  // 0: forgepoint.monitor.v1.ThresholdConfig.drift_type:type_name -> forgepoint.monitor.v1.DriftType
 	1,  // 1: forgepoint.monitor.v1.ThresholdConfig.method:type_name -> forgepoint.monitor.v1.DriftMethod
-	33, // 2: forgepoint.monitor.v1.Monitor.window_duration:type_name -> google.protobuf.Duration
+	36, // 2: forgepoint.monitor.v1.Monitor.window_duration:type_name -> google.protobuf.Duration
 	4,  // 3: forgepoint.monitor.v1.Monitor.thresholds:type_name -> forgepoint.monitor.v1.ThresholdConfig
 	3,  // 4: forgepoint.monitor.v1.Monitor.state:type_name -> forgepoint.monitor.v1.MonitorState
-	34, // 5: forgepoint.monitor.v1.Monitor.baseline_captured_at:type_name -> google.protobuf.Timestamp
-	34, // 6: forgepoint.monitor.v1.Monitor.created_at:type_name -> google.protobuf.Timestamp
-	34, // 7: forgepoint.monitor.v1.Monitor.updated_at:type_name -> google.protobuf.Timestamp
+	37, // 5: forgepoint.monitor.v1.Monitor.baseline_captured_at:type_name -> google.protobuf.Timestamp
+	37, // 6: forgepoint.monitor.v1.Monitor.created_at:type_name -> google.protobuf.Timestamp
+	37, // 7: forgepoint.monitor.v1.Monitor.updated_at:type_name -> google.protobuf.Timestamp
 	1,  // 8: forgepoint.monitor.v1.DriftMetric.method:type_name -> forgepoint.monitor.v1.DriftMethod
 	2,  // 9: forgepoint.monitor.v1.DriftMetric.severity:type_name -> forgepoint.monitor.v1.DriftSeverity
 	0,  // 10: forgepoint.monitor.v1.DriftReport.drift_type:type_name -> forgepoint.monitor.v1.DriftType
 	2,  // 11: forgepoint.monitor.v1.DriftReport.severity:type_name -> forgepoint.monitor.v1.DriftSeverity
 	6,  // 12: forgepoint.monitor.v1.DriftReport.metrics:type_name -> forgepoint.monitor.v1.DriftMetric
-	34, // 13: forgepoint.monitor.v1.DriftReport.window_start:type_name -> google.protobuf.Timestamp
-	34, // 14: forgepoint.monitor.v1.DriftReport.window_end:type_name -> google.protobuf.Timestamp
-	34, // 15: forgepoint.monitor.v1.DriftReport.created_at:type_name -> google.protobuf.Timestamp
+	37, // 13: forgepoint.monitor.v1.DriftReport.window_start:type_name -> google.protobuf.Timestamp
+	37, // 14: forgepoint.monitor.v1.DriftReport.window_end:type_name -> google.protobuf.Timestamp
+	37, // 15: forgepoint.monitor.v1.DriftReport.created_at:type_name -> google.protobuf.Timestamp
 	5,  // 16: forgepoint.monitor.v1.MonitorStatus.monitor:type_name -> forgepoint.monitor.v1.Monitor
 	3,  // 17: forgepoint.monitor.v1.MonitorStatus.state:type_name -> forgepoint.monitor.v1.MonitorState
 	7,  // 18: forgepoint.monitor.v1.MonitorStatus.latest_report:type_name -> forgepoint.monitor.v1.DriftReport
-	34, // 19: forgepoint.monitor.v1.MonitorStatus.last_event_at:type_name -> google.protobuf.Timestamp
+	37, // 19: forgepoint.monitor.v1.MonitorStatus.last_event_at:type_name -> google.protobuf.Timestamp
 	2,  // 20: forgepoint.monitor.v1.ModelHealth.overall_severity:type_name -> forgepoint.monitor.v1.DriftSeverity
-	31, // 21: forgepoint.monitor.v1.ModelHealth.severity_by_type:type_name -> forgepoint.monitor.v1.ModelHealth.SeverityByTypeEntry
+	34, // 21: forgepoint.monitor.v1.ModelHealth.severity_by_type:type_name -> forgepoint.monitor.v1.ModelHealth.SeverityByTypeEntry
 	3,  // 22: forgepoint.monitor.v1.ModelHealth.state:type_name -> forgepoint.monitor.v1.MonitorState
-	34, // 23: forgepoint.monitor.v1.ModelHealth.last_event_at:type_name -> google.protobuf.Timestamp
-	34, // 24: forgepoint.monitor.v1.GroundTruthLabel.observed_at:type_name -> google.protobuf.Timestamp
-	33, // 25: forgepoint.monitor.v1.ConfigureMonitorRequest.window_duration:type_name -> google.protobuf.Duration
+	37, // 23: forgepoint.monitor.v1.ModelHealth.last_event_at:type_name -> google.protobuf.Timestamp
+	37, // 24: forgepoint.monitor.v1.GroundTruthLabel.observed_at:type_name -> google.protobuf.Timestamp
+	36, // 25: forgepoint.monitor.v1.ConfigureMonitorRequest.window_duration:type_name -> google.protobuf.Duration
 	4,  // 26: forgepoint.monitor.v1.ConfigureMonitorRequest.thresholds:type_name -> forgepoint.monitor.v1.ThresholdConfig
 	5,  // 27: forgepoint.monitor.v1.ConfigureMonitorResponse.monitor:type_name -> forgepoint.monitor.v1.Monitor
 	8,  // 28: forgepoint.monitor.v1.GetMonitorStatusResponse.status:type_name -> forgepoint.monitor.v1.MonitorStatus
 	9,  // 29: forgepoint.monitor.v1.GetModelHealthResponse.health:type_name -> forgepoint.monitor.v1.ModelHealth
 	2,  // 30: forgepoint.monitor.v1.ListMonitorsRequest.min_severity:type_name -> forgepoint.monitor.v1.DriftSeverity
 	3,  // 31: forgepoint.monitor.v1.ListMonitorsRequest.state:type_name -> forgepoint.monitor.v1.MonitorState
-	35, // 32: forgepoint.monitor.v1.ListMonitorsRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
-	32, // 33: forgepoint.monitor.v1.ListMonitorsResponse.entries:type_name -> forgepoint.monitor.v1.ListMonitorsResponse.Entry
-	36, // 34: forgepoint.monitor.v1.ListMonitorsResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
+	38, // 32: forgepoint.monitor.v1.ListMonitorsRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
+	35, // 33: forgepoint.monitor.v1.ListMonitorsResponse.entries:type_name -> forgepoint.monitor.v1.ListMonitorsResponse.Entry
+	39, // 34: forgepoint.monitor.v1.ListMonitorsResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
 	5,  // 35: forgepoint.monitor.v1.ResetBaselineResponse.monitor:type_name -> forgepoint.monitor.v1.Monitor
 	7,  // 36: forgepoint.monitor.v1.GetDriftReportResponse.report:type_name -> forgepoint.monitor.v1.DriftReport
 	2,  // 37: forgepoint.monitor.v1.ListDriftReportsRequest.min_severity:type_name -> forgepoint.monitor.v1.DriftSeverity
-	34, // 38: forgepoint.monitor.v1.ListDriftReportsRequest.since:type_name -> google.protobuf.Timestamp
-	34, // 39: forgepoint.monitor.v1.ListDriftReportsRequest.until:type_name -> google.protobuf.Timestamp
-	35, // 40: forgepoint.monitor.v1.ListDriftReportsRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
+	37, // 38: forgepoint.monitor.v1.ListDriftReportsRequest.since:type_name -> google.protobuf.Timestamp
+	37, // 39: forgepoint.monitor.v1.ListDriftReportsRequest.until:type_name -> google.protobuf.Timestamp
+	38, // 40: forgepoint.monitor.v1.ListDriftReportsRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
 	7,  // 41: forgepoint.monitor.v1.ListDriftReportsResponse.reports:type_name -> forgepoint.monitor.v1.DriftReport
-	36, // 42: forgepoint.monitor.v1.ListDriftReportsResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
-	10, // 43: forgepoint.monitor.v1.SubmitGroundTruthRequest.labels:type_name -> forgepoint.monitor.v1.GroundTruthLabel
-	2,  // 44: forgepoint.monitor.v1.StreamDriftEventsRequest.min_severity:type_name -> forgepoint.monitor.v1.DriftSeverity
-	7,  // 45: forgepoint.monitor.v1.StreamDriftEventsResponse.report:type_name -> forgepoint.monitor.v1.DriftReport
-	2,  // 46: forgepoint.monitor.v1.ModelHealth.SeverityByTypeEntry.value:type_name -> forgepoint.monitor.v1.DriftSeverity
-	5,  // 47: forgepoint.monitor.v1.ListMonitorsResponse.Entry.monitor:type_name -> forgepoint.monitor.v1.Monitor
-	9,  // 48: forgepoint.monitor.v1.ListMonitorsResponse.Entry.health:type_name -> forgepoint.monitor.v1.ModelHealth
-	11, // 49: forgepoint.monitor.v1.MonitorService.ConfigureMonitor:input_type -> forgepoint.monitor.v1.ConfigureMonitorRequest
-	19, // 50: forgepoint.monitor.v1.MonitorService.DeleteMonitor:input_type -> forgepoint.monitor.v1.DeleteMonitorRequest
-	21, // 51: forgepoint.monitor.v1.MonitorService.ResetBaseline:input_type -> forgepoint.monitor.v1.ResetBaselineRequest
-	15, // 52: forgepoint.monitor.v1.MonitorService.GetModelHealth:input_type -> forgepoint.monitor.v1.GetModelHealthRequest
-	13, // 53: forgepoint.monitor.v1.MonitorService.GetMonitorStatus:input_type -> forgepoint.monitor.v1.GetMonitorStatusRequest
-	17, // 54: forgepoint.monitor.v1.MonitorService.ListMonitors:input_type -> forgepoint.monitor.v1.ListMonitorsRequest
-	23, // 55: forgepoint.monitor.v1.MonitorService.GetDriftReport:input_type -> forgepoint.monitor.v1.GetDriftReportRequest
-	25, // 56: forgepoint.monitor.v1.MonitorService.ListDriftReports:input_type -> forgepoint.monitor.v1.ListDriftReportsRequest
-	27, // 57: forgepoint.monitor.v1.MonitorService.SubmitGroundTruth:input_type -> forgepoint.monitor.v1.SubmitGroundTruthRequest
-	29, // 58: forgepoint.monitor.v1.MonitorService.StreamDriftEvents:input_type -> forgepoint.monitor.v1.StreamDriftEventsRequest
-	12, // 59: forgepoint.monitor.v1.MonitorService.ConfigureMonitor:output_type -> forgepoint.monitor.v1.ConfigureMonitorResponse
-	20, // 60: forgepoint.monitor.v1.MonitorService.DeleteMonitor:output_type -> forgepoint.monitor.v1.DeleteMonitorResponse
-	22, // 61: forgepoint.monitor.v1.MonitorService.ResetBaseline:output_type -> forgepoint.monitor.v1.ResetBaselineResponse
-	16, // 62: forgepoint.monitor.v1.MonitorService.GetModelHealth:output_type -> forgepoint.monitor.v1.GetModelHealthResponse
-	14, // 63: forgepoint.monitor.v1.MonitorService.GetMonitorStatus:output_type -> forgepoint.monitor.v1.GetMonitorStatusResponse
-	18, // 64: forgepoint.monitor.v1.MonitorService.ListMonitors:output_type -> forgepoint.monitor.v1.ListMonitorsResponse
-	24, // 65: forgepoint.monitor.v1.MonitorService.GetDriftReport:output_type -> forgepoint.monitor.v1.GetDriftReportResponse
-	26, // 66: forgepoint.monitor.v1.MonitorService.ListDriftReports:output_type -> forgepoint.monitor.v1.ListDriftReportsResponse
-	28, // 67: forgepoint.monitor.v1.MonitorService.SubmitGroundTruth:output_type -> forgepoint.monitor.v1.SubmitGroundTruthResponse
-	30, // 68: forgepoint.monitor.v1.MonitorService.StreamDriftEvents:output_type -> forgepoint.monitor.v1.StreamDriftEventsResponse
-	59, // [59:69] is the sub-list for method output_type
-	49, // [49:59] is the sub-list for method input_type
-	49, // [49:49] is the sub-list for extension type_name
-	49, // [49:49] is the sub-list for extension extendee
-	0,  // [0:49] is the sub-list for field type_name
+	39, // 42: forgepoint.monitor.v1.ListDriftReportsResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
+	37, // 43: forgepoint.monitor.v1.EvalScore.created_at:type_name -> google.protobuf.Timestamp
+	37, // 44: forgepoint.monitor.v1.ListEvalScoresRequest.since:type_name -> google.protobuf.Timestamp
+	38, // 45: forgepoint.monitor.v1.ListEvalScoresRequest.pagination:type_name -> forgepoint.common.v1.PaginationRequest
+	27, // 46: forgepoint.monitor.v1.ListEvalScoresResponse.scores:type_name -> forgepoint.monitor.v1.EvalScore
+	39, // 47: forgepoint.monitor.v1.ListEvalScoresResponse.pagination:type_name -> forgepoint.common.v1.PaginationResponse
+	10, // 48: forgepoint.monitor.v1.SubmitGroundTruthRequest.labels:type_name -> forgepoint.monitor.v1.GroundTruthLabel
+	2,  // 49: forgepoint.monitor.v1.StreamDriftEventsRequest.min_severity:type_name -> forgepoint.monitor.v1.DriftSeverity
+	7,  // 50: forgepoint.monitor.v1.StreamDriftEventsResponse.report:type_name -> forgepoint.monitor.v1.DriftReport
+	2,  // 51: forgepoint.monitor.v1.ModelHealth.SeverityByTypeEntry.value:type_name -> forgepoint.monitor.v1.DriftSeverity
+	5,  // 52: forgepoint.monitor.v1.ListMonitorsResponse.Entry.monitor:type_name -> forgepoint.monitor.v1.Monitor
+	9,  // 53: forgepoint.monitor.v1.ListMonitorsResponse.Entry.health:type_name -> forgepoint.monitor.v1.ModelHealth
+	11, // 54: forgepoint.monitor.v1.MonitorService.ConfigureMonitor:input_type -> forgepoint.monitor.v1.ConfigureMonitorRequest
+	19, // 55: forgepoint.monitor.v1.MonitorService.DeleteMonitor:input_type -> forgepoint.monitor.v1.DeleteMonitorRequest
+	21, // 56: forgepoint.monitor.v1.MonitorService.ResetBaseline:input_type -> forgepoint.monitor.v1.ResetBaselineRequest
+	15, // 57: forgepoint.monitor.v1.MonitorService.GetModelHealth:input_type -> forgepoint.monitor.v1.GetModelHealthRequest
+	13, // 58: forgepoint.monitor.v1.MonitorService.GetMonitorStatus:input_type -> forgepoint.monitor.v1.GetMonitorStatusRequest
+	17, // 59: forgepoint.monitor.v1.MonitorService.ListMonitors:input_type -> forgepoint.monitor.v1.ListMonitorsRequest
+	23, // 60: forgepoint.monitor.v1.MonitorService.GetDriftReport:input_type -> forgepoint.monitor.v1.GetDriftReportRequest
+	25, // 61: forgepoint.monitor.v1.MonitorService.ListDriftReports:input_type -> forgepoint.monitor.v1.ListDriftReportsRequest
+	28, // 62: forgepoint.monitor.v1.MonitorService.ListEvalScores:input_type -> forgepoint.monitor.v1.ListEvalScoresRequest
+	30, // 63: forgepoint.monitor.v1.MonitorService.SubmitGroundTruth:input_type -> forgepoint.monitor.v1.SubmitGroundTruthRequest
+	32, // 64: forgepoint.monitor.v1.MonitorService.StreamDriftEvents:input_type -> forgepoint.monitor.v1.StreamDriftEventsRequest
+	12, // 65: forgepoint.monitor.v1.MonitorService.ConfigureMonitor:output_type -> forgepoint.monitor.v1.ConfigureMonitorResponse
+	20, // 66: forgepoint.monitor.v1.MonitorService.DeleteMonitor:output_type -> forgepoint.monitor.v1.DeleteMonitorResponse
+	22, // 67: forgepoint.monitor.v1.MonitorService.ResetBaseline:output_type -> forgepoint.monitor.v1.ResetBaselineResponse
+	16, // 68: forgepoint.monitor.v1.MonitorService.GetModelHealth:output_type -> forgepoint.monitor.v1.GetModelHealthResponse
+	14, // 69: forgepoint.monitor.v1.MonitorService.GetMonitorStatus:output_type -> forgepoint.monitor.v1.GetMonitorStatusResponse
+	18, // 70: forgepoint.monitor.v1.MonitorService.ListMonitors:output_type -> forgepoint.monitor.v1.ListMonitorsResponse
+	24, // 71: forgepoint.monitor.v1.MonitorService.GetDriftReport:output_type -> forgepoint.monitor.v1.GetDriftReportResponse
+	26, // 72: forgepoint.monitor.v1.MonitorService.ListDriftReports:output_type -> forgepoint.monitor.v1.ListDriftReportsResponse
+	29, // 73: forgepoint.monitor.v1.MonitorService.ListEvalScores:output_type -> forgepoint.monitor.v1.ListEvalScoresResponse
+	31, // 74: forgepoint.monitor.v1.MonitorService.SubmitGroundTruth:output_type -> forgepoint.monitor.v1.SubmitGroundTruthResponse
+	33, // 75: forgepoint.monitor.v1.MonitorService.StreamDriftEvents:output_type -> forgepoint.monitor.v1.StreamDriftEventsResponse
+	65, // [65:76] is the sub-list for method output_type
+	54, // [54:65] is the sub-list for method input_type
+	54, // [54:54] is the sub-list for extension type_name
+	54, // [54:54] is the sub-list for extension extendee
+	0,  // [0:54] is the sub-list for field type_name
 }
 
 func init() { file_forgepoint_monitor_v1_monitor_proto_init() }
@@ -2979,7 +3231,7 @@ func file_forgepoint_monitor_v1_monitor_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_forgepoint_monitor_v1_monitor_proto_rawDesc), len(file_forgepoint_monitor_v1_monitor_proto_rawDesc)),
 			NumEnums:      4,
-			NumMessages:   29,
+			NumMessages:   32,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

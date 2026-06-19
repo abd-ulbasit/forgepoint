@@ -871,6 +871,38 @@ message ListDriftReportsResponse {
 }
 
 // ============================================================================
+// ListEvalScores (M7/L4 — LLM quality evaluation read model)
+// ============================================================================
+
+// EvalScore is one LLM-as-judge quality evaluation of a served LLM completion.
+// The judge scores each axis 1-5; scored=false (axes all 0) means the judge could
+// not produce a usable score (no response text captured, or an unparseable reply).
+message EvalScore {
+  string model = 1;
+  int32 relevance = 2;
+  int32 coherence = 3;
+  int32 safety = 4;
+  int32 overall = 5;
+  bool scored = 6;        // false => the judge returned no usable score.
+  string request_id = 7;  // the completion this scored (correlation id).
+  google.protobuf.Timestamp created_at = 8;
+}
+
+// ListEvalScoresRequest lists the caller TEAM's recent quality evals, newest
+// first. model_name is OPTIONAL (empty = all of the team's models) — unlike drift
+// history, an eval dashboard wants a cross-model view by default.
+message ListEvalScoresRequest {
+  string model_name = 1;  // optional: scope to one model (empty = all team models).
+  google.protobuf.Timestamp since = 2;  // optional lower bound on created_at.
+  forgepoint.common.v1.PaginationRequest pagination = 3;
+}
+
+message ListEvalScoresResponse {
+  repeated EvalScore scores = 1;
+  forgepoint.common.v1.PaginationResponse pagination = 2;
+}
+
+// ============================================================================
 // SubmitGroundTruth
 // ============================================================================
 
@@ -1087,6 +1119,11 @@ service MonitorService {
   // with optional severity and time-range filters. Page size is capped server-
   // side at 100.
   rpc ListDriftReports(ListDriftReportsRequest) returns (ListDriftReportsResponse);
+
+  // ListEvalScores returns the caller team's LLM-as-judge quality evals (newest
+  // first), optionally scoped to one model — the read model behind the eval
+  // dashboard (M7/L4). Page size is capped server-side at 100.
+  rpc ListEvalScores(ListEvalScoresRequest) returns (ListEvalScoresResponse);
 
   // SubmitGroundTruth backfills delayed true outcomes (batched) so the monitor
   // can compute PERFORMANCE DECAY — the lagging, ground-truth confirmation of
