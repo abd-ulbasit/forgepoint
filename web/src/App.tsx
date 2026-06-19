@@ -11,6 +11,8 @@ import { AppShell } from '@/components/layout/AppShell'
 import { LoginPage } from '@/pages/LoginPage'
 import { DashboardPage } from '@/pages/DashboardPage'
 import { ChatPage } from '@/pages/ChatPage'
+import { PromptsPage } from '@/pages/PromptsPage'
+import { EvalsPage } from '@/pages/EvalsPage'
 import { ModelsPage } from '@/pages/ModelsPage'
 import { ModelDetailPage } from '@/pages/ModelDetailPage'
 import { PipelinesPage } from '@/pages/PipelinesPage'
@@ -37,6 +39,8 @@ export default function App() {
       >
         <Route path="/" element={<DashboardPage />} />
         <Route path="/playground" element={<ChatPage />} />
+        <Route path="/prompts" element={<PromptsPage />} />
+        <Route path="/evals" element={<EvalsPage />} />
         <Route path="/models" element={<ModelsPage />} />
         <Route path="/models/:id" element={<ModelDetailPage />} />
         <Route path="/pipelines" element={<PipelinesPage />} />

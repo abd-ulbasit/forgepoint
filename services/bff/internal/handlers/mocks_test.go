@@ -84,12 +84,12 @@ func (m *mockRegistry) ListVersions(ctx context.Context, in *registryv1.ListVers
 // ---- Pipeline mock ----------------------------------------------------------
 
 type mockPipeline struct {
-	listFn       func(ctx context.Context, in *pipelinev1.ListPipelinesRequest) (*pipelinev1.ListPipelinesResponse, error)
-	createFn     func(ctx context.Context, in *pipelinev1.CreatePipelineRequest) (*pipelinev1.CreatePipelineResponse, error)
-	triggerFn    func(ctx context.Context, in *pipelinev1.TriggerExecutionRequest) (*pipelinev1.TriggerExecutionResponse, error)
-	getExecFn    func(ctx context.Context, in *pipelinev1.GetExecutionRequest) (*pipelinev1.GetExecutionResponse, error)
-	listExecFn   func(ctx context.Context, in *pipelinev1.ListExecutionsRequest) (*pipelinev1.ListExecutionsResponse, error)
-	watchFn      func(ctx context.Context, in *pipelinev1.WatchExecutionRequest) (grpc.ServerStreamingClient[pipelinev1.WatchExecutionResponse], error)
+	listFn     func(ctx context.Context, in *pipelinev1.ListPipelinesRequest) (*pipelinev1.ListPipelinesResponse, error)
+	createFn   func(ctx context.Context, in *pipelinev1.CreatePipelineRequest) (*pipelinev1.CreatePipelineResponse, error)
+	triggerFn  func(ctx context.Context, in *pipelinev1.TriggerExecutionRequest) (*pipelinev1.TriggerExecutionResponse, error)
+	getExecFn  func(ctx context.Context, in *pipelinev1.GetExecutionRequest) (*pipelinev1.GetExecutionResponse, error)
+	listExecFn func(ctx context.Context, in *pipelinev1.ListExecutionsRequest) (*pipelinev1.ListExecutionsResponse, error)
+	watchFn    func(ctx context.Context, in *pipelinev1.WatchExecutionRequest) (grpc.ServerStreamingClient[pipelinev1.WatchExecutionResponse], error)
 }
 
 func (m *mockPipeline) ListPipelines(ctx context.Context, in *pipelinev1.ListPipelinesRequest, _ ...grpc.CallOption) (*pipelinev1.ListPipelinesResponse, error) {
@@ -130,6 +130,7 @@ func (m *mockExperiment) GetRun(ctx context.Context, in *experimentv1.GetRunRequ
 type mockMonitor struct {
 	listMonitorsFn func(ctx context.Context, in *monitorv1.ListMonitorsRequest) (*monitorv1.ListMonitorsResponse, error)
 	listDriftFn    func(ctx context.Context, in *monitorv1.ListDriftReportsRequest) (*monitorv1.ListDriftReportsResponse, error)
+	listEvalsFn    func(ctx context.Context, in *monitorv1.ListEvalScoresRequest) (*monitorv1.ListEvalScoresResponse, error)
 }
 
 func (m *mockMonitor) ListMonitors(ctx context.Context, in *monitorv1.ListMonitorsRequest, _ ...grpc.CallOption) (*monitorv1.ListMonitorsResponse, error) {
@@ -137,6 +138,9 @@ func (m *mockMonitor) ListMonitors(ctx context.Context, in *monitorv1.ListMonito
 }
 func (m *mockMonitor) ListDriftReports(ctx context.Context, in *monitorv1.ListDriftReportsRequest, _ ...grpc.CallOption) (*monitorv1.ListDriftReportsResponse, error) {
 	return m.listDriftFn(ctx, in)
+}
+func (m *mockMonitor) ListEvalScores(ctx context.Context, in *monitorv1.ListEvalScoresRequest, _ ...grpc.CallOption) (*monitorv1.ListEvalScoresResponse, error) {
+	return m.listEvalsFn(ctx, in)
 }
 
 // ---- Billing mock -----------------------------------------------------------
@@ -162,9 +166,13 @@ func (m *mockNotification) ListNotifications(ctx context.Context, in *notificati
 // ---- AI Gateway mock --------------------------------------------------------
 
 type mockAIGateway struct {
-	chatFn      func(ctx context.Context, in *aiv1.ChatCompletionRequest) (grpc.ServerStreamingClient[aiv1.ChatCompletionResponse], error)
-	providersFn func(ctx context.Context, in *aiv1.ListProvidersRequest) (*aiv1.ListProvidersResponse, error)
-	usageFn     func(ctx context.Context, in *aiv1.GetUsageRequest) (*aiv1.GetUsageResponse, error)
+	chatFn         func(ctx context.Context, in *aiv1.ChatCompletionRequest) (grpc.ServerStreamingClient[aiv1.ChatCompletionResponse], error)
+	providersFn    func(ctx context.Context, in *aiv1.ListProvidersRequest) (*aiv1.ListProvidersResponse, error)
+	usageFn        func(ctx context.Context, in *aiv1.GetUsageRequest) (*aiv1.GetUsageResponse, error)
+	createPromptFn func(ctx context.Context, in *aiv1.CreatePromptRequest) (*aiv1.CreatePromptResponse, error)
+	getPromptFn    func(ctx context.Context, in *aiv1.GetPromptRequest) (*aiv1.GetPromptResponse, error)
+	listPromptsFn  func(ctx context.Context, in *aiv1.ListPromptsRequest) (*aiv1.ListPromptsResponse, error)
+	renderPromptFn func(ctx context.Context, in *aiv1.RenderPromptRequest) (*aiv1.RenderPromptResponse, error)
 }
 
 func (m *mockAIGateway) ChatCompletion(ctx context.Context, in *aiv1.ChatCompletionRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[aiv1.ChatCompletionResponse], error) {
@@ -175,6 +183,18 @@ func (m *mockAIGateway) ListProviders(ctx context.Context, in *aiv1.ListProvider
 }
 func (m *mockAIGateway) GetUsage(ctx context.Context, in *aiv1.GetUsageRequest, _ ...grpc.CallOption) (*aiv1.GetUsageResponse, error) {
 	return m.usageFn(ctx, in)
+}
+func (m *mockAIGateway) CreatePrompt(ctx context.Context, in *aiv1.CreatePromptRequest, _ ...grpc.CallOption) (*aiv1.CreatePromptResponse, error) {
+	return m.createPromptFn(ctx, in)
+}
+func (m *mockAIGateway) GetPrompt(ctx context.Context, in *aiv1.GetPromptRequest, _ ...grpc.CallOption) (*aiv1.GetPromptResponse, error) {
+	return m.getPromptFn(ctx, in)
+}
+func (m *mockAIGateway) ListPrompts(ctx context.Context, in *aiv1.ListPromptsRequest, _ ...grpc.CallOption) (*aiv1.ListPromptsResponse, error) {
+	return m.listPromptsFn(ctx, in)
+}
+func (m *mockAIGateway) RenderPrompt(ctx context.Context, in *aiv1.RenderPromptRequest, _ ...grpc.CallOption) (*aiv1.RenderPromptResponse, error) {
+	return m.renderPromptFn(ctx, in)
 }
 
 // Compile-time assertions that the mocks satisfy the handler ports.

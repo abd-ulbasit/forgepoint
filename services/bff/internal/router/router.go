@@ -63,6 +63,9 @@ func New(cfg Config) http.Handler {
 	// SAME SSELimits as the pipelines watch relay (its own limiter instance) so the
 	// chat stream inherits the global/per-user/lifetime DoS bounds.
 	aiH := handlers.NewAIHandler(cl.AIGateway, log, cfg.SSELimits)
+	// Prompt registry (L3): list/create/get/render prompt templates. Shares the AI
+	// gateway stub with aiH but is its own handler (plain unary CRUD, no SSE).
+	promptsH := handlers.NewPromptsHandler(cl.AIGateway, log)
 
 	// ---- PROTECTED routes (require a forwarded bearer token) -----------------
 	protected := http.NewServeMux()
@@ -84,9 +87,10 @@ func New(cfg Config) http.Handler {
 	protected.HandleFunc("GET /api/v1/runs", experimentsH.ListRuns)
 	protected.HandleFunc("GET /api/v1/runs/{id}", experimentsH.GetRun)
 
-	// Monitors + drift
+	// Monitors + drift + LLM evals (L4)
 	protected.HandleFunc("GET /api/v1/monitors", monitorsH.List)
 	protected.HandleFunc("GET /api/v1/drift-reports", monitorsH.DriftReports)
+	protected.HandleFunc("GET /api/v1/evals", monitorsH.Evals)
 
 	// Billing
 	protected.HandleFunc("GET /api/v1/usage", billingH.Usage)
@@ -101,6 +105,14 @@ func New(cfg Config) http.Handler {
 	protected.HandleFunc("POST /api/v1/chat", aiH.Chat)
 	protected.HandleFunc("GET /api/v1/ai/providers", aiH.Providers)
 	protected.HandleFunc("GET /api/v1/ai/usage", aiH.Usage)
+
+	// Prompt registry (L3). List/Create live on the collection; Get/Render hang off
+	// the {name} segment. Render is a POST (it carries a variables map body) even
+	// though it reads — the body is the reason, same as POST /chat.
+	protected.HandleFunc("GET /api/v1/prompts", promptsH.List)
+	protected.HandleFunc("POST /api/v1/prompts", promptsH.Create)
+	protected.HandleFunc("GET /api/v1/prompts/{name}", promptsH.Get)
+	protected.HandleFunc("POST /api/v1/prompts/{name}/render", promptsH.Render)
 
 	// Aggregation
 	protected.HandleFunc("GET /api/v1/dashboard", dashboardH.Dashboard)

@@ -80,6 +80,11 @@ const VALUE_TONE: Record<string, Tone> = {
   PROVIDER_KIND_OPENAI: 'success',
   PROVIDER_KIND_ANTHROPIC: 'success',
   PROVIDER_KIND_UNSPECIFIED: 'neutral',
+  // Prompt registry stage (L3) — a prompt version's lifecycle stage
+  PROMPT_STAGE_DEV: 'neutral',
+  PROMPT_STAGE_PRODUCTION: 'success',
+  PROMPT_STAGE_ARCHIVED: 'neutral',
+  PROMPT_STAGE_UNSPECIFIED: 'neutral',
 }
 
 /** Strip the longest known prefix so the label reads cleanly. */
@@ -98,6 +103,7 @@ function labelFor(value: string): string {
     'STEP_TYPE_',
     'METER_TYPE_',
     'PROVIDER_KIND_',
+    'PROMPT_STAGE_',
   ]
   const p = prefixes.find((pre) => value.startsWith(pre))
   return humanizeEnum(value, p)

@@ -58,6 +58,12 @@ type monitorService struct {
 	publisher DriftPublisher
 	orch      Orchestrator
 	gate      RetrainGate
+	// evals is the L4 quality-eval store, READ here for the eval-history dashboard
+	// (ListEvalScores). The control plane only READS it; the WRITE path (recording a
+	// judged completion) lives entirely in QualityEvalService on the data plane, so
+	// this is a read-only borrow of the same store.Evals() adapter. May be nil when
+	// L4 is not wired (eval disabled) — ListEvalScores guards that.
+	evals EvalStore
 
 	cooldown time.Duration
 	now      func() time.Time // injectable clock — tests pin it; prod passes time.Now
@@ -70,6 +76,11 @@ type monitorService struct {
 //
 // `now` may be nil, in which case time.Now is used — tests pass a fixed clock so
 // the time-based window close and the cooldown are deterministic.
+//
+// `evals` is the L4 quality-eval store, READ by ListEvalScores for the eval-history
+// dashboard. It may be nil when L4/eval is disabled — ListEvalScores returns an empty
+// page rather than dereferencing a nil store. The WRITE side of evals lives in
+// QualityEvalService (the data plane); this service only reads.
 func NewMonitorService(
 	monitors MonitorRepository,
 	reports DriftReportRepository,
@@ -79,6 +90,7 @@ func NewMonitorService(
 	publisher DriftPublisher,
 	orch Orchestrator,
 	gate RetrainGate,
+	evals EvalStore,
 	cooldown time.Duration,
 	now func() time.Time,
 ) MonitorService {
@@ -97,6 +109,7 @@ func NewMonitorService(
 		publisher: publisher,
 		orch:      orch,
 		gate:      gate,
+		evals:     evals,
 		cooldown:  cooldown,
 		now:       now,
 	}
@@ -399,6 +412,41 @@ func (s *monitorService) ListDriftReports(ctx context.Context, ownerTeam string,
 		return nil, "", fmt.Errorf("list reports: %w", err)
 	}
 	return rs, next, nil
+}
+
+// ListEvalScores returns a team's LLM quality-eval history (newest first), paginated —
+// the read model behind the L4 eval dashboard. It is the eval-side twin of
+// ListDriftReports and enforces the SAME tenancy invariant: ownerTeam (from auth claims)
+// is the mandatory scope and we OVERWRITE the filter's Team with it, never trusting a
+// client-supplied Team. f.Model is OPTIONAL (empty = all of the team's models, the
+// default cross-model view); f.Since is an OPTIONAL lower bound. Because Team always
+// scopes the read, an empty Model means "all of MY models", never an unscoped read.
+//
+// If the eval store is not wired (L4 disabled), there is no eval history to return — we
+// hand back an empty page rather than dereferencing a nil store, so the dashboard tile
+// degrades to "no scores yet" instead of erroring.
+func (s *monitorService) ListEvalScores(ctx context.Context, ownerTeam string, f EvalFilter, opts ListOptions) ([]Eval, string, error) {
+	if strings.TrimSpace(ownerTeam) == "" {
+		return nil, "", fmt.Errorf("%w: owner_team is required (from auth claims)", ErrValidation)
+	}
+	// TENANCY: overwrite the filter's Team with the claim-derived value — the always-
+	// present partition key. Model (when set) narrows within it; an empty Model lists
+	// every model THIS team owns, never a cross-tenant read.
+	f.Team = ownerTeam
+	// Same default + cap discipline as every other list (DefaultListPageSize /
+	// MaxListPageSize) — a client asking for more than the cap gets the cap, not an error.
+	opts = capPage(opts)
+
+	if s.evals == nil {
+		// L4 not wired: no eval history exists. An empty page is the honest answer (the
+		// dashboard renders "no scores yet"), not an internal error.
+		return nil, "", nil
+	}
+	scores, next, err := s.evals.ListScores(ctx, f, opts)
+	if err != nil {
+		return nil, "", fmt.Errorf("list eval scores: %w", err)
+	}
+	return scores, next, nil
 }
 
 // ============================================================================

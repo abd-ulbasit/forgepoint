@@ -146,6 +146,17 @@ type MonitorService interface {
 	// decay. Only accepts labels for observed request_ids; reports unmatched ones.
 	SubmitGroundTruth(ctx context.Context, ownerTeam string, in SubmitGroundTruthInput) (SubmitGroundTruthResult, error)
 
+	// ListEvalScores returns a team's LLM quality-eval history (newest first),
+	// paginated, with optional model_name + since filters — the READ MODEL behind the
+	// L4 eval dashboard. ownerTeam is service-set from auth claims and is the MANDATORY
+	// scope; the filter's Team is OVERWRITTEN with it so a client can never read another
+	// tenant's scores (model names are not unique across teams). f.Model is OPTIONAL:
+	// set narrows to one model; EMPTY returns scores across ALL of this team's models
+	// (the default cross-model dashboard view) — never an unscoped read. The returned
+	// rows include BOTH scored and unscored evals (the dashboard surfaces un-judgeable
+	// traffic too). Pagination is capped exactly like ListDriftReports.
+	ListEvalScores(ctx context.Context, ownerTeam string, f EvalFilter, opts ListOptions) (scores []Eval, nextToken string, err error)
+
 	// -----------------------------------------------------------------------
 	// DATA PLANE (event-driven — the NATS consumer calls these, not the handler)
 	// -----------------------------------------------------------------------

@@ -124,6 +124,9 @@ func (f *fakeMonitorService) GetDriftReport(context.Context, string, string) (do
 func (f *fakeMonitorService) ListDriftReports(context.Context, string, domain.ReportFilter, domain.ListOptions) ([]domain.DriftReport, string, error) {
 	return nil, "", nil
 }
+func (f *fakeMonitorService) ListEvalScores(context.Context, string, domain.EvalFilter, domain.ListOptions) ([]domain.Eval, string, error) {
+	return nil, "", nil
+}
 func (f *fakeMonitorService) SubmitGroundTruth(context.Context, string, domain.SubmitGroundTruthInput) (domain.SubmitGroundTruthResult, error) {
 	return domain.SubmitGroundTruthResult{}, nil
 }

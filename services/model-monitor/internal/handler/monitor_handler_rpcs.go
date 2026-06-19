@@ -63,6 +63,7 @@ package handler
 import (
 	"context"
 	"errors"
+	"math"
 	"time"
 
 	commonv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/common/v1"
@@ -444,6 +445,69 @@ func (h *MonitorHandler) ListDriftReports(ctx context.Context, req *monitorv1.Li
 
 	return &monitorv1.ListDriftReportsResponse{
 		Reports:    out,
+		Pagination: paginationResponse(nextToken),
+	}, nil
+}
+
+// ============================================================================
+// ListEvalScores — the L4 eval dashboard's read model (paginated, filtered)
+// ============================================================================
+//
+// TENANCY: the filter's Team is set from claims (NEVER the request) and is the
+// mandatory scope. model_name is OPTIONAL — empty is the team-wide cross-model eval
+// view (the dashboard default); a non-empty value narrows to one model. Because Team
+// always scopes the read, an empty model_name lists only THIS team's scores, never
+// another tenant's same-named model. since is an OPTIONAL lower bound on created_at.
+//
+// SHAPE: this mirrors ListDriftReports exactly — same pagination normalization (default
+// 20, cap 100), same "empty model_name is valid, not a 400", same claim-derived team —
+// because an eval-score list is the same kind of team-scoped, keyset-paginated history
+// read as a drift-report list, just over the eval_scores table.
+func (h *MonitorHandler) ListEvalScores(ctx context.Context, req *monitorv1.ListEvalScoresRequest) (*monitorv1.ListEvalScoresResponse, error) {
+	if h.svc == nil {
+		return nil, errServiceNotWired
+	}
+
+	ownerTeam, err := callerTeam(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// page_size is defaulted (0) and clamped (over cap) at the boundary; a negative
+	// size is a client bug and is rejected (shared paginationFromProto).
+	opts, err := paginationFromProto(req.GetPagination())
+	if err != nil {
+		return nil, err
+	}
+
+	// since is an OPTIONAL lower bound; nil means "unbounded". Reject a malformed
+	// timestamp at the boundary rather than letting it become a confusing time in SQL.
+	since, err := optionalTime(req.GetSince(), "since")
+	if err != nil {
+		return nil, err
+	}
+
+	f := domain.EvalFilter{
+		// Team is intentionally NOT set from the request — the service overwrites it with
+		// the claim-derived team; we set it here too for clarity, but the service is the
+		// authority (defense in depth against a future caller that forgets to scope).
+		Team:  ownerTeam,
+		Model: req.GetModelName(),
+		Since: since,
+	}
+
+	scores, nextToken, err := h.svc.ListEvalScores(ctx, ownerTeam, f, opts)
+	if err != nil {
+		return nil, toStatusError(err)
+	}
+
+	out := make([]*monitorv1.EvalScore, 0, len(scores))
+	for _, e := range scores {
+		out = append(out, evalScoreToProto(e))
+	}
+
+	return &monitorv1.ListEvalScoresResponse{
+		Scores:     out,
 		Pagination: paginationResponse(nextToken),
 	}, nil
 }
@@ -884,6 +948,35 @@ func driftReportToProto(r domain.DriftReport) *monitorv1.DriftReport {
 		WindowEnd:    nilableTimestamp(r.WindowEnd),
 		CreatedAt:    nilableTimestamp(r.CreatedAt),
 	}
+}
+
+// evalScoreToProto maps one domain.Eval (the L4 quality-eval row) to the proto
+// EvalScore. The domain stores the axes as DOUBLE PRECISION on the 1–5 scale (the judge
+// can emit fractional/clamped values, and Overall is the mean of three), but the proto
+// EvalScore axes are int32 — a deliberate UI contract (a dashboard renders "4/5 stars",
+// not "4.33"). So we ROUND each axis to the nearest whole star. An UNSCORED row carries
+// all-zero axes and scored=false; rounding leaves those 0s as-is, so the dashboard can
+// render it distinctly from a low (but judged) score. request_id and created_at ride
+// along for the per-row drill-in; created_at maps to nil when zero (unset stays unset).
+func evalScoreToProto(e domain.Eval) *monitorv1.EvalScore {
+	return &monitorv1.EvalScore{
+		Model:     e.Model,
+		Relevance: roundScore(e.Scores.Relevance),
+		Coherence: roundScore(e.Scores.Coherence),
+		Safety:    roundScore(e.Scores.Safety),
+		Overall:   roundScore(e.Scores.Overall),
+		Scored:    e.Scores.Scored,
+		RequestId: e.RequestID,
+		CreatedAt: nilableTimestamp(e.CreatedAt),
+	}
+}
+
+// roundScore rounds a 1–5 float axis to the nearest int for the proto's int32 star
+// rating. math.Round gives banker's-free half-away-from-zero rounding (4.5 → 5), which
+// matches how a UI would round a star average. Negative is impossible on the 1–5 scale
+// (an unscored row carries 0), but Round is total so it is safe regardless.
+func roundScore(v float64) int32 {
+	return int32(math.Round(v))
 }
 
 func monitorStatusToProto(s domain.MonitorStatus) *monitorv1.MonitorStatus {

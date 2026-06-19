@@ -15,7 +15,7 @@ import {
   keepPreviousData,
 } from '@tanstack/react-query'
 import * as api from '@/api/endpoints'
-import type { PageParams, RegisterModelRequest } from '@/api/types'
+import type { CreatePromptRequest, PageParams, RegisterModelRequest } from '@/api/types'
 
 // Centralized cache keys. Arrays are stable & serializable, so identical params
 // hit the same cache entry.
@@ -34,6 +34,9 @@ export const qk = {
   notifications: (p?: PageParams & { unreadOnly?: boolean }) => ['notifications', p ?? {}] as const,
   aiProviders: ['ai-providers'] as const,
   aiUsage: ['ai-usage'] as const,
+  prompts: (p?: PageParams) => ['prompts', p ?? {}] as const,
+  prompt: (name: string, version?: number) => ['prompt', name, version ?? 'latest'] as const,
+  evals: (p?: PageParams & { modelName?: string; since?: string }) => ['evals', p ?? {}] as const,
 }
 
 // ---- Dashboard -------------------------------------------------------------
@@ -188,5 +191,59 @@ export function useAIUsage() {
   return useQuery({
     queryKey: qk.aiUsage,
     queryFn: api.getAIUsage,
+  })
+}
+
+// ---- Prompt registry (L3) --------------------------------------------------
+
+export function usePrompts(params?: PageParams) {
+  return useQuery({
+    queryKey: qk.prompts(params),
+    queryFn: () => api.listPrompts(params),
+    placeholderData: keepPreviousData,
+  })
+}
+
+export function usePrompt(name: string, version?: number) {
+  return useQuery({
+    queryKey: qk.prompt(name, version),
+    queryFn: () => api.getPrompt(name, version),
+    enabled: Boolean(name),
+  })
+}
+
+export function useCreatePrompt() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (body: CreatePromptRequest) => api.createPrompt(body),
+    onSuccess: () => {
+      // A create either mints a new prompt or a new version; invalidate the list
+      // so it reflects the change immediately.
+      qc.invalidateQueries({ queryKey: ['prompts'] })
+    },
+  })
+}
+
+/**
+ * Render is a MUTATION even though it reads — it has a request body (the
+ * variables map) and we trigger it imperatively from a button, not on mount.
+ * Modeling it as a mutation (rather than a query keyed on the variables) keeps
+ * the "fill the form, click Render, show the result" flow explicit and avoids
+ * refetching on every keystroke.
+ */
+export function useRenderPrompt() {
+  return useMutation({
+    mutationFn: (vars: { name: string; variables: Record<string, string>; version?: number }) =>
+      api.renderPrompt(vars.name, vars.variables, vars.version),
+  })
+}
+
+// ---- LLM evals (L4) --------------------------------------------------------
+
+export function useEvalScores(params?: PageParams & { modelName?: string; since?: string }) {
+  return useQuery({
+    queryKey: qk.evals(params),
+    queryFn: () => api.listEvalScores(params),
+    placeholderData: keepPreviousData,
   })
 }

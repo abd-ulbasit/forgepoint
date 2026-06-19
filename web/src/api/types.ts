@@ -560,6 +560,88 @@ export interface AIUsageResponse {
   remainingTokens: string
 }
 
+// ---- Prompt registry (L3) --------------------------------------------------
+//
+// Mirrors gen/go/forgepoint/ai/v1 Prompt + its CRUD/render messages as relayed
+// by the BFF (services/bff/internal/handlers/prompts.go). protojson conventions
+// apply: `stage` is the full SCREAMING_SNAKE enum name; `version` is int32 → a
+// JSON number; `variables` is the list of {{names}} the gateway extracted from
+// the template.
+
+export type PromptStage =
+  | 'PROMPT_STAGE_UNSPECIFIED'
+  | 'PROMPT_STAGE_DEV'
+  | 'PROMPT_STAGE_PRODUCTION'
+  | 'PROMPT_STAGE_ARCHIVED'
+
+export interface Prompt {
+  id: string
+  name: string
+  version: number
+  stage: PromptStage
+  template: string
+  variables: string[]
+  description: string
+  team: string
+  createdAt: Timestamp
+}
+
+export interface ListPromptsResponse {
+  prompts: Prompt[]
+  pagination: PaginationResponse
+}
+
+export interface GetPromptResponse {
+  prompt: Prompt
+}
+
+/** Body for POST /api/v1/prompts. idempotencyKey makes a retried submit safe. */
+export interface CreatePromptRequest {
+  name: string
+  template: string
+  description: string
+  idempotencyKey?: string
+}
+
+export interface CreatePromptResponse {
+  prompt: Prompt
+}
+
+/** Body for POST /api/v1/prompts/{name}/render. The name comes from the URL; the
+ *  body carries the variables map (and optionally a version to pin). */
+export interface RenderPromptRequest {
+  version?: number
+  variables: Record<string, string>
+}
+
+export interface RenderPromptResponse {
+  rendered: string
+  version: number
+}
+
+// ---- LLM evals (L4) --------------------------------------------------------
+//
+// Mirrors gen/go/forgepoint/monitor/v1 EvalScore. The four axes
+// (relevance/coherence/safety/overall) are int32 scores (0–5, an LLM-as-judge
+// rubric) → JSON numbers; `scored` distinguishes a real judged sample from a
+// not-yet-scored placeholder.
+
+export interface EvalScore {
+  model: string
+  relevance: number
+  coherence: number
+  safety: number
+  overall: number
+  scored: boolean
+  requestId: string
+  createdAt: Timestamp
+}
+
+export interface ListEvalScoresResponse {
+  scores: EvalScore[]
+  pagination: PaginationResponse
+}
+
 // ---- Generic ---------------------------------------------------------------
 
 /** The BFF's sanitized error envelope (httpx.errorBody). */

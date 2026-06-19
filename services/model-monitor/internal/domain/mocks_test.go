@@ -376,6 +376,7 @@ type harness struct {
 	publisher *fakePublisher
 	orch      *fakeOrchestrator
 	gate      *fakeGate
+	evals     *fakeEvalStore
 	clock     *fakeClock
 }
 
@@ -408,10 +409,11 @@ func newHarness(cooldown time.Duration, baselineAvailable bool) *harness {
 		publisher: &fakePublisher{},
 		orch:      &fakeOrchestrator{},
 		gate:      newFakeGate(),
+		evals:     newFakeEvalStore(),
 		clock:     &fakeClock{t: time.Unix(1_000_000, 0)},
 	}
 	h.svc = NewMonitorService(h.monitors, h.reports, h.windows, h.truth, h.baselines,
-		h.publisher, h.orch, h.gate, cooldown, h.clock.now)
+		h.publisher, h.orch, h.gate, h.evals, cooldown, h.clock.now)
 	return h
 }
 

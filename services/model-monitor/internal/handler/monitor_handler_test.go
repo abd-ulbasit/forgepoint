@@ -106,18 +106,20 @@ type mockMonitorService struct {
 	listMonitorsFn    func(ctx context.Context, ownerTeam string, minSeverity domain.DriftSeverity, state domain.MonitorState, opts domain.ListOptions) ([]domain.FleetEntry, string, error)
 	getReportFn       func(ctx context.Context, ownerTeam, reportID string) (domain.DriftReport, error)
 	listReportsFn     func(ctx context.Context, ownerTeam string, f domain.ReportFilter, opts domain.ListOptions) ([]domain.DriftReport, string, error)
+	listEvalScoresFn  func(ctx context.Context, ownerTeam string, f domain.EvalFilter, opts domain.ListOptions) ([]domain.Eval, string, error)
 	submitGroundTruth func(ctx context.Context, ownerTeam string, in domain.SubmitGroundTruthInput) (domain.SubmitGroundTruthResult, error)
 
 	// Call recorders — let validation tests assert the domain was NOT reached.
-	configureCalls     int
-	deleteCalls        int
-	resetBaselineCalls int
-	getHealthCalls     int
-	getStatusCalls     int
-	listMonitorsCalls  int
-	getReportCalls     int
-	listReportsCalls   int
-	submitCalls        int
+	configureCalls      int
+	deleteCalls         int
+	resetBaselineCalls  int
+	getHealthCalls      int
+	getStatusCalls      int
+	listMonitorsCalls   int
+	getReportCalls      int
+	listReportsCalls    int
+	listEvalScoresCalls int
+	submitCalls         int
 
 	// Captured inputs for happy-path conversion assertions.
 	lastOwnerTeam    string
@@ -131,6 +133,8 @@ type mockMonitorService struct {
 	lastReportID     string
 	lastReportFilter domain.ReportFilter
 	lastReportOpts   domain.ListOptions
+	lastEvalFilter   domain.EvalFilter
+	lastEvalOpts     domain.ListOptions
 	lastSubmitInput  domain.SubmitGroundTruthInput
 }
 
@@ -192,6 +196,14 @@ func (m *mockMonitorService) ListDriftReports(ctx context.Context, ownerTeam str
 	m.lastReportFilter = f
 	m.lastReportOpts = opts
 	return m.listReportsFn(ctx, ownerTeam, f, opts)
+}
+
+func (m *mockMonitorService) ListEvalScores(ctx context.Context, ownerTeam string, f domain.EvalFilter, opts domain.ListOptions) ([]domain.Eval, string, error) {
+	m.listEvalScoresCalls++
+	m.lastOwnerTeam = ownerTeam
+	m.lastEvalFilter = f
+	m.lastEvalOpts = opts
+	return m.listEvalScoresFn(ctx, ownerTeam, f, opts)
 }
 
 func (m *mockMonitorService) SubmitGroundTruth(ctx context.Context, ownerTeam string, in domain.SubmitGroundTruthInput) (domain.SubmitGroundTruthResult, error) {
@@ -1011,6 +1023,196 @@ func TestListDriftReports_EmptyModel_ReachesDomain(t *testing.T) {
 	if len(resp.GetReports()) != 2 {
 		t.Fatalf("fleet view must return all team reports, got %d", len(resp.GetReports()))
 	}
+}
+
+// ============================================================================
+// ListEvalScores — L4 eval dashboard read model
+// ============================================================================
+
+func TestListEvalScores_HappyPath_ConvertsAndTeamScope(t *testing.T) {
+	since := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	created := time.Date(2026, 6, 9, 12, 0, 0, 0, time.UTC)
+	mock := &mockMonitorService{
+		listEvalScoresFn: func(ctx context.Context, ownerTeam string, f domain.EvalFilter, opts domain.ListOptions) ([]domain.Eval, string, error) {
+			return []domain.Eval{
+				{
+					Team:      testTeam,
+					Model:     "chatbot",
+					RequestID: "req-1",
+					// Domain stores 1–5 floats; the handler rounds to int32 stars. 4.33 → 4.
+					Scores:    domain.JudgeScores{Relevance: 4, Coherence: 5, Safety: 4, Overall: 4.33, Scored: true},
+					CreatedAt: created,
+				},
+				// An UNSCORED row: axes all 0, scored=false — must round to 0s and stay scored=false.
+				{Team: testTeam, Model: "chatbot", RequestID: "req-2", Scores: domain.Unscored(), CreatedAt: created},
+			}, "cursor-2", nil
+		},
+	}
+	client := newTestClient(t, mock, true)
+	resp, err := client.ListEvalScores(authCtx(), &monitorv1.ListEvalScoresRequest{
+		ModelName:  "chatbot",
+		Since:      timestamppb.New(since),
+		Pagination: &commonv1.PaginationRequest{PageSize: 25},
+	})
+	if err != nil {
+		t.Fatalf("ListEvalScores error: %v", err)
+	}
+
+	// (a) TENANCY: the filter's Team comes from claims, not the request; model + since forwarded.
+	f := mock.lastEvalFilter
+	if f.Team != testTeam || f.Model != "chatbot" {
+		t.Fatalf("filter conversion mismatch: %+v", f)
+	}
+	if !f.Since.Equal(since) {
+		t.Fatalf("since not converted: %v", f.Since)
+	}
+	if mock.lastOwnerTeam != testTeam {
+		t.Fatalf("owner team = %q; want %q (from claims)", mock.lastOwnerTeam, testTeam)
+	}
+	if mock.lastEvalOpts.PageSize != 25 {
+		t.Fatalf("page size not forwarded: %d", mock.lastEvalOpts.PageSize)
+	}
+
+	// (a) domain -> proto conversion of the rows.
+	if len(resp.GetScores()) != 2 {
+		t.Fatalf("want 2 scores, got %d", len(resp.GetScores()))
+	}
+	s0 := resp.GetScores()[0]
+	if s0.GetModel() != "chatbot" || s0.GetRequestId() != "req-1" || !s0.GetScored() {
+		t.Fatalf("scored row mismatch: %+v", s0)
+	}
+	// The 4.33 overall rounds to 4; axes 4/5/4 stay as-is.
+	if s0.GetRelevance() != 4 || s0.GetCoherence() != 5 || s0.GetSafety() != 4 || s0.GetOverall() != 4 {
+		t.Fatalf("axis rounding mismatch: %+v", s0)
+	}
+	if !s0.GetCreatedAt().AsTime().Equal(created) {
+		t.Fatalf("created_at not converted: %v", s0.GetCreatedAt().AsTime())
+	}
+	// The unscored row: all axes 0, scored=false.
+	s1 := resp.GetScores()[1]
+	if s1.GetScored() || s1.GetRelevance() != 0 || s1.GetOverall() != 0 {
+		t.Fatalf("unscored row should carry scored=false + 0 axes: %+v", s1)
+	}
+
+	if resp.GetPagination().GetNextPageToken() != "cursor-2" {
+		t.Fatalf("next token mismatch: %q", resp.GetPagination().GetNextPageToken())
+	}
+}
+
+// TestListEvalScores_EmptyModel_ReachesDomain pins that an empty model_name is VALID (the
+// cross-model dashboard default), not a 400 — it must reach the domain with the claim
+// team and an empty Model (read as "all of the team's models").
+func TestListEvalScores_EmptyModel_ReachesDomain(t *testing.T) {
+	mock := &mockMonitorService{
+		listEvalScoresFn: func(ctx context.Context, ownerTeam string, f domain.EvalFilter, opts domain.ListOptions) ([]domain.Eval, string, error) {
+			return []domain.Eval{{Team: testTeam, Model: "chatbot", RequestID: "r-1", Scores: domain.Unscored()}}, "", nil
+		},
+	}
+	client := newTestClient(t, mock, true)
+	resp, err := client.ListEvalScores(authCtx(), &monitorv1.ListEvalScoresRequest{}) // no model_name
+	if err != nil {
+		t.Fatalf("empty model_name must NOT be a 400 (cross-model view); got %v", err)
+	}
+	if mock.listEvalScoresCalls != 1 {
+		t.Fatalf("domain must be called once, got %d", mock.listEvalScoresCalls)
+	}
+	if mock.lastEvalFilter.Team != testTeam {
+		t.Fatalf("team must come from claims, got %q", mock.lastEvalFilter.Team)
+	}
+	if mock.lastEvalFilter.Model != "" {
+		t.Fatalf("empty model_name must reach the domain empty, got %q", mock.lastEvalFilter.Model)
+	}
+	if len(resp.GetScores()) != 1 {
+		t.Fatalf("want 1 score, got %d", len(resp.GetScores()))
+	}
+}
+
+// TestListEvalScores_PageSizeDefaultedAndClamped pins the boundary pagination
+// normalization (shared paginationFromProto): 0 → default, over-cap → clamp, in-range → kept.
+func TestListEvalScores_PageSizeDefaultedAndClamped(t *testing.T) {
+	cases := []struct {
+		name     string
+		reqSize  int32
+		wantSize int
+	}{
+		{"zero -> default", 0, domain.DefaultListPageSize},
+		{"over cap -> clamped", 5000, domain.MaxListPageSize},
+		{"within range -> kept", 50, 50},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := &mockMonitorService{
+				listEvalScoresFn: func(ctx context.Context, ownerTeam string, f domain.EvalFilter, opts domain.ListOptions) ([]domain.Eval, string, error) {
+					return nil, "", nil
+				},
+			}
+			client := newTestClient(t, mock, true)
+			_, err := client.ListEvalScores(authCtx(), &monitorv1.ListEvalScoresRequest{
+				Pagination: &commonv1.PaginationRequest{PageSize: tc.reqSize},
+			})
+			if err != nil {
+				t.Fatalf("ListEvalScores error: %v", err)
+			}
+			if mock.lastEvalOpts.PageSize != tc.wantSize {
+				t.Fatalf("page size = %d; want %d", mock.lastEvalOpts.PageSize, tc.wantSize)
+			}
+		})
+	}
+}
+
+func TestListEvalScores_Validation(t *testing.T) {
+	cases := []struct {
+		name string
+		req  *monitorv1.ListEvalScoresRequest
+	}{
+		{"negative page_size", &monitorv1.ListEvalScoresRequest{Pagination: &commonv1.PaginationRequest{PageSize: -1}}},
+		// A timestamp out of the valid proto range is rejected at the boundary.
+		{"invalid since", &monitorv1.ListEvalScoresRequest{Since: &timestamppb.Timestamp{Seconds: -1 << 62}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := &mockMonitorService{
+				listEvalScoresFn: func(ctx context.Context, ownerTeam string, f domain.EvalFilter, opts domain.ListOptions) ([]domain.Eval, string, error) {
+					t.Fatal("domain must NOT be called for invalid input")
+					return nil, "", nil
+				},
+			}
+			client := newTestClient(t, mock, true)
+			_, err := client.ListEvalScores(authCtx(), tc.req)
+			requireCode(t, err, codes.InvalidArgument)
+			if mock.listEvalScoresCalls != 0 {
+				t.Fatalf("domain ListEvalScores called %d times; want 0", mock.listEvalScoresCalls)
+			}
+		})
+	}
+}
+
+func TestListEvalScores_NoClaims_Unauthenticated(t *testing.T) {
+	mock := &mockMonitorService{
+		listEvalScoresFn: func(ctx context.Context, ownerTeam string, f domain.EvalFilter, opts domain.ListOptions) ([]domain.Eval, string, error) {
+			t.Fatal("domain must NOT be called without claims")
+			return nil, "", nil
+		},
+	}
+	client := newTestClient(t, mock, false) // no auth interceptor -> no claims
+	_, err := client.ListEvalScores(context.Background(), &monitorv1.ListEvalScoresRequest{})
+	requireCode(t, err, codes.Unauthenticated)
+	if mock.listEvalScoresCalls != 0 {
+		t.Fatalf("domain called %d times without claims; want 0", mock.listEvalScoresCalls)
+	}
+}
+
+func TestListEvalScores_InternalError_Sanitized(t *testing.T) {
+	mock := &mockMonitorService{
+		listEvalScoresFn: func(ctx context.Context, ownerTeam string, f domain.EvalFilter, opts domain.ListOptions) ([]domain.Eval, string, error) {
+			return nil, "", errFake("pq: relation eval_scores does not exist at db-primary:5432")
+		},
+	}
+	client := newTestClient(t, mock, true)
+	_, err := client.ListEvalScores(authCtx(), &monitorv1.ListEvalScoresRequest{})
+	requireCode(t, err, codes.Internal)
+	st, _ := status.FromError(err)
+	assertNoLeak(t, st.Message())
 }
 
 // ============================================================================

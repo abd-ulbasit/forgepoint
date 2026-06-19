@@ -74,11 +74,20 @@ type ExperimentClient interface {
 	GetRun(ctx context.Context, in *experimentv1.GetRunRequest, opts ...grpc.CallOption) (*experimentv1.GetRunResponse, error)
 }
 
-// MonitorClient is the slice of the model-monitor API the monitors/drift
+// MonitorClient is the slice of the model-monitor API the monitors/drift/evals
 // endpoints use.
+//
+// ListEvalScores (L4) is the LLM-eval read path: the monitor service judges a
+// sample of LLM responses (an LLM-as-judge step) and stores per-response
+// relevance/coherence/safety/overall scores. The eval dashboard lists them; the
+// monitor ALSO emits an `llm_quality` performance-drift report off these scores,
+// which is why the dashboard cross-links to /drift-reports rather than
+// recomputing drift in the browser (the BFF stays logic-free — the monitor owns
+// the threshold math).
 type MonitorClient interface {
 	ListMonitors(ctx context.Context, in *monitorv1.ListMonitorsRequest, opts ...grpc.CallOption) (*monitorv1.ListMonitorsResponse, error)
 	ListDriftReports(ctx context.Context, in *monitorv1.ListDriftReportsRequest, opts ...grpc.CallOption) (*monitorv1.ListDriftReportsResponse, error)
+	ListEvalScores(ctx context.Context, in *monitorv1.ListEvalScoresRequest, opts ...grpc.CallOption) (*monitorv1.ListEvalScoresResponse, error)
 }
 
 // BillingClient is the slice of the billing API the usage endpoint uses.
@@ -92,15 +101,25 @@ type NotificationClient interface {
 	ListNotifications(ctx context.Context, in *notificationv1.ListNotificationsRequest, opts ...grpc.CallOption) (*notificationv1.ListNotificationsResponse, error)
 }
 
-// AIGatewayClient is the slice of the AI Gateway API the chat/playground
-// endpoints use. ChatCompletion is the server-streaming RPC the BFF relays to
-// the browser as SSE (the one piece of LLM real-time the BFF owns); the other
-// two are plain unary proxies. We segregate to exactly these three methods even
-// though the generated stub also exposes the prompt-registry RPCs — the BFF's
-// chat surface does not touch them, so naming only what we call keeps the
-// dependency honest and the mock tiny.
+// AIGatewayClient is the slice of the AI Gateway API the chat/playground AND
+// prompt-registry endpoints use. ChatCompletion is the server-streaming RPC the
+// BFF relays to the browser as SSE (the one piece of LLM real-time the BFF owns);
+// everything else is a plain unary proxy.
+//
+// The four Prompt RPCs (L3 — the prompt registry) are the new additions:
+// Create/Get/List version prompt templates, and Render expands a template's
+// {{variables}} against a supplied map server-side. We deliberately keep
+// rendering on the SERVER (not in the browser) so the SAME templating engine the
+// gateway uses at completion time produces the preview — a client-side {{ }}
+// replace would risk drifting from the real render and would also be a place to
+// accidentally introduce an injection sink. The BFF just forwards the variables
+// map and relays the rendered text as data.
 type AIGatewayClient interface {
 	ChatCompletion(ctx context.Context, in *aiv1.ChatCompletionRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[aiv1.ChatCompletionResponse], error)
 	ListProviders(ctx context.Context, in *aiv1.ListProvidersRequest, opts ...grpc.CallOption) (*aiv1.ListProvidersResponse, error)
 	GetUsage(ctx context.Context, in *aiv1.GetUsageRequest, opts ...grpc.CallOption) (*aiv1.GetUsageResponse, error)
+	CreatePrompt(ctx context.Context, in *aiv1.CreatePromptRequest, opts ...grpc.CallOption) (*aiv1.CreatePromptResponse, error)
+	GetPrompt(ctx context.Context, in *aiv1.GetPromptRequest, opts ...grpc.CallOption) (*aiv1.GetPromptResponse, error)
+	ListPrompts(ctx context.Context, in *aiv1.ListPromptsRequest, opts ...grpc.CallOption) (*aiv1.ListPromptsResponse, error)
+	RenderPrompt(ctx context.Context, in *aiv1.RenderPromptRequest, opts ...grpc.CallOption) (*aiv1.RenderPromptResponse, error)
 }

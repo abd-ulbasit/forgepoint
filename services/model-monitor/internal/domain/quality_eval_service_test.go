@@ -2,6 +2,10 @@ package domain
 
 import (
 	"context"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -84,6 +88,91 @@ func (s *fakeEvalStore) recordedCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.recorded)
+}
+
+// ListScores is the in-memory twin of the Postgres adapter's keyset read: it filters by
+// Team (mandatory), optional Model and Since, sorts NEWEST-FIRST by (created_at,
+// request_id) — the exact total order the adapter's index gives — and pages via the
+// opaque cursor. It includes BOTH scored and unscored rows (the dashboard surfaces
+// un-judgeable traffic), unlike RecentOverall. Keying the filter by Team is what makes
+// the team-isolation test real: a row for another team is simply never selected.
+func (s *fakeEvalStore) ListScores(_ context.Context, f EvalFilter, opts ListOptions) ([]Eval, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 1. FILTER on the same predicates the SQL WHERE applies (team mandatory; model/since
+	// optional). We never match on model alone — team always scopes first.
+	matched := make([]Eval, 0, len(s.recorded))
+	for _, e := range s.recorded {
+		if e.Team != f.Team {
+			continue
+		}
+		if f.Model != "" && e.Model != f.Model {
+			continue
+		}
+		if !f.Since.IsZero() && e.CreatedAt.Before(f.Since) {
+			continue
+		}
+		matched = append(matched, e)
+	}
+
+	// 2. SORT newest-first by (created_at, request_id) — the adapter's ORDER BY
+	// created_at DESC, request_id DESC. request_id is the tiebreaker (total order).
+	sort.Slice(matched, func(i, j int) bool {
+		if !matched[i].CreatedAt.Equal(matched[j].CreatedAt) {
+			return matched[i].CreatedAt.After(matched[j].CreatedAt)
+		}
+		return matched[i].RequestID > matched[j].RequestID
+	})
+
+	// 3. APPLY the keyset cursor: drop everything at-or-after the previous page's last
+	// (created_at, request_id) — i.e. keep rows strictly BEFORE it in the DESC order.
+	if opts.PageToken != "" {
+		ts, id, ok := decodeFakeEvalCursor(opts.PageToken)
+		if !ok {
+			return nil, "", fmt.Errorf("%w: bad eval page token", ErrValidation)
+		}
+		filtered := matched[:0:0]
+		for _, e := range matched {
+			if e.CreatedAt.Before(ts) || (e.CreatedAt.Equal(ts) && e.RequestID < id) {
+				filtered = append(filtered, e)
+			}
+		}
+		matched = filtered
+	}
+
+	// 4. PAGE: take PageSize, mint a cursor only when more rows remain (mirrors the
+	// adapter's +1 sentinel). PageSize is already defaulted/capped by the service.
+	size := opts.PageSize
+	if size <= 0 {
+		size = DefaultListPageSize
+	}
+	var next string
+	if len(matched) > size {
+		last := matched[size-1]
+		next = encodeFakeEvalCursor(last.CreatedAt, last.RequestID)
+		matched = matched[:size]
+	}
+	return matched, next, nil
+}
+
+// encodeFakeEvalCursor / decodeFakeEvalCursor are a trivial test-only cursor codec (the
+// real adapter uses base64url JSON; the fake just needs a round-trippable token to prove
+// the service forwards cursors correctly across pages).
+func encodeFakeEvalCursor(ts time.Time, id string) string {
+	return strconv.FormatInt(ts.UnixNano(), 10) + "|" + id
+}
+
+func decodeFakeEvalCursor(tok string) (time.Time, string, bool) {
+	i := strings.IndexByte(tok, '|')
+	if i < 0 {
+		return time.Time{}, "", false
+	}
+	ns, err := strconv.ParseInt(tok[:i], 10, 64)
+	if err != nil {
+		return time.Time{}, "", false
+	}
+	return time.Unix(0, ns), tok[i+1:], true
 }
 
 // qualityHarness bundles a wired QualityEvalService + its fakes.

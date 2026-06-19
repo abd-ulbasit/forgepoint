@@ -310,6 +310,7 @@ func main() {
 		publisher,
 		orch,
 		gate,
+		store.Evals(), // domain.EvalStore — READ by ListEvalScores (L4 eval dashboard); write path is QualityEvalService
 		cfg.RetrainCooldown,
 		nil, // production wall-clock (time.Now)
 	)

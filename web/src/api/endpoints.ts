@@ -16,23 +16,29 @@
 import { apiClient } from './client'
 import type {
   AIUsageResponse,
+  CreatePromptRequest,
+  CreatePromptResponse,
   ListProvidersResponse,
   DashboardResponse,
   GetExecutionResponse,
   GetModelResponse,
+  GetPromptResponse,
   GetRunResponse,
   GetUsageResponse,
   ListDriftReportsResponse,
+  ListEvalScoresResponse,
   ListModelsResponse,
   ListMonitorsResponse,
   ListNotificationsResponse,
   ListPipelinesResponse,
+  ListPromptsResponse,
   ListRunsResponse,
   ListVersionsResponse,
   LoginResponse,
   PageParams,
   RegisterModelRequest,
   RegisterModelResponse,
+  RenderPromptResponse,
   TriggerExecutionResponse,
 } from './types'
 
@@ -220,6 +226,67 @@ export async function getAIUsage(): Promise<AIUsageResponse> {
  */
 export function chatStreamUrl(): string {
   return `/api/v1/chat`
+}
+
+// ---- Prompt registry (L3) --------------------------------------------------
+
+/** GET /api/v1/prompts — paginated, newest-first prompt list. */
+export async function listPrompts(params?: PageParams): Promise<ListPromptsResponse> {
+  const { data } = await apiClient.get<ListPromptsResponse>('/v1/prompts', {
+    params: pageQuery(params),
+  })
+  return data
+}
+
+/** GET /api/v1/prompts/{name} — optionally pin a specific version. */
+export async function getPrompt(name: string, version?: number): Promise<GetPromptResponse> {
+  const { data } = await apiClient.get<GetPromptResponse>(
+    `/v1/prompts/${encodeURIComponent(name)}`,
+    { params: version ? { version: String(version) } : {} },
+  )
+  return data
+}
+
+/** POST /api/v1/prompts — create a prompt (or a new version of an existing name). */
+export async function createPrompt(body: CreatePromptRequest): Promise<CreatePromptResponse> {
+  const { data } = await apiClient.post<CreatePromptResponse>('/v1/prompts', body)
+  return data
+}
+
+/**
+ * POST /api/v1/prompts/{name}/render — expand the template's {{variables}}
+ * SERVER-SIDE against the supplied map. We render on the server (not in the
+ * browser) so the preview uses the exact engine the gateway uses at completion
+ * time. The rendered string is shown as plain TEXT in the UI.
+ */
+export async function renderPrompt(
+  name: string,
+  variables: Record<string, string>,
+  version?: number,
+): Promise<RenderPromptResponse> {
+  const body = version ? { version, variables } : { variables }
+  const { data } = await apiClient.post<RenderPromptResponse>(
+    `/v1/prompts/${encodeURIComponent(name)}/render`,
+    body,
+  )
+  return data
+}
+
+// ---- LLM evals (L4) --------------------------------------------------------
+
+/** GET /api/v1/evals — the caller team's recent quality evals (newest first).
+ *  Optional model_name + since (RFC3339) filters. */
+export async function listEvalScores(
+  params?: PageParams & { modelName?: string; since?: string },
+): Promise<ListEvalScoresResponse> {
+  const { data } = await apiClient.get<ListEvalScoresResponse>('/v1/evals', {
+    params: {
+      ...pageQuery(params),
+      ...(params?.modelName ? { model_name: params.modelName } : {}),
+      ...(params?.since ? { since: params.since } : {}),
+    },
+  })
+  return data
 }
 
 // ---- SSE watch URL ---------------------------------------------------------

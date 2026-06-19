@@ -13,6 +13,7 @@ import {
   BillingIcon,
   ChatIcon,
   DashboardIcon,
+  EvalsIcon,
   ExperimentsIcon,
   LogoutIcon,
   MenuIcon,
@@ -20,6 +21,7 @@ import {
   MonitoringIcon,
   NotificationsIcon,
   PipelinesIcon,
+  PromptsIcon,
 } from './icons'
 import type { ComponentType } from 'react'
 
@@ -32,6 +34,8 @@ interface NavItem {
 const NAV: NavItem[] = [
   { to: '/', label: 'Dashboard', Icon: DashboardIcon },
   { to: '/playground', label: 'Playground', Icon: ChatIcon },
+  { to: '/prompts', label: 'Prompts', Icon: PromptsIcon },
+  { to: '/evals', label: 'Evals', Icon: EvalsIcon },
   { to: '/models', label: 'Models', Icon: ModelsIcon },
   { to: '/pipelines', label: 'Pipelines', Icon: PipelinesIcon },
   { to: '/experiments', label: 'Experiments', Icon: ExperimentsIcon },

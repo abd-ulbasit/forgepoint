@@ -164,15 +164,25 @@ type Judge interface {
 	Score(ctx context.Context, c Completion) (JudgeScores, error)
 }
 
-// ============================================================================
-// EVAL STORE PORT (the Postgres adapter implements this)
-// ============================================================================
+// EvalFilter narrows a ListScores (eval-history) read for the L4 dashboard. It is
+// the eval-side analogue of ReportFilter (see ports.go) and follows the SAME tenancy
+// discipline: Team is REQUIRED and set by the SERVICE from the caller's auth claims —
+// never a client field — because a model name is not globally unique across teams
+// (team-a/"chatbot" ≠ team-b/"chatbot"). Model is an OPTIONAL filter (empty = ALL of
+// the team's models, the default cross-model dashboard view); Since is an OPTIONAL
+// lower bound on created_at (zero = unbounded). The adapter MUST always filter on team,
+// so an empty Model can never widen the read past the caller's own tenancy.
+type EvalFilter struct {
+	Team  string // REQUIRED, service-set from auth claims (tenant scope)
+	Model string // OPTIONAL: set = one model; empty = all of the team's models
+	Since time.Time
+}
 
-// EvalStore persists eval rows and reads back the rolling window for drift math.
-// TENANCY: every method is scoped by (team, model) TOGETHER — never model alone —
+// EvalStore persists eval rows and reads them back — both the rolling window for the
+// drift math (RecentOverall) and the paginated history for the dashboard (ListScores).
+// TENANCY: every method is scoped by Team (with Model) TOGETHER — never model alone —
 // for the exact same reason DriftReportRepository is (a model name is not globally
-// unique across teams). The adapter SQL must include `WHERE team = $1 AND model = $2`
-// on every read.
+// unique across teams). The adapter SQL must include `WHERE team = $1` on every read.
 type EvalStore interface {
 	// Record persists one eval row (scored or unscored). Idempotent on RequestID:
 	// re-recording the same request_id (stream redelivery) does NOT double-count the
@@ -184,6 +194,16 @@ type EvalStore interface {
 	// adapter (they carry no overall to average). This is the input to the rolling
 	// quality average + the drift decision.
 	RecentOverall(ctx context.Context, team, model string, limit int) ([]float64, error)
+	// ListScores returns a page of a team's eval ROWS (scored AND unscored), newest
+	// first, under the filter, plus an opaque next-page cursor. This is the READ MODEL
+	// behind the L4 eval dashboard — it returns whole Eval rows (every axis + scored
+	// flag + request_id + created_at), NOT just the overall averages RecentOverall
+	// gives the drift math. f.Team (service-set) is the mandatory scope; f.Model (when
+	// set) and f.Since narrow within it. The adapter paginates with a keyset cursor on
+	// (created_at, request_id) — the table's total order — so pages stay stable under
+	// the continuous insert of new evals. Unlike RecentOverall, UNSCORED rows ARE
+	// included: the dashboard wants to show un-judgeable traffic too.
+	ListScores(ctx context.Context, f EvalFilter, opts ListOptions) (scores []Eval, nextToken string, err error)
 }
 
 // ============================================================================
