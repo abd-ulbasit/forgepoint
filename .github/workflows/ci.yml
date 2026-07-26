@@ -7,7 +7,7 @@
 #   service under services/* is an INDEPENDENT module with its own go.mod.
 #   Running each module as its own matrix leg gives us:
 #     - Parallelism: legs run concurrently on separate runners → wall-clock CI
-#       stays flat as services are added (10 services don't make CI 10x slower).
+#       stays flat as services are added (N services don't make CI N times slower).
 #     - Isolation + signal: a failure names the exact module; a flaky service's
 #       test doesn't mask another's. Per-module dependency caching is precise.
 #     - Module-boundary enforcement: building a module on its own catches an
@@ -25,7 +25,7 @@
 # WHY Docker/testcontainers "just work" here:
 #   GitHub-hosted ubuntu runners ship a running Docker daemon. The integration
 #   tests use testcontainers-go to spin REAL Postgres/NATS/Redis — no service
-#   containers or DinD config needed. That is the whole reason CLAUDE.md says
+#   containers or DinD config needed. That is the whole reason the testing policy says
 #   "never mock databases": the same containers run locally and in CI.
 # =============================================================================
 
@@ -74,7 +74,19 @@ jobs:
         module:
           - pkg
           - gen/go
+          - cli
           - services/auth
+          - services/registry
+          - services/inference-gateway
+          - services/pipeline-orchestrator
+          - services/feature-store
+          - services/experiment-tracker
+          - services/billing
+          - services/notification
+          - services/model-serving
+          - services/model-monitor
+          - services/ai-gateway
+          - services/bff
     defaults:
       run:
         working-directory: ${{ matrix.module }}
@@ -124,10 +136,23 @@ jobs:
       matrix:
         # gen/go is intentionally excluded: .golangci.yml already excludes the
         # `gen` dir (generated code is not ours to lint), so a lint leg there
-        # would have nothing to do.
+        # would have nothing to do. Every other module in go.work is linted —
+        # a gate that covers two modules is not a gate.
         module:
           - pkg
+          - cli
           - services/auth
+          - services/registry
+          - services/inference-gateway
+          - services/pipeline-orchestrator
+          - services/feature-store
+          - services/experiment-tracker
+          - services/billing
+          - services/notification
+          - services/model-serving
+          - services/model-monitor
+          - services/ai-gateway
+          - services/bff
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

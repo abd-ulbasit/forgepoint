@@ -2,7 +2,7 @@
 # SECURITY — supply-chain gates (Forgepoint milestone M6)
 # =============================================================================
 #
-# This workflow implements the M6 "supply chain" standards from CLAUDE.md:
+# This workflow implements the M6 supply-chain standards:
 #   govulncheck (known-CVE Go deps) → Trivy (filesystem + image CVEs) →
 #   Syft SBOM (CycloneDX) → cosign keyless signature (Sigstore/OIDC).
 # Together they answer: "what's in our software, is any of it vulnerable, and

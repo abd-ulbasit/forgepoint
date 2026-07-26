@@ -10,7 +10,7 @@
 #     2. Backward-incompatible API change → `buf breaking` at FILE level (the
 #        strictest level: even a field rename, which is wire-compatible, is
 #        rejected because it breaks generated Go).
-#   This is our "contract test" tier from CLAUDE.md's testing conventions —
+#   This is the "contract test" tier of docs/design/service-architecture.md —
 #   run on every PR so a breaking change can't reach main unnoticed.
 #
 # WHY compare against the BASE branch (not the previous commit):

@@ -1,31 +1,51 @@
 # ============================================================================
-# golangci-lint Configuration
+# golangci-lint Configuration (schema v2)
 # ============================================================================
 #
 # WHY golangci-lint:
-#   Runs 50+ Go linters in parallel with shared AST parsing. Instead of
-#   managing individual linter binaries (errcheck, govet, etc.), this single
-#   tool handles everything with one config file.
+#   Runs the linters in parallel over one shared AST parse. Instead of managing
+#   individual linter binaries (errcheck, staticcheck, ...), one tool and one
+#   config file cover them all.
 #
-# LINTER CHOICES:
-#   - errcheck: Catches unchecked errors (Go's #1 bug source)
-#   - govet: Catches subtle bugs (printf format strings, struct tags, etc.)
-#   - staticcheck: Advanced static analysis (like a mini formal verifier)
-#   - unused: Finds dead code (functions, types, variables never referenced)
-#   - gosimple: Suggests simpler code constructs
-#   - ineffassign: Catches assignments to variables that are never read
-#   - misspell: Catches typos in comments and strings
-#   - gofmt/goimports: Enforces standard Go formatting
-#   - gocritic: Opinionated style checks (range over map, etc.)
-#   - revive: Extensible linter (successor to golint)
+# WHAT RUNS:
+#   `default: standard` turns on errcheck, govet, ineffassign, staticcheck and
+#   unused. (Schema v2 folded gosimple and stylecheck into staticcheck, so they
+#   are not separate entries.) On top of that:
+#   - gocritic:  the `diagnostic` tag only — the checks that find bugs
+#     (appendAssign, exitAfterDefer, sloppyReassign, deferInLoop). The `style`
+#     and `performance` tags are off: this codebase carries long design-rationale
+#     comment blocks and value-typed domain records by intent, and those two tags
+#     fire on both.
+#   - revive:    `unused-parameter`. The `exported` rule is off — Go's own
+#     convention is followed for the public API, but revive also demands a doc
+#     comment on every method of an unexported type implementing an interface
+#     (traceContextHandler.Handle, wrappedServerStream.Context, ...), which is
+#     noise on code that is not part of any package's public surface.
+#   - misspell:  typos. No `locale` is set on purpose — the codebase uses
+#     British spelling consistently ("cancelled" in 43 files vs "canceled" in 2),
+#     and `locale: US` would rewrite prose rather than catch typos.
+#   - prealloc, unconvert, unparam.
 #
-# DISABLED:
-#   - exhaustruct: Requires ALL struct fields to be set explicitly. Too noisy
-#     for proto-generated structs (which have dozens of fields). Would need
+# FORMATTING:
+#   In schema v2 formatters are a SEPARATE top-level block — naming gofmt under
+#   `linters:` is silently NOT a formatting gate. The `formatters:` block below
+#   is what makes `golangci-lint run` fail on unformatted code, and
+#   `golangci-lint fmt` fix it. goimports groups this repo's own packages last
+#   via local-prefixes.
+#
+# NOT ENABLED (deliberate):
+#   - exhaustruct: requires ALL struct fields to be set explicitly. Too noisy
+#     against proto-generated structs (dozens of fields) — it would need
 #     `//nolint:exhaustruct` on every proto conversion.
-#   - wrapcheck: Requires wrapping every error from external packages. Good
-#     in theory, but overly strict with gRPC status errors which should be
-#     returned as-is.
+#   - wrapcheck: requires wrapping every error from an external package. Good in
+#     theory, but a wrapped gRPC status error loses its status code.
+#
+# EXCLUSIONS:
+#   `presets: [std-error-handling, common-false-positives]` are golangci-lint's
+#   own curated sets. std-error-handling is what stops errcheck reporting every
+#   `defer conn.Close()` and `fmt.Fprintln(os.Stdout, ...)`; unchecked errors
+#   that actually matter are still reported.
+#   gen/ is protoc output — excluded from both the linters and the formatters.
 # ============================================================================
 
 version: "2"
@@ -44,34 +64,68 @@ linters:
     - prealloc
     - unconvert
     - unparam
-  disable:
-    # Too noisy for proto-generated struct conversions.
-    - exhaustruct
 
-linters-settings:
-  gocritic:
-    enabled-tags:
-      - diagnostic
-      - style
-      - performance
-  revive:
+  settings:
+    gocritic:
+      enabled-tags:
+        - diagnostic
+      disabled-checks:
+        # False-positive rate is 100% here. This codebase annotates wiring lines
+        # with trailing comments that restate a value — `natsutil.NewPublisher(js,
+        # events.Source) // source = "billing"` — and lists URI schemes in prose
+        # (`// s3://, gs://, etc.`). commentedOutCode reads both as dead code.
+        - commentedOutCode
+    revive:
+      rules:
+        - name: unused-parameter
+    misspell: {}
+
+  exclusions:
+    generated: lax
+    presets:
+      - std-error-handling
+      - common-false-positives
+    paths:
+      # Generated proto code — not our responsibility to lint.
+      - gen
     rules:
-      - name: exported
-        arguments:
-          - "checkPrivateReceivers"
-      - name: unused-parameter
-  misspell:
-    locale: US
+      # Test files: gocritic's opinions and unused-parameter on table-driven
+      # helpers are noise here. The correctness linters (errcheck, govet,
+      # staticcheck, ineffassign, unused) still apply to tests.
+      - path: _test\.go
+        linters:
+          - gocritic
+          - revive
+          - unparam
+          - prealloc
+
+      # exitAfterDefer in a composition root: every cmd/server/main.go registers
+      # `defer stop()` (signal.NotifyContext) and then `os.Exit(1)` on a startup
+      # error. The deferred call does not run — which is the intended behaviour:
+      # unregistering a signal handler microseconds before the process dies is a
+      # no-op, and a startup failure must exit non-zero so the pod restarts.
+      # KNOWN COST: an os.Exit after observability.Setup also skips the telemetry
+      # flush, so the last spans of a failed startup are lost; the error itself is
+      # already on stderr. Removing that would mean restructuring each main into
+      # `run() error`, which is tracked separately rather than silenced here.
+      - path: cmd/server/main\.go
+        text: exitAfterDefer
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      local-prefixes:
+        - github.com/abd-ulbasit/forgepoint
+  exclusions:
+    generated: lax
+    paths:
+      - gen
 
 issues:
-  exclude-dirs:
-    # Generated proto code — not our responsibility to lint
-    - gen
-  exclude-rules:
-    # Test files can have longer functions and magic numbers
-    - path: _test\.go
-      linters:
-        - gocritic
-        - revive
   max-issues-per-linter: 0
   max-same-issues: 0
