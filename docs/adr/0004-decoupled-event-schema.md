@@ -3,7 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-06-17
 **Deciders:** Abdul Basit Sajid
-**Context phase:** Implementation Plan — async backbone / per-service event wiring (M2)
+**Context phase:** async backbone / per-service event wiring (M2)
 
 ## Context
 

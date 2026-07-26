@@ -3,7 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-06-17
 **Deciders:** Abdul Basit Sajid
-**Context phase:** Implementation Plan — Phase 16 (Milestone M2)
+**Context phase:** Phase 16 (Milestone M2)
 
 ## Context
 
@@ -34,7 +34,7 @@ retraining — closing the loop.
 ### Option C — A dedicated **Model Monitor** service (chosen)
 - **Pro:** closes the loop with a clear owner; introduces a genuinely new pattern (windowed
   streaming aggregation + a control loop that acts on the platform); produces the missing
-  `ModelDriftDetected` event; the most "alive" story in the system (models that self-heal).
+  `ModelDriftDetected` event, which Notification already consumes but nothing published.
 - **Con:** a 10th service to build and operate.
 
 ## Decision
@@ -46,13 +46,14 @@ auto-retrain is enabled — calls the Pipeline Orchestrator to run the model's t
 The new version flows through the existing canary→promote saga, closing the loop.
 
 Deciding factor: this is the single change that makes "full ML lifecycle" *true* rather than
-aspirational, and it does so by adding learning value (streaming + control loop) instead of
-out-sourcing it.
+aspirational, and it keeps the streaming aggregation and the control loop inside the system —
+where their failure modes (late ground truth, window boundaries, retrain storms) are ours to
+handle — instead of out-sourcing them to a vendor.
 
 ## Consequences
 
 - **Positive:** the lifecycle is genuinely closed; `ModelDriftDetected` now has a producer; a
-  distinctive self-healing demo; a new pattern in the portfolio.
+  degrading model triggers its own retrain without an operator in the path.
 - **Negative:** more drift-math to implement and test; another service to deploy/monitor;
   ground-truth labels arrive late, so accuracy metrics lag (acknowledged in the windowing design).
 - **Follow-ups:** Progressive delivery (Phase 21) can consume the same drift signal as a canary

@@ -52,6 +52,11 @@ tmp/
 CLAUDE.md
 .claude/
 
+# Working build plan — a private task-by-task checklist, not documentation.
+# The architecture it produced is documented in docs/plans/forgepoint-platform-design.md
+# and docs/adr/.
+docs/plans/forgepoint-implementation-plan.md
+
 # Compiled service binaries from `go build`/`make build`
 services/*/server
 

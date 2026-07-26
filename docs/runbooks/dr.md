@@ -467,7 +467,7 @@ Run this checklist after every DR drill (quarterly minimum):
 
 - [ ] Wiped test cluster entirely (or used a separate cluster)
 - [ ] Followed Section 4 (full cluster restore) from scratch
-- [ ] All 10 services healthy and responding to grpcurl probes
+- [ ] Every service healthy and responding to grpcurl probes
 - [ ] Inference gateway returned a correct prediction
 - [ ] Noted total restore duration: ________ hours
 - [ ] Filed post-drill issues in GitHub (backup gaps, documentation errors)

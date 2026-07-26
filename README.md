@@ -6,8 +6,6 @@
 
 A full ML‑lifecycle platform built as **11 Go microservices** (plus a BFF), each implementing **one** distributed‑systems pattern to production depth rather than sketching several: saga with ordered compensation, CQRS, event sourcing, transactional outbox, circuit breaker, choreography, streaming drift detection. gRPC for sync, NATS JetStream for async, one Postgres per service, on Kubernetes. The lifecycle runs as a **closed loop** (serve → monitor → retrain) and ships via **GitOps**.
 
-> **Domain as a vehicle.** Forgepoint models an MLOps platform (train → register → deploy → serve → monitor → retrain), but the ML parts are deliberately thin (pre‑trained CPU ONNX models, no GPU). The real subject is **distributed‑systems engineering**: one well‑known pattern implemented properly per service, instrumented and deployed the way you would in production.
-
 ---
 
 ## The parts worth reading
@@ -25,6 +23,8 @@ The concurrency and durability edges, with the specific failure each one closes:
 - **Transactional outbox, including the crash between publish and stamp.** `RecordUsageTx` writes the usage row and its outbox rows in one transaction; the relay publishes and then stamps `published_at`. A crash in the gap leaves the row unpublished, the relay re-publishes on restart, and consumers dedupe on the outbox id — which *is* the `EventEnvelope.id`. At-least-once, never at-most-once. → `services/billing/internal/repository/postgres/usage_store.go`, `internal/events/relay.go`
 
 - **Drift statistics asserted against hand-computed arithmetic.** PSI, KL and KS are pure functions; the tests pin them to known distributions with the arithmetic written out in the test, because `score > 0` proves nothing about a drift detector. → `services/model-monitor/internal/domain/drift.go`, `drift_test.go`
+
+> **Scope of the ML layer.** Forgepoint models an MLOps platform (train → register → deploy → serve → monitor → retrain), but the ML itself is thin on purpose: pre‑trained CPU ONNX models, no GPU, no training framework. The subject is the **distributed‑systems layer** — the lifecycle is the workload that gives those patterns something real to coordinate.
 
 ---
 
@@ -62,29 +62,15 @@ A **Backend‑for‑Frontend (BFF)** + web UI and an `fp` **CLI** sit in front o
 
 ## Status
 
-The **10 M0–M6 services** are code‑complete across every layer — built test‑first with adversarial bug/security verification, and validated with the race detector against real Postgres/Redis/NATS (testcontainers). **All 10 are deployed and running on Kubernetes (k3s), JWT-authenticated end to end** — with a live cross-service E2E + k6 load suite, a Web UI / `fp` CLI / Python SDK product surface, and SRE / service-mesh / audit / backup operability.
+Every service is complete through all four layers — domain, gRPC handlers, Postgres/Redis adapters plus migrations, and NATS event publish/consume — and the persistence and event layers are tested against real Postgres, Redis and NATS via testcontainers under `-race`. The counts are checkable in the tree: **15 Go modules** in `go.work`, **12 Helm charts** (11 services + BFF), **10 service Applications + `infra.yaml`** in `deploy/argocd/apps/`, **162 `_test.go` files**.
 
-The **AI Gateway (M7, LLMOps)** is the 11th service: built, tested and Helm-charted, but not yet added to the ArgoCD app-of-apps — so the counts below are M0–M6 unless stated. See the table.
+It runs on a single-node k3s cluster at home, which is not publicly reachable — so treat any deployment claim here as unverifiable from the repo. What *is* verifiable is the delivery layer that produced it: the Helm charts, the ArgoCD app-of-apps, the Istio `PeerAuthentication`/`AuthorizationPolicy` set, the Kyverno policies, the Terraform modules, the E2E script in `tools/e2e/` and the k6 scripts in `load/`.
 
-| Area | State |
-|---|---|
-| `pkg/` shared libraries | ✅ Built & tested (build · vet · `-race`) |
-| Proto contracts + `events/v1` event schema | ✅ All 10 services, `buf` lint/breaking |
-| Service **domains** (one pattern each) | ✅ All 10 — TDD + adversarial review |
-| Service **handlers** (gRPC, proto↔domain) | ✅ All 10 — bufconn component tests |
-| **Persistence** (Postgres/Redis adapters + migrations) | ✅ All 10 — testcontainers `-race` |
-| **Events** (NATS pub/sub, idempotent, DLQ, **protojson** wire format) + wiring | ✅ All 10 — testcontainers `-race` |
-| Helm charts | ✅ All 11 + BFF |
-| ArgoCD app‑of‑apps | ✅ 10 (M0–M6); AI Gateway chart not yet registered |
-| k8s data infra (NATS/Postgres/Redis/MinIO) | ✅ Deployed to k3s `fp-infra` |
-| Observability stack · CI/CD + supply‑chain · M6 (Kyverno/GitOps/secrets) · Terraform (AWS) | ✅ Authored |
-| **Deployed & running** (image → k3s → Helm) | ✅ 10/10 M0–M6 services + BFF + infra; JWT-auth end to end |
-| Cross-service **E2E** + **k6** load | ✅ Live (login → register → read-back → cross-service event propagation; CQRS read model + DLQ-clean; thresholds green) |
-| **Web UI** (BFF + React SPA) · **`fp` CLI** · **Python SDK** + API docs | ✅ M4 product surface |
-| **AI Gateway** (M7 — provider failover · token budgets · semantic cache · prompt registry · LLM-as-judge evals) | ✅ Built & tested; chart authored |
-| **SRE** (SLOs · burn-rate alerts · runbooks) · **Istio** mesh (STRICT mTLS · deny-by-default authz) · tamper-evident **audit log** · **Backup/DR** | ✅ M3 / M6 / M5 |
+Three gaps, stated rather than buried:
 
-See the [implementation plan](docs/plans/forgepoint-implementation-plan.md) for the full phased roadmap and the [ADRs](docs/adr/) for the key decisions.
+- **AI Gateway (M7) is not in the app-of-apps.** It is built, tested and Helm-charted, but `deploy/argocd/apps/` holds 10 service Applications, not 11 — so it deploys by `helm install`, not by GitOps.
+- **The testcontainers tests self-skip without a Docker engine.** On a machine with no reachable engine they skip rather than fail, and they are ~18% of the suite — concentrated in exactly the persistence and event layers. `go test ./...` coming back green on such a machine is not evidence those ran; check the skip count.
+- **`docs/diagrams/c4-architecture.md` covers M0–M6 only.** The AI Gateway is not yet in the container diagram.
 
 ### Shared libraries (`pkg/`)
 
@@ -133,8 +119,10 @@ pkg/          Shared libraries (built & tested)
 services/     The 11 microservices + BFF
 deploy/       Helm, K8s manifests, Terraform, Skaffold
 docs/
-  plans/      Platform design + phased implementation plan
+  plans/      Platform + LLMOps design docs
   adr/        Architecture Decision Records
+  design/     Per-service design notes
+  diagrams/   C4 diagrams (M0–M6)
 docker-compose.yaml   Local infrastructure
 ```
 
@@ -142,9 +130,10 @@ docker-compose.yaml   Local infrastructure
 
 ## Documentation
 
+- **[Architecture Decision Records](docs/adr/)** — the non‑obvious decisions, each with the options rejected and what the choice costs.
 - **[Platform design](docs/plans/forgepoint-platform-design.md)** — architecture, services, communication, infra.
-- **[Implementation plan](docs/plans/forgepoint-implementation-plan.md)** — phased roadmap with Core/Stretch tiers.
-- **[Architecture Decision Records](docs/adr/)** — non‑obvious decisions and their tradeoffs.
+- **[LLMOps extension design](docs/plans/forgepoint-llmops-extension-design.md)** — how the M0–M6 patterns were re‑applied to LLM infrastructure (M7).
+- **[Per-service design notes](docs/design/)** · **[C4 diagrams](docs/diagrams/)** · **[Proto reference](docs/api/proto-reference.md)**
 
 ---
 

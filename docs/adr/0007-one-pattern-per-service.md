@@ -3,7 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-06-17
 **Deciders:** Abdul Basit Sajid
-**Context phase:** Implementation Plan — platform-wide service design (M1–M2)
+**Context phase:** platform-wide service design (M1–M2)
 
 ## Context
 
@@ -30,7 +30,8 @@ canonical home, readable end-to-end, without the result feeling contrived?
 - **Con:** no service is the *clean* exemplar of any pattern — the saga logic, the outbox, the
   circuit breaker all appear in several services partially. Depth is diluted and no single
   file shows a pattern end-to-end.
-- **Con:** more total complexity per service, slower to a polished, explainable state.
+- **Con:** more total complexity per service, and a change to one pattern touches several
+  services instead of one.
 
 ### Option B — Deliberately assign ONE headline pattern per service (chosen)
 
@@ -41,9 +42,9 @@ around its one pattern.
 
 - **Pro:** every pattern has a **single canonical home** you can read top-to-bottom.
   "Where's CQRS?" → `services/registry`. "Where's the outbox?" → `services/billing`.
-- **Pro:** each service stays small enough to polish and explain line-by-line.
-- **Pro:** the 10 patterns together still compose a *coherent, working* platform (the lifecycle
-  closes), so the result is a working platform rather than a catalog of disconnected demos.
+- **Pro:** each service stays small enough that its whole pattern fits in one review.
+- **Pro:** the patterns together still compose a *coherent, working* platform (the lifecycle
+  closes), so the seams between them are exercised rather than assumed.
 - **Con:** **less realistic** — a production registry would blend CQRS with an outbox and a
   promotion saga; here those live in *different* services. We accept the simplification and
   name it (see Consequences) rather than hide it.
@@ -53,8 +54,9 @@ around its one pattern.
 Standalone demos, one per pattern, not wired into a lifecycle.
 
 - **Pro:** maximal pattern isolation.
-- **Con:** no end-to-end system, no "alive" story, nothing that demonstrates the patterns
-  *cooperating* — the weakest portfolio narrative.
+- **Con:** the interesting failures only happen where patterns meet — a saga compensating over
+  an outbox, a CQRS projection lagging the write model, a circuit breaker tripping mid-saga.
+  Isolated demos never exercise those seams, so the hard parts stay untested.
 
 ## Decision
 
@@ -84,9 +86,9 @@ codebase optimizes for one legible implementation of each pattern.
 
 ## Consequences
 
-- **Positive:** a single canonical, line-by-line-explainable home for each pattern;
-  small, polishable services; the patterns still cooperate in one working closed-loop platform
-  (not a disconnected catalog).
+- **Positive:** a single canonical, reviewable home for each pattern; small services; the
+  patterns still cooperate in one working closed-loop platform, so cross-pattern seams get
+  exercised rather than assumed.
 - **Negative:** **deliberately less realistic than production** — real services blend patterns
   (a production registry would also carry an outbox and a promotion saga). We own this
   explicitly: the *primary* concern of each service is its headline pattern; secondary

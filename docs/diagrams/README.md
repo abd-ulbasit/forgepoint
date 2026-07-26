@@ -12,7 +12,7 @@ the system they describe.
 
 ### [`c4-architecture.md`](./c4-architecture.md) — the C4 model
 
-A [C4](https://c4model.com/) walk from the outside in, each diagram with a teaching paragraph:
+A [C4](https://c4model.com/) walk from the outside in, each diagram with a note on what it shows:
 
 - **Level 1 — System Context:** the actors (ML Engineer, API Client, Operator), the Forgepoint
   boundary, and the external world it touches (notification channels, infrastructure). No cloud

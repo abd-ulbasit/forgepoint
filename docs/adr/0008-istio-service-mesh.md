@@ -3,7 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-06-18
 **Deciders:** Abdul Basit Sajid
-**Context phase:** M3 Production hardening — Phase 10 (Istio service mesh), per CLAUDE.md build priority
+**Context phase:** M3 Production hardening — Phase 10 (Istio service mesh)
 
 ## Context
 
@@ -31,7 +31,7 @@ every service hop), **defense-in-depth authz** (workload identity *and* user ide
 **uniform L7 observability** (golden metrics/traces for every hop without per-service
 code), and **mesh-native traffic management** (exact canary weighting, transport
 circuit breaking) — **without** rewriting the services and **without** discarding the
-app-layer patterns that are themselves the teaching artifacts (ADR 0007).
+app-layer patterns that are the point of the codebase (ADR 0007).
 
 And one hard constraint: the homelab k3s node has ~7 GB RAM and cannot host istiod +
 sidecars, so whatever we choose must be **authorable and correct now, installable
@@ -46,7 +46,7 @@ isolation.
 
 - **Pro:** zero new infra; no sidecar memory/latency tax; simplest to run on the homelab.
 - **Pro:** the app circuit breaker / saga split / JWT auth already exist and are the
-  ADR-0007 teaching patterns.
+  ADR-0007 headline patterns.
 - **Con:** **no transport encryption** and **no workload identity** — the zero-trust
   story is missing its foundation; a stolen JWT from any pod is fully usable.
 - **Con:** NetworkPolicy is **IP/namespace**-grained and is a **no-op on Flannel** — not
@@ -70,7 +70,7 @@ traffic management **transparently** — the services don't change.
   app-layer breaker/split rather than replacing them.
 - **Pro:** free, uniform L7 telemetry + mTLS cert rotation; services untouched.
 - **Con:** **operational complexity + cost** — istiod, a sidecar per pod (~50–100 MB +
-  a small latency hop), a new CRD surface, and a real learning/operating burden.
+  a small latency hop), a new CRD surface, and a real operating burden.
 - **Con:** footguns (probes under STRICT, stateful infra in the mesh, the
   empty-policy-means-deny-all semantic) must be understood or they cause outages.
 
@@ -82,10 +82,10 @@ per-pod sidecar; a per-node ztunnel for L4 mTLS + optional waypoints for L7).
 - **Pro:** lower memory/latency overhead; Linkerd is famously simpler to operate.
 - **Pro:** Istio ambient removes the per-pod sidecar tax — attractive for a small cluster.
 - **Con:** Linkerd's L7 authorization + traffic-management surface is **less rich** than
-  Istio's (no equally expressive AuthorizationPolicy/VirtualService); weaker as a
-  *teaching* instrument for the patterns we want to show.
+  Istio's (no equally expressive AuthorizationPolicy/VirtualService), so the
+  authorization policies this platform needs would have to be expressed less precisely.
 - **Con:** Istio ambient's L7 (waypoint) story was still maturing at authoring time;
-  the **sidecar** model is the canonical, best-documented one to *learn and explain*.
+  the **sidecar** model is the canonical, best-documented one to operate.
 
 ## Decision
 
@@ -186,7 +186,7 @@ cluster (multi-node Kind / larger k3s / **EKS via M5 Terraform**).
   `fp-models`. The *install path* actually resolved serving to `fp-system` for BOTH Helm
   (the Makefile forced `--namespace fp-system` for all charts) and the Argo Rollouts
   manifests (hardcoded `fp-system`) — while the BFF config, the gateway/BFF egress
-  allow-lists, the CLAUDE.md namespace map, and these mesh objects all expected `fp-models`.
+  allow-lists, the namespace map in `deploy/istio/00-namespaces.yaml`, and these mesh objects all expected `fp-models`.
   Net effect of the bug: the fp-models `DestinationRule` + `AuthorizationPolicy` selected
   **zero** pods while serving ran in `fp-system` under the deny-all baseline with no allow
   for inference-gateway → serving — the real predict edge was BLOCKED/misrouted and the

@@ -25,7 +25,7 @@
 
 ## Level 1 — System Context
 
-**Teaching note.** At this zoom Forgepoint is **one box**. The point of a Context diagram is to
+**Reading this diagram.** At this zoom Forgepoint is **one box**. The point of a Context diagram is to
 fix the *boundary* and the *actors*, not the internals. Three human/role actors drive the
 system: **ML Engineers** (register models, define pipelines, read drift), **API Clients** (the
 apps and SDKs that send the high-volume `predict` traffic), and **Platform Operators** (run it,
@@ -68,7 +68,7 @@ C4Context
 
 ## Level 2 — Containers
 
-**Teaching note.** This is the workhorse diagram: the **10 services**, the **edge tier** (API
+**Reading this diagram.** This is the workhorse diagram: the **10 services**, the **edge tier** (API
 Gateway + BFF), the **data infrastructure** (a Postgres database *per service* — never shared —
 plus shared Redis, NATS JetStream, and MinIO/S3), and the **observability** sink. The shape to
 internalise is a **request spine that is synchronous** and an **event fabric that is
@@ -243,7 +243,7 @@ patterns: the **saga**, the **closed loop**, and **CQRS**.
 
 ### 3a — Pipeline Orchestrator (Saga + DAG engine)
 
-**Teaching note.** The orchestrator is the platform's **Temporal-lite**: a generic workflow
+**Reading this diagram.** The orchestrator is the platform's **Temporal-lite**: a generic workflow
 engine where the *engine is pure* and all side effects live behind one port. The component to
 stare at is **`StepExecutor`** (`internal/domain/ports.go`) — the engine sequences steps, runs
 the **state machine** (`PENDING→RUNNING→COMPLETED/FAILED`, then `COMPENSATING`), and on failure
@@ -319,7 +319,7 @@ flowchart TB
 
 ### 3b — Model Monitor (the closed loop: sense → decide → act)
 
-**Teaching note.** Model Monitor is where the lifecycle becomes a *loop*. It runs a
+**Reading this diagram.** Model Monitor is where the lifecycle becomes a *loop*. It runs a
 **streaming-aggregation control loop**: every `fp.inference.completed` is folded into a per-model
 **sliding Window** (Redis); when a window closes it is scored against the model's **training
 baseline** (resolved server-side from the Registry — never client-supplied, so an attacker can't
@@ -384,7 +384,7 @@ flowchart TB
 
 ### 3c — Model Registry (CQRS)
 
-**Teaching note.** The Registry is the canonical **CQRS** lesson: the *write model* and the
+**Reading this diagram.** The Registry is the canonical **CQRS** case: the *write model* and the
 *read model* are **separate stores with separate ports**. Commands (`RegisterModel`,
 `CreateVersion`, `PromoteVersion`, …) go to the **WriteStore** (Postgres) — the normalized
 source of truth, where transactions enforce the invariants (`(team,name)` uniqueness, and the
@@ -440,7 +440,7 @@ flowchart LR
 
 ## The Closed Loop — `serve → monitor → retrain → promote → serve`
 
-**Teaching note.** This is the sequence the whole platform exists to demonstrate: a model that
+**Reading this diagram.** This is the sequence the whole platform exists to demonstrate: a model that
 **degrades in production heals itself** with no human in the hot path. Follow the wall between
 sync and async. The prediction (1–2) is **synchronous** and fast. Everything that closes the
 loop rides the **async** fabric: the single `fp.inference.completed` (3) fans out to billing,

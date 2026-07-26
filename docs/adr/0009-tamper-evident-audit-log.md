@@ -3,7 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-06-18
 **Deciders:** Abdul Basit Sajid
-**Context phase:** Implementation Plan — Phase 25 / platform security (M6)
+**Context phase:** Phase 25 / platform security (M6)
 
 ## Context
 

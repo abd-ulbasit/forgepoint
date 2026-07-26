@@ -1,6 +1,6 @@
 # Canonical Service Architecture (the template every service follows)
 
-> This is the reference structure for all 10 microservices, distilled from the Auth service
+> This is the reference structure every service in the platform follows, distilled from the Auth service
 > (the first one built). Every new service mirrors this so the platform stays uniform. When
 > in doubt, read `services/auth/` — it is the worked example.
 
@@ -73,10 +73,10 @@ logs or error responses (interceptor sanitizes status messages). Validate/cap al
 sizes and batch sizes. Idempotency keys on mutating RPCs. crypto/rand for tokens/ids;
 constant-time compares for secrets.
 
-## Testing (TDD, per CLAUDE.md)
+## Testing (TDD)
 
-Unit (domain, mock ports, `-race`) → Integration (testcontainers Postgres/NATS/Redis on the
-remote thinkpad engine; see the offload memory) → Component (bufconn in-process gRPC). Tests must
+Unit (domain, mock ports, `-race`) → Integration (testcontainers Postgres/NATS/Redis — they need a
+reachable Docker engine and self-skip without one) → Component (bufconn in-process gRPC). Tests must
 verify **real behavior** (e.g. the stored hash actually verifies), not just mock interactions.
 Coverage target: 80%+ domain, 70%+ handlers.
 

@@ -1,7 +1,7 @@
 # Architecture Decision Records
 
 Every non-obvious architectural decision is captured here as an ADR (see the project
-standards in `CLAUDE.md`). ADRs are immutable once Accepted — to change a decision, add a new
+standards in `docs/design/service-architecture.md`). ADRs are immutable once Accepted — to change a decision, add a new
 ADR that supersedes the old one and update the status.
 
 **Format:** Context → Options Considered → Decision → Consequences. Number sequentially,

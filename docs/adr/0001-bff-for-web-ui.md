@@ -3,7 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-06-10
 **Deciders:** Abdul Basit Sajid
-**Context phase:** Implementation Plan — Phase 14
+**Context phase:** Phase 14
 
 ## Context
 

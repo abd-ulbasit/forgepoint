@@ -4,14 +4,21 @@
 **Status:** Approved
 **Author:** Abdul Basit Sajid
 
+> **Scope note (2026-06).** This document is the M0–M6 design as approved, and the
+> service count below (10) is the count at that date. An 11th service — `ai-gateway`
+> (M7, LLMOps) — was added later and is designed in
+> [`forgepoint-llmops-extension-design.md`](forgepoint-llmops-extension-design.md);
+> the addendum to [ADR 0007](../adr/0007-one-pattern-per-service.md) records why it
+> deliberately reuses existing patterns rather than introducing a new one. This file
+> is left at its original scope rather than retro-edited.
+
 ## Overview
 
 Forgepoint is a full ML lifecycle platform built as a distributed microservices system in Go. It covers model training, registration, deployment, serving, monitoring, and retraining as a **closed loop** — orchestrated across 10 independent services communicating via gRPC (sync) and NATS JetStream (async), deployed on Kubernetes via GitOps (ArgoCD).
 
 **Goals:**
-- Learn every major microservices pattern (saga, CQRS, event sourcing, choreography, outbox, etc.) with a real, production-standard project
-- Build a portfolio-grade, production-standard project demonstrating platform-engineering practice
-- Demonstrate mastery of Go, Kubernetes, distributed systems, and cloud-native infrastructure
+- Implement each major microservices pattern (saga, CQRS, event sourcing, choreography, outbox) to production depth in a single canonical place, rather than sketching several per service
+- Hold the platform to production operating standards: per-service databases, race-tested persistence against real Postgres/Redis/NATS, tracing/metrics/logs on every hop, GitOps delivery
 - Cover the full MLOps lifecycle: train → register → deploy → serve → monitor → retrain
 - Deliver a polished, working product with good UX — including a web UI as a first-class interface alongside the CLI and gRPC/HTTP APIs
 
@@ -228,7 +235,7 @@ of `ModelDriftDetected`, the event the Notification service already reacts to.
 
 ## Pattern Coverage
 
-| Pattern | Service | What It Teaches |
+| Pattern | Service | What It Solves |
 |---------|---------|-----------------|
 | **Saga (Orchestration)** | Pipeline Orchestrator | Distributed transactions, compensation, durability |
 | **CQRS** | Model Registry | Read/write separation, projections, eventual consistency |

@@ -1,6 +1,6 @@
 # Forgepoint LLMOps Extension — Design Doc (M7)
 
-**Status:** Draft for sign-off · **Author:** AI-implemented, developer-directed · **Date:** 2026-06-18
+**Status:** Accepted · **Author:** Abdul Basit Sajid · **Date:** 2026-06-18
 
 This extends Forgepoint from a **classic MLOps** platform (train→register→serve→monitor→retrain)
 into an **LLMOps / AI-platform** layer (gateway → serve → cache → eval → govern), reusing the exact
@@ -8,28 +8,32 @@ distributed-systems patterns already built. It is M7 in the roadmap.
 
 ---
 
-## 1. Why this, why now
+## 1. Why this
 
-By 2026 the hiring/spend center of gravity for "Platform Engineer (Go/K8s)" moved from classic
-MLOps (commoditized) to **AI/LLM infrastructure**: AI gateways, LLM serving, semantic caching,
-token-cost governance, evals/quality monitoring. The decisive insight for Forgepoint:
+M0–M6 built each distributed-systems pattern once, against a classic-model workload. The open
+question is whether those implementations are actually general or whether they were shaped by
+that one workload. An LLM serving path is the sharpest available test: it has a different
+latency profile (seconds, streamed, not milliseconds), a different cost model (per token, not
+per request), a different failure mode (a provider that degrades rather than errors), and a
+different cache key (semantic, not exact).
 
-> **The platform patterns are model-size-agnostic.** An AI gateway's circuit-breaker, token
-> budget, semantic cache, and streaming code is byte-identical whether the backend is a 135 M
-> local model or GPT-4. So we keep the *model* thin (smallest local models) and make the
-> *infrastructure* real — the same "domain as a vehicle" principle that governs the ONNX side.
+> **The platform layer is model-size-agnostic.** An AI gateway's circuit breaker, token budget,
+> semantic cache and streaming path are the same code whether the backend is a 135 M local model
+> or a frontier API. So the *model* stays thin (smallest local models) and the *infrastructure*
+> is the real work — the same split the ONNX side already uses.
 
-**Thesis:** the classic-MLOps patterns extend to LLM infrastructure unchanged — provider
-failover via circuit breaker, per-tenant token budgets via distributed rate-limiting, semantic
-cache, cost chargeback, and eval-gated quality monitoring.
+**What this tests:** whether provider failover falls out of the existing circuit breaker,
+per-tenant token budgets out of the distributed rate limiter, cost chargeback out of the outbox,
+and eval-gated quality out of the drift/closed-loop machinery — without re-deriving any of them.
+Where a pattern does *not* transfer cleanly, that is the finding worth recording.
 
 ---
 
-## 2. Compute reality (the hard constraint) — smallest models, on the thinkpad
+## 2. Compute reality (the hard constraint) — smallest models, on the k3s node
 
 The homelab is a single **k3s node, ~7 GB RAM, no GPU**, already running 10 services + BFF + infra.
-Per the directive: **run the LLMs locally on the thinkpad via Ollama — no Mac, no GPU, smallest
-possible models, and do not let them sit resident.**
+The constraint this design is built around: **run the LLMs on that node via Ollama — no GPU,
+smallest usable models, and never resident when idle.** Everything below follows from it.
 
 | Concern | Decision |
 |---|---|
@@ -52,7 +56,7 @@ if keys are present, for the genuine cross-provider demo.
 ```
                        ┌──────────── AI Gateway (new) ────────────┐
  Web Chat/Playground → │ routing · provider failover · streaming  │ → Provider:
- (BFF SSE)             │ token budgets · semantic cache · guardrail│    • Ollama (thinkpad, KEDA 0→1)
+ (BFF SSE)             │ token budgets · semantic cache · guardrail│    • Ollama (in-cluster, KEDA 0→1)
                        └───────────────┬──────────────────────────┘    • Stub (tests)
                                        │  emits usage events                • Cloud (optional)
                    ┌───────────────────┼─────────────────────┬───────────────┐
@@ -87,7 +91,7 @@ Net new code is mostly *domain glue + a provider abstraction* — the hard infra
 
 **D2 — LLM serving deployment.**
 - *A. Ollama as a k3s Deployment + KEDA scale-to-zero* (recommended) — in-cluster, demonstrates autoscaling, network-policy-governed. Needs a KEDA HTTP/queue trigger + a cold-start budget (~2–5 s first token).
-- *B. Ollama as a host systemd service on the thinkpad* — simplest, lowest overhead, but outside the k8s story (no autoscaling demo).
+- *B. Ollama as a host systemd service on the node* — simplest, lowest overhead, but outside the k8s story (no autoscaling demo).
 - **Recommendation: A**, model `qwen2.5:0.5b`, `keep_alive=30s`, memory limit ~2 Gi, with B as the fallback if cold-start hurts demos.
 
 **D3 — Provider set.** Built-in **Ollama + Stub**; **cloud optional** (config + secret-gated). Recommendation: ship Ollama+Stub; add an `OpenAIProvider`/`AnthropicProvider` behind `AI_PROVIDERS` config so the cross-provider failover demo works with *two local models* by default and *cloud* if keys exist.
@@ -114,7 +118,7 @@ Net new code is mostly *domain glue + a provider abstraction* — the hard infra
 
 ## 6. Milestones (L-phases)
 
-- **L0 — Foundation:** Ollama on thinkpad (k3s Deployment + KEDA scale-to-zero) with `qwen2.5:0.5b` + `all-minilm`; the `Provider` interface + `StubProvider` + `OllamaProvider`; smoke test (chat + embed). *Pattern: serving + autoscale.*
+- **L0 — Foundation:** Ollama in-cluster (k3s Deployment + KEDA scale-to-zero) with `qwen2.5:0.5b` + `all-minilm`; the `Provider` interface + `StubProvider` + `OllamaProvider`; smoke test (chat + embed). *Pattern: serving + autoscale.*
 - **L1 — AI Gateway core:** `ai-gateway` service — chat routing, **streaming**, **circuit-breaker provider failover**, **per-tenant token budgets** (rate-limiter), basic guardrails (PII/length). Proto→domain→handler→events→BFF SSE→Web chat page. *Adversarially verified.*
 - **L2 — Semantic cache + cost:** embedding-based cache (Ollama+Redis); token-cost metering via **billing outbox**; usage page.
 - **L3 — Prompt registry:** versioned prompts (CQRS), render-with-vars, dev/prod stages, gateway uses them.
@@ -141,7 +145,7 @@ deployed to k3s — same bar as M0–M6.
 2. **D2**: Ollama as k3s Deployment + KEDA scale-to-zero (recommended) vs. host systemd?
 3. **D3**: ship Ollama+Stub now, cloud providers optional/key-gated (recommended) — or include a cloud provider from L1?
 4. **Model**: `qwen2.5:0.5b` (recommended) vs. `smollm2:360m`/`135m` (smaller, lower quality)?
-5. **Scope of first cut**: stop after **L1+L2** (gateway + cache + cost — a complete, demoable AI gateway) and assess, or commit the full L0–L5 up front?
+5. **Scope of first cut**: stop after **L1+L2** (gateway + cache + cost — a complete, usable AI gateway) and assess, or commit the full L0–L5 up front?
 
-On sign-off I will build L0→L1 first (the smallest end-to-end slice: thinkpad Ollama → gateway →
+Build order: L0→L1 first (the smallest end-to-end slice: Ollama → gateway →
 streaming chat in the Web UI), then proceed phase-by-phase.

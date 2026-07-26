@@ -1,8 +1,8 @@
 # Phase 1 Design Note — Auth/IAM Service
 
-> Per-phase design doc. The task-by-task mechanics live in
-> `docs/plans/forgepoint-implementation-plan.md` (Phase 1). This note captures the
-> **architectural decisions and their tradeoffs** — the parts worth defending line by line.
+> Per-phase design doc, capturing the **architectural decisions and their tradeoffs**
+> for the first service built. Platform-wide context is in
+> [`docs/plans/forgepoint-platform-design.md`](../plans/forgepoint-platform-design.md).
 
 ## What this service is
 

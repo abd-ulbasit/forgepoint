@@ -3,7 +3,7 @@
 **Status:** Accepted
 **Date:** 2026-06-17
 **Deciders:** Abdul Basit Sajid
-**Context phase:** Implementation Plan — Phase 1.3/1.4 (Auth domain + repositories), generalized to every service
+**Context phase:** Phase 1.3/1.4 (Auth domain + repositories), generalized to every service
 
 ## Context
 

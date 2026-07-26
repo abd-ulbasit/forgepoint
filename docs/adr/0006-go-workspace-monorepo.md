@@ -3,11 +3,11 @@
 **Status:** Accepted
 **Date:** 2026-06-17
 **Deciders:** Abdul Basit Sajid
-**Context phase:** Implementation Plan — M0 Foundation (repo layout, build tooling)
+**Context phase:** M0 Foundation (repo layout, build tooling)
 
 ## Context
 
-Forgepoint is 10 microservices plus shared libraries (`pkg/`) and generated proto code
+Forgepoint is 11 microservices plus a BFF, shared libraries (`pkg/`) and generated proto code
 (`gen/go/`). They must (a) **share code** — every service imports `pkg/config`,
 `pkg/observability`, `pkg/grpcutil`, `pkg/natsutil`, `pkg/health`, and the generated types in
 `gen/go/` — while (b) staying **independently versioned and independently built**, so a Redis
@@ -28,7 +28,7 @@ per-service images.
 ### Option A — Single-module monolith (one `go.mod` for the whole repo)
 
 - **Pro:** dead simple; every import just works; no workspace machinery.
-- **Con:** **one dependency graph for all 10 services** — a version bump any service needs is
+- **Con:** **one dependency graph for every service** — a version bump any service needs is
   forced on all of them. No independent evolution; no module isolation; the antithesis of
   "database/dependencies per service."
 
@@ -36,8 +36,9 @@ per-service images.
 
 - **Pro:** maximal isolation; each service truly standalone.
 - **Con:** cross-cutting changes (a proto edit, a `pkg` API change) become a multi-repo,
-  multi-PR, version-bump-and-publish dance. For a solo portfolio platform the coordination
-  overhead is pure tax with no payoff.
+  multi-PR, version-bump-and-publish dance. With a single team owning every module, that
+  coordination overhead buys nothing — it exists to decouple teams that ship on different
+  cadences, which is not the situation here.
 - **Con:** `pkg`/`gen/go` must be **published and versioned** for services to consume them —
   every shared-lib change is a release.
 
@@ -69,8 +70,8 @@ its own `go.mod`; `pkg/` and `gen/go/` are sibling modules the workspace resolve
 ## Decision
 
 Adopt **Option D**: a **Go workspace monorepo** — `go.work` + a module per service +
-`gen/go` + `pkg`. The `go.work` `use(...)` block lists `./gen/go`, `./pkg`, and all 10
-`./services/*` modules; the workspace declares `go 1.26.0`.
+`gen/go` + `pkg`. The `go.work` `use(...)` block lists `./gen/go`, `./pkg`, `./cli` and every
+`./services/*` module (15 entries today); the workspace declares `go 1.26.0`.
 
 Three gotchas are part of the decision (each cost real debugging; all are now encoded in
 `docs/design/service-architecture.md` and `services/auth/Dockerfile`):
@@ -94,7 +95,7 @@ one module cascades platform-wide. Concretely: a newer **gRPC** pulled a newer *
 
 ### 3. Each service's Docker build generates a **minimal** `go.work` — never copies the repo's
 
-The repo's `go.work` lists 10+ modules. Copying it into an image would make the build **fail**
+The repo's `go.work` lists every module in the workspace. Copying it into an image would make the build **fail**
 the moment any sibling listed in `use(...)` isn't copied into that image's context (Go tries to
 resolve every `use` directive and errors on the missing directory). Instead each `Dockerfile`
 copies only the three modules the service compiles (`pkg`, `gen/go`, `services/<svc>`) and
@@ -104,7 +105,7 @@ copies only the three modules the service compiles (`pkg`, `gen/go`, `services/<
 RUN go work init ./pkg ./gen/go ./services/auth && go mod download -x all
 ```
 
-This is **self-contained** (adding an 11th service never breaks an existing image), **correct**
+This is **self-contained** (adding another service never breaks an existing image), **correct**
 (`./pkg`/`./gen/go` resolve to local source exactly as on a laptop), and keeps **module
 isolation honest** — a service image can only build against `pkg`, `gen/go`, and its own
 source, never another service's. The builder image is pinned to `golang:1.26-alpine` to match
