@@ -9,7 +9,7 @@
 // streaming, and usage/cost metering. The model itself is deliberately tiny
 // (a local Ollama smollm2); the subject is the platform infrastructure.
 //
-// PATTERN REUSE (interview framing): every concern here maps to a pattern already
+// PATTERN REUSE: every concern here maps to a pattern already
 // built elsewhere in Forgepoint —
 //   - provider failover      -> Circuit Breaker (inference-gateway)
 //   - per-team token budgets  -> distributed Rate Limiter (inference-gateway)

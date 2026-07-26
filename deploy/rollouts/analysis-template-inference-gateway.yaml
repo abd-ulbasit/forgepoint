@@ -42,10 +42,10 @@
 # (Phase 10 observability). The template structure and auto-rollback mechanics
 # are fully functional; only the metric name strings need updating.
 #
-# INTERVIEW FRAMING
-# ------------------
-# Q: "How do you prevent a bad deploy from taking down production?"
-# A: "We use Argo Rollouts with Prometheus AnalysisTemplates as automatic gates.
+# WHY THIS TEMPLATE EXISTS
+# ------------------------
+# A bad deploy must not take down production. The mechanism:
+#    "We use Argo Rollouts with Prometheus AnalysisTemplates as automatic gates.
 #     A new version gets 20% of traffic. If its error rate exceeds 1% or p99
 #     latency exceeds the SLO threshold, the AnalysisRun marks the canary as
 #     Failed, the controller resets traffic to 0%, scales the canary down,

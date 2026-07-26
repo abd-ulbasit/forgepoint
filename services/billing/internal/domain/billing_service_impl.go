@@ -2,8 +2,7 @@
 //
 // This is the platform's "money truth": the code here decides what a customer is
 // charged. The teaching comments name each pattern (Outbox, idempotent consumer,
-// server-authoritative pricing) and the financial bug each guard prevents,
-// because for a billing service the WHY of every line is the interview.
+// server-authoritative pricing) and the financial bug each guard prevents.
 //
 // ============================================================================
 // CLEAN ARCHITECTURE PLACEMENT

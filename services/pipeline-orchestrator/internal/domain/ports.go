@@ -25,8 +25,8 @@
 // how a CANARY shifts traffic. That side-effecting work is behind the
 // StepExecutor port. This is exactly why the engine is unit-testable with
 // hand-written mock executors that simulate success/failure/panic without any
-// real infrastructure — and why an interviewer can see the saga logic in
-// isolation from the I/O.
+// real infrastructure — and why the saga logic is readable in isolation from
+// the I/O.
 // ============================================================================
 package domain
 
@@ -184,7 +184,7 @@ type StepInput struct {
 
 // StepResult is what a StepExecutor returns from a forward (Execute) run.
 //
-// SSRF GUARD (interview-critical): for DEPLOY/CANARY/PROMOTE, the serving
+// SSRF GUARD: for DEPLOY/CANARY/PROMOTE, the serving
 // Endpoint a downstream consumer (Inference Gateway / Model Serving) will route
 // to is RESOLVED BY THE EXECUTOR ITSELF — constructed from the model version and
 // the K8s Service the executor created in the fp-models namespace. It is NEVER
@@ -211,7 +211,7 @@ type StepResult struct {
 // ExecutorRegistry. The engine calls Execute on the forward pass and Compensate
 // on rollback.
 //
-// THE COMPENSATION CONTRACT (the heart of the saga — study these three lines):
+// THE COMPENSATION CONTRACT (the heart of the saga):
 //
 //   - Compensate UNDOES a previously-COMPLETED Execute. The engine only calls it
 //     for steps that actually completed (a step that never ran has no effect to
@@ -229,7 +229,7 @@ type StepResult struct {
 //     engine skips it. Compensate is only invoked for steps that have a
 //     compensation defined.
 //
-// INTERVIEW framing: "What happens if a compensation itself fails?" — It is the
+// IF A COMPENSATION ITSELF FAILS: this is the
 // worst case. Compensation is best-effort and idempotent by design; a failed
 // compensation is surfaced as COMPENSATION_FAILED + an alert (NOT a silent
 // state), because we may have leaked a real resource (an orphaned serving pod).

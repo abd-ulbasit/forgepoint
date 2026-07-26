@@ -170,7 +170,7 @@ func (a *App) pipelinesStatus(args []string) error {
 // Ctrl-C. This is the one command that needs streaming + signal handling.
 //
 // ============================================================================
-// CONSUMING A gRPC SERVER STREAM (interview-critical)
+// CONSUMING A gRPC SERVER STREAM
 // ============================================================================
 //
 // WatchExecution returns a stream client. We loop calling stream.Recv():

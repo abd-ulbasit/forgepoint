@@ -109,7 +109,7 @@ func NewValidator(svc tokenValidator) *Validator {
 //	                        messages through), so no DB host/SQL leaks — while the
 //	                        Internal code keeps SLO alerting on the right signal.
 //
-// WHY this distinction matters (interview): conflating "backend down" with "bad
+// WHY this distinction matters: conflating "backend down" with "bad
 // token" would (a) tell an attacker nothing useful but (b) silently mis-route
 // your alerting — a Postgres outage would look like a spike of clients sending
 // bad tokens (a 4xx-class Unauthenticated) instead of a 5xx-class server fault.

@@ -24,7 +24,7 @@
 -- guarantee the domain's DedupMetricPoints starts in memory.
 --
 -- ----------------------------------------------------------------------------
--- DESIGN CHOICES (so each is interview-defensible)
+-- DESIGN CHOICES
 -- ----------------------------------------------------------------------------
 --
 -- IDs are TEXT (UUIDv4 strings), not native uuid. The domain carries ids as
@@ -249,8 +249,8 @@ CREATE TABLE run_params (
 -- table here — partitioning is an operational/scale concern layered on later via
 -- a migration — but the schema is already partition-READY: ts is a first-class
 -- column and the unique key leads with run_id (a local index per partition still
--- enforces dedup within the hot partition). INTERVIEW: "How would you scale
--- run_metrics?" Declarative RANGE partitioning on ts (monthly), drop old
+-- enforces dedup within the hot partition). SCALING PATH: declarative RANGE
+-- partitioning on ts (monthly), drop old
 -- partitions for retention; the (run,key,step) uniqueness becomes a per-partition
 -- local index. We left it unpartitioned to keep the teaching schema readable.
 CREATE TABLE run_metrics (

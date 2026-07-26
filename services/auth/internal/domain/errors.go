@@ -37,7 +37,7 @@ var (
 	//   named sentinel lets callers errors.Is(err, ErrWeakSecret) and handle it
 	//   separately from a legitimately invalid credential.
 	//
-	// INTERVIEW: "What key-length requirements do you enforce for HS256?"
+	// HS256 KEY-LENGTH REQUIREMENT:
 	//   >= 32 bytes, enforced symmetrically in both mint and verify so a
 	//   misconfigured verifier can't accept tokens the minter would reject.
 	ErrWeakSecret = errors.New("auth: HMAC secret must be at least 32 bytes (256 bits)")

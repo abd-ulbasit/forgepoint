@@ -22,7 +22,7 @@ class NotificationServiceStub:
     PREFERENCES (config): GetPreferences, UpdatePreferences, TestChannel
     (TestChannel is a control-plane self-check, not a "send" RPC — see its doc.)
 
-    WHY NO STREAMING RPC HERE (a deliberate choice, interview-relevant):
+    WHY NO STREAMING RPC HERE (a deliberate choice):
     A live "watch my inbox" stream is tempting, but the natural realtime path
     for notifications is the very NATS stream this service already consumes and
     the fan-out channels (web push, Slack) it already delivers over. The web UI
@@ -34,7 +34,7 @@ class NotificationServiceStub:
     WatchExecution server-stream, because there the authoritative state lives in
     that service and a client genuinely needs to follow one execution's lifecycle.
 
-    IDEMPOTENCY (interview-critical, on BOTH paths):
+    IDEMPOTENCY (on BOTH paths):
     - Async consumer: events can be redelivered (NATS at-least-once). The
     consumer dedupes on EventEnvelope.id (carried into Notification.event_id)
     per recipient, so a redelivered event never creates a duplicate inbox row
@@ -105,7 +105,7 @@ class NotificationServiceServicer:
     PREFERENCES (config): GetPreferences, UpdatePreferences, TestChannel
     (TestChannel is a control-plane self-check, not a "send" RPC — see its doc.)
 
-    WHY NO STREAMING RPC HERE (a deliberate choice, interview-relevant):
+    WHY NO STREAMING RPC HERE (a deliberate choice):
     A live "watch my inbox" stream is tempting, but the natural realtime path
     for notifications is the very NATS stream this service already consumes and
     the fan-out channels (web push, Slack) it already delivers over. The web UI
@@ -117,7 +117,7 @@ class NotificationServiceServicer:
     WatchExecution server-stream, because there the authoritative state lives in
     that service and a client genuinely needs to follow one execution's lifecycle.
 
-    IDEMPOTENCY (interview-critical, on BOTH paths):
+    IDEMPOTENCY (on BOTH paths):
     - Async consumer: events can be redelivered (NATS at-least-once). The
     consumer dedupes on EventEnvelope.id (carried into Notification.event_id)
     per recipient, so a redelivered event never creates a duplicate inbox row
@@ -262,7 +262,7 @@ class NotificationService:
     PREFERENCES (config): GetPreferences, UpdatePreferences, TestChannel
     (TestChannel is a control-plane self-check, not a "send" RPC — see its doc.)
 
-    WHY NO STREAMING RPC HERE (a deliberate choice, interview-relevant):
+    WHY NO STREAMING RPC HERE (a deliberate choice):
     A live "watch my inbox" stream is tempting, but the natural realtime path
     for notifications is the very NATS stream this service already consumes and
     the fan-out channels (web push, Slack) it already delivers over. The web UI
@@ -274,7 +274,7 @@ class NotificationService:
     WatchExecution server-stream, because there the authoritative state lives in
     that service and a client genuinely needs to follow one execution's lifecycle.
 
-    IDEMPOTENCY (interview-critical, on BOTH paths):
+    IDEMPOTENCY (on BOTH paths):
     - Async consumer: events can be redelivered (NATS at-least-once). The
     consumer dedupes on EventEnvelope.id (carried into Notification.event_id)
     per recipient, so a redelivered event never creates a duplicate inbox row

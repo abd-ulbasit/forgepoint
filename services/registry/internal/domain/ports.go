@@ -63,7 +63,7 @@
 // the lagging projection. A caller needing read-your-writes consumes the event
 // rather than polling the read API.
 //
-// INTERVIEW: "Isn't a dual write to Postgres+Redis inside one command unsafe?"
+// IS A DUAL WRITE TO POSTGRES+REDIS INSIDE ONE COMMAND UNSAFE?
 //
 //	Exactly — that is the dual-write problem (the second write can fail after the
 //	first commits, leaving the stores inconsistent with no rollback). We avoid it:
@@ -140,7 +140,7 @@ type ListModelsFilter struct {
 // adapter implements each method in a single transaction so the business
 // invariants (uniqueness, single-production) hold atomically.
 //
-// IDEMPOTENCY — TWO LEDGERS, ONE CONTRACT (interview-critical):
+// IDEMPOTENCY — TWO LEDGERS, ONE CONTRACT:
 //
 //	(1) CREATE idempotency. The two genuinely-creating commands (RegisterModel,
 //	    CreateVersion) take an idempotency key recorded INLINE with the created row
@@ -403,7 +403,7 @@ const (
 // ProjectionEmitter is the CQRS sync seam: a command records its state change
 // here so the read projection can be (re)built and external consumers can react.
 //
-// CONTRACT / FAILURE POSTURE (interview-relevant): in this phase the emitter is a
+// CONTRACT / FAILURE POSTURE: in this phase the emitter is a
 // simple port. The production adapter publishes to NATS. The service emits AFTER
 // the WriteStore commit succeeds — the write is the truth and must not be undone
 // by an emit failure. An emit error is therefore logged and surfaced but does NOT

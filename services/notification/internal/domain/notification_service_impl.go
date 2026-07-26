@@ -154,7 +154,7 @@ func (s *notificationService) ReactToEvent(_ context.Context, event InboundEvent
 
 	// (3) PER-CHANNEL routing. For each candidate channel (every configured one
 	// plus the implicit IN_APP), decide DELIVER vs SUPPRESSED(reason). The order of
-	// checks matters and is interview-relevant:
+	// checks matters:
 	//   disabled  → SUPPRESSED(disabled)      (user turned it off)
 	//   below floor → SUPPRESSED(below_severity)
 	//   external & no target → SUPPRESSED(no_target)
@@ -221,7 +221,7 @@ func (s *notificationService) candidateChannels(prefs NotificationPreferences) [
 // WHY this lives in the domain (not the adapter): the key SHAPE is a business
 // rule (per-recipient dedup), and the matching Notification.EventID field is a
 // domain field. Defining the key here keeps the rule testable and authoritative;
-// the adapter just calls IdempotencyStore.Seen(EventDedupKey(...)). Interview note:
+// the adapter just calls IdempotencyStore.Seen(EventDedupKey(...)). NOTE:
 // this is the "idempotent consumer" platform rule made concrete — at-least-once
 // delivery is made effectively-once by a dedup key derived from the event id.
 func EventDedupKey(eventID, recipientUserID string) string {
@@ -602,7 +602,7 @@ func (s *notificationService) TestChannel(ctx context.Context, in TestChannelInp
 // validateChannelTarget validates ONE channel preference's target by channel
 // type. This runs at WRITE time so a bad target never reaches storage.
 //
-// SPLIT OF RESPONSIBILITY (interview-critical): the DOMAIN does everything that
+// SPLIT OF RESPONSIBILITY: the DOMAIN does everything that
 // needs no network — parse the URL, enforce https-only, reject userinfo creds,
 // allowlist the Slack host, and reject IP-LITERAL targets that are loopback/
 // link-local/private/etc. The ADAPTER does the network-dependent half at delivery
@@ -703,7 +703,7 @@ func validateWebhookTarget(channel NotificationChannel, target string) error {
 // multicast. This same classification is re-applied by the adapter against the
 // RESOLVED IP at connect time.
 //
-// WHY each range is denied (the interview-critical "why"):
+// WHY each range is denied:
 //   - 127.0.0.0/8, ::1            loopback → internal-only services / admin APIs
 //   - 169.254.0.0/16, fe80::/10   link-local → 169.254.169.254 is the AWS/GCP
 //     metadata endpoint; an SSRF here steals IAM credentials. THE classic attack.

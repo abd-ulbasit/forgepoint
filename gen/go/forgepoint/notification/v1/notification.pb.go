@@ -26,7 +26,7 @@
 //   user just authors a rule whose pattern matches the new subject. THAT is the
 //   payoff of choreography: extreme decoupling and independent evolvability.
 //
-//   THE OTHER SIDE OF THE COIN (interview tradeoff): choreography's weakness is
+//   THE OTHER SIDE OF THE COIN: choreography's weakness is
 //   that no single place describes "the whole workflow". To answer "what
 //   happens when a pipeline fails?" you must inspect every subscriber. We accept
 //   that here because notification is a leaf reaction, not a multi-step business
@@ -54,7 +54,7 @@
 //   toggles) rather than a free-form rule CRUD API, because that is the shape an
 //   end user actually wants ("email me on failures, Slack me on drift"). A
 //   richer admin rule-builder can arrive as a v2 addition without breaking this
-//   surface. This tradeoff is called out so it is defensible in an interview.
+//   surface. The tradeoff is called out explicitly rather than hidden.
 //   The plan's third RPC, GetDeliveryLog, IS honored here as ListDeliveryAttempts
 //   (the cross-notification delivery-health/audit query).
 //
@@ -644,7 +644,7 @@ func (x *DeliveryAttempt) GetAttemptedAt() *timestamppb.Timestamp {
 //	on reads while accepting the full value on UpdatePreferences. We document
 //	this rather than hard-code masking so the storage layer owns the policy.
 //
-// SECURITY — SSRF (the headline risk for THIS service, interview-critical):
+// SECURITY — SSRF (the headline risk for THIS service):
 //
 //	`target` for WEBHOOK/SLACK is a CLIENT-SUPPLIED URL that the delivery layer
 //	will make an outbound HTTP request to. A naive implementation is a textbook

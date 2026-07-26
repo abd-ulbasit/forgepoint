@@ -2,7 +2,7 @@
 // TOKEN STORE — the single source of truth for the access token.
 // ============================================================================
 //
-// SECURITY DESIGN (the interview-critical decision, mirroring the BFF's auth
+// SECURITY DESIGN (the critical decision, mirroring the BFF's auth
 // handler comment): we keep the JWT in MEMORY (a module-level variable) AND
 // mirror it to sessionStorage. Each choice is deliberate:
 //

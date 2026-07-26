@@ -210,7 +210,7 @@ func (s *promptService) CreatePrompt(ctx context.Context, team string, in Create
 }
 
 // ============================================================================
-// GetPrompt — the VERSION-RESOLUTION RULE (documented, interview-relevant)
+// GetPrompt — the VERSION-RESOLUTION RULE
 // ============================================================================
 //
 // version > 0  → return that EXACT (team, name, version). Missing → ErrNotFound.

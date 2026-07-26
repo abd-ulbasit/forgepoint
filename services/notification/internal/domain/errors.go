@@ -27,7 +27,7 @@ var (
 
 	// ErrNotFound is returned when a Get/MarkRead targets a notification that
 	// does not exist OR belongs to another user. WHY collapse "missing" and
-	// "someone else's" into ONE error (interview-critical): returning a different
+	// "someone else's" into ONE error: returning a different
 	// error for "exists but not yours" would let an attacker probe which
 	// notification ids exist (existence oracle / IDOR). One generic NotFound — the
 	// handler maps it to codes.NotFound — closes that side channel. This is the

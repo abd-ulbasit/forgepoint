@@ -41,7 +41,7 @@
 // jwt.WithValidMethods(["HS256"]) as belt-and-suspenders: the parser rejects
 // unexpected algs before even calling the keyfunc. Two independent gates.
 //
-// INTERVIEW: "How do you prevent JWT algorithm confusion?"
+// PREVENTING JWT ALGORITHM CONFUSION:
 //
 //	Pin the algorithm on the verifier side; never trust the token's alg header.
 //	Concretely: assert token.Method is *jwt.SigningMethodHMAC inside the keyfunc
@@ -110,7 +110,7 @@ type jwtClaims struct {
 //
 //	Empty / nil secrets are also covered: len(nil) == 0 < 32.
 //
-// INTERVIEW: "Why do you enforce a minimum key length in the code, not just docs?"
+// WHY THE MINIMUM KEY LENGTH IS ENFORCED IN CODE, NOT JUST DOCS:
 //
 //	Docs can be ignored or never read; a run-time check fires on every call.
 //	An operator who accidentally sets JWT_SECRET=abc gets an immediate, named

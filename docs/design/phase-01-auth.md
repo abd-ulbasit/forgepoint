@@ -2,8 +2,7 @@
 
 > Per-phase design doc. The task-by-task mechanics live in
 > `docs/plans/forgepoint-implementation-plan.md` (Phase 1). This note captures the
-> **architectural decisions and their tradeoffs** — the things an interviewer probes,
-> and the things future-me needs to be able to defend line-by-line.
+> **architectural decisions and their tradeoffs** — the parts worth defending line by line.
 
 ## What this service is
 
@@ -33,9 +32,9 @@ Pattern headline: **Centralized authentication, stateless JWT propagation, RBAC.
 - **Tradeoff:** revocation is not instant — a JWT is valid until `exp`. Mitigation: short TTLs
   (minutes), and `ValidateToken` RPC still exists for the API-key path and for callers that
   want centralized checks. This is the classic **JWT vs opaque-token-introspection** tradeoff:
-  we trade instant revocation for availability + latency. Interview framing: "stateless JWT,
-  short TTL, accept eventual revocation; if we needed instant revocation we'd add a denylist
-  in Redis checked by the interceptor."
+  we trade instant revocation for availability + latency. The posture: stateless JWT, short
+  TTL, eventual revocation accepted; instant revocation would mean a denylist in Redis checked
+  by the interceptor.
 
 ### D3 — API keys: prefix + hash, raw shown once
 - Store `key_prefix` (first 8 chars, for lookup/display) + `key_hash` (SHA256 of the full key).

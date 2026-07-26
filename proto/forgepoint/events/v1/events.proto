@@ -64,7 +64,7 @@
 //     where a reaction must be immediate and self-contained, thin where the
 //     event is just a "something changed, pull if you care" notification.
 //
-//   INTERVIEW FRAMING (likely probes):
+//   DESIGN NOTES:
 //     - "Why not embed the domain message in the event?" → import cycles +
 //       coupling + independent evolution; the event is a separate published
 //       contract (schema-registry thinking).

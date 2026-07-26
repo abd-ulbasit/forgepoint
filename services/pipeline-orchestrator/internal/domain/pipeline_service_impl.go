@@ -85,7 +85,7 @@ type pipelineService struct {
 	// SaveStep call) and contention is negligible at ML-pipeline fan-out widths
 	// (tens of steps), so a single mutex is simplest and provably correct.
 	//
-	// INTERVIEW: "How do you make the parallel DAG scheduler safe?" The executors
+	// MAKING THE PARALLEL DAG SCHEDULER SAFE: the executors
 	// run concurrently (the expensive work), but every mutation of the shared
 	// execution state is funneled through execMu, so the state machine transitions
 	// are serialized even though the side-effecting work is parallel.
@@ -505,7 +505,7 @@ func (s *pipelineService) saveTerminal(ctx context.Context, exec Execution) erro
 // COMPLETED steps in REVERSE completion order and returns the cause (the step
 // error, or context.Canceled). On success it returns nil.
 //
-// COMPENSATION ORDERING (the interview centerpiece): when step k fails, steps
+// COMPENSATION ORDERING (the centerpiece): when step k fails, steps
 // 0..k-1 have applied side effects. We must undo them in the OPPOSITE order they
 // were applied — last-applied is undone first — because later steps may depend on
 // the state earlier steps created (e.g. "shift traffic" before "destroy
@@ -677,7 +677,7 @@ func (s *pipelineService) compensateOne(ctx context.Context, p *PipelineDefiniti
 // structure obvious and the test deterministic (a level is a clean barrier). A
 // ready-set scheduler is more efficient for sparse graphs but harder to reason
 // about; for ML pipelines (tens of steps) the level approach is plenty and is
-// far easier to explain in an interview.
+// far easier to explain.
 func (s *pipelineService) runStepsDAG(ctx context.Context, p *PipelineDefinition, exec *Execution, errs *stepErrs) error {
 	levels, err := topoLevels(p.Steps)
 	if err != nil {
@@ -767,7 +767,7 @@ func anyParentFailed(def *StepDefinition, failed map[string]bool) bool {
 // step output and (for deploy steps) emits ModelDeployed/StepCompleted. On
 // exhausting retries it records FAILED + emits StepFailed and returns the error.
 //
-// IDEMPOTENT RETRY (interview note): the Attempt counter is passed to the
+// IDEMPOTENT RETRY: the Attempt counter is passed to the
 // executor in StepInput so a non-idempotent forward action can make itself safe
 // across retries ("if attempt > 1, check whether I already created the resource").
 // The engine guarantees attempts are sequential and the count is persisted.
@@ -1202,7 +1202,7 @@ func validateGraph(_ PipelineType, steps []StepDefinition) error {
 // step whose dependencies are all in level 0, and so on. Steps within a level are
 // mutually independent and therefore safe to run in PARALLEL (the DAG fan-out).
 //
-// KAHN'S ALGORITHM (interview-ready):
+// KAHN'S ALGORITHM:
 //  1. Compute the in-degree (number of unmet deps) of every node.
 //  2. The current level = all nodes with in-degree 0.
 //  3. "Remove" them, decrementing the in-degree of their dependents.

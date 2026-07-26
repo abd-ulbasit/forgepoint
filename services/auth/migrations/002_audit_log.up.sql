@@ -30,7 +30,7 @@
 --      mutation, and — because it does NOT own the table — cannot DISABLE or DROP
 --      the triggers either.
 --
--- WHAT THIS DOES NOT BUY (read before claiming "immutable" in an interview):
+-- WHAT THIS DOES NOT BUY (read before claiming "immutable"):
 --   The triggers stop UPDATE/DELETE/TRUNCATE, but an actor with DDL rights on this
 --   table (the table OWNER, or a superuser) can still `ALTER TABLE audit_log
 --   DISABLE TRIGGER ALL` / `DROP TRIGGER ...` and THEN mutate freely. So the

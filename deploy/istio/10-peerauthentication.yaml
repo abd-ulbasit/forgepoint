@@ -50,7 +50,7 @@
 #   steps 2 and 3.
 #
 # ───────────────────────────────────────────────────────────────────────────────
-# KUBELET PROBES UNDER STRICT mTLS — THE CLASSIC GOTCHA (interview-critical)
+# KUBELET PROBES UNDER STRICT mTLS — THE CLASSIC GOTCHA
 # ───────────────────────────────────────────────────────────────────────────────
 #   PROBLEM: kubelet liveness/readiness/startup probes originate from the NODE, which
 #   is NOT in the mesh and has NO client certificate. Under naive STRICT mTLS, every

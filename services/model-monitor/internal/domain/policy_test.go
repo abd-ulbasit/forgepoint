@@ -7,8 +7,8 @@ import (
 
 // ============================================================================
 // CLOSED-LOOP POLICY — the decision table from DecideRetrain, exercised as a
-// pure function. This is where an interviewer probes "how do you stop a retrain
-// storm?". Each case is one row of the documented table.
+// pure function. This is what stops a retrain storm; each case is one row of
+// the documented table.
 // ============================================================================
 
 // report builds a report at a given severity for the decision tests.

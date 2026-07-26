@@ -29,7 +29,7 @@
 // part (batching/back-pressure) can be added in the events layer WITHOUT
 // touching the rules tested here.
 //
-// INTERVIEW FRAMING:
+// DESIGN NOTE:
 //
 //	Q: "Where does the back-pressure live in your event-driven service?"
 //	A: In the events adapter (the consumer NAKs when its buffer is full). The

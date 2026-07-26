@@ -13,7 +13,7 @@
 //      backends and their live circuit state) + an AI-usage tile.
 //   2. The transcript: the running conversation. Each turn renders as TEXT — we
 //      NEVER use dangerouslySetInnerHTML; model output is untrusted and could
-//      contain markup, so we let React escape it. (Interview point: rendering LLM
+//      contain markup, so we let React escape it. (NOTE: rendering LLM
 //      output as HTML is a classic stored-XSS sink.)
 //   3. The composer: a textarea + Send/Stop. Enter sends, Shift+Enter newlines.
 //

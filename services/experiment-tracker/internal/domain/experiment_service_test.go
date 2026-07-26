@@ -8,9 +8,8 @@
 // The tests exercise only the EXPORTED surface — exactly what the handler and
 // the NATS consumer depend on. Using the external `_test` package keeps us
 // honest (no reaching into unexported helpers) and mirrors the Auth service's
-// choice. Hand-written mocks satisfy the domain PORTS (no codegen — every line
-// is interview-explainable). An unset mock func panics if called, surfacing
-// accidental coupling (a test hitting a repo method it didn't intend to).
+// choice. Hand-written mocks satisfy the domain PORTS (no codegen). An unset
+// mock func panics if called, surfacing accidental coupling (a test hitting a repo method it didn't intend to).
 //
 // These tests assert REAL behavior — the dedup actually drops the right point,
 // the state machine actually rejects the illegal edge, the final-metric

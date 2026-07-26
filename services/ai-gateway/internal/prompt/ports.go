@@ -22,7 +22,7 @@
 // versions, read occasionally (mostly at render time). There is no read-amplification
 // problem to solve, so a SINGLE Postgres-backed repository serves both commands and
 // queries. Adding Redis here would be complexity with no payoff — a deliberate
-// "don't pattern-match CQRS onto everything" choice worth defending in an interview.
+// "don't pattern-match CQRS onto everything" choice.
 package prompt
 
 import (

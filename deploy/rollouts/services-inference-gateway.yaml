@@ -23,7 +23,7 @@
 # gives roughly 33% canary; true percentage-weight splitting requires a
 # traffic management plugin (Istio, AWS ALB, etc.) installed alongside Argo
 # Rollouts. Without a traffic management plugin, weight is approximated by
-# replica ratios — document this for your interview.
+# replica ratios.
 #
 # TRAFFIC MANAGEMENT (OPTIONAL)
 # --------------------------------

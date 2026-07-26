@@ -48,7 +48,7 @@
 # kube-proxy, CSI drivers) legitimately need privilege/hostPath/root; blocking
 # them would break the cluster. We constrain blast radius to what we own.
 #
-# AUTOGEN NOTE (important to understand for interviews)
+# AUTOGEN NOTE
 # -----------------------------------------------------
 # We `match` on `Pod` only. Kyverno AUTOMATICALLY generates equivalent rules for
 # Deployment/StatefulSet/DaemonSet/Job/CronJob/ReplicaSet/ReplicationController
@@ -84,7 +84,7 @@
 #   a foreach+deny. Adding it as a second rule keeps concerns separated and
 #   makes the policy easier to read and test independently.
 #
-# INTERVIEW NOTE: "pod-level securityContext is inherited but container-level
+# NOTE: "pod-level securityContext is inherited but container-level
 # overrides it" is a common gotcha. The correct fix is a deny-on-explicit-false
 # rule, not trying to write a single pattern that covers both. Kyverno's
 # anyPattern cannot guard against a container actively disabling a setting.

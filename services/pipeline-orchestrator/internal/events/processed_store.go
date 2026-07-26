@@ -43,7 +43,7 @@ import (
 // see and prune old dedup rows so the table does not grow unbounded — the exact
 // failure mode that makes MemoryProcessedStore unusable in production.
 //
-// INTERVIEW framing ("how do you make an at-least-once consumer idempotent?"):
+// MAKING AN AT-LEAST-ONCE CONSUMER IDEMPOTENT:
 //   - transport layer: this store dedups on the envelope id (handled by natsutil
 //     BEFORE our handler runs) — collapses redeliveries even across replicas
 //     because the store is SHARED (one Postgres table, not per-pod memory),

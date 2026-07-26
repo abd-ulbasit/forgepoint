@@ -9,7 +9,7 @@
 // as they arrive so the UI shows saga step transitions in real time.
 //
 // WHY fetch()+ReadableStream INSTEAD OF the native EventSource API
-// (interview-relevant): EventSource cannot send custom headers, so it cannot
+// EventSource cannot send custom headers, so it cannot
 // carry our "Authorization: Bearer <token>". Our dev auth flow keeps the token
 // in JS memory (not an httpOnly cookie), so the watch request MUST send that
 // header — which only fetch() can do. We therefore implement a minimal SSE

@@ -250,7 +250,7 @@ func TestValidateToken_MalformedRejected(t *testing.T) {
 //	in BOTH paths so the invariant is enforced symmetrically — the verifier
 //	is at least as strict as the minter. These tests pin that contract.
 //
-// INTERVIEW: "What happens if your JWT secret is short?"
+// WHAT A SHORT JWT SECRET COSTS:
 //
 //	Brute-force becomes feasible. Any attacker who captures a signed token
 //	can try every possible key offline, without rate limits, until one

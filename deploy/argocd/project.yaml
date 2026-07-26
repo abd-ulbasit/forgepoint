@@ -14,9 +14,9 @@
 #   "only this repo, only fp-* namespaces, only these kinds" is LEAST PRIVILEGE
 #   applied to the delivery layer itself.
 #
-# INTERVIEW FRAMING — "how do you stop GitOps from becoming a cluster-admin
-# backdoor?" The answer is exactly this object: sourceRepos allow-list,
-# destinations allow-list, and the namespaced/clusterResource allow-lists below.
+# HOW GitOps IS STOPPED FROM BECOMING A CLUSTER-ADMIN BACKDOOR: this object —
+# the sourceRepos allow-list, the destinations allow-list, and the
+# namespaced/clusterResource allow-lists below.
 # ============================================================================
 apiVersion: argoproj.io/v1alpha1
 kind: AppProject

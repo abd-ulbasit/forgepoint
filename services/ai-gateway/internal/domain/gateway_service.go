@@ -45,7 +45,7 @@
 // wire format — and the sink's error (client disconnected) cancels the loop. This
 // is the same "push, don't return a channel" shape gRPC server-streaming wants.
 //
-// FAILOVER + STREAMING TENSION (interview-critical): once we've streamed tokens
+// FAILOVER + STREAMING TENSION: once we've streamed tokens
 // from provider A and A then errors mid-stream, we CANNOT silently retry on B —
 // the client already saw A's partial tokens, and replaying B's full answer would
 // duplicate/garble the output. So mid-stream failures are TERMINAL (the client

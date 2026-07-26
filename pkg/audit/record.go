@@ -38,7 +38,7 @@
 // other Forgepoint event makes (human-readable in the NATS CLI / DLQ).
 //
 // ============================================================================
-// TAMPER EVIDENCE vs TAMPER PROOF (read before an interview)
+// TAMPER EVIDENCE vs TAMPER PROOF
 // ============================================================================
 //
 // Each persisted record commits to ALL prior records via a hash chain:

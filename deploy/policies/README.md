@@ -174,7 +174,7 @@ these Kyverno policies for the parts PSA can't express — registry allowlists,
 **documented per-workload exceptions** PSA has no way to model. If one layer is
 misconfigured, the other still holds.
 
-> Interview probe — "Why Kyverno *and* PodSecurity?" PSA is the cheap,
+> Why Kyverno *and* PodSecurity? PSA is the cheap,
 > always-on baseline (no extra component); Kyverno covers everything PSA can't
 > express and gives auditable reports + surgical exceptions. They overlap on the
 > securityContext basics on purpose — that overlap is the defense-in-depth.

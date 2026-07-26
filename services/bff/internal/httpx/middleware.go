@@ -155,7 +155,7 @@ func Chain(mws ...func(http.Handler) http.Handler) func(http.Handler) http.Handl
 // construction. A per-handler approach relies on every author remembering — an
 // easy miss that creates a silent DoS hole on a public endpoint.
 //
-// HOW it works (interview point): http.MaxBytesReader wraps the body with a
+// HOW it works: http.MaxBytesReader wraps the body with a
 // reader that returns *http.MaxBytesError after maxBytes have been consumed. The
 // HTTP server uses this to close the connection and send a 413 automatically
 // ONLY if the handler has not started writing yet — in practice, our handlers

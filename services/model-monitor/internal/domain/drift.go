@@ -1,6 +1,5 @@
-// drift.go — THE STATISTICS. This is the teaching centerpiece an interviewer
-// will probe ("which test, and why? what's the PSI formula? how do you handle an
-// empty bin?"). Every function here is pure: inputs in, score out, no I/O — which
+// drift.go — THE STATISTICS: which test, why, the PSI formula, and how an empty
+// bin is handled. Every function here is pure: inputs in, score out, no I/O — which
 // is exactly why the tests in drift_test.go can pin them to KNOWN distributions
 // with KNOWN expected values.
 //
@@ -13,9 +12,9 @@
 // proportions over the SAME bin layout. We need a single number — bigger = more
 // drift — so a threshold can fire the control loop.
 //
-// Three established tests, each with a different shape (see the cheat-sheet on
+// Three established tests, each with a different shape (see the reference on
 // each function). All three are implemented because the proto exposes the METHOD
-// per metric and an interviewer expects you to know the tradeoffs.
+// per metric, so the tradeoffs between them are part of the contract.
 //
 // ============================================================================
 // REPRESENTING A DISTRIBUTION: the histogram
@@ -96,7 +95,7 @@ const defaultEps = 1e-6
 // PSI computes the Population Stability Index between a baseline and a current
 // histogram over the SAME bins.
 //
-// ┌─ INTERVIEW CHEAT-SHEET ─────────────────────────────────────────────────┐
+// ┌─ METHOD REFERENCE ──────────────────────────────────────────────────────┐
 // │ FORMULA:  PSI = Σ_bins (curr% − base%) · ln(curr% / base%)               │
 // │ INTUITION: each bin contributes (difference in mass) × (log ratio of     │
 // │   mass). A bin whose proportion barely changed contributes ~0; a bin that │
@@ -141,7 +140,7 @@ func PSI(baseline, current Histogram) (float64, error) {
 // KL computes the Kullback–Leibler divergence D(current ‖ baseline) — the
 // relative entropy of the CURRENT distribution with respect to the BASELINE.
 //
-// ┌─ INTERVIEW CHEAT-SHEET ─────────────────────────────────────────────────┐
+// ┌─ METHOD REFERENCE ──────────────────────────────────────────────────────┐
 // │ FORMULA:  KL(P‖Q) = Σ P(i) · ln(P(i) / Q(i))   with P=current, Q=baseline │
 // │ DIRECTION MATTERS:  we use D(current ‖ baseline) — "how surprised is a    │
 // │   model that EXPECTS the baseline when it SEES the current traffic?".      │
@@ -180,7 +179,7 @@ func KL(baseline, current Histogram) (float64, error) {
 // KS computes the two-sample Kolmogorov–Smirnov statistic: the maximum absolute
 // gap between the two empirical CDFs built from the histograms' bin proportions.
 //
-// ┌─ INTERVIEW CHEAT-SHEET ─────────────────────────────────────────────────┐
+// ┌─ METHOD REFERENCE ──────────────────────────────────────────────────────┐
 // │ STATISTIC:  D = max_x | F_current(x) − F_baseline(x) |                    │
 // │   where F is the empirical CDF (running cumulative proportion over bins).  │
 // │ RANGE:  [0, 1]. 0 = identical CDFs; 1 = completely disjoint support.       │

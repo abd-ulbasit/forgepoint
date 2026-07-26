@@ -404,7 +404,7 @@ func main() {
 	// that scopes to grpcutil.ClaimsFromContext (the inbox/prefs RPCs, which read the
 	// caller's UserID — the anti-IDOR rule) had no identity to scope to.
 	//
-	// authN vs authZ — THE DIVISION OF LABOR (interview-critical):
+	// authN vs authZ — THE DIVISION OF LABOR:
 	//   - AUTHENTICATION (this interceptor): "who are you?" It validates the bearer
 	//     JWT's signature/expiry LOCALLY with the shared secret (design D2 — no
 	//     per-request hop to the auth service) and, on success, puts the typed

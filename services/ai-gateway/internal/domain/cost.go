@@ -37,7 +37,7 @@ type providerRate struct {
 //
 // Keeping this a package var (not a const map — Go has no const maps) is fine: it
 // is read-only after init and never mutated. A future iteration loads it from
-// config; hard-coding here keeps the core dependency-free and interview-simple.
+// config; hard-coding here keeps the core dependency-free and simple.
 var rateTable = map[ProviderKind]providerRate{
 	// ~$0.10 / 1M prompt, ~$0.40 / 1M output — a plausible tiny-model internal price.
 	ProviderKindOllama: {promptMicroPer1K: 100, outputMicroPer1K: 400},

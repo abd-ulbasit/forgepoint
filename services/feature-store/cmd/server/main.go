@@ -361,7 +361,7 @@ func main() {
 	// service in development.
 	//
 	// AUTHENTICATION (this interceptor) vs AUTHORIZATION (the handlers) — the
-	// division of labor is the interview-critical point:
+	// division of labor is the critical point:
 	//
 	//   - AUTHN here: fpauth.NewJWTValidator verifies the bearer token's HS256
 	//     signature LOCALLY with the shared FP_JWT_SECRET (design D2: stateless

@@ -22,7 +22,7 @@
 // gRPC CreateUser handler, it legitimately bypasses the RPC admin-gate without
 // weakening it: the gate still protects every network caller.
 //
-// SECURITY POSTURE / INTERVIEW FRAMING:
+// SECURITY POSTURE:
 //   - WHY not a SQL seed in the migration? Because the password must be bcrypted,
 //     and a migration cannot bcrypt a runtime-supplied secret without baking a
 //     credential into committed SQL. Doing it in Go reuses the exact CreateUser

@@ -1,6 +1,6 @@
 # deploy/llm/ollama-scaledobject.yaml — KEDA scale-to-zero for in-cluster LLM serving (M7/L0).
 #
-# THE PATTERN (interview-critical): an idle LLM should cost ZERO. On a GPU box this
+# THE PATTERN: an idle LLM should cost ZERO. On a GPU box this
 # is the difference between paying for an idle A100 and paying nothing; here on a
 # RAM-starved homelab it is the difference between a ~256Mi idle pod and reclaiming
 # that memory for the TTS. KEDA scales the Ollama Deployment 1<->0 based on demand.

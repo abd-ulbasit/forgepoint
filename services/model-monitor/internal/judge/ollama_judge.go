@@ -26,7 +26,7 @@
 // place raw content is handled.
 //
 // ============================================================================
-// ROBUSTNESS CONTRACT (the interview-probed part)
+// ROBUSTNESS CONTRACT
 // ============================================================================
 //
 // The judge model is TINY (smollm2-class), so its output is unreliable: it may wrap

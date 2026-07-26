@@ -153,7 +153,7 @@ type UsageStore interface {
 // the client already received. The port returns the error so the use-case can
 // log-and-continue.
 //
-// WARM-FIRST ORDERING (interview-critical): the use-case publishes the warm signal
+// WARM-FIRST ORDERING: the use-case publishes the warm signal
 // BEFORE it calls the provider (so a cold Ollama starts scaling up while the
 // gateway retries with backoff), and publishes the served event AFTER. The served
 // event drains nothing; the warm signal is acked by the ollama-warmer consumer once

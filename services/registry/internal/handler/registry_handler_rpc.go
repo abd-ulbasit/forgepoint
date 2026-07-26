@@ -81,7 +81,7 @@
 // log the real error server-side (for the operator) and return a generic
 // "internal error" to the caller. This is the security boundary the task demands.
 //
-// INTERVIEW: "How do you stop internal errors leaking to clients?" → one mapping
+// KEEPING INTERNAL ERRORS OFF THE WIRE: one mapping
 // function (toStatus) that only ever emits sentinel-derived messages or a fixed
 // "internal error"; the real error is logged, never serialized to the wire.
 // ============================================================================
@@ -541,7 +541,7 @@ func (h *RegistryHandler) CreateVersion(ctx context.Context, req *registryv1.Cre
 // the domain only cross-checks, never copies into v.ArtifactDigest) and is out
 // of scope for this handler-only change.
 //
-// INTERVIEW: "Why return Unimplemented instead of best-effort?" — Because the
+// WHY Unimplemented AND NOT BEST-EFFORT: because the
 // READY edge is a trust boundary that fans out a content-addressable identity to
 // other services. A best-effort confirm that trusts client input isn't a smaller
 // feature, it's a content-integrity vulnerability. Unimplemented keeps the

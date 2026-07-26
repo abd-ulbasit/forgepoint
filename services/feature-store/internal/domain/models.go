@@ -31,7 +31,7 @@
 //	                                                          └─ offline: as-of T
 //
 // The fold lives HERE, in the pure domain (ProjectLatest / ProjectAsOf below),
-// for three reasons that are interview-critical:
+// for three reasons:
 //
 //  1. REPLAYABILITY / DETERMINISM. A projection is a pure function of the log:
 //     same events in the same order ⇒ same view, every time, with no I/O. That is
@@ -50,7 +50,7 @@
 //  3. TESTABILITY. Because the fold is pure, "append then project" and "point-in-
 //     time reconstruction" are ordinary table tests over in-memory slices.
 //
-// TRADEOFFS (be ready to defend these):
+// TRADEOFFS:
 //   - STORAGE grows forever (the log is never compacted in place). Mitigation =
 //     snapshots (periodic checkpoints so replay starts mid-log) + retention on
 //     very old versions. Snapshots are a read-side optimization, NOT part of the

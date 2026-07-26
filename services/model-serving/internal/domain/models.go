@@ -414,7 +414,7 @@ const maxInt64 = int64(^uint64(0) >> 1)
 // authoritative and unit-testable: a wrong inflight count would scale the
 // fleet wrong.
 //
-// INTERVIEW NOTE — "why inflight, not CPU, for inference autoscaling?":
+// WHY INFLIGHT, NOT CPU, FOR INFERENCE AUTOSCALING:
 // inference latency is dominated by request QUEUING once the CPU is busy;
 // inflight (concurrency / queue depth) crosses the danger threshold BEFORE CPU
 // saturates, giving the HPA an earlier, more stable signal. CPU is a lagging

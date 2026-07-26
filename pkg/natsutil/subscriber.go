@@ -224,7 +224,7 @@ func (s *Subscriber) Subscribe(
 	//   cc.Stop() is idempotent (safe to call multiple times), so it is safe
 	//   to call it from both the ctx path and the done path.
 	//
-	// INTERVIEW NOTE: This is the classic "goroutine leak via unbounded
+	// This is the classic "goroutine leak via unbounded
 	// select-on-one-channel" pattern. The fix is always to give the goroutine a
 	// second exit: a done/quit channel that the owner closes on shutdown.
 	go func() {
@@ -386,7 +386,7 @@ func (s *Subscriber) handleFailure(ctx context.Context, msg jetstream.Msg, envel
 //   The message is lost, but the loop is bounded. An alert on DLQ-publish errors
 //   in Grafana signals the broken subject for ops to fix and replay.
 //
-// INTERVIEW: This is the "what happens when your DLQ is also broken?" question.
+// The "what happens when the DLQ is also broken?" case.
 // The correct answer: drop and alert, don't loop. Kafka uses the same pattern
 // (if DLT publish fails, skip and commit offset). AWS SQS just drops after
 // maxReceiveCount with no DLQ fallback-for-DLQ.

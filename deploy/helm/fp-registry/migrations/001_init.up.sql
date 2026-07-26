@@ -150,7 +150,7 @@ CREATE UNIQUE INDEX model_versions_model_version_uniq ON model_versions (model_i
 -- enforcement of the invariant the service guards in PromoteVersionTx. Even if two
 -- promotions raced past the application check, this index would reject the second
 -- commit with 23505 — the invariant holds under concurrency, not just under correct
--- code. THIS is the interview answer to "what stops two production versions?": the
+-- code. THIS is what stops two production versions: the
 -- service demotes-then-promotes in one tx, AND this index is the backstop.
 CREATE UNIQUE INDEX model_versions_one_production_per_model
     ON model_versions (model_id)
@@ -172,7 +172,7 @@ CREATE INDEX model_versions_model_created_idx
 -- command_idempotency — the generic MUTATION-idempotency ledger.
 -- ----------------------------------------------------------------------------
 --
--- WHY THIS TABLE EXISTS (the interview centerpiece of idempotency, from ports.go):
+-- WHY THIS TABLE EXISTS (the centerpiece of idempotency, from ports.go):
 --
 --   RegisterModel/CreateVersion are CREATES — their idempotency key hangs on the
 --   created row (the inline idempotency_key columns above). But the three MUTATION

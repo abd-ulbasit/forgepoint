@@ -8,7 +8,7 @@
 # Together they answer: "what's in our software, is any of it vulnerable, and
 # can a consumer cryptographically verify the image we publish?"
 #
-# WHY each tool (and what it would catch in an interview answer):
+# WHY each tool (and what it catches):
 #   - govulncheck: Go-aware. Unlike a generic scanner it uses CALL-GRAPH
 #     reachability — it reports a vuln only if your code actually reaches the
 #     vulnerable symbol, so it has far fewer false positives than "this go.sum

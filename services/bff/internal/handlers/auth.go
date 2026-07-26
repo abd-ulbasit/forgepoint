@@ -106,7 +106,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	//     itself carries everything the header needs (sub/email/name/team/role/exp),
 	//     so we read it back out here for display convenience.
 	//
-	// WHY WE DO NOT VERIFY THE SIGNATURE HERE (interview-critical): the BFF is not
+	// WHY WE DO NOT VERIFY THE SIGNATURE HERE: the BFF is not
 	// an identity authority (see httpx/auth.go) and this token did not arrive from
 	// an untrusted client — we MINTED it one line above via a trusted in-cluster
 	// gRPC call to the auth service. Re-verifying would force the BFF to hold

@@ -56,7 +56,7 @@
 //   - calls h.svc.<Method>(...),
 //   - converts the domain result (or error sentinel) back to proto / a gRPC status.
 //
-// INTERVIEW: "How does grpc-go ensure forward compatibility of service servers?"
+// FORWARD COMPATIBILITY OF gRPC SERVICE SERVERS:
 //
 //	The mustEmbedUnimplemented…() private method forces embedding the Unimplemented
 //	base. Adding an RPC to the proto can't break a server that embeds the base —

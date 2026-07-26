@@ -51,7 +51,7 @@
 // surface) — which is the correct fix but a DOMAIN change, out of scope for this
 // persistence adapter (the domain package is frozen here). We do NOT reach into the
 // private maps via reflection/unsafe: that is fragile, silently breaks on any domain
-// refactor, and is not interview-defensible. So this adapter persists the
+// refactor, and is not defensible. So this adapter persists the
 // publicly-recoverable window state with full fidelity and documents the gap loudly
 // rather than faking completeness. (In the live single-process path the window is
 // folded and scored without ever round-tripping through Redis between Add and score;

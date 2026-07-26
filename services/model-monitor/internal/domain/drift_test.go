@@ -10,9 +10,10 @@ import (
 // PSI — pinned against HAND-COMPUTED values on known distributions.
 // ============================================================================
 //
-// WHY hand-compute: an interviewer will ask "is your PSI right?". A test that
-// only checks "score > 0" proves nothing. Each case below states the arithmetic
-// so the expected value is auditable, and we assert to a tight tolerance.
+// WHY hand-compute: "is this PSI right?" is the question the test must answer.
+// A test that only checks "score > 0" proves nothing. Each case below states
+// the arithmetic so the expected value is auditable, asserted to a tight
+// tolerance.
 
 // floatNear asserts a and b are within tol — the right way to compare floats.
 func floatNear(t *testing.T, got, want, tol float64, msg string) {

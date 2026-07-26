@@ -21,7 +21,7 @@
 # whereas auth has no Redis dependency. We open egress ONLY to the stores this
 # service actually uses (least privilege).
 #
-# ENFORCEMENT CAVEAT (interview-critical): a NetworkPolicy is only enforced if
+# ENFORCEMENT CAVEAT: a NetworkPolicy is only enforced if
 # the cluster's CNI supports it (Calico, Cilium, etc.). On a CNI without policy
 # support it is silently ignored — present but not enforced. So this is defense
 # in depth, not a substitute for authn/authz at the app layer.

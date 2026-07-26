@@ -12,7 +12,7 @@
 // per-command FlagSets; all we add is a two-level dispatcher (command →
 // subcommand) and a usage printer. The result is ~the same ergonomics for our
 // command count, with zero third-party code to audit — and it makes the
-// dispatch mechanism itself something you can read and explain in an interview.
+// dispatch mechanism itself easy to read.
 //
 // COMMAND TREE:
 //

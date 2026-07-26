@@ -17,7 +17,7 @@ import (
 // ChatCompletion — SERVER-STREAMING
 // ============================================================================
 //
-// THE STREAM-AUTH MECHANIC (interview-critical): a server-streaming RPC's handler
+// THE STREAM-AUTH MECHANIC: a server-streaming RPC's handler
 // gets a grpc.ServerStreamingServer whose Context() is the per-RPC context the auth
 // STREAM interceptor populated with claims. So grpcutil.ClaimsFromContext on
 // stream.Context() yields the verified principal — exactly as a unary handler reads

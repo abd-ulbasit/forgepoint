@@ -181,14 +181,14 @@ func (DriftType) EnumDescriptor() ([]byte, []int) {
 // ============================================================================
 //
 // WHY surface the statistical METHOD: PSI, KL-divergence, and the KS-test
-// answer "did the distribution move?" differently, and an interviewer will ask
-// "which test, and why?". Exposing the method on every metric makes the report
-// self-describing — a reader (or the Web UI) knows a score of 0.3 means
+// answer "did the distribution move?" differently, so a score is meaningless
+// without the test that produced it. Exposing the method on every metric makes
+// the report self-describing — a reader (or the Web UI) knows a score of 0.3 means
 // "PSI=0.3 (significant)" vs "KS=0.3 (a p-value-ish distance)". Different
 // methods have different threshold conventions, so the method must travel with
 // the score.
 //
-// METHOD CHEAT-SHEET (interview-critical):
+// METHOD REFERENCE:
 //   - PSI (Population Stability Index): bins both distributions, sums
 //     (curr% - base%) * ln(curr%/base%) per bin. Rule of thumb: <0.1 stable,
 //     0.1–0.25 moderate shift, >0.25 significant. Cheap, interpretable, the
@@ -731,7 +731,7 @@ type DriftMetric struct {
 	// or a metric name for performance decay (e.g., "accuracy", "f1").
 	Name string `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	// The statistical method used to produce `score` (PSI/KL/KS). Travels with the
-	// score because thresholds are method-specific (see DriftMethod cheat-sheet).
+	// score because thresholds are method-specific (see the DriftMethod reference).
 	Method DriftMethod `protobuf:"varint,2,opt,name=method,proto3,enum=forgepoint.monitor.v1.DriftMethod" json:"method,omitempty"`
 	// The computed drift score under `method`. Higher = more drift. SERVER-computed.
 	Score float64 `protobuf:"fixed64,3,opt,name=score,proto3" json:"score,omitempty"`

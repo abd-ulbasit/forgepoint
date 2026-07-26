@@ -27,9 +27,9 @@
 // (bounded memory), so the O(k log k) sort on read is negligible, and it keeps
 // the domain dependency-free (no histogram library). The interface (P50/P99) is
 // what matters and is honest; the estimator can be swapped without changing the
-// ServingMetrics contract. This tradeoff is called out so an interviewer sees we
-// know the "real" answer (streaming histograms) and chose a simpler one
-// deliberately for the teaching codebase.
+// ServingMetrics contract. The tradeoff is called out explicitly: the "real"
+// answer is streaming histograms; the simpler estimator is a deliberate choice
+// for a small, bounded window.
 // ============================================================================
 package domain
 
@@ -146,8 +146,7 @@ func (m *metricsAccumulator) lastInferenceLatency() time.Duration {
 //
 // PERCENTILE INDEXING: we use the "nearest-rank" method — p-th percentile is the
 // value at ceil(p/100 * N), 1-indexed, clamped to the last element. It is simple
-// and exact for the discrete samples we hold (no interpolation ambiguity to
-// defend in an interview).
+// and exact for the discrete samples we hold (no interpolation ambiguity).
 func percentilesLocked(window []time.Duration) (p50, p99 time.Duration) {
 	n := len(window)
 	if n == 0 {

@@ -58,7 +58,7 @@
 //   Mirrors domain.validateHMACSecret — weak secrets are rejected at
 //   construction time, not silently accepted.
 //
-// INTERVIEW: "What is algorithm confusion and how do you prevent it?"
+// ALGORITHM CONFUSION:
 //   The attacker changes the alg header in a JWT to trick the verifier into
 //   using a different algorithm than the signer intended. Prevention: pin the
 //   algorithm on the VERIFIER side (never trust the token's alg header); assert

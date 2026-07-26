@@ -95,7 +95,7 @@ const (
 // Render substitutes {{variable}} placeholders in template with values from vars,
 // honoring the MissingVarPolicy for any placeholder lacking a value.
 //
-// THE SUBSTITUTION (interview note): we do a SINGLE regexp pass with a replacer
+// THE SUBSTITUTION: we do a SINGLE regexp pass with a replacer
 // callback, NOT iterative strings.Replace per variable. WHY single-pass matters:
 //
 //  1. NO RE-SUBSTITUTION / INJECTION: if a variable's VALUE itself contains a

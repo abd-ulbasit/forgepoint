@@ -25,8 +25,8 @@ import (
 // This file centralizes that decision for the LOAD path so the handlers stay
 // readable and the policy is one auditable place.
 //
-// INTERVIEW FRAMING: "How do you stop a poison message from looping forever?"
-// → classify errors; ACK permanent ones immediately, NAK transient ones with a
+// STOPPING A POISON MESSAGE FROM LOOPING FOREVER:
+// classify errors; ACK permanent ones immediately, NAK transient ones with a
 // bounded retry budget + DLQ. Never NAK an error that can't get better.
 
 // permanentLoadErrors are the domain errors that a redelivery cannot fix, because

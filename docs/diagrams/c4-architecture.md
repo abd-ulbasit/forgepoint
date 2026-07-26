@@ -252,7 +252,7 @@ implementations chosen by a `StepType` registry. This is exactly what makes the 
 unit-testable with mock executors that simulate success/failure/panic with no real
 infrastructure.
 
-Three mechanics an interviewer probes, all visible below: **(1) durability** — every step is
+Three mechanics, all visible below: **(1) durability** — every step is
 written to Postgres (`ExecutionRepository.SaveStep`) *before* it runs (write-ahead), so a
 crashed orchestrator reloads the last checkpoint and **resumes** rather than restarts;
 **(2) compensation-failure** — a `Compensate` that errors is *not* swallowed, it ends the saga
@@ -327,7 +327,7 @@ drift, and — when delayed ground-truth labels arrive via `SubmitGroundTruth` �
 decay. The scored `DriftReport` is saved **idempotently on its window id** (one window → one
 report → at most one event).
 
-The decision half is a **pure policy** (`DecideRetrain`) with an interview-ready truth table:
+The decision half is a **pure policy** (`DecideRetrain`) with an explicit truth table:
 `OK` persists silently; `WARNING` emits `ModelDriftDetected` (alert a human) but does **not**
 retrain; `CRITICAL` emits *and*, if `auto_retrain` is on with a pipeline configured *and* the
 **cooldown** has elapsed, fires `TriggerRetrain` at the orchestrator. That cooldown

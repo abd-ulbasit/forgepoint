@@ -29,9 +29,9 @@
 #     Service, making local/cloud parity harder.
 #   - Phase 12 (Terraform) uses RDS for the production environment.
 #
-#   DECISION: CNPG for the K8s-native path (interviewed as "how I'd run Postgres
-#   on EKS"); RDS for the managed cloud path (Phase 12 Terraform). Both are
-#   documented here so an interviewer can ask about either.
+#   DECISION: CNPG for the K8s-native path (operator-managed Postgres on EKS);
+#   RDS for the managed cloud path (Phase 12 Terraform). Both are
+#   documented here.
 #
 # INSTALL CNPG OPERATOR (run once per cluster):
 #   kubectl apply --server-side -f \

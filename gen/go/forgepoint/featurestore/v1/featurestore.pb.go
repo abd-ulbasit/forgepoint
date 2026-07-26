@@ -61,7 +61,7 @@
 //      regenerated; the log cannot be regenerated.
 //   4. AUDIT — every feature value's full lineage is inspectable.
 //
-// TRADEOFFS / ALTERNATIVES (interview-critical — be ready to defend):
+// TRADEOFFS / ALTERNATIVES:
 //   - vs CRUD table (UPDATE in place): simplest, but destroys history →
 //     impossible point-in-time reads, no reproducibility. Disqualifying here.
 //   - vs CDC/temporal tables (Postgres system-versioned rows): you DO keep
@@ -815,7 +815,7 @@ type DefineFeatureViewRequest struct {
 	// The feature schema (specs). Server validates: non-empty, unique names,
 	// valid value_types, sane dimensions.
 	Features []*FeatureSpec `protobuf:"bytes,4,rep,name=features,proto3" json:"features,omitempty"`
-	// IDEMPOTENCY KEY (interview-critical for "exactly-once intent"):
+	// IDEMPOTENCY KEY (for "exactly-once intent"):
 	//
 	//	DefineFeatureView mutates state by appending an event. A network retry
 	//	after a server-side success (response lost) must NOT append a duplicate

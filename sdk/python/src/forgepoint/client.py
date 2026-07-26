@@ -163,7 +163,7 @@ class Client:
     ) -> grpc.Channel:
         """Create a secure channel by default; plaintext only on explicit opt-out.
 
-        SECURITY (interview point): the *default* path is ``secure_channel`` with
+        SECURITY: the *default* path is ``secure_channel`` with
         TLS. ``insecure_channel`` is reachable ONLY when the caller passes
         ``insecure=True`` AND the target is loopback. Refusing an insecure channel
         to a remote host prevents the classic "I set insecure for local dev and
@@ -217,7 +217,7 @@ class Client:
     def _require_auth(self) -> None:
         """Guard every authenticated method: no token → fail fast, locally.
 
-        WHY (interview point): without this, calling e.g. ``list_models()`` on a
+        WHY: without this, calling e.g. ``list_models()`` on a
         client that never logged in would still make a round-trip and come back
         with an opaque server ``UNAUTHENTICATED``. That wastes a network call and
         hides the real cause (you forgot to authenticate). Raising

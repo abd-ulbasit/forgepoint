@@ -46,7 +46,7 @@
 // domain, the route admin RPCs, the circuit observability reads) land once the
 // repository/event adapters exist to construct a real domain service.
 //
-// INTERVIEW: "How does grpc-go keep service servers forward-compatible?" The
+// FORWARD COMPATIBILITY OF gRPC SERVICE SERVERS: the
 // mustEmbed... private method forces embedding the Unimplemented base; a new RPC
 // in the proto compiles fine for servers that embed it (returning Unimplemented)
 // instead of breaking the build.

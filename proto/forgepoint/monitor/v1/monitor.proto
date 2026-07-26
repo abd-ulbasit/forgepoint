@@ -143,14 +143,14 @@ enum DriftType {
 // ============================================================================
 //
 // WHY surface the statistical METHOD: PSI, KL-divergence, and the KS-test
-// answer "did the distribution move?" differently, and an interviewer will ask
-// "which test, and why?". Exposing the method on every metric makes the report
-// self-describing — a reader (or the Web UI) knows a score of 0.3 means
+// answer "did the distribution move?" differently, so a score is meaningless
+// without the test that produced it. Exposing the method on every metric makes
+// the report self-describing — a reader (or the Web UI) knows a score of 0.3 means
 // "PSI=0.3 (significant)" vs "KS=0.3 (a p-value-ish distance)". Different
 // methods have different threshold conventions, so the method must travel with
 // the score.
 //
-// METHOD CHEAT-SHEET (interview-critical):
+// METHOD REFERENCE:
 //   - PSI (Population Stability Index): bins both distributions, sums
 //     (curr% - base%) * ln(curr%/base%) per bin. Rule of thumb: <0.1 stable,
 //     0.1–0.25 moderate shift, >0.25 significant. Cheap, interpretable, the
@@ -392,7 +392,7 @@ message DriftMetric {
   string name = 1;
 
   // The statistical method used to produce `score` (PSI/KL/KS). Travels with the
-  // score because thresholds are method-specific (see DriftMethod cheat-sheet).
+  // score because thresholds are method-specific (see the DriftMethod reference).
   DriftMethod method = 2;
 
   // The computed drift score under `method`. Higher = more drift. SERVER-computed.

@@ -22,7 +22,7 @@
 // The enum mappers use an EXPLICIT switch rather than a raw int cast. The proto
 // and domain enum integer values are aligned on purpose (see models.go), so a
 // cast WOULD work today — but an explicit switch (a) rejects out-of-range client
-// ints precisely (anti-garbage), (b) is auditable line-by-line in an interview,
+// ints precisely (anti-garbage), (b) is auditable line-by-line,
 // and (c) does not silently break if the two enums ever diverge. The price is a
 // few lines of boilerplate; the safety is worth it at a trust boundary.
 package handler

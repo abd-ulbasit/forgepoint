@@ -21,9 +21,9 @@ retraining — closing the loop.
 
 ### Option A — Integrate an external ML-monitoring tool (Evidently / Arize / WhyLabs)
 - **Pro:** batteries-included drift metrics and dashboards; less code.
-- **Con:** off-loads the most interesting distributed-systems learning (streaming aggregation,
-  windowing, closed-loop control); adds a heavy external dependency; weaker interview story
-  ("I wired up a SaaS" vs "I built the loop"); doesn't fit the self-contained Go-microservices thesis.
+- **Con:** off-loads the distributed-systems core (streaming aggregation, windowing,
+  closed-loop control) to a vendor; adds a heavy external dependency; doesn't fit the
+  self-contained Go-microservices thesis.
 
 ### Option B — Fold monitoring into the Experiment Tracker
 - **Pro:** reuses an existing event-driven consumer; no new service.

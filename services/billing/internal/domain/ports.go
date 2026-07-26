@@ -32,7 +32,7 @@
 // them in one tx (see UsageStore.RecordUsageTx). The atomicity MECHANISM (BEGIN/
 // COMMIT, pgx) is the adapter's secret; the domain only states the requirement.
 //
-// INTERVIEW: "How do you keep the domain pure but still demand a transaction?"
+// KEEPING THE DOMAIN PURE WHILE STILL DEMANDING A TRANSACTION:
 //
 //	The port METHOD is the transaction boundary: one call = one atomic unit. The
 //	domain hands the adapter everything that must commit together; the adapter

@@ -3,10 +3,10 @@
 # ============================================================================
 # We build EKS from PRIMITIVES (aws_eks_cluster / aws_eks_node_group / IAM /
 # aws_iam_openid_connect_provider) rather than the terraform-aws-modules/eks
-# community module. WHY for a portfolio piece: an interviewer can read every
-# resource and I can explain each one. The community module is excellent in
-# production but hides the OIDC/IRSA wiring, KMS envelope encryption, and IAM
-# trust relationships that are exactly what an interview probes.
+# community module. WHY: every resource here is readable and explicit. The
+# community module is excellent in production but hides the OIDC/IRSA wiring,
+# KMS envelope encryption, and IAM trust relationships — which are exactly the
+# parts worth understanding.
 # ----------------------------------------------------------------------------
 
 # ============================================================================
@@ -15,7 +15,7 @@
 # By default EKS encrypts etcd with an AWS-owned key. Adding a CUSTOMER-managed
 # KMS key gives ENVELOPE encryption of the Secret resources specifically: the K8s
 # Secret payload is encrypted with a data key that is itself encrypted by this
-# CMK. Benefits an interviewer wants to hear:
+# CMK. Benefits:
 #   - we control the key policy, rotation, and can REVOKE access (cut the key) to
 #     cryptographically lock secrets in an incident.
 #   - key rotation is automatic (enable_key_rotation) — yearly new backing key.
@@ -170,7 +170,7 @@ locals {
 # ============================================================================
 # (5c) KMS GRANTS FOR NODE EBS
 # ============================================================================
-# WHY kms:CreateGrant is needed (the tricky part interviewers probe):
+# WHY kms:CreateGrant is needed (the subtle part):
 #   When EC2/Auto Scaling launches an EBS-encrypted instance, it needs to call
 #   kms:Decrypt and kms:GenerateDataKeyWithoutPlaintext on behalf of the instance.
 #   It does this via an EBS service grant, NOT via the role policy, because the
@@ -212,7 +212,7 @@ data "aws_iam_policy_document" "node_ebs_kms" {
 #     - block_device_mappings with ebs.encrypted = true → root volume is encrypted
 #       with our CMK.
 #
-# Interview angle: "why hop_limit = 1?" — at hop limit 2 the TTL survives one
+# WHY hop_limit = 1: at hop limit 2 the TTL survives one
 # network hop, meaning a container (which is one hop from the node kernel's network
 # namespace) can reach IMDS. At hop limit 1 only the node host itself can reach it;
 # a container's network namespace counts as a hop and the request dies. This is the
@@ -291,7 +291,7 @@ resource "aws_iam_role" "node" {
 #   ECR ReadOnly      — pull container images (complements the ECR VPC endpoints)
 # We do NOT grant nodes broad access; pods that need AWS get it via IRSA (per
 # workload, least privilege), NOT via the node role. That separation is the whole
-# point of IRSA and a classic interview question ("why not just use the node role?").
+# point of IRSA ("why not just use the node role?").
 resource "aws_iam_role_policy_attachment" "node_worker" {
   role       = aws_iam_role.node.name
   policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"

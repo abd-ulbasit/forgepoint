@@ -49,7 +49,7 @@
 //     a SANITIZED codes.Internal (we never echo raw error text — it can carry
 //     endpoints, query fragments, or PII).
 //
-// INTERVIEW: the streaming auth/cancellation mechanics to study are (a) a
+// The streaming auth/cancellation mechanics are (a) a
 // server-streaming RPC's nil-guard returns the status as the error, and (b) the
 // stream loop checks stream.Context().Err() each iteration so a client
 // disconnect / deadline stops work promptly instead of scoring a dead batch.
@@ -176,8 +176,7 @@ func requireScope(claims *grpcutil.Claims, scope string) error {
 // ============================================================================
 
 // statusFromDomainErr maps a domain sentinel error to the precise gRPC status the
-// API contract promises. This is THE single translation point (interview-critical
-// — be ready to recite it):
+// API contract promises. This is THE single translation point:
 //
 //	ErrNoRoute        → NotFound            (model not routable)
 //	ErrInvalidInput   → InvalidArgument     (bad tensors/shape — data plane)
@@ -534,7 +533,7 @@ func (h *InferenceHandler) BatchPredict(ctx context.Context, req *inferencev1.Ba
 // StreamPredict implements the SERVER-STREAMING large-batch RPC: one request,
 // N responses streamed AS each item completes.
 //
-// STREAMING MECHANICS to study (interview):
+// STREAMING MECHANICS:
 //   - the NIL-SVC GUARD returns the status as the error (no response value).
 //   - the identity/authz come from stream.Context() — the auth interceptor wraps
 //     the ServerStream so its Context() carries the verified Claims (the stream

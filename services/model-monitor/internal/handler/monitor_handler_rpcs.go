@@ -53,7 +53,7 @@
 // status vocabulary and SANITIZES anything it does not recognize down to
 // codes.Internal with a fixed generic message. See toStatusError at the bottom.
 //
-// INTERVIEW — "How do you stop internal errors leaking through gRPC?": centralize
+// KEEPING INTERNAL ERRORS OFF THE WIRE: centralize
 // the mapping; whitelist the codes you intend to expose; sanitize everything else
 // to Internal with a fixed string; use errors.Is (not ==) so a wrapped sentinel
 // still classifies; never str-format the raw error into the status message on the

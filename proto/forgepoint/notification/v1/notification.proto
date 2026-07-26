@@ -26,7 +26,7 @@
 //   user just authors a rule whose pattern matches the new subject. THAT is the
 //   payoff of choreography: extreme decoupling and independent evolvability.
 //
-//   THE OTHER SIDE OF THE COIN (interview tradeoff): choreography's weakness is
+//   THE OTHER SIDE OF THE COIN: choreography's weakness is
 //   that no single place describes "the whole workflow". To answer "what
 //   happens when a pipeline fails?" you must inspect every subscriber. We accept
 //   that here because notification is a leaf reaction, not a multi-step business
@@ -54,7 +54,7 @@
 //   toggles) rather than a free-form rule CRUD API, because that is the shape an
 //   end user actually wants ("email me on failures, Slack me on drift"). A
 //   richer admin rule-builder can arrive as a v2 addition without breaking this
-//   surface. This tradeoff is called out so it is defensible in an interview.
+//   surface. The tradeoff is called out explicitly rather than hidden.
 //   The plan's third RPC, GetDeliveryLog, IS honored here as ListDeliveryAttempts
 //   (the cross-notification delivery-health/audit query).
 //
@@ -349,7 +349,7 @@ message DeliveryAttempt {
 //   on reads while accepting the full value on UpdatePreferences. We document
 //   this rather than hard-code masking so the storage layer owns the policy.
 //
-// SECURITY — SSRF (the headline risk for THIS service, interview-critical):
+// SECURITY — SSRF (the headline risk for THIS service):
 //   `target` for WEBHOOK/SLACK is a CLIENT-SUPPLIED URL that the delivery layer
 //   will make an outbound HTTP request to. A naive implementation is a textbook
 //   Server-Side Request Forgery primitive: a user could point a "webhook" at
@@ -474,7 +474,7 @@ message NotificationPreferences {
 //   inline, not imported. Defining/decoding them would couple us to producers'
 //   schemas and destroy the "zero knowledge of what events mean" property that
 //   makes adding a new event type a zero-code-change operation here. That opacity
-//   is the entire payoff of choreography (interview-critical: it's WHY a new
+//   is the entire payoff of choreography (it is WHY a new
 //   producer needs no change in this service — a user just writes a rule pattern).
 //
 // KEEP EVENTS SMALL & STABLE: the emitted delivery events carry identifiers +
@@ -785,7 +785,7 @@ message TestChannelResponse {
 //   PREFERENCES (config): GetPreferences, UpdatePreferences, TestChannel
 //   (TestChannel is a control-plane self-check, not a "send" RPC — see its doc.)
 //
-// WHY NO STREAMING RPC HERE (a deliberate choice, interview-relevant):
+// WHY NO STREAMING RPC HERE (a deliberate choice):
 //   A live "watch my inbox" stream is tempting, but the natural realtime path
 //   for notifications is the very NATS stream this service already consumes and
 //   the fan-out channels (web push, Slack) it already delivers over. The web UI
@@ -797,7 +797,7 @@ message TestChannelResponse {
 //   WatchExecution server-stream, because there the authoritative state lives in
 //   that service and a client genuinely needs to follow one execution's lifecycle.
 //
-// IDEMPOTENCY (interview-critical, on BOTH paths):
+// IDEMPOTENCY (on BOTH paths):
 //   - Async consumer: events can be redelivered (NATS at-least-once). The
 //     consumer dedupes on EventEnvelope.id (carried into Notification.event_id)
 //     per recipient, so a redelivered event never creates a duplicate inbox row

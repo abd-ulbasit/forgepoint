@@ -1,7 +1,7 @@
 # ============================================================================
 # rds — PostgreSQL: private, KMS-encrypted, SG-restricted, creds in Secrets Manager
 # ============================================================================
-# The credential flow is the interview centerpiece:
+# The credential flow is the centerpiece:
 #   random_password → aws_db_instance.master_password → aws_secretsmanager_secret
 # The plaintext password exists only inside Terraform's run and the encrypted
 # Secrets Manager entry. It is NEVER an input var, NEVER an output, and the random

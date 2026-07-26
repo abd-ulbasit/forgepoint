@@ -3,7 +3,7 @@ apiVersion: v2
 # fp-pipeline-orchestrator mirrors the REFERENCE Helm chart fp-auth. It changes
 # only what is service-specific (name, image, config, NetworkPolicy egress). Keep
 # it boringly uniform with the other service charts so the platform's deployment
-# surface is interview-explainable and easy to audit.
+# surface is uniform and easy to audit.
 name: fp-pipeline-orchestrator
 description: Forgepoint Pipeline Orchestrator service (Saga orchestration + compensation, DAG execution) — mirrors the fp-auth reference chart.
 

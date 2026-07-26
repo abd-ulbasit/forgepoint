@@ -5,7 +5,7 @@ apiVersion: v2
 # to the Model Registry service: the name, the image, and the config/egress for
 # its data stores (Postgres WRITE side + Redis READ side — the two halves of
 # CQRS). Keep it boringly uniform with fp-auth so the platform's deployment
-# surface stays interview-explainable and easy to audit.
+# surface stays uniform and easy to audit.
 name: fp-registry
 description: Forgepoint Model Registry service (CQRS — Postgres write store, Redis read projection, NATS projection events).
 

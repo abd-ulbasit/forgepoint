@@ -45,8 +45,8 @@
 // consumer owns the port); the Ollama judge adapter (internal/judge) and the
 // Postgres eval store (internal/repository/postgres) implement them. The SCORE
 // PARSER, the SAMPLING selector, and the QUALITY-DRIFT decision are pure functions
-// so they unit-test in microseconds against known inputs — exactly the interview-
-// probed parts ("how do you tolerate a tiny model's messy output?", "how does
+// so they unit-test in microseconds against known inputs — exactly the parts
+// that need proving ("how do you tolerate a tiny model's messy output?", "how does
 // 1-in-N sampling stay deterministic?", "when does a window of low scores alert?").
 package domain
 
@@ -481,7 +481,7 @@ type QualityDriftResult struct {
 // SCORED overall scores (newest first or any order — we just average them) and the
 // config, decide whether quality has drifted DOWN.
 //
-// DECISION (interview-ready):
+// DECISION:
 //  1. Fewer than MinSamples scored evals ⇒ NOT drifted (warming up — never alert on
 //     a near-empty window; a single bad answer must not retrain a model).
 //  2. average < FloorScore ⇒ DRIFTED (absolute quality floor breached).

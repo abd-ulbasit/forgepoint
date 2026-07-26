@@ -31,7 +31,7 @@
 #   cron-style polling) that must run continuously. The correct answer for
 #   billing is scale-to-zero=false; keep ≥1 replica always hot.
 #
-# Interview framing: "Why doesn't billing scale to zero?"
+# WHY BILLING DOES NOT SCALE TO ZERO:
 # → Because the Outbox relay is a duty-cycle background goroutine, not a
 #   pure event consumer. A zero-replica billing service would stop flushing
 #   its outbox table, leaving billing events stuck indefinitely. The safety

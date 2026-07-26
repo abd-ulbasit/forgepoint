@@ -18,7 +18,7 @@
 //	   ▼ Subscribers call PipelineService.TriggerExecution  (inbound)
 //	wire (NATS ModelDriftDetected → auto-retrain saga)
 //
-// THE SINGLE DESIGN DECISION WORTH DEFENDING IN AN INTERVIEW — protojson, not
+// THE SINGLE DESIGN DECISION WORTH DEFENDING — protojson, not
 // encoding/json, for the event payloads:
 //
 //   pkg/natsutil.Publisher serializes whatever payload it is handed with
@@ -40,8 +40,8 @@
 //   env.Data (a json.RawMessage) and protojson.Unmarshal it back into the same
 //   generated type — one canonical contract, both ends of every pipe.
 //
-//   INTERVIEW framing: "Why not just let the JSON publisher marshal the proto?"
-//   → Proto well-known types (Timestamp/Struct/enum) don't serialize correctly
+//   WHY NOT LET THE JSON PUBLISHER MARSHAL THE PROTO:
+//   proto well-known types (Timestamp/Struct/enum) don't serialize correctly
 //   under encoding/json; protojson is the canonical, cross-language encoding the
 //   published event contract requires. We pre-encode and pass the raw bytes
 //   through.

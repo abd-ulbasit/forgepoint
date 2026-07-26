@@ -21,7 +21,7 @@
 --                   not duplicates — the persistence half of exactly-once.
 --
 -- ----------------------------------------------------------------------------
--- THE TWO LOAD-BEARING INVARIANTS (each is interview-probed)
+-- THE TWO LOAD-BEARING INVARIANTS
 -- ----------------------------------------------------------------------------
 --
 -- 1) TENANCY KEY = (owner_team, model_name), NOT model_name alone.
@@ -41,7 +41,7 @@
 --    event fires exactly once per window even under stream redelivery.
 --
 -- ----------------------------------------------------------------------------
--- DESIGN CHOICES (each interview-defensible, consistent with the other services)
+-- DESIGN CHOICES (consistent with the other services)
 -- ----------------------------------------------------------------------------
 --
 -- IDs are TEXT (UUIDv4 strings), not native uuid — the domain carries ids as

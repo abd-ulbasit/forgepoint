@@ -23,7 +23,7 @@
 //	event: message_stop
 //	data: {"type":"message_stop"}
 //
-// THE TOKEN-ACCOUNTING SUBTLETY (interview-worthy): Anthropic splits usage across two
+// THE TOKEN-ACCOUNTING SUBTLETY: Anthropic splits usage across two
 // events. INPUT tokens arrive on `message_start` (message.usage.input_tokens); OUTPUT
 // tokens arrive on `message_delta` (usage.output_tokens) near the end. So unlike
 // OpenAI (one final usage block) we must ACCUMULATE: stash input_tokens from

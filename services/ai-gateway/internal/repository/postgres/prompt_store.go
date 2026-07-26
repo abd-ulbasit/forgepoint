@@ -26,7 +26,7 @@
 //
 //  3. THE ATOMIC VERSION ASSIGNMENT. CreateNextVersion computes the next per-(team,
 //     name) version AND inserts the row inside ONE transaction, so the version number
-//     has no read-modify-write race window (the interview centerpiece — see below).
+//     has no read-modify-write race window (the centerpiece — see below).
 //
 //  4. TEAM-SCOPED READS. Every SELECT carries WHERE team = $1, so no query can return
 //     another team's row. Tenancy is enforced in the SQL, not just the service.
@@ -110,7 +110,7 @@ const promptColumns = `id, name, version, stage, template, variables, descriptio
 // CreateNextVersion — THE ATOMIC PER-(team,name) VERSION ASSIGNMENT
 // ============================================================================
 //
-// INTERVIEW CENTERPIECE — "how do you assign a monotonic version with no race?":
+// ASSIGNING A MONOTONIC VERSION WITH NO RACE:
 //
 //	The next version is COALESCE(MAX(version),0)+1 over the (team,name) rows. If we
 //	read MAX in one statement and INSERT in another WITHOUT a transaction, two

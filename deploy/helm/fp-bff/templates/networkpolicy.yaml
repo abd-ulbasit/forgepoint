@@ -20,7 +20,7 @@
 #             the collector. NO Postgres / Redis / NATS egress — the BFF talks to
 #             none of them (it is stateless and publishes no events).
 #
-# ENFORCEMENT CAVEAT (interview-critical): a NetworkPolicy is only enforced if the
+# ENFORCEMENT CAVEAT: a NetworkPolicy is only enforced if the
 # CNI supports it (Calico, Cilium, ...). k3s' default Flannel does NOT — so on this
 # cluster the policy is PRESENT and GitOps-correct (it starts enforcing the moment
 # the CNI is swapped) but a runtime no-op. Defense in depth, never a substitute for

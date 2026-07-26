@@ -877,9 +877,8 @@ ACTION NAMES:
   &#34;read&#34;, &#34;write&#34;, &#34;delete&#34;, &#34;admin&#34;
   &#34;admin&#34; action means full control including granting the resource to others.
 
-INTERVIEW NOTE: Interviewer might ask &#34;how do you check a wildcard admin
-permission that grants everything?&#34; Answer: CheckPermission on the Auth
-service iterates the user&#39;s role permissions. If any Permission has
+WILDCARD ADMIN PERMISSIONS — a role that grants everything: CheckPermission
+on the Auth service iterates the user&#39;s role permissions. If any Permission has
 resource=&#34;*&#34; and action=&#34;*&#34;, it short-circuits to allowed.
 ============================================================================
 
@@ -944,7 +943,7 @@ BUILT-IN ROLES (not defined in proto, just examples for documentation):
 WHY NOT HIERARCHICAL ROLES:
   Some systems support role inheritance (admin extends engineer). We keep
   roles flat for simplicity — explicit permission lists are easier to audit
-  in interviews (&#34;what exactly can an engineer do?&#34;) and reduce surprise.
+  (&#34;what exactly can an engineer do?&#34;) and reduce surprise.
   If we need hierarchy later, we add parent_role_id to this message.
 ============================================================================
 
@@ -971,7 +970,7 @@ WHY: The decoded payload of a JWT. Other services call ValidateToken and
 receive these claims — they don&#39;t need to decode the JWT themselves, which
 avoids distributing the JWT secret and simplifies revocation checks.
 
-JWT STRUCTURE RECAP (for interview clarity):
+JWT STRUCTURE RECAP:
   Header.Payload.Signature (base64url encoded, dot-separated)
   Payload contains claims: sub (subject/user_id), exp, iat, custom fields.
   We embed role &#43; scopes in the payload so the auth interceptor has enough
@@ -1037,9 +1036,8 @@ ROLE MODEL — RBAC (Role-Based Access Control):
       these ON TOP of RBAC — an API key can only do a subset of what the
       user&#39;s role permits.
 
-INTERVIEW NOTE: Be ready to explain why we store role as a string name
-here (denormalized) rather than a role_id FK. Answer: this is the JWT claims
-shape — when we issue a token, we embed role name (not ID) so ValidateToken
+WHY role is stored as a string name here (denormalized) rather than a
+role_id FK: this is the JWT claims shape — when we issue a token, we embed role name (not ID) so ValidateToken
 can return claims without a database join. The canonical role definition
 lives in the roles table; the name is stable and human-readable.
 ============================================================================
@@ -1124,7 +1122,7 @@ RPC CATEGORIES:
   TOKEN VALIDATION: ValidateToken (called by every other service&#39;s interceptor)
   ACCESS CONTROL: CheckPermission, AssignRole
 
-INTERCEPTOR CALL PATTERN (interview-critical):
+INTERCEPTOR CALL PATTERN:
   Every gRPC service in Forgepoint has an auth interceptor that:
     1. Extracts &#34;authorization: Bearer &lt;token&gt;&#34; from incoming metadata
     2. Calls AuthService.ValidateToken() → gets TokenClaims
@@ -1161,7 +1159,7 @@ ASCII DIAGRAM — Token Validation Flow:
 
 Performance note: the auth service caches validation results in Redis with a 30-second TTL. This keeps auth overhead below 1ms p99 while still enforcing near-real-time revocation.
 
-INTERVIEW NOTE: Interviewers often ask &#34;what happens if the auth service goes down?&#34; Answer: the other services&#39; interceptors can be configured with a fail-open (allow) or fail-closed (deny) policy. Forgepoint uses fail-closed (safe default for a security service). A circuit breaker on the auth gRPC client prevents cascade failures during auth service outages. |
+NOTE — what happens if the auth service goes down: the other services&#39; interceptors can be configured with a fail-open (allow) or fail-closed (deny) policy. Forgepoint uses fail-closed (safe default for a security service). A circuit breaker on the auth gRPC client prevents cascade failures during auth service outages. |
 | CheckPermission | [CheckPermissionRequest](#forgepoint-auth-v1-CheckPermissionRequest) | [CheckPermissionResponse](#forgepoint-auth-v1-CheckPermissionResponse) | CheckPermission evaluates whether a user&#39;s role permits a specific resource&#43;action. Called by auth interceptors after ValidateToken to enforce RBAC. Returns allowed bool &#43; human-readable reason. |
 | AssignRole | [AssignRoleRequest](#forgepoint-auth-v1-AssignRoleRequest) | [AssignRoleResponse](#forgepoint-auth-v1-AssignRoleResponse) | AssignRole changes a user&#39;s role. Requires admin permission. NOTE: The newly assigned role takes effect on the NEXT token issuance — existing JWTs retain the old role until they expire (or are revoked). For immediate role change enforcement, also revoke the user&#39;s existing tokens. |
 
@@ -1947,7 +1945,7 @@ QUOTA ENFORCEMENT — two complementary mechanisms:
   acceptable for a pre-flight — the worst case is a handful of over-quota calls
   slip through before the cache flips, which the next RecordUsage still meters.
 
-ASCII DIAGRAM — the outbox metering pipeline (interview-critical):
+ASCII DIAGRAM — the outbox metering pipeline:
 
   Inference Gateway ──fp.inference.completed──► Billing NATS consumer
                                                      │ (dedupe on request_id)
@@ -4063,7 +4061,7 @@ mass-assignment.
 | description | [string](#string) |  | Human-readable description for the catalog. |
 | entity | [Entity](#forgepoint-featurestore-v1-Entity) |  | The Entity this view is keyed by (name &#43; join_key). Defining the entity inline keeps the view self-contained for M2; a first-class entity registry is a possible later refinement. |
 | features | [FeatureSpec](#forgepoint-featurestore-v1-FeatureSpec) | repeated | The feature schema (specs). Server validates: non-empty, unique names, valid value_types, sane dimensions. |
-| idempotency_key | [string](#string) |  | IDEMPOTENCY KEY (interview-critical for &#34;exactly-once intent&#34;): DefineFeatureView mutates state by appending an event. A network retry after a server-side success (response lost) must NOT append a duplicate FeatureViewDefined / spuriously bump schema_version. The server records processed idempotency_keys; a repeat returns the SAME FeatureView. UUID v4 generated by the client per logical attempt (not per retry). |
+| idempotency_key | [string](#string) |  | IDEMPOTENCY KEY (for &#34;exactly-once intent&#34;): DefineFeatureView mutates state by appending an event. A network retry after a server-side success (response lost) must NOT append a duplicate FeatureViewDefined / spuriously bump schema_version. The server records processed idempotency_keys; a repeat returns the SAME FeatureView. UUID v4 generated by the client per logical attempt (not per retry). |
 
 
 
@@ -4771,7 +4769,7 @@ SERVER-ENFORCED LIMITS (in the CONTRACT, not just prose — see each RPC):
     native numeric bound, so these caps are documented as named constants and
     enforced server-side; the constants are the contract.
 
-STREAMING CHOICE (interview-critical):
+STREAMING CHOICE:
   DATA-PLANE RPCs are UNARY; the long-running ADMIN replay is SERVER-STREAMING.
     - WriteFeatures: producers emit in BATCHES (one RPC = one atomic append
       with one idempotency key). Client-streaming would blur the idempotency/
@@ -4785,11 +4783,11 @@ STREAMING CHOICE (interview-critical):
     - RebuildViews: SERVER-STREAMING — a full log replay runs for minutes, so
       we stream RebuildViewsResponse frames for live feedback and use stream-close as the
       completion signal (no poll loop). Note this is justified by DURATION, not
-      data volume — the contrast with the unary reads is the interview point.
+      data volume — the contrast with the unary reads is the point.
   So the only streaming RPC is the admin replay, deliberately, and every choice
   is documented so it is defensible.
 
-EVENT-SOURCING RECAP (what an interviewer will probe):
+EVENT-SOURCING RECAP:
   * Source of truth = append-only feature_events log. Views are caches.
   * Reads never replay on the hot path; they read projections.
   * Reproducibility = GetHistoricalFeatures(as_of) over event_time.
@@ -4952,7 +4950,7 @@ because its breaker is OPEN&#34;). Exposing it read-only turns an invisible
 failure mode into an observable one. The metric
 fp_gateway_circuit_breaker_state mirrors this for Prometheus.
 
-THE 3-STATE MACHINE (interview-critical):
+THE 3-STATE MACHINE:
 
   ┌─────────┐  failures ≥ threshold   ┌──────┐
   │ CLOSED  │ ──────────────────────► │ OPEN │
@@ -5471,7 +5469,7 @@ TRADEOFF: bytes are opaque to JSON/grpcurl — you can&#39;t eyeball the numbers
 For the external HTTP API the gateway accepts/returns JSON arrays and
 converts; this binary form is the efficient internal/gRPC representation.
 
-INTERVIEW NOTE: be ready to explain &#34;why not repeated float?&#34; — answer:
+WHY NOT repeated float:
 wire size &#43; zero-copy forwarding. shape carries dimensions (e.g., [1, 4]
 for one iris sample of 4 features); data length must equal product(shape) *
 sizeof(dtype), which the gateway validates.
@@ -5864,7 +5862,7 @@ a single model-level number would throw that away.
 | Field | Type | Label | Description |
 | ----- | ---- | ----- | ----------- |
 | name | [string](#string) |  | The thing whose distribution was measured: a feature name for data drift (e.g., &#34;income&#34;), an output name/class for prediction drift (e.g., &#34;fraud&#34;), or a metric name for performance decay (e.g., &#34;accuracy&#34;, &#34;f1&#34;). |
-| method | [DriftMethod](#forgepoint-monitor-v1-DriftMethod) |  | The statistical method used to produce `score` (PSI/KL/KS). Travels with the score because thresholds are method-specific (see DriftMethod cheat-sheet). |
+| method | [DriftMethod](#forgepoint-monitor-v1-DriftMethod) |  | The statistical method used to produce `score` (PSI/KL/KS). Travels with the score because thresholds are method-specific (see the DriftMethod reference). |
 | score | [double](#double) |  | The computed drift score under `method`. Higher = more drift. SERVER-computed. |
 | baseline_value | [double](#double) |  | The baseline (training-time) summary value for context, e.g., baseline mean. Lets the UI render &#34;was 5.1, now 7.8&#34; without a second lookup. |
 | current_value | [double](#double) |  | The current-window summary value, paired with baseline_value above. |
@@ -6446,14 +6444,14 @@ DriftMethod
 ============================================================================
 
 WHY surface the statistical METHOD: PSI, KL-divergence, and the KS-test
-answer &#34;did the distribution move?&#34; differently, and an interviewer will ask
-&#34;which test, and why?&#34;. Exposing the method on every metric makes the report
-self-describing — a reader (or the Web UI) knows a score of 0.3 means
+answer &#34;did the distribution move?&#34; differently, so a score is meaningless
+without the test that produced it. Exposing the method on every metric makes
+the report self-describing — a reader (or the Web UI) knows a score of 0.3 means
 &#34;PSI=0.3 (significant)&#34; vs &#34;KS=0.3 (a p-value-ish distance)&#34;. Different
 methods have different threshold conventions, so the method must travel with
 the score.
 
-METHOD CHEAT-SHEET (interview-critical):
+METHOD REFERENCE:
   - PSI (Population Stability Index): bins both distributions, sums
     (curr% - base%) * ln(curr%/base%) per bin. Rule of thumb: &lt;0.1 stable,
     0.1–0.25 moderate shift, &gt;0.25 significant. Cheap, interpretable, the
@@ -6640,7 +6638,7 @@ SECURITY — secrets/PII handling (masking-on-read):
   on reads while accepting the full value on UpdatePreferences. We document
   this rather than hard-code masking so the storage layer owns the policy.
 
-SECURITY — SSRF (the headline risk for THIS service, interview-critical):
+SECURITY — SSRF (the headline risk for THIS service):
   `target` for WEBHOOK/SLACK is a CLIENT-SUPPLIED URL that the delivery layer
   will make an outbound HTTP request to. A naive implementation is a textbook
   Server-Side Request Forgery primitive: a user could point a &#34;webhook&#34; at
@@ -7205,7 +7203,7 @@ RPC CATEGORIES:
   PREFERENCES (config): GetPreferences, UpdatePreferences, TestChannel
   (TestChannel is a control-plane self-check, not a &#34;send&#34; RPC — see its doc.)
 
-WHY NO STREAMING RPC HERE (a deliberate choice, interview-relevant):
+WHY NO STREAMING RPC HERE (a deliberate choice):
   A live &#34;watch my inbox&#34; stream is tempting, but the natural realtime path
   for notifications is the very NATS stream this service already consumes and
   the fan-out channels (web push, Slack) it already delivers over. The web UI
@@ -7217,7 +7215,7 @@ WHY NO STREAMING RPC HERE (a deliberate choice, interview-relevant):
   WatchExecution server-stream, because there the authoritative state lives in
   that service and a client genuinely needs to follow one execution&#39;s lifecycle.
 
-IDEMPOTENCY (interview-critical, on BOTH paths):
+IDEMPOTENCY (on BOTH paths):
   - Async consumer: events can be redelivered (NATS at-least-once). The
     consumer dedupes on EventEnvelope.id (carried into Notification.event_id)
     per recipient, so a redelivered event never creates a duplicate inbox row
@@ -7666,7 +7664,7 @@ WHY &#34;Trigger&#34; and not &#34;Create&#34;: the client does not construct an
 it asks the orchestrator to START one. The orchestrator owns the resulting
 Execution&#39;s entire lifecycle (status, steps, timestamps).
 
-IDEMPOTENCY (interview-critical): triggering a deployment saga twice (e.g., a
+IDEMPOTENCY: triggering a deployment saga twice (e.g., a
 client retry after a network blip) would deploy the same model twice and
 could leave orphaned serving instances. The idempotency_key makes the trigger
 EXACTLY-ONCE from the caller&#39;s view: the server stores key → execution_id; a
@@ -7819,7 +7817,7 @@ ExecutionStatus
 WHY: This is the saga state machine, surfaced as an enum. The orchestrator
 transitions an Execution through these states and persists each transition.
 
-STATE MACHINE (interview-critical — know this cold):
+STATE MACHINE:
 
   PENDING ──► RUNNING ──► COMPLETED            (happy path)
                  │
@@ -7864,7 +7862,7 @@ PipelineType
 WHY: One service, two execution models. The type tells the engine HOW to run
 the steps — sequentially with compensation (saga) or as a parallel DAG.
 
-INTERVIEW NOTE: &#34;Why not two separate services?&#34; Because the durable state,
+WHY NOT TWO SEPARATE SERVICES: because the durable state,
 crash recovery, persistence, and observability are identical for both; only
 the scheduling differs. Splitting would duplicate the hard 80% (durability)
 to vary the easy 20% (scheduling). The type field selects the strategy at
@@ -7899,9 +7897,9 @@ COMPENSATION SUB-STATES (the saga-specific bit):
   COMPENSATION_FAILED is the worst case in any saga: we could not undo a
   side effect (e.g., failed to destroy a serving instance). This is a
   &#34;stuck saga&#34; requiring human intervention; the engine surfaces it loudly
-  rather than silently leaving orphaned resources. Interviewers love probing
-  this: the honest answer is &#34;compensation is best-effort and idempotent,
-  and a failed compensation is an alert, not a silent state&#34;.
+  rather than silently leaving orphaned resources. The honest posture:
+  &#34;compensation is best-effort and idempotent, and a failed compensation
+  is an alert, not a silent state&#34;.
 
 WHY SKIPPED EXISTS: in a DAG, if a parent fails, its not-yet-started
 dependents are marked SKIPPED (never ran) — distinct from FAILED (ran and
@@ -7970,7 +7968,7 @@ DEFINING workflows (CreatePipeline / ListPipelines) and RUNNING &#43; OBSERVING
 them (Trigger / Get / Watch / Cancel / List executions). They share the same
 durable store and domain model, so they live behind one service boundary.
 
-STREAMING CHOICE (interview-critical): only WatchExecution is server-
+STREAMING CHOICE: only WatchExecution is server-
 streaming; everything else is unary. WHY:
   - WatchExecution: the orchestrator is the SINGLE source of truth for saga
     state and PUSHES transitions as they happen. One client request →
@@ -7981,7 +7979,7 @@ streaming; everything else is unary. WHY:
     client-streaming or bidi anywhere here: the client never sends a stream of
     data to the orchestrator; it issues discrete commands.
 
-LEADER ELECTION (deployment note, surfaced for interviews): although the gRPC
+LEADER ELECTION (deployment note): although the gRPC
 API can be served by many replicas, only the ELECTED LEADER actually drives
 sagas (runs steps, writes checkpoints). This prevents two pods from executing
 the same saga concurrently and double-applying side effects. Read RPCs
@@ -8512,7 +8510,7 @@ WHY one PromoteVersion RPC instead of separate Promote/Demote/Archive RPCs:
   illegal transitions (e.g., DEV→PRODUCTION skipping STAGING, or promoting a
   non-READY version) with FAILED_PRECONDITION.
 
-THE SINGLE-PRODUCTION INVARIANT (interview-critical):
+THE SINGLE-PRODUCTION INVARIANT:
   Promoting version B of model M to PRODUCTION must ATOMICALLY demote the
   current production version A of M to ARCHIVED — there is never a moment with
   two production versions. This happens in ONE Postgres transaction; the
@@ -8671,7 +8669,7 @@ SECURITY / MASS-ASSIGNMENT (the whole reason this message is so small):
   mutated. owner_id/team/stage/status/timestamps/artifact fields are absent so
   a caller can NEVER reassign ownership, jump teams, or backdate via this RPC.
 
-PARTIAL-UPDATE SEMANTICS (interview note — &#34;how do you patch in proto3?&#34;):
+PARTIAL-UPDATE SEMANTICS (&#34;how do you patch in proto3?&#34;):
   proto3 scalars have no presence, so &#34;field omitted&#34; vs &#34;field set to empty&#34;
   are indistinguishable for a bare string. We make the contract explicit with
   update_mask-style booleans (update_description / replace_tags) rather than a
@@ -8746,7 +8744,7 @@ WHY stage lives on the VERSION, not the Model:
   ModelVersion lets exactly one version per model occupy PRODUCTION while
   older versions sit in ARCHIVED and newer candidates wait in STAGING.
 
-THE TRANSITION RULES (enforced server-side, documented for interviews):
+THE TRANSITION RULES (enforced server-side):
   DEV ──► STAGING ──► PRODUCTION ──► ARCHIVED
    └──────────────────────────────────► ARCHIVED (abandon a candidate)
   Promoting a version to PRODUCTION auto-demotes the *current* production
@@ -8759,7 +8757,7 @@ WHY an enum, not a free string:
   Buf STANDARD requires the _UNSPECIFIED zero value &#43; ENUM_NAME prefix on
   every value (so the int 0 never accidentally means &#34;DEV&#34;).
 
-CANONICAL-EVENT MAPPING (interview-relevant decoupling point):
+CANONICAL-EVENT MAPPING (the decoupling point):
   This enum is the SERVICE/API enum. The event bus carries a MIRROR enum,
   events.v1.ModelStage, with byte-identical values (UNSPECIFIED=0, DEV=1,
   STAGING=2, PRODUCTION=3, ARCHIVED=4). They are kept numerically aligned on
@@ -8834,7 +8832,7 @@ STREAMING CHOICE — why everything here is UNARY:
   and cacheability that a server stream does not. Contrast with the Pipeline
   Orchestrator&#39;s WatchExecution, which IS server-streaming because execution
   progress is a genuine open-ended event feed. Picking unary&#43;pagination here
-  is the correct, defensible call (interviewers probe this: &#34;why not stream
+  is the correct call (&#34;why not stream
   ListModels?&#34; → backpressure &#43; resumable cursor &#43; simpler caching).
 
 RPC GROUPS:
@@ -9271,7 +9269,7 @@ WHY this is a first-class RPC response and not just /metrics scraping:
   read a stable, documented shape. The Prometheus /metrics endpoint is the
   transport for the HPA; this message is the canonical schema.
 
-INTERVIEW NOTE: &#34;Why inflight requests and not CPU for autoscaling?&#34;
+WHY INFLIGHT REQUESTS AND NOT CPU FOR AUTOSCALING:
   Inference latency is dominated by request queuing once the CPU is busy;
   inflight (concurrency/queue depth) crosses the danger threshold BEFORE CPU
   saturates, giving the HPA earlier, more stable scaling signals. This is the
@@ -9318,8 +9316,8 @@ WHY BIDIRECTIONAL (stream→stream) not server-streaming:
 TRADEOFF: streaming complicates the HPA inflight accounting (a stream holds a
 connection but may be idle) and load balancing (L7 gRPC LBs balance streams,
 not messages). For that reason unary Predict remains the PRIMARY path the
-gateway uses; StreamPredict is opt-in for batch/online clients. Documented so
-an interviewer sees we know streaming isn&#39;t free.
+gateway uses; StreamPredict is opt-in for batch/online clients. Documented
+because streaming is not free.
 
 Buf note: streaming RPCs still require dedicated Request/Response messages
 (RPC_REQUEST_RESPONSE_UNIQUE). We reuse the same tensor shapes but in

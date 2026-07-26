@@ -77,8 +77,8 @@
 // needs its narrow subject added here (still no payload decode — choreography
 // intact). The reactor body is UNCHANGED: it still decodes ONLY the envelope.
 //
-// INTERVIEW FRAMING: "How does a choreography consumer span many domains when each
-// domain is a separate JetStream stream and consumers bind to one stream?" Answer:
+// HOW A CHOREOGRAPHY CONSUMER SPANS MANY DOMAINS when each
+// domain is a separate JetStream stream and consumers bind to one stream:
 // you DON'T use one wildcard consumer (that needs one stream whose subjects overlap
 // every domain stream — forbidden). You run one durable consumer per subject, each
 // bound to its owning stream, and resolve the owning stream by subject at boot. The

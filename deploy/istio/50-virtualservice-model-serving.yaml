@@ -12,7 +12,7 @@
 #   canary weight to 0 — no redeploy, just a config change Envoy applies live.
 #
 # HOW THIS RELATES TO Argo Rollouts (deploy/rollouts) — THE THREE-LAYER CANARY STORY
-#   Forgepoint has canary at THREE distinct layers; naming them is the interview win:
+#   Forgepoint has canary at THREE distinct layers:
 #     1. APPLICATION (Pipeline Orchestrator saga + inference-gateway weight_bps,
 #        ADR 0007): routes between MODEL VERSIONS (v1 weights vs v2 weights) inside
 #        the serving fleet. Business-aware, model-specific.

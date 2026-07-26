@@ -55,7 +55,7 @@
 // contract that the (now polyglot — there is a Python SDK) platform can read. An
 // encoding/json payload would be Go-only and would DLQ in any protojson consumer.
 //
-// INTERVIEW FRAMING: "Why JSON on the bus and not protobuf binary?" → the
+// WHY JSON ON THE BUS AND NOT PROTOBUF BINARY: the
 // envelope/codec is a transport concern owned by the shared natsutil layer; the
 // event SCHEMA is still the versioned events/v1 contract (buf-breaking-guarded).
 // protojson keeps messages human-readable in the NATS CLI / DLQ for ops AND stays

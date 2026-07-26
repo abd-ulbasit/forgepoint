@@ -22,7 +22,7 @@ import (
 // ----------------------------------------------------------------------------
 // Hand-written mock ports. Each is a struct with function fields / in-memory
 // state; an unset behavior uses a sensible default so each test wires only what
-// it cares about. No codegen — every line is interview-explainable.
+// it cares about. No codegen.
 // ----------------------------------------------------------------------------
 
 // mockRouteStore keeps routes in a map so a route "deployed" via an event can be

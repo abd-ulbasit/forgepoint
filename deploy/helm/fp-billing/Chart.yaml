@@ -3,7 +3,7 @@ apiVersion: v2
 # fp-billing MIRRORS the reference chart fp-auth. Every Forgepoint service copies
 # the fp-auth chart and changes only the name, image, ports, and service-specific
 # config. Keeping the structure boringly uniform makes the platform's deployment
-# surface interview-explainable and easy to audit.
+# surface uniform and easy to audit.
 #
 # WHAT MAKES BILLING SPECIFIC (vs the reference): it implements the OUTBOX
 # pattern. The service write and an outbox event commit in ONE Postgres tx; a

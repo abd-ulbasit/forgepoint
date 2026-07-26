@@ -10,7 +10,7 @@
 // model+provider against this list and REJECTS anything not on it
 // (codes.PermissionDenied, captured by the audit interceptor as a DENY).
 //
-// WHY an allow-list — three governance forces it satisfies (interview framing):
+// WHY an allow-list — three governance forces it satisfies:
 //
 //  1. COST CONTROL. LLM spend is unbounded per request and varies 100x across
 //     models (a frontier model can cost orders of magnitude more per token than a

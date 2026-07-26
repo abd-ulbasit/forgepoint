@@ -30,7 +30,7 @@ class InferenceGatewayServiceStub:
     error-prone publish-time mapping — for a vocabulary (NO_ROUTE / RATE_LIMITED
     / BULKHEAD_FULL / CIRCUIT_OPEN / UPSTREAM_ERROR / TIMEOUT / INVALID_INPUT /
     QUOTA_EXCEEDED) that Model Monitor and Notification also consume. One enum,
-    owned by the event contract, is the right call. The interview point still
+    owned by the event contract, is the right call. The point still
     stands: each value names a resilience pattern firing and maps to a distinct
     operational response (CIRCUIT_OPEN = backend-health; RATE_LIMITED = capacity)
     and to a distinct gRPC status at the edge (NO_ROUTE→NOT_FOUND, RATE_LIMITED /
@@ -168,7 +168,7 @@ class InferenceGatewayServiceServicer:
     error-prone publish-time mapping — for a vocabulary (NO_ROUTE / RATE_LIMITED
     / BULKHEAD_FULL / CIRCUIT_OPEN / UPSTREAM_ERROR / TIMEOUT / INVALID_INPUT /
     QUOTA_EXCEEDED) that Model Monitor and Notification also consume. One enum,
-    owned by the event contract, is the right call. The interview point still
+    owned by the event contract, is the right call. The point still
     stands: each value names a resilience pattern firing and maps to a distinct
     operational response (CIRCUIT_OPEN = backend-health; RATE_LIMITED = capacity)
     and to a distinct gRPC status at the edge (NO_ROUTE→NOT_FOUND, RATE_LIMITED /
@@ -427,7 +427,7 @@ class InferenceGatewayService:
     error-prone publish-time mapping — for a vocabulary (NO_ROUTE / RATE_LIMITED
     / BULKHEAD_FULL / CIRCUIT_OPEN / UPSTREAM_ERROR / TIMEOUT / INVALID_INPUT /
     QUOTA_EXCEEDED) that Model Monitor and Notification also consume. One enum,
-    owned by the event contract, is the right call. The interview point still
+    owned by the event contract, is the right call. The point still
     stands: each value names a resilience pattern firing and maps to a distinct
     operational response (CIRCUIT_OPEN = backend-health; RATE_LIMITED = capacity)
     and to a distinct gRPC status at the edge (NO_ROUTE→NOT_FOUND, RATE_LIMITED /

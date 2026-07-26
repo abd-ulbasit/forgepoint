@@ -12,7 +12,7 @@
 //      expands the template (POST /api/v1/prompts/{name}/render), showing the
 //      rendered text.
 //
-// SECURITY NOTE (interview point): every server-supplied string — the template,
+// SECURITY NOTE: every server-supplied string — the template,
 // the description, and CRUCIALLY the rendered output — is rendered as TEXT. We
 // never use dangerouslySetInnerHTML. A prompt template (or a rendered result
 // derived from user-supplied variables) is untrusted content; injecting it as

@@ -5,8 +5,8 @@
 // ============================================================================
 //
 // These tests run a REAL in-process gRPC stack over bufconn (pkg/testutil) WITH the
-// shared auth interceptors installed, so they exercise the interview-critical
-// STREAM-AUTH path: the client sets an "authorization: Bearer <token>" metadata, the
+// shared auth interceptors installed, so they exercise the STREAM-AUTH path:
+// the client sets an "authorization: Bearer <token>" metadata, the
 // AuthStreamInterceptor validates it (via a stub validator returning fixed claims)
 // and wraps the ServerStream so its Context() carries the claims, and the handler's
 // ChatCompletion reads the TEAM from that context via grpcutil.ClaimsFromContext —

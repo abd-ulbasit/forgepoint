@@ -38,7 +38,7 @@
 //                            GetModel / ListModels / GetVersion ─┘
 //                            SearchByTag  (eventually consistent)
 //
-//   WHY CQRS HERE (interview framing):
+//   WHY CQRS HERE:
 //     - Read:write ratio is enormous. Every inference request path may ask
 //       "what's the prod version of model X?" thousands of times per second;
 //       models are registered/promoted rarely. Separating the stores lets us
@@ -150,7 +150,7 @@ const (
 //	ModelVersion lets exactly one version per model occupy PRODUCTION while
 //	older versions sit in ARCHIVED and newer candidates wait in STAGING.
 //
-// THE TRANSITION RULES (enforced server-side, documented for interviews):
+// THE TRANSITION RULES (enforced server-side):
 //
 //	DEV ──► STAGING ──► PRODUCTION ──► ARCHIVED
 //	 └──────────────────────────────────► ARCHIVED (abandon a candidate)
@@ -165,7 +165,7 @@ const (
 //	Buf STANDARD requires the _UNSPECIFIED zero value + ENUM_NAME prefix on
 //	every value (so the int 0 never accidentally means "DEV").
 //
-// CANONICAL-EVENT MAPPING (interview-relevant decoupling point):
+// CANONICAL-EVENT MAPPING (the decoupling point):
 //
 //	This enum is the SERVICE/API enum. The event bus carries a MIRROR enum,
 //	events.v1.ModelStage, with byte-identical values (UNSPECIFIED=0, DEV=1,
@@ -860,7 +860,7 @@ func (x *RegisterModelResponse) GetModel() *Model {
 //	mutated. owner_id/team/stage/status/timestamps/artifact fields are absent so
 //	a caller can NEVER reassign ownership, jump teams, or backdate via this RPC.
 //
-// PARTIAL-UPDATE SEMANTICS (interview note — "how do you patch in proto3?"):
+// PARTIAL-UPDATE SEMANTICS ("how do you patch in proto3?"):
 //
 //	proto3 scalars have no presence, so "field omitted" vs "field set to empty"
 //	are indistinguishable for a bare string. We make the contract explicit with
@@ -2087,7 +2087,7 @@ func (x *ListVersionsResponse) GetPagination() *v1.PaginationResponse {
 //	illegal transitions (e.g., DEV→PRODUCTION skipping STAGING, or promoting a
 //	non-READY version) with FAILED_PRECONDITION.
 //
-// THE SINGLE-PRODUCTION INVARIANT (interview-critical):
+// THE SINGLE-PRODUCTION INVARIANT:
 //
 //	Promoting version B of model M to PRODUCTION must ATOMICALLY demote the
 //	current production version A of M to ARCHIVED — there is never a moment with

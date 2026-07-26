@@ -28,7 +28,7 @@
 // adapters; tests inject fakes. That is dependency inversion: the business logic
 // dictates the engine/fetcher contract; the infrastructure conforms.
 //
-// CONCURRENCY MODEL (interview-critical):
+// CONCURRENCY MODEL:
 //   - Predict is the hot path and runs concurrently across goroutines. The
 //     registry map is guarded by a RWMutex; reads (the resident-model lookup on
 //     the Predict fast path) take the read lock so many predicts proceed in

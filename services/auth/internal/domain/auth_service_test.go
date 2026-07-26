@@ -38,7 +38,7 @@ import (
 )
 
 // ----------------------------------------------------------------------------
-// Hand-written mocks (no codegen — every line is interview-explainable).
+// Hand-written mocks (no codegen).
 // Each mock is a struct with function fields; an unset field panics if called,
 // surfacing accidental coupling (a test hitting a repo it didn't intend to).
 // ----------------------------------------------------------------------------
@@ -558,7 +558,7 @@ func TestCheckPermission(t *testing.T) {
 //	  2. permissionMatches treats an empty stored Resource or Action as
 //	     NON-matching: a wildcard must be the explicit "*" string, never "".
 //
-// INTERVIEW: "Why can't the empty string act as a wildcard?"
+// WHY THE EMPTY STRING IS NOT A WILDCARD:
 //
 //	A wildcard is an explicit capability grant ("this role can do anything").
 //	An empty field is a misconfiguration or programming error. Treating "" as a

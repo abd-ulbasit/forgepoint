@@ -85,7 +85,7 @@ class BillingServiceStub:
     acceptable for a pre-flight — the worst case is a handful of over-quota calls
     slip through before the cache flips, which the next RecordUsage still meters.
 
-    ASCII DIAGRAM — the outbox metering pipeline (interview-critical):
+    ASCII DIAGRAM — the outbox metering pipeline:
 
     Inference Gateway ──fp.inference.completed──► Billing NATS consumer
     │ (dedupe on request_id)
@@ -229,7 +229,7 @@ class BillingServiceServicer:
     acceptable for a pre-flight — the worst case is a handful of over-quota calls
     slip through before the cache flips, which the next RecordUsage still meters.
 
-    ASCII DIAGRAM — the outbox metering pipeline (interview-critical):
+    ASCII DIAGRAM — the outbox metering pipeline:
 
     Inference Gateway ──fp.inference.completed──► Billing NATS consumer
     │ (dedupe on request_id)
@@ -439,7 +439,7 @@ class BillingService:
     acceptable for a pre-flight — the worst case is a handful of over-quota calls
     slip through before the cache flips, which the next RecordUsage still meters.
 
-    ASCII DIAGRAM — the outbox metering pipeline (interview-critical):
+    ASCII DIAGRAM — the outbox metering pipeline:
 
     Inference Gateway ──fp.inference.completed──► Billing NATS consumer
     │ (dedupe on request_id)

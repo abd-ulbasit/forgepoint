@@ -3,7 +3,7 @@ apiVersion: v2
 # fp-experiment-tracker mirrors the REFERENCE chart fp-auth. Every Forgepoint
 # service copies fp-auth and changes only the name, image, ports, and
 # service-specific config. Keep it boringly uniform so the platform's deployment
-# surface is interview-explainable and easy to audit.
+# surface is uniform and easy to audit.
 name: fp-experiment-tracker
 description: Forgepoint Experiment Tracker service (event-driven async batch ingestion of runs/metrics) — mirrors the fp-auth reference chart.
 

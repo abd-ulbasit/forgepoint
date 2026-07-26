@@ -23,7 +23,7 @@
 //	   │ implements      │ implements
 //	postgres adapter   nats adapter            handler (proto ↔ domain)
 //
-// INTERVIEW: "Where do repository interfaces belong?" In Hexagonal Architecture
+// WHERE REPOSITORY INTERFACES BELONG: in Hexagonal Architecture
 // the port is owned by the side that USES it (the domain). The adapter (DB/NATS)
 // implements it. Defining the port on the adapter side creates a cycle the moment
 // a domain consumer needs it.

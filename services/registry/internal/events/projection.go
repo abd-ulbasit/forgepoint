@@ -106,7 +106,7 @@ type ProjectionWriter interface {
 // model X's authoritative, FIELD-COMPLETE state from the write store and projects
 // that. This keeps the event contract minimal while the read model stays complete.
 //
-// TRADEOFF (interview framing): read-back adds one write-store round-trip per
+// TRADEOFF: read-back adds one write-store round-trip per
 // projected register and reintroduces a read of the truth on the projection path
 // (versus a self-contained "fat event"). We accept it here because (a) registers are
 // low-volume relative to the hot query path, (b) it avoids a contract change to a

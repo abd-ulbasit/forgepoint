@@ -101,11 +101,10 @@ Deciding factors:
    workload identity are *transport-layer* facts the application fundamentally cannot
    provide itself. The mesh fills the zero-trust gap **without touching service code**.
 2. **It complements, never duplicates, the ADR-0007 patterns.** We keep the app circuit
-   breaker and saga traffic split (they're the teaching patterns) and **add** the mesh's
-   transport-level twins beside them — the layering itself is the senior-engineer story.
-3. **Istio over Linkerd/ambient for teaching depth.** The richest, most-explainable
-   AuthorizationPolicy/VirtualService/DestinationRule surface — the project optimizes for
-   interview-explainable depth (CLAUDE.md), and Istio's sidecar model is the canonical one.
+   breaker and saga traffic split and **add** the mesh's transport-level twins beside them —
+   the layering itself is the point.
+3. **Istio over Linkerd/ambient.** The richest AuthorizationPolicy / VirtualService /
+   DestinationRule surface, and its sidecar model is the canonical one.
 
 ### STRICT mTLS (not PERMISSIVE)
 
@@ -174,8 +173,8 @@ cluster (multi-node Kind / larger k3s / **EKS via M5 Terraform**).
 - **Negative / honest:** **not running on the homelab.** The mesh is validated and
   installable, not live; the *enforced* security on the homelab remains the app JWT (+
   NetworkPolicy where a real CNI exists). We name this rather than imply a meshed cluster.
-- **Interview framing:** *"You already have a circuit breaker and JWT auth and a traffic
-  split — why a mesh?"* → because those are **application-layer** facts; the mesh adds the
+- **"You already have a circuit breaker and JWT auth and a traffic split — why a mesh?"**
+  Because those are **application-layer** facts; the mesh adds the
   **transport-layer** facts they cannot provide (encryption + unspoofable workload
   identity) and **complements** the app patterns with their transport-level twins. The
   layering — app breaker **and** outlier detection, user JWT **and** SPIFFE authz, saga

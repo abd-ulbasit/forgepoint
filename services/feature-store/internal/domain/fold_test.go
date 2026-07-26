@@ -6,9 +6,9 @@
 //   - foldView is exercised indirectly via the service tests (it is unexported).
 //
 // They assert REAL OUTCOMES — that the math/ordering is correct and that the fold
-// is a PURE, REPLAYABLE function of the log — not mock interactions. This is the
-// part an interviewer probes hardest ("prove your projection is deterministic and
-// point-in-time correct"), so the tests double as the proof.
+// is a PURE, REPLAYABLE function of the log — not mock interactions. The claim
+// under test is "this projection is deterministic and point-in-time correct",
+// so the tests double as the proof.
 //
 // In-package test (package domain) deliberately: the fold functions are part of
 // the domain's public surface and have no port dependencies, so there is no
@@ -181,7 +181,7 @@ func TestProjectAsOf_BoundaryIsInclusive(t *testing.T) {
 	}
 }
 
-// TestProjectLatest_vs_AsOf_DifferOnBackfill is the interview-critical contrast:
+// TestProjectLatest_vs_AsOf_DifferOnBackfill is the critical contrast:
 // "latest" follows WRITE order (version); "as-of" follows EVENT TIME. A backfill
 // with an OLD event_time but a NEW version is the latest online value, yet a
 // point-in-time read before that event_time must not see it.

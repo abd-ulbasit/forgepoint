@@ -38,7 +38,7 @@ import (
 // reads only after wg.Wait()). This is the memory-model guarantee that makes the
 // lock-free fan-out correct: Wait() happens-after every Done().
 //
-// PARTIAL-FAILURE TOLERANCE (the interview point): a BFF dashboard must DEGRADE,
+// PARTIAL-FAILURE TOLERANCE: a BFF dashboard must DEGRADE,
 // not collapse. If model-monitor is down, the "drift" tile shows an error and
 // the OTHER three tiles still render. So each tile carries its own {data,error,
 // ok} and a per-call failure is captured into that tile — it NEVER fails the

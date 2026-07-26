@@ -17,7 +17,7 @@
 //   - if the proto enum and the domain enum ever drift in numbering, the switch
 //     breaks at compile/test time instead of silently mis-mapping.
 //
-// INTERVIEW: "Why not just cast the enum int?" Because the two enums are
+// WHY NOT JUST CAST THE ENUM INT: because the two enums are
 // independent types whose numeric values are a coincidence of today's proto; a
 // switch is the contract, a cast is a latent bug.
 // ============================================================================

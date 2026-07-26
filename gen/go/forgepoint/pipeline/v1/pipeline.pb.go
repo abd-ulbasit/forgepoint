@@ -44,7 +44,7 @@
 //     to our DAG mode (TRAINING_DAG).
 //   - Netflix Conductor: orchestration-based saga engine for microservices.
 //
-// DURABILITY (interview-critical): every StepExecution is persisted to Postgres
+// DURABILITY: every StepExecution is persisted to Postgres
 // BEFORE the step runs (write-ahead). If the orchestrator pod crashes mid-saga,
 // on restart it loads the last persisted checkpoint and RESUMES — it does not
 // restart the whole pipeline. The Helm chart runs this service with LEADER
@@ -94,7 +94,7 @@
 // records "pipeline-orchestrator" as the real producer). The Inference Gateway
 // and Model Serving CONSUME these to add/remove routes and (un)load versions; a
 // serving pod must NOT emit a competing ModelLoaded/Unloaded lifecycle event.
-//   SSRF GUARD (interview-critical): events.ModelDeployed.endpoint is the serving
+//   SSRF GUARD: events.ModelDeployed.endpoint is the serving
 //   backend address. It is RESOLVED SERVER-SIDE by the DEPLOY executor (from the
 //   model version + the K8s Service it created), NEVER taken from client-supplied
 //   step `config`. Accepting a client URL as the route target would let a caller
@@ -139,7 +139,7 @@ const (
 // WHY: One service, two execution models. The type tells the engine HOW to run
 // the steps — sequentially with compensation (saga) or as a parallel DAG.
 //
-// INTERVIEW NOTE: "Why not two separate services?" Because the durable state,
+// WHY NOT TWO SEPARATE SERVICES: because the durable state,
 // crash recovery, persistence, and observability are identical for both; only
 // the scheduling differs. Splitting would duplicate the hard 80% (durability)
 // to vary the easy 20% (scheduling). The type field selects the strategy at
@@ -306,7 +306,7 @@ func (StepType) EnumDescriptor() ([]byte, []int) {
 // WHY: This is the saga state machine, surfaced as an enum. The orchestrator
 // transitions an Execution through these states and persists each transition.
 //
-// STATE MACHINE (interview-critical — know this cold):
+// STATE MACHINE:
 //
 //	PENDING ──► RUNNING ──► COMPLETED            (happy path)
 //	               │
@@ -406,9 +406,9 @@ func (ExecutionStatus) EnumDescriptor() ([]byte, []int) {
 //	COMPENSATION_FAILED is the worst case in any saga: we could not undo a
 //	side effect (e.g., failed to destroy a serving instance). This is a
 //	"stuck saga" requiring human intervention; the engine surfaces it loudly
-//	rather than silently leaving orphaned resources. Interviewers love probing
-//	this: the honest answer is "compensation is best-effort and idempotent,
-//	and a failed compensation is an alert, not a silent state".
+//	rather than silently leaving orphaned resources. The honest posture:
+//	"compensation is best-effort and idempotent, and a failed compensation is
+//	an alert, not a silent state".
 //
 // WHY SKIPPED EXISTS: in a DAG, if a parent fails, its not-yet-started
 // dependents are marked SKIPPED (never ran) — distinct from FAILED (ran and
@@ -1187,7 +1187,7 @@ func (x *CreatePipelineResponse) GetPipeline() *PipelineDefinition {
 // it asks the orchestrator to START one. The orchestrator owns the resulting
 // Execution's entire lifecycle (status, steps, timestamps).
 //
-// IDEMPOTENCY (interview-critical): triggering a deployment saga twice (e.g., a
+// IDEMPOTENCY: triggering a deployment saga twice (e.g., a
 // client retry after a network blip) would deploy the same model twice and
 // could leave orphaned serving instances. The idempotency_key makes the trigger
 // EXACTLY-ONCE from the caller's view: the server stores key → execution_id; a

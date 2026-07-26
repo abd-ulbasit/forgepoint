@@ -52,7 +52,7 @@
 // This is the IDIOMATIC Go/gRPC scaffold, a production-correct running server —
 // not a placeholder. Per-RPC implementations land in the handler phase.
 //
-// INTERVIEW: "How does grpc-go ensure forward compatibility of service servers?"
+// FORWARD COMPATIBILITY OF gRPC SERVICE SERVERS:
 //
 //	The mustEmbed… private method forces embedding the Unimplemented base; a new
 //	RPC compiles against existing servers that embed it (returning Unimplemented)
@@ -570,7 +570,7 @@ func (h *FeatureStoreHandler) DeleteFeatureView(ctx context.Context, req *featur
 // ============================================================================
 //
 // This is the only streaming RPC. THREE things make the streaming handler
-// different from the unary ones (all interview-critical):
+// different from the unary ones:
 //
 //  1. RETURN SHAPE: a streaming handler returns only `error`. There is no resp to
 //     return — every response frame flows through stream.Send. So the nil-svc

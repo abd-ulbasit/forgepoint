@@ -20,7 +20,7 @@
 # object store, so those egress rules are disabled in values.yaml and emit nothing
 # here. We open exactly the paths the saga engine needs and not one more.
 #
-# ENFORCEMENT CAVEAT (interview-critical): a NetworkPolicy is only enforced if
+# ENFORCEMENT CAVEAT: a NetworkPolicy is only enforced if
 # the cluster's CNI supports it (Calico, Cilium, etc.). On a CNI without policy
 # support it is silently ignored — present but not enforced. So this is defense
 # in depth, not a substitute for authn/authz at the app layer.

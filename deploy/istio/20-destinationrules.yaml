@@ -11,7 +11,7 @@
 #
 # ───────────────────────────────────────────────────────────────────────────────
 # MESH CIRCUIT BREAKING vs. THE APP-LEVEL CIRCUIT BREAKER — WHY BOTH EXIST
-# (interview-critical: this is the layering question an interviewer WILL probe)
+# (the layering question: what does each layer actually protect against?)
 # ───────────────────────────────────────────────────────────────────────────────
 #   Forgepoint ALREADY has an application-level circuit breaker, in the
 #   inference-gateway: services/inference-gateway/internal/domain/circuit_breaker.go —
@@ -149,7 +149,7 @@ spec:
       # to have zero endpoints.
       minHealthPercent: 50
   # ── CANARY SUBSETS — partition the host's endpoints by track label ──────────
-  # WHY ONE DR PER HOST (interview-critical correctness point):
+  # WHY ONE DR PER HOST (a correctness point):
   #   Istio does NOT reliably merge multiple DestinationRules that target the SAME
   #   specific host in the same namespace. With two such DRs (one carrying
   #   trafficPolicy, one carrying subsets) the behavior is order-dependent/undefined

@@ -99,9 +99,8 @@ const (
 //	    these ON TOP of RBAC — an API key can only do a subset of what the
 //	    user's role permits.
 //
-// INTERVIEW NOTE: Be ready to explain why we store role as a string name
-// here (denormalized) rather than a role_id FK. Answer: this is the JWT claims
-// shape — when we issue a token, we embed role name (not ID) so ValidateToken
+// WHY role is stored as a string name here (denormalized) rather than a
+// role_id FK: this is the JWT claims shape — when we issue a token, we embed role name (not ID) so ValidateToken
 // can return claims without a database join. The canonical role definition
 // lives in the roles table; the name is stable and human-readable.
 // ============================================================================
@@ -341,7 +340,7 @@ func (x *APIKey) GetCreatedAt() *timestamppb.Timestamp {
 //
 //	Some systems support role inheritance (admin extends engineer). We keep
 //	roles flat for simplicity — explicit permission lists are easier to audit
-//	in interviews ("what exactly can an engineer do?") and reduce surprise.
+//	("what exactly can an engineer do?") and reduce surprise.
 //	If we need hierarchy later, we add parent_role_id to this message.
 //
 // ============================================================================
@@ -435,9 +434,8 @@ func (x *Role) GetPermissions() []*Permission {
 //	"read", "write", "delete", "admin"
 //	"admin" action means full control including granting the resource to others.
 //
-// INTERVIEW NOTE: Interviewer might ask "how do you check a wildcard admin
-// permission that grants everything?" Answer: CheckPermission on the Auth
-// service iterates the user's role permissions. If any Permission has
+// WILDCARD ADMIN PERMISSIONS — a role that grants everything: CheckPermission
+// on the Auth service iterates the user's role permissions. If any Permission has
 // resource="*" and action="*", it short-circuits to allowed.
 // ============================================================================
 type Permission struct {
@@ -504,7 +502,7 @@ func (x *Permission) GetAction() string {
 // receive these claims — they don't need to decode the JWT themselves, which
 // avoids distributing the JWT secret and simplifies revocation checks.
 //
-// JWT STRUCTURE RECAP (for interview clarity):
+// JWT STRUCTURE RECAP:
 //
 //	Header.Payload.Signature (base64url encoded, dot-separated)
 //	Payload contains claims: sub (subject/user_id), exp, iat, custom fields.

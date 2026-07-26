@@ -52,7 +52,7 @@ class PipelineOrchestratorServiceStub:
     them (Trigger / Get / Watch / Cancel / List executions). They share the same
     durable store and domain model, so they live behind one service boundary.
 
-    STREAMING CHOICE (interview-critical): only WatchExecution is server-
+    STREAMING CHOICE: only WatchExecution is server-
     streaming; everything else is unary. WHY:
     - WatchExecution: the orchestrator is the SINGLE source of truth for saga
     state and PUSHES transitions as they happen. One client request →
@@ -63,7 +63,7 @@ class PipelineOrchestratorServiceStub:
     client-streaming or bidi anywhere here: the client never sends a stream of
     data to the orchestrator; it issues discrete commands.
 
-    LEADER ELECTION (deployment note, surfaced for interviews): although the gRPC
+    LEADER ELECTION (deployment note): although the gRPC
     API can be served by many replicas, only the ELECTED LEADER actually drives
     sagas (runs steps, writes checkpoints). This prevents two pods from executing
     the same saga concurrently and double-applying side effects. Read RPCs
@@ -185,7 +185,7 @@ class PipelineOrchestratorServiceServicer:
     them (Trigger / Get / Watch / Cancel / List executions). They share the same
     durable store and domain model, so they live behind one service boundary.
 
-    STREAMING CHOICE (interview-critical): only WatchExecution is server-
+    STREAMING CHOICE: only WatchExecution is server-
     streaming; everything else is unary. WHY:
     - WatchExecution: the orchestrator is the SINGLE source of truth for saga
     state and PUSHES transitions as they happen. One client request →
@@ -196,7 +196,7 @@ class PipelineOrchestratorServiceServicer:
     client-streaming or bidi anywhere here: the client never sends a stream of
     data to the orchestrator; it issues discrete commands.
 
-    LEADER ELECTION (deployment note, surfaced for interviews): although the gRPC
+    LEADER ELECTION (deployment note): although the gRPC
     API can be served by many replicas, only the ELECTED LEADER actually drives
     sagas (runs steps, writes checkpoints). This prevents two pods from executing
     the same saga concurrently and double-applying side effects. Read RPCs
@@ -409,7 +409,7 @@ class PipelineOrchestratorService:
     them (Trigger / Get / Watch / Cancel / List executions). They share the same
     durable store and domain model, so they live behind one service boundary.
 
-    STREAMING CHOICE (interview-critical): only WatchExecution is server-
+    STREAMING CHOICE: only WatchExecution is server-
     streaming; everything else is unary. WHY:
     - WatchExecution: the orchestrator is the SINGLE source of truth for saga
     state and PUSHES transitions as they happen. One client request →
@@ -420,7 +420,7 @@ class PipelineOrchestratorService:
     client-streaming or bidi anywhere here: the client never sends a stream of
     data to the orchestrator; it issues discrete commands.
 
-    LEADER ELECTION (deployment note, surfaced for interviews): although the gRPC
+    LEADER ELECTION (deployment note): although the gRPC
     API can be served by many replicas, only the ELECTED LEADER actually drives
     sagas (runs steps, writes checkpoints). This prevents two pods from executing
     the same saga concurrently and double-applying side effects. Read RPCs

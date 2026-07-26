@@ -126,9 +126,9 @@
 // protojson-first is the path that fires for every real producer today; the
 // fallback costs one extra unmarshal attempt ONLY when protojson fails — negligible
 // against the broker round-trip, and worth it for graceful behavior across a mixed
-// fleet during a deploy. (Interview framing: "the platform converged on protojson
-// — why didn't you delete the fallback?" → it's compat tolerance for rolling
-// deploys / a future plain-JSON producer, not a claim that producers still
+// fleet during a deploy. (The platform converged on protojson — so why keep the
+// fallback? It is compat tolerance for rolling deploys / a future plain-JSON
+// producer, not a claim that producers still
 // disagree; the canonical path is what actually runs.)
 //
 // ============================================================================

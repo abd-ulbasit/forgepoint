@@ -14,8 +14,8 @@
 // math (the part that, if wrong, charges a real customer a wrong amount) is unit
 // testable WITHOUT a database, a gRPC server, or a NATS broker. A test can prove
 // "quantity * price overflows → we reject, never wrap" in microseconds against
-// pure functions. That is exactly the property an interviewer probes for a
-// money system, and Clean Architecture is what makes it cheap to demonstrate.
+// pure functions. That is exactly the property a money system needs, and Clean
+// Architecture is what makes it cheap to demonstrate.
 //
 // The handler converts proto (billing.v1.*) ↔ these domain types; the
 // repository converts these ↔ Postgres rows; the events layer converts these ↔
@@ -46,9 +46,8 @@
 // testable here (we assert "a usage write yields exactly one matching outbox
 // event") without any infrastructure.
 //
-// INTERVIEW: "Where does the outbox pattern's transactional boundary live in
-// your code?" — In the PORT METHOD: RecordUsageTx(record, []OutboxEvent) is one
-// call = one atomic unit; the adapter wraps it in a tx. The domain owns the
+// WHERE THE OUTBOX PATTERN'S TRANSACTIONAL BOUNDARY LIVES: in the PORT METHOD.
+// RecordUsageTx(record, []OutboxEvent) is one call = one atomic unit; the adapter wraps it in a tx. The domain owns the
 // CONTENT of the event and the invariant that it always accompanies the write;
 // the adapter owns the ATOMICITY mechanism (the tx) and the relay owns delivery.
 // ============================================================================

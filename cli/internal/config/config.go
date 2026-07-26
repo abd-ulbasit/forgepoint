@@ -16,7 +16,7 @@
 //  3. CONFIG FILE ~/.forgepoint/config   (key = value, addr.<svc> = host:port)
 //  4. DEFAULT     localhost:<conventional per-service port>
 //
-// WHY THIS ORDER (interview framing): the rule of thumb across mature CLIs
+// WHY THIS ORDER: the rule of thumb across mature CLIs
 // (kubectl, gh, aws, docker) is "the more immediate and explicit the source,
 // the higher it ranks." A flag is typed for THIS invocation, so it must beat a
 // persisted file. Env sits between: it's per-shell-session (more ephemeral than

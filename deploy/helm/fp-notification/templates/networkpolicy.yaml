@@ -21,7 +21,7 @@
 # EGRESS DELTA vs fp-auth: adds `redis` (notification's dedup store). No MinIO
 # (stores no artifacts).
 #
-# OUTBOUND DELIVERY (Slack webhooks / external SMTP) — interview-critical: the
+# OUTBOUND DELIVERY (Slack webhooks / external SMTP): the
 # delivery adapter makes SSRF-GUARDED outbound HTTPS to the public internet
 # (e.g. hooks.slack.com:443). That egress is INTENTIONALLY not opened by default
 # — a blanket 0.0.0.0/0:443 rule would gut zero-trust egress and the real
@@ -30,7 +30,7 @@
 # adapter is enabled, add a narrowly-scoped rule via `egress.extraEgress`
 # (ideally to a forward proxy / egress gateway, not raw internet).
 #
-# ENFORCEMENT CAVEAT (interview-critical): a NetworkPolicy is only enforced if
+# ENFORCEMENT CAVEAT: a NetworkPolicy is only enforced if
 # the cluster's CNI supports it (Calico, Cilium, etc.). On a CNI without policy
 # support it is silently ignored — present but not enforced. So this is defense
 # in depth, not a substitute for authn/authz at the app layer.

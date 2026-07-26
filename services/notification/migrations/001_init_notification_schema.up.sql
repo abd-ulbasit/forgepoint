@@ -20,7 +20,7 @@
 --                              FAILED/SUPPRESSED + response detail). Append-only.
 --
 -- ----------------------------------------------------------------------------
--- DESIGN CHOICES (each interview-defensible)
+-- DESIGN CHOICES
 -- ----------------------------------------------------------------------------
 --
 -- IDs are TEXT (UUIDv4 strings), not native uuid. The domain carries ids as

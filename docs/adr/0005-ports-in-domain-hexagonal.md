@@ -87,10 +87,10 @@ which is the whole point of "ports and adapters."
   arrow per service; adapters and handlers are swappable details; mocks live with the domain
   for friction-free TDD.
 - **Negative:** a one-time orientation cost ("why is `UserRepository` in `domain`, not
-  `repository`?") — mitigated by the teaching header in every `ports.go` and the canonical
+  `repository`?") — mitigated by the header comment in every `ports.go` and the canonical
   doc.
-- **Interview framing:** *"Where do repository interfaces belong — the data layer or the
-  business layer?"* In Hexagonal Architecture the **consumer owns the port**; the domain is
+- **Where repository interfaces belong — the data layer or the business layer:** in
+  Hexagonal Architecture the **consumer owns the port**; the domain is
   the consumer of persistence, so the interface lives in the domain and the database
   *implements* it. Defining the port in the DB package while the domain consumes it forces
   `domain → repository → domain` — a cycle Go rejects the instant a domain type satisfies

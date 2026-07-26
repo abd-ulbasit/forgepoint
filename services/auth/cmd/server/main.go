@@ -44,7 +44,7 @@
 // order they must RUN, exploiting LIFO so the code reads top-to-bottom.)
 //
 // ----------------------------------------------------------------------------
-// STATE OF THE ASYNC EDGE (read this before an interview):
+// STATE OF THE ASYNC EDGE:
 //
 //   - PUBLISHER (Phase 1.6, DONE): we connect NATS, EnsureStream the AUTH stream,
 //     construct the events.Publisher adapter, and INJECT it into the request path

@@ -22,7 +22,7 @@
 # application-level canary *above* the infra layer. The Rollout here is the
 # *infra layer* canary for the serving binary itself.
 #
-# This distinction is worth knowing in an interview: Forgepoint has two canary
+# The distinction matters: Forgepoint has two canary
 # layers:
 #   1. Application-level (Pipeline Orchestrator saga weight_bps, Phase 5) —
 #      routes traffic between *model versions* (e.g. v1 vs v2 weights).

@@ -94,7 +94,7 @@ func scanMonitor(row rowScanner) (domain.Monitor, error) {
 // rows. Returns the stored monitor and `created` true on a fresh insert.
 //
 // ============================================================================
-// THE UPSERT MECHANICS (interview-probed)
+// THE UPSERT MECHANICS
 // ============================================================================
 //
 //   - ON CONFLICT targets the PARTIAL unique index by repeating its predicate

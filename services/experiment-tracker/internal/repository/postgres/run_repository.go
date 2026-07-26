@@ -91,9 +91,8 @@ func (r *RunRepository) CreateRun(ctx context.Context, run domain.Run) (domain.R
 // the idempotency row. The DB commits all three or none — there is no in-between
 // state a retry can observe. On replay the service's Lookup now ALWAYS finds the
 // recorded run (it could not have been committed without its key), so no duplicate
-// run is ever created. INTERVIEW: "How do you make create-then-record atomic
-// without 2PC?" Put both writes in the same local transaction against the same DB;
-// the key lives in the same database as the entity, so one commit covers both.
+// run is ever created. MAKING create-then-record ATOMIC WITHOUT 2PC: put both
+// writes in the same local transaction against the same DB; the key lives in the same database as the entity, so one commit covers both.
 //
 // FK NOTE: a dangling experiment_id surfaces as a 23503 → ErrRepoNotFound (the
 // service already verified the parent; this is the storage backstop).

@@ -148,7 +148,7 @@ would erase the whole chain unseen); and a guarded migration block `REVOKE`s
 `UPDATE/DELETE/TRUNCATE` from a dedicated non-owner app role (`fp_audit_app`), leaving it
 `INSERT+SELECT` only.
 
-**Honest limit (do not overstate this in an interview):** a trigger is not a table ACL, so it fires
+**Honest limit:** a trigger is not a table ACL, so it fires
 for the owner and a superuser too — but the **owner** (and a superuser) can `DISABLE`/`DROP` the
 trigger and then mutate. So the trigger is only binding for a role that is **neither the owner nor a
 superuser**. If the app connects as the table owner (the default single-role dev/test setup where

@@ -14,7 +14,7 @@
 # count, every `helm upgrade` resets replicas to replicaCount and then the HPA
 # corrects it — visible flapping. With the HPA as sole owner, scaling is stable.
 #
-# MULTI-METRIC SEMANTICS (interview-probe): when several metrics are listed, the
+# MULTI-METRIC SEMANTICS: when several metrics are listed, the
 # HPA computes the desired replicas for EACH and takes the MAXIMUM — it scales to
 # satisfy the most-pressed metric, never under-provisioning.
 apiVersion: autoscaling/v2

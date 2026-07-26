@@ -32,7 +32,7 @@
 //
 // PATTERN — API GATEWAY + RESILIENCE STACK:
 //   This service composes FOUR classic resilience patterns into one request
-//   path. Each is interview-namable and each is realized by a part of this API:
+//   path. Each is realized by a part of this API:
 //
 //     1. TRAFFIC SPLITTING (canary / A-B): a model has N candidate versions,
 //        each with a weight. The gateway picks one per request by weighted

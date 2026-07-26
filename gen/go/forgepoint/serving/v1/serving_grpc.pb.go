@@ -39,7 +39,7 @@
 //   import events.proto; redeclaring or importing-without-use would violate the
 //   decoupling rule and Buf's import hygiene):
 //     - fp.models.version.ready    (events.ModelVersionReady)  → a version is
-//          now loadable; pre-warm / be ready to LoadModel it.
+//          now loadable; pre-warm or LoadModel it.
 //     - fp.pipelines.model.deployed (events.ModelDeployed)     → ensure this
 //          version is LOADED (the controller reconciles the pod to READY).
 //     - fp.pipelines.model.undeployed (events.ModelUndeployed) → UNLOAD the
@@ -87,7 +87,7 @@
 //       isolation story is worth more than the bin-packing efficiency. KEDA
 //       scale-to-zero (M6) recovers idle cost.
 //
-//   INTERVIEW NOTE: Expect "how does the HPA know to scale?" Answer: the pod
+//   HOW THE HPA KNOWS TO SCALE: the pod
 //   publishes inflight_requests via GetServingMetrics + a /metrics Prometheus
 //   endpoint; Prometheus Adapter surfaces it as a custom metric; HPA targets an
 //   average inflight per pod. CPU alone is a poor signal for inference (latency

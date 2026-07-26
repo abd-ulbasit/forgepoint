@@ -7,7 +7,7 @@ implemented ONCE as channel interceptors rather than repeated in every method:
      on every outgoing call, reading the token from a shared, mutable holder so a
      later ``login()`` transparently authenticates *already-created* stubs.
 
-WHY AN INTERCEPTOR INSTEAD OF per-call ``metadata=[...]`` (interview-critical)
+WHY AN INTERCEPTOR INSTEAD OF per-call ``metadata=[...]``
 -----------------------------------------------------------------------------
 gRPC-Python lets you pass ``metadata`` to each stub call, but doing that in every
 SDK method is repetitive and easy to forget on one method (an auth hole). A
@@ -30,8 +30,8 @@ moment ``login()`` writes the new token, every subsequent RPC picks it up.
   it is ONLY honored on SECURE channels — on a local insecure channel gRPC raises
   if you attach call creds. Since the SDK must support an explicit insecure
   localhost opt-out for dev, a metadata interceptor (which works on both secure
-  and insecure channels) is the portable choice. We document this tradeoff here
-  because an interviewer will ask "why not call credentials?".
+  and insecure channels) is the portable choice. The tradeoff is documented here
+  because "why not call credentials?" is the obvious question.
 
 SECURITY: the token lives ONLY in the holder and is written ONLY into request
 metadata. It is never logged, never put in a URL, never stored on disk by the

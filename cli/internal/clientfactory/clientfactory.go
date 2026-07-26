@@ -38,7 +38,7 @@
 //	                                             │   CheckPermission(..) │
 //	                                             └──────────────────────┘
 //
-// INTERVIEW NOTE: the server reads this with metadata.FromIncomingContext and
+// NOTE: the server reads this with metadata.FromIncomingContext and
 // the "authorization" key. metadata keys are lowercased by gRPC, so the server
 // looks up "authorization" regardless of how we cased it here. We send it
 // lowercase to match.
@@ -183,7 +183,7 @@ func isLoopback(host string) bool {
 // vulnerability. We detect this and refuse: parse the host with net.SplitHostPort
 // and check isLoopback. Non-loopback + !useTLS → hard error before any dial.
 //
-// INTERVIEW NOTE: this is defence-in-depth at the CLI layer. The server also
+// NOTE: this is defence-in-depth at the CLI layer. The server also
 // enforces TLS (mutual or one-way) in production, but client-side refusal means
 // the secret never leaves the machine in clear text even if the server were
 // misconfigured.
@@ -267,7 +267,7 @@ func unaryTokenInterceptor(token string) grpc.UnaryClientInterceptor {
 // streamTokenInterceptor does the same for streaming RPCs (e.g. WatchExecution).
 // Streams need their own interceptor type — a unary interceptor never fires for
 // a stream — so without this, `fp pipelines watch` would go out UNAUTHENTICATED.
-// This is a classic gotcha worth flagging in an interview.
+// This is a classic gotcha.
 func streamTokenInterceptor(token string) grpc.StreamClientInterceptor {
 	bearer := "Bearer " + token
 	return func(

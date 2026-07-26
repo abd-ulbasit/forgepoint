@@ -97,7 +97,7 @@ type Store struct {
 
 // New connects to Postgres at dsn and returns a Store with a ready pool.
 //
-// POOL LIFECYCLE (12-factor / interview note): the pool is created here and MUST
+// POOL LIFECYCLE (12-factor): the pool is created here and MUST
 // be released by the caller via Close() at shutdown — we do NOT hide a global.
 // pgxpool.New parses the DSN (incl. pool tunables like pool_max_conns) and
 // establishes the pool lazily; we Ping once so a bad DSN / unreachable DB fails

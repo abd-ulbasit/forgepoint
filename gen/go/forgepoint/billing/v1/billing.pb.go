@@ -71,8 +71,8 @@
 //     - This is exactly how Stripe, Shopify, and most ledger systems publish
 //       events reliably. Debezium + Kafka Connect productize the "tail the
 //       outbox/WAL" half. Temporal sidesteps it with durable workflow state.
-//     - INTERVIEW NOTE: the classic probe is "why not just publish to NATS
-//       inside the same code path after the DB commit?" — answer: the process
+//     - WHY NOT JUST PUBLISH TO NATS inside the same code path after the DB
+//       commit: the process
 //       can die in the gap between commit and publish; the outbox moves the
 //       publish intent INTO the committed transaction so a crash loses nothing.
 //

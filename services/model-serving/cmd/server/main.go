@@ -363,7 +363,7 @@ func main() {
 	// WithAuthValidator so EVERY serving RPC requires a valid JWT and the verified
 	// claims are placed in the request context for any handler authZ check.
 	//
-	// authN vs authZ — the division of labor (interview-critical):
+	// authN vs authZ — the division of labor:
 	//   - AUTHENTICATION (this interceptor, fpauth.NewJWTValidator): "WHO are you?"
 	//     It verifies the bearer token's HS256 signature against FP_JWT_SECRET
 	//     LOCALLY (design D2: in-process verify, no round-trip to the auth service),

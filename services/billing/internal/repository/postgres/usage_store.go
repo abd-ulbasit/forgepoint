@@ -22,9 +22,8 @@
 //	└────────────────────────────────────────────────────────┘
 //	          later: relay SELECT … WHERE published_at IS NULL → NATS → UPDATE published_at
 //
-// INTERVIEW: "What happens if the relay crashes after publishing but before
-// stamping published_at?" → the row stays unpublished, the relay re-publishes on
-// restart, and the consumer dedupes on the outbox id (== EventEnvelope.id). The
+// IF THE RELAY CRASHES AFTER PUBLISHING BUT BEFORE STAMPING published_at: the
+// row stays unpublished, the relay re-publishes on restart, and the consumer dedupes on the outbox id (== EventEnvelope.id). The
 // failure mode is at-least-once, never at-most-once — we never silently drop an
 // event. The atomicity test below proves the WRITE side of that guarantee.
 // ============================================================================

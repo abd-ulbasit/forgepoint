@@ -81,7 +81,7 @@
 // codes the message is a clean, caller-actionable string we author here — never
 // the domain's wrapped detail verbatim (which could also carry internals).
 //
-// INTERVIEW: "How do you stop internal errors leaking to clients?" One
+// KEEPING INTERNAL ERRORS OFF THE WIRE: one
 // translation function, errors.Is on typed sentinels, a sanitized default of
 // codes.Internal with a constant message, and author-controlled messages for the
 // known client-error codes. The wrapped detail stays in the server logs.
@@ -219,7 +219,7 @@ func (h *ServingHandler) Predict(ctx context.Context, req *servingv1.PredictRequ
 
 // StreamPredict is a bidirectional stream for batch/online scoring.
 //
-// STREAMING CONTRACT (the interview-critical mechanics):
+// STREAMING CONTRACT (the mechanics):
 //   - This is a Recv→process→Send LOOP. For each request message we run one
 //     inference and send back one response paired by idempotency_key (responses
 //     are NOT 1:1-ordered with requests in general; the key pairs them).

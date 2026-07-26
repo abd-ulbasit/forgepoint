@@ -101,7 +101,7 @@ class FeatureStoreServiceStub:
     native numeric bound, so these caps are documented as named constants and
     enforced server-side; the constants are the contract.
 
-    STREAMING CHOICE (interview-critical):
+    STREAMING CHOICE:
     DATA-PLANE RPCs are UNARY; the long-running ADMIN replay is SERVER-STREAMING.
     - WriteFeatures: producers emit in BATCHES (one RPC = one atomic append
     with one idempotency key). Client-streaming would blur the idempotency/
@@ -115,11 +115,11 @@ class FeatureStoreServiceStub:
     - RebuildViews: SERVER-STREAMING — a full log replay runs for minutes, so
     we stream RebuildViewsResponse frames for live feedback and use stream-close as the
     completion signal (no poll loop). Note this is justified by DURATION, not
-    data volume — the contrast with the unary reads is the interview point.
+    data volume — the contrast with the unary reads is the point.
     So the only streaming RPC is the admin replay, deliberately, and every choice
     is documented so it is defensible.
 
-    EVENT-SOURCING RECAP (what an interviewer will probe):
+    EVENT-SOURCING RECAP:
     * Source of truth = append-only feature_events log. Views are caches.
     * Reads never replay on the hot path; they read projections.
     * Reproducibility = GetHistoricalFeatures(as_of) over event_time.
@@ -276,7 +276,7 @@ class FeatureStoreServiceServicer:
     native numeric bound, so these caps are documented as named constants and
     enforced server-side; the constants are the contract.
 
-    STREAMING CHOICE (interview-critical):
+    STREAMING CHOICE:
     DATA-PLANE RPCs are UNARY; the long-running ADMIN replay is SERVER-STREAMING.
     - WriteFeatures: producers emit in BATCHES (one RPC = one atomic append
     with one idempotency key). Client-streaming would blur the idempotency/
@@ -290,11 +290,11 @@ class FeatureStoreServiceServicer:
     - RebuildViews: SERVER-STREAMING — a full log replay runs for minutes, so
     we stream RebuildViewsResponse frames for live feedback and use stream-close as the
     completion signal (no poll loop). Note this is justified by DURATION, not
-    data volume — the contrast with the unary reads is the interview point.
+    data volume — the contrast with the unary reads is the point.
     So the only streaming RPC is the admin replay, deliberately, and every choice
     is documented so it is defensible.
 
-    EVENT-SOURCING RECAP (what an interviewer will probe):
+    EVENT-SOURCING RECAP:
     * Source of truth = append-only feature_events log. Views are caches.
     * Reads never replay on the hot path; they read projections.
     * Reproducibility = GetHistoricalFeatures(as_of) over event_time.
@@ -538,7 +538,7 @@ class FeatureStoreService:
     native numeric bound, so these caps are documented as named constants and
     enforced server-side; the constants are the contract.
 
-    STREAMING CHOICE (interview-critical):
+    STREAMING CHOICE:
     DATA-PLANE RPCs are UNARY; the long-running ADMIN replay is SERVER-STREAMING.
     - WriteFeatures: producers emit in BATCHES (one RPC = one atomic append
     with one idempotency key). Client-streaming would blur the idempotency/
@@ -552,11 +552,11 @@ class FeatureStoreService:
     - RebuildViews: SERVER-STREAMING — a full log replay runs for minutes, so
     we stream RebuildViewsResponse frames for live feedback and use stream-close as the
     completion signal (no poll loop). Note this is justified by DURATION, not
-    data volume — the contrast with the unary reads is the interview point.
+    data volume — the contrast with the unary reads is the point.
     So the only streaming RPC is the admin replay, deliberately, and every choice
     is documented so it is defensible.
 
-    EVENT-SOURCING RECAP (what an interviewer will probe):
+    EVENT-SOURCING RECAP:
     * Source of truth = append-only feature_events log. Views are caches.
     * Reads never replay on the hot path; they read projections.
     * Reproducibility = GetHistoricalFeatures(as_of) over event_time.

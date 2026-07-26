@@ -450,7 +450,7 @@ func (h *BillingHandler) GetUsage(ctx context.Context, req *billingv1.GetUsageRe
 // Admins (claims.Role == adminRole) bypass the team check: the proto allows an
 // admin to read any team's invoice (back-office/support).
 //
-// INTERVIEW: "Why map a forbidden read to NotFound instead of Forbidden?" — to
+// WHY A FORBIDDEN READ MAPS TO NotFound AND NOT Forbidden: to
 // avoid a resource-existence side channel. For an isolated, id-addressable resource
 // the secure default is "indistinguishable from missing"; 403 vs 404 itself leaks.
 func (h *BillingHandler) GetInvoice(ctx context.Context, req *billingv1.GetInvoiceRequest) (*billingv1.GetInvoiceResponse, error) {

@@ -1,9 +1,8 @@
 # Canonical Service Architecture (the template every service follows)
 
 > This is the reference structure for all 10 microservices, distilled from the Auth service
-> (the first one built) and CLAUDE.md. Every new service mirrors this so the platform is
-> uniform and interview-explainable. When in doubt, read `services/auth/` — it is the
-> worked example.
+> (the first one built). Every new service mirrors this so the platform stays uniform. When
+> in doubt, read `services/auth/` — it is the worked example.
 
 ## Clean Architecture / Hexagonal layers
 

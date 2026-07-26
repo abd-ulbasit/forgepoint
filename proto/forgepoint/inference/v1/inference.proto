@@ -32,7 +32,7 @@
 //
 // PATTERN — API GATEWAY + RESILIENCE STACK:
 //   This service composes FOUR classic resilience patterns into one request
-//   path. Each is interview-namable and each is realized by a part of this API:
+//   path. Each is realized by a part of this API:
 //
 //     1. TRAFFIC SPLITTING (canary / A-B): a model has N candidate versions,
 //        each with a weight. The gateway picks one per request by weighted
@@ -212,7 +212,7 @@ enum DataType {
 // For the external HTTP API the gateway accepts/returns JSON arrays and
 // converts; this binary form is the efficient internal/gRPC representation.
 //
-// INTERVIEW NOTE: be ready to explain "why not repeated float?" — answer:
+// WHY NOT repeated float:
 // wire size + zero-copy forwarding. shape carries dimensions (e.g., [1, 4]
 // for one iris sample of 4 features); data length must equal product(shape) *
 // sizeof(dtype), which the gateway validates.
@@ -347,7 +347,7 @@ message Route {
 // failure mode into an observable one. The metric
 // fp_gateway_circuit_breaker_state mirrors this for Prometheus.
 //
-// THE 3-STATE MACHINE (interview-critical):
+// THE 3-STATE MACHINE:
 //
 //   ┌─────────┐  failures ≥ threshold   ┌──────┐
 //   │ CLOSED  │ ──────────────────────► │ OPEN │
@@ -930,7 +930,7 @@ message ModelInfo {
 //   error-prone publish-time mapping — for a vocabulary (NO_ROUTE / RATE_LIMITED
 //   / BULKHEAD_FULL / CIRCUIT_OPEN / UPSTREAM_ERROR / TIMEOUT / INVALID_INPUT /
 //   QUOTA_EXCEEDED) that Model Monitor and Notification also consume. One enum,
-//   owned by the event contract, is the right call. The interview point still
+//   owned by the event contract, is the right call. The point still
 //   stands: each value names a resilience pattern firing and maps to a distinct
 //   operational response (CIRCUIT_OPEN = backend-health; RATE_LIMITED = capacity)
 //   and to a distinct gRPC status at the edge (NO_ROUTE→NOT_FOUND, RATE_LIMITED /

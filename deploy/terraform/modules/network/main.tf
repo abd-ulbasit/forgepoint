@@ -11,7 +11,7 @@
 #                          │   S3/ECR traffic ── VPC endpoints ──▶ AWS (no NAT)│
 #                          └──────────────────────────────────────────────────┘
 #
-# DESIGN CHOICES an interviewer will probe:
+# DESIGN CHOICES:
 #   * public vs private split: only NAT + load balancers sit public. Databases and
 #     pods are private — they reach OUT via NAT but nothing reaches IN. Classic
 #     three-tier isolation.

@@ -310,7 +310,7 @@ func main() {
 	// (recovery → logging → auth). WithReflection lets grpcurl/grpcui introspect
 	// the service in dev without the .proto files locally.
 	//
-	// ── AUTHN vs AUTHZ — the division of labor (read before an interview) ──
+	// ── AUTHN vs AUTHZ — the division of labor ──
 	// The auth interceptor wired here is AUTHENTICATION ("WHO are you?"): it takes
 	// the bearer JWT off the request metadata, verifies its HS256 signature LOCALLY
 	// against the shared FP_JWT_SECRET (design D2 — no per-RPC network hop to the

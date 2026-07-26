@@ -15,7 +15,7 @@
 // supply-chain hygiene: fewer deps = smaller attack surface). Method-specific
 // patterns also give us 405 Method Not Allowed for free.
 //
-// THE PUBLIC/PROTECTED SPLIT (interview point): rather than check auth inside
+// THE PUBLIC/PROTECTED SPLIT: rather than check auth inside
 // each handler (easy to forget one = an auth bypass), we register protected
 // routes on a SEPARATE mux wrapped ONCE in RequireAuth, and mount it under the
 // root mux. Auth is then structural — a new protected route is automatically

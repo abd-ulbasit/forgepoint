@@ -48,7 +48,7 @@
 //  3. Is FORWARD-COMPATIBLE: adding a new RPC to the proto doesn't break this
 //     service — the embedded base answers it (Unimplemented) until we implement.
 //
-// INTERVIEW: "How does grpc-go guarantee forward compatibility of servers?" The
+// FORWARD COMPATIBILITY OF gRPC SERVERS: the
 // mustEmbed… private method forces embedding the Unimplemented base; new RPCs
 // added to the proto are handled (Unimplemented) by the base, so the service
 // keeps compiling and serving. That is gRPC's server-side compatibility story.

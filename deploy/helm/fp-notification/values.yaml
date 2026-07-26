@@ -211,7 +211,7 @@ resources:
 # `customMetrics` is wired for the Prometheus-Adapter / KEDA path the platform
 # uses later (e.g. NATS consumer lag, gRPC RPS) — see templates/hpa.yaml.
 #
-# INTERVIEW NOTE: for a reactor like notification, the RIGHT scaling signal is
+# NOTE: for a reactor like notification, the RIGHT scaling signal is
 # NATS consumer LAG (KEDA's nats-jetstream scaler), not CPU — a delivery backlog
 # shows up as lag long before it shows up as CPU. CPU is the safe default here;
 # wire the lag metric via customMetrics when KEDA lands.

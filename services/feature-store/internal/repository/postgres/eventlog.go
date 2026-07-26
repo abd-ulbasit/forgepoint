@@ -43,7 +43,7 @@
 // keep one global lock. Throughput tradeoff is acceptable: appends are batched and
 // the critical section is tiny.)
 //
-// INTERVIEW: "How do you get gap-free ordering without a sequence's gaps?" Assign
+// GAP-FREE ORDERING WITHOUT A SEQUENCE'S GAPS: assign
 // the number inside the same transaction that inserts the row, under a lock, so a
 // rollback releases the number. The lock makes the read-modify-write of the head
 // atomic across concurrent appenders.

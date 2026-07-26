@@ -51,7 +51,7 @@
 // filled in Task 1.5 (Login, CreateUser, ValidateToken, etc.) by overriding
 // each method on *AuthHandler.
 //
-// INTERVIEW: "How does grpc-go ensure forward compatibility of service servers?"
+// FORWARD COMPATIBILITY OF gRPC SERVICE SERVERS:
 //
 //	The mustEmbedUnimplementedAuthServiceServer() private method forces embedding
 //	the Unimplemented base. Adding a new RPC to the proto breaks clients that

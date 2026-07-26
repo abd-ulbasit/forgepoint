@@ -8,7 +8,7 @@
 #   of pins and copy the same constraints into environments/*/versions.tf so
 #   every env locks identical versions. A drift between them is a review smell.
 #
-# PINNING PHILOSOPHY (interview point):
+# PINNING PHILOSOPHY:
 #   - required_version uses ">= , <" to allow patch/minor bug-fixes but block a
 #     surprise MAJOR (e.g. a future 2.x) that could change HCL semantics.
 #   - provider versions use "~>" (pessimistic) so we get security/bug patches

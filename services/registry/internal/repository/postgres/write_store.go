@@ -319,7 +319,7 @@ func (s *WriteStore) FindProductionVersion(ctx context.Context, modelID string) 
 // ARCHIVED stage inside ONE transaction, so there is never an instant with two
 // PRODUCTION rows for the model.
 //
-// THE ORDERING SUBTLETY (interview-critical) — DEMOTE BEFORE PROMOTE:
+// THE ORDERING SUBTLETY — DEMOTE BEFORE PROMOTE:
 //
 //	The model_versions_one_production_per_model partial unique index forbids two rows
 //	with stage=PRODUCTION for the same model. If we UPDATE the new version to PRODUCTION

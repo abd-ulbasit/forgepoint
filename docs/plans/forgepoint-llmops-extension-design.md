@@ -19,9 +19,9 @@ token-cost governance, evals/quality monitoring. The decisive insight for Forgep
 > local model or GPT-4. So we keep the *model* thin (smallest local models) and make the
 > *infrastructure* real — the same "domain as a vehicle" principle that governs the ONNX side.
 
-**Interview thesis:** *"I built classic MLOps and extended the identical patterns to LLM infra —
-provider failover via circuit breaker, per-tenant token budgets via distributed rate-limiting,
-semantic cache, cost chargeback, and eval-gated quality monitoring."* Current, deep, defensible.
+**Thesis:** the classic-MLOps patterns extend to LLM infrastructure unchanged — provider
+failover via circuit breaker, per-tenant token budgets via distributed rate-limiting, semantic
+cache, cost chargeback, and eval-gated quality monitoring.
 
 ---
 
@@ -121,8 +121,8 @@ Net new code is mostly *domain glue + a provider abstraction* — the hard infra
 - **L4 — Eval + quality drift:** `LLMEvaluator` (LLM-as-judge) in **model-monitor**, quality-drift detection → closed-loop alert/retrain; evals dashboard.
 - **L5 — Governance tie-in:** prompt/response **audit** (hash-chained), Kyverno policy gate on provider/model allow-lists; optional cloud provider enablement.
 
-Each phase: proto-first, clean architecture, TDD + adversarial bug/security verification, deployed
-to k3s, interview-explainable line-by-line — same bar as M0–M6.
+Each phase: proto-first, clean architecture, TDD + adversarial bug/security verification,
+deployed to k3s — same bar as M0–M6.
 
 ---
 

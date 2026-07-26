@@ -74,7 +74,7 @@ class RegistryServiceStub:
     and cacheability that a server stream does not. Contrast with the Pipeline
     Orchestrator's WatchExecution, which IS server-streaming because execution
     progress is a genuine open-ended event feed. Picking unary+pagination here
-    is the correct, defensible call (interviewers probe this: "why not stream
+    is the correct call ("why not stream
     ListModels?" → backpressure + resumable cursor + simpler caching).
 
     RPC GROUPS:
@@ -232,7 +232,7 @@ class RegistryServiceServicer:
     and cacheability that a server stream does not. Contrast with the Pipeline
     Orchestrator's WatchExecution, which IS server-streaming because execution
     progress is a genuine open-ended event feed. Picking unary+pagination here
-    is the correct, defensible call (interviewers probe this: "why not stream
+    is the correct call ("why not stream
     ListModels?" → backpressure + resumable cursor + simpler caching).
 
     RPC GROUPS:
@@ -521,7 +521,7 @@ class RegistryService:
     and cacheability that a server stream does not. Contrast with the Pipeline
     Orchestrator's WatchExecution, which IS server-streaming because execution
     progress is a genuine open-ended event feed. Picking unary+pagination here
-    is the correct, defensible call (interviewers probe this: "why not stream
+    is the correct call ("why not stream
     ListModels?" → backpressure + resumable cursor + simpler caching).
 
     RPC GROUPS:

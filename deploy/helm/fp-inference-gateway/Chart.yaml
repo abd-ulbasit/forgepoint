@@ -5,7 +5,7 @@ apiVersion: v2
 # NetworkPolicy egress allow-list (this service talks to Redis + NATS + OTLP, NOT
 # Postgres). Everything structural (security contexts, probes, PDB, HPA, spread,
 # ServiceMonitor) is identical so the platform's deployment surface stays
-# boringly uniform and interview-explainable. See fp-auth/Chart.yaml for the
+# boringly uniform and easy to audit. See fp-auth/Chart.yaml for the
 # rationale behind each field.
 name: fp-inference-gateway
 description: Forgepoint Inference Gateway (circuit breaker, rate limiting, traffic splitting) — Redis-backed gRPC front door to model serving.

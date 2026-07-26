@@ -5,7 +5,7 @@ apiVersion: v2
 # NetworkPolicy egress allow-list (this service talks to Redis + NATS + OTLP, plus
 # Ollama in fp-ml; NOT Postgres in this core). Everything structural (security
 # contexts, probes, PDB, HPA, spread, ServiceMonitor) is identical so the
-# platform's deployment surface stays boringly uniform and interview-explainable.
+# platform's deployment surface stays boringly uniform and easy to audit.
 name: fp-ai-gateway
 description: Forgepoint AI Gateway (LLM provider routing, circuit-breaker failover, per-team token budgets, streaming) — the LLM front door over Ollama + a deterministic stub.
 

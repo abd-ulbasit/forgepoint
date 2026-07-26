@@ -38,7 +38,7 @@
 //                            GetModel / ListModels / GetVersion ─┘
 //                            SearchByTag  (eventually consistent)
 //
-//   WHY CQRS HERE (interview framing):
+//   WHY CQRS HERE:
 //     - Read:write ratio is enormous. Every inference request path may ask
 //       "what's the prod version of model X?" thousands of times per second;
 //       models are registered/promoted rarely. Separating the stores lets us
@@ -155,7 +155,7 @@ import "forgepoint/common/v1/common.proto";
 //   ModelVersion lets exactly one version per model occupy PRODUCTION while
 //   older versions sit in ARCHIVED and newer candidates wait in STAGING.
 //
-// THE TRANSITION RULES (enforced server-side, documented for interviews):
+// THE TRANSITION RULES (enforced server-side):
 //   DEV ──► STAGING ──► PRODUCTION ──► ARCHIVED
 //    └──────────────────────────────────► ARCHIVED (abandon a candidate)
 //   Promoting a version to PRODUCTION auto-demotes the *current* production
@@ -168,7 +168,7 @@ import "forgepoint/common/v1/common.proto";
 //   Buf STANDARD requires the _UNSPECIFIED zero value + ENUM_NAME prefix on
 //   every value (so the int 0 never accidentally means "DEV").
 //
-// CANONICAL-EVENT MAPPING (interview-relevant decoupling point):
+// CANONICAL-EVENT MAPPING (the decoupling point):
 //   This enum is the SERVICE/API enum. The event bus carries a MIRROR enum,
 //   events.v1.ModelStage, with byte-identical values (UNSPECIFIED=0, DEV=1,
 //   STAGING=2, PRODUCTION=3, ARCHIVED=4). They are kept numerically aligned on
@@ -460,7 +460,7 @@ message RegisterModelResponse {
 //   mutated. owner_id/team/stage/status/timestamps/artifact fields are absent so
 //   a caller can NEVER reassign ownership, jump teams, or backdate via this RPC.
 //
-// PARTIAL-UPDATE SEMANTICS (interview note — "how do you patch in proto3?"):
+// PARTIAL-UPDATE SEMANTICS ("how do you patch in proto3?"):
 //   proto3 scalars have no presence, so "field omitted" vs "field set to empty"
 //   are indistinguishable for a bare string. We make the contract explicit with
 //   update_mask-style booleans (update_description / replace_tags) rather than a
@@ -802,7 +802,7 @@ message ListVersionsResponse {
 //   illegal transitions (e.g., DEV→PRODUCTION skipping STAGING, or promoting a
 //   non-READY version) with FAILED_PRECONDITION.
 //
-// THE SINGLE-PRODUCTION INVARIANT (interview-critical):
+// THE SINGLE-PRODUCTION INVARIANT:
 //   Promoting version B of model M to PRODUCTION must ATOMICALLY demote the
 //   current production version A of M to ARCHIVED — there is never a moment with
 //   two production versions. This happens in ONE Postgres transaction; the
@@ -968,7 +968,7 @@ message GetDownloadURLResponse {
 //   and cacheability that a server stream does not. Contrast with the Pipeline
 //   Orchestrator's WatchExecution, which IS server-streaming because execution
 //   progress is a genuine open-ended event feed. Picking unary+pagination here
-//   is the correct, defensible call (interviewers probe this: "why not stream
+//   is the correct call ("why not stream
 //   ListModels?" → backpressure + resumable cursor + simpler caching).
 //
 // RPC GROUPS:

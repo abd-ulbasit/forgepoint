@@ -132,7 +132,7 @@ prod, so this also (a) rejects the committed dev-only placeholder string and
 (b) enforces the >= 32-byte minimum pkg/auth demands for HS256. Centralizing it
 here means every render path that needs the key gets the identical guard.
 
-INTERVIEW NOTE: HS256 is symmetric — the same secret signs AND verifies. A leaked
+WHY: HS256 is symmetric — the same secret signs AND verifies. A leaked
 or guessable key lets an attacker forge tokens for ANY identity, so the chart must
 refuse to install with a weak/default key rather than ship a usable one. Returns
 the validated key so call sites do `{{ include "fp-ai-gateway.validateJwtSecret" . | quote }}`.

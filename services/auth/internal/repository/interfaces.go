@@ -26,9 +26,9 @@
 // New code should prefer the domain names directly. The SOURCE OF TRUTH is
 // services/auth/internal/domain/ports.go.
 //
-// INTERVIEW: "You had an import cycle between domain and repository — how did you
-// resolve it?" Move the port to the consumer (domain). In Hexagonal terms the
-// port is defined by the side that uses it; the adapter implements it. The cycle
+// THE IMPORT CYCLE BETWEEN DOMAIN AND REPOSITORY, AND HOW IT WAS RESOLVED:
+// move the port to the consumer (domain). In Hexagonal terms the port is
+// defined by the side that uses it; the adapter implements it. The cycle
 // was the symptom of putting the port on the adapter side.
 // ============================================================================
 package repository

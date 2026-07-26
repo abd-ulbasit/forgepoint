@@ -24,7 +24,7 @@ import (
 //	delivery succeeded  → fp.notifications.delivered (NotificationDelivered)
 //	delivery exhausted  → fp.notifications.failed    (NotificationFailed)
 //
-// WHY publish a delivery-FAILURE event at all (a subtle, interview-worthy point):
+// WHY publish a delivery-FAILURE event at all (a subtle point):
 // "we tried to alert a human about a CRITICAL drift and the webhook was down" is
 // ITSELF an alert-worthy fact. Making delivery health observable platform-wide lets
 // experiment-tracker build success-rate dashboards and lets an on-call escalation

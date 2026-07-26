@@ -144,7 +144,7 @@ func NewPublisher(pub natsPublisher) *Publisher {
 // Emit implements domain.ProjectionEmitter. It switches on the event Kind to pick
 // the subject + build the matching eventsv1 payload, then publishes.
 //
-// FAILURE POSTURE (interview-relevant, per the ports.go contract): the service
+// FAILURE POSTURE (per the ports.go contract): the service
 // calls Emit AFTER the WriteStore commit. The write is the truth and must not be
 // undone by a publish failure, so Emit returns the error for the service to LOG —
 // the service does NOT roll back the already-committed command. The projection
@@ -177,7 +177,7 @@ func (p *Publisher) Emit(ctx context.Context, ev domain.ProjectionEvent) error {
 //
 // Each mapper copies the FLAT fields the contract specifies for that event from
 // the domain object into the wire message. They are pure functions (no ctx, no
-// I/O) so they are dead-simple to unit-test and to read in an interview. The
+// I/O) so they are dead-simple to unit-test and to read. The
 // *_by audit fields come from ev.Actor.UserID — the server-authoritative caller
 // identity (never a client value), exactly as the proto field docs require.
 
@@ -282,8 +282,8 @@ func modelArchived(ev domain.ProjectionEvent) *eventsv1.ModelArchived {
 // coincidence) so that if either enum is ever reordered, this stays correct and
 // the intent is auditable. The numeric values DO currently align byte-for-byte
 // (UNSPECIFIED=0..ARCHIVED=4), but relying on that implicitly would be a latent
-// bug — an interviewer probing "what if someone inserts a stage in the middle?"
-// is answered by: this switch breaks visibly, the implicit cast would not.
+// bug: if someone inserts a stage in the middle, this switch breaks visibly
+// where the implicit cast would not.
 func toEventStage(s domain.ModelStage) eventsv1.ModelStage {
 	switch s {
 	case domain.StageDev:

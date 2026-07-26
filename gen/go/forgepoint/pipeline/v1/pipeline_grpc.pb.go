@@ -44,7 +44,7 @@
 //     to our DAG mode (TRAINING_DAG).
 //   - Netflix Conductor: orchestration-based saga engine for microservices.
 //
-// DURABILITY (interview-critical): every StepExecution is persisted to Postgres
+// DURABILITY: every StepExecution is persisted to Postgres
 // BEFORE the step runs (write-ahead). If the orchestrator pod crashes mid-saga,
 // on restart it loads the last persisted checkpoint and RESUMES — it does not
 // restart the whole pipeline. The Helm chart runs this service with LEADER
@@ -94,7 +94,7 @@
 // records "pipeline-orchestrator" as the real producer). The Inference Gateway
 // and Model Serving CONSUME these to add/remove routes and (un)load versions; a
 // serving pod must NOT emit a competing ModelLoaded/Unloaded lifecycle event.
-//   SSRF GUARD (interview-critical): events.ModelDeployed.endpoint is the serving
+//   SSRF GUARD: events.ModelDeployed.endpoint is the serving
 //   backend address. It is RESOLVED SERVER-SIDE by the DEPLOY executor (from the
 //   model version + the K8s Service it created), NEVER taken from client-supplied
 //   step `config`. Accepting a client URL as the route target would let a caller
@@ -151,7 +151,7 @@ const (
 // them (Trigger / Get / Watch / Cancel / List executions). They share the same
 // durable store and domain model, so they live behind one service boundary.
 //
-// STREAMING CHOICE (interview-critical): only WatchExecution is server-
+// STREAMING CHOICE: only WatchExecution is server-
 // streaming; everything else is unary. WHY:
 //   - WatchExecution: the orchestrator is the SINGLE source of truth for saga
 //     state and PUSHES transitions as they happen. One client request →
@@ -162,7 +162,7 @@ const (
 //     client-streaming or bidi anywhere here: the client never sends a stream of
 //     data to the orchestrator; it issues discrete commands.
 //
-// LEADER ELECTION (deployment note, surfaced for interviews): although the gRPC
+// LEADER ELECTION (deployment note): although the gRPC
 // API can be served by many replicas, only the ELECTED LEADER actually drives
 // sagas (runs steps, writes checkpoints). This prevents two pods from executing
 // the same saga concurrently and double-applying side effects. Read RPCs
@@ -350,7 +350,7 @@ func (c *pipelineOrchestratorServiceClient) ListExecutions(ctx context.Context, 
 // them (Trigger / Get / Watch / Cancel / List executions). They share the same
 // durable store and domain model, so they live behind one service boundary.
 //
-// STREAMING CHOICE (interview-critical): only WatchExecution is server-
+// STREAMING CHOICE: only WatchExecution is server-
 // streaming; everything else is unary. WHY:
 //   - WatchExecution: the orchestrator is the SINGLE source of truth for saga
 //     state and PUSHES transitions as they happen. One client request →
@@ -361,7 +361,7 @@ func (c *pipelineOrchestratorServiceClient) ListExecutions(ctx context.Context, 
 //     client-streaming or bidi anywhere here: the client never sends a stream of
 //     data to the orchestrator; it issues discrete commands.
 //
-// LEADER ELECTION (deployment note, surfaced for interviews): although the gRPC
+// LEADER ELECTION (deployment note): although the gRPC
 // API can be served by many replicas, only the ELECTED LEADER actually drives
 // sagas (runs steps, writes checkpoints). This prevents two pods from executing
 // the same saga concurrently and double-applying side effects. Read RPCs

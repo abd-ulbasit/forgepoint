@@ -18,7 +18,7 @@
 //  1. MESSAGE MAPPING  — codes.Code → a short, actionable sentence.
 //  2. EXIT-CODE MAPPING — codes.Code → a stable integer the SHELL can branch on.
 //
-// WHY STABLE EXIT CODES MATTER (interview framing):
+// WHY STABLE EXIT CODES MATTER:
 //
 //	CLIs are composed in scripts and CI. `fp pipelines status X || handle_err`
 //	only works if the exit code is meaningful and stable. We map auth failures

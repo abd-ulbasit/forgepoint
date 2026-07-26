@@ -64,7 +64,7 @@ import (
 // (a notify fires while no relay is connected → the row waits for the next poll
 // anyway), so polling must back it regardless; we keep just the poll for simplicity.
 //
-// SINGLE-WRITER NOTE (interview probe — "what if two relay replicas run?"): this
+// SINGLE-WRITER NOTE ("what if two relay replicas run?"): this
 // relay claims with a plain SELECT, so two replicas could both publish the same
 // row → two publishes. That is still SAFE (dedup as above) but wasteful. The
 // production hardening is `FOR UPDATE SKIP LOCKED` on the claim (each replica grabs

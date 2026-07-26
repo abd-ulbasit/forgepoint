@@ -21,7 +21,7 @@
 # buckets, route mirror, quota cache, breaker state) and to model-serving in
 # fp-models (the forward path). We open ONLY the ports the service actually uses.
 #
-# ENFORCEMENT CAVEAT (interview-critical): a NetworkPolicy is only enforced if
+# ENFORCEMENT CAVEAT: a NetworkPolicy is only enforced if
 # the cluster's CNI supports it (Calico, Cilium, etc.). On a CNI without policy
 # support it is silently ignored — present but not enforced. So this is defense
 # in depth, not a substitute for authn/authz at the app layer.

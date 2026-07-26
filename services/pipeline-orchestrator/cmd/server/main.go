@@ -59,7 +59,7 @@
 //     edge of the closed loop: a CRITICAL drift with auto_retrain armed triggers
 //     the model's retrain pipeline with no human in the path.
 //
-// LEADER ELECTION NOTE (deployment, surfaced for interviews): the gRPC API can be
+// LEADER ELECTION NOTE (deployment): the gRPC API can be
 // served by many replicas, but only the ELECTED LEADER should DRIVE sagas (run
 // steps, write checkpoints) so two pods never double-apply a deployment. Read RPCs
 // (Get/List/Watch) are served by any replica from the shared DB. The drift
@@ -386,7 +386,7 @@ func main() {
 	// grpcutil.NewServer applies the standard chain (recovery → logging → tracing →
 	// AUTH). The AUTHENTICATION interceptor is now wired via WithAuthValidator.
 	//
-	// AUTHENTICATION vs AUTHORIZATION — the division of labor (interview-critical):
+	// AUTHENTICATION vs AUTHORIZATION — the division of labor:
 	//   - authN (THIS interceptor): "who are you?" It verifies the JWT signature with
 	//     the shared secret (design D2 — LOCAL verify, no per-RPC hop to auth), and on
 	//     success injects the caller's TokenClaims (UserID/Team/Role/Scopes) into the

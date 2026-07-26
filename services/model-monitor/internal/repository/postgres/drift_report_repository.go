@@ -2,7 +2,7 @@
 // domain.DriftReportRepository (the durable drift-verdict history).
 //
 // ============================================================================
-// THE TWO DEFINING MECHANICS (both interview-probed)
+// THE TWO DEFINING MECHANICS
 // ============================================================================
 //
 // 1) IDEMPOTENT Save on window_id — the persistence half of exactly-once.

@@ -21,7 +21,7 @@ import (
 // the returned JWT to ~/.forgepoint/token at mode 0600.
 //
 // ============================================================================
-// THE LOGIN FLOW (interview framing)
+// THE LOGIN FLOW
 // ============================================================================
 //
 //	fp login --email you@co

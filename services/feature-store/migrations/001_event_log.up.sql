@@ -149,7 +149,7 @@ CREATE INDEX idx_view_name_index_team_id
 -- idempotency_keys — exactly-once EFFECT for retried Append commands
 -- ----------------------------------------------------------------------------
 --
--- IDEMPOTENCY (the interview-critical bit): NATS/gRPC give AT-LEAST-once delivery.
+-- IDEMPOTENCY: NATS/gRPC give AT-LEAST-once delivery.
 -- A producer whose response was lost will retry WriteFeatures with the SAME
 -- idempotency key. Without dedup the retry would append duplicate value events and
 -- corrupt counts/history. This table records, per key, the version RANGE the

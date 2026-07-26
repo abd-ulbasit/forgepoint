@@ -45,9 +45,8 @@
 // GetInvoice, ListInvoices, GetRatePlan) are added in the handler phase by
 // overriding each method on *BillingHandler.
 //
-// INTERVIEW: "How does grpc-go guarantee forward compatibility of service
-// servers?" — the mustEmbed... private method forces embedding the Unimplemented
-// base; a server that embeds it compiles (and returns Unimplemented) when a new
+// FORWARD COMPATIBILITY OF gRPC SERVICE SERVERS: the mustEmbed... private
+// method forces embedding the Unimplemented base; a server that embeds it compiles (and returns Unimplemented) when a new
 // RPC is added to the proto, instead of failing to satisfy the interface.
 // ============================================================================
 package handler

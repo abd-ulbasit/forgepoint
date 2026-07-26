@@ -321,7 +321,7 @@ func main() {
 	// grpcutil.NewServer applies the standard interceptor chain (recovery → logging →
 	// auth → tracing). WithReflection lets grpcurl/grpcui introspect in dev.
 	//
-	// AUTHENTICATION vs AUTHORIZATION — the division of labor (read before an interview):
+	// AUTHENTICATION vs AUTHORIZATION — the division of labor:
 	//
 	//   AUTHENTICATION (THIS interceptor): "WHO are you?" The AuthUnaryInterceptor/
 	//   AuthStreamInterceptor that WithAuthValidator installs runs on EVERY RPC that

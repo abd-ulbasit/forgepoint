@@ -77,8 +77,8 @@ func NewPublisher(pub *natsutil.Publisher) *Publisher {
 // For a portfolio control-plane this is acceptable; the gold-standard fix is the
 // TRANSACTIONAL OUTBOX (write the event to an outbox table IN the same tx, a relay
 // publishes it) — which is exactly the pattern the BILLING service implements.
-// Auth deliberately uses the simpler publish-after-commit here; the interview
-// answer is to name the outbox as the upgrade path.
+// Auth deliberately uses the simpler publish-after-commit here; the outbox is
+// the named upgrade path.
 func (p *Publisher) PublishUserCreated(ctx context.Context, in UserCreatedInput) error {
 	payload := asEventsV1UserCreated(in, p.now)
 	return p.pub.Publish(ctx, SubjectUserCreated, payload)

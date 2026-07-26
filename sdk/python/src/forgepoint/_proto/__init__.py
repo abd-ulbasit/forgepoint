@@ -53,8 +53,8 @@ ALTERNATIVES CONSIDERED (and why this one):
     Chosen. (This is ``pkgutil``-style namespace path extension, the same
     mechanism setuptools' ``pkg_resources`` namespace packages use.)
 
-INTERVIEW NOTE: an interviewer probing "how do you vendor generated gRPC code
-without editing it?" — the answer is that protoc emits import paths mirroring the
+NOTE — how generated gRPC code is vendored
+without editing it: protoc emits import paths mirroring the
 proto ``package`` declaration, not the filesystem, so you make that package path
 importable. Extending ``__path__`` does that cleanly.
 """

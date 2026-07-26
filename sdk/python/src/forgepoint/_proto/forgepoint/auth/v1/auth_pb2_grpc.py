@@ -26,7 +26,7 @@ class AuthServiceStub:
     TOKEN VALIDATION: ValidateToken (called by every other service's interceptor)
     ACCESS CONTROL: CheckPermission, AssignRole
 
-    INTERCEPTOR CALL PATTERN (interview-critical):
+    INTERCEPTOR CALL PATTERN:
     Every gRPC service in Forgepoint has an auth interceptor that:
     1. Extracts "authorization: Bearer <token>" from incoming metadata
     2. Calls AuthService.ValidateToken() → gets TokenClaims
@@ -122,7 +122,7 @@ class AuthServiceServicer:
     TOKEN VALIDATION: ValidateToken (called by every other service's interceptor)
     ACCESS CONTROL: CheckPermission, AssignRole
 
-    INTERCEPTOR CALL PATTERN (interview-critical):
+    INTERCEPTOR CALL PATTERN:
     Every gRPC service in Forgepoint has an auth interceptor that:
     1. Extracts "authorization: Bearer <token>" from incoming metadata
     2. Calls AuthService.ValidateToken() → gets TokenClaims
@@ -204,9 +204,8 @@ class AuthServiceServicer:
         with a 30-second TTL. This keeps auth overhead below 1ms p99 while
         still enforcing near-real-time revocation.
 
-        INTERVIEW NOTE: Interviewers often ask "what happens if the auth service
-        goes down?" Answer: the other services' interceptors can be configured
-        with a fail-open (allow) or fail-closed (deny) policy. Forgepoint uses
+        NOTE — what happens if the auth service goes down: the other services'
+        interceptors can be configured with a fail-open (allow) or fail-closed (deny) policy. Forgepoint uses
         fail-closed (safe default for a security service). A circuit breaker on
         the auth gRPC client prevents cascade failures during auth service outages.
         """
@@ -305,7 +304,7 @@ class AuthService:
     TOKEN VALIDATION: ValidateToken (called by every other service's interceptor)
     ACCESS CONTROL: CheckPermission, AssignRole
 
-    INTERCEPTOR CALL PATTERN (interview-critical):
+    INTERCEPTOR CALL PATTERN:
     Every gRPC service in Forgepoint has an auth interceptor that:
     1. Extracts "authorization: Bearer <token>" from incoming metadata
     2. Calls AuthService.ValidateToken() → gets TokenClaims

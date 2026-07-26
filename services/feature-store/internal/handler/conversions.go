@@ -17,7 +17,7 @@
 //   - a wire-format quirk (e.g. proto encoding every number as a float64) is
 //     handled once, not smeared across six RPC methods.
 //
-// THE INT64 PRECISION TRAP (interview-critical):
+// THE INT64 PRECISION TRAP:
 //
 //	google.protobuf.Value has only a `number_value` (double). A JSON/Value
 //	number cannot losslessly carry every int64 (doubles have 53 bits of mantissa;

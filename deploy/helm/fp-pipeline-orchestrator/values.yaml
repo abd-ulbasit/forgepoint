@@ -19,7 +19,7 @@
 # PodDisruptionBudget (minAvailable: 1) can always be satisfied. When autoscaling
 # is enabled the HPA owns the replica count and this value is ignored.
 #
-# ORCHESTRATOR NOTE (interview-critical): all replicas serve the READ RPCs
+# ORCHESTRATOR NOTE: all replicas serve the READ RPCs
 # (Get/List/Watch) from the shared Postgres, but only the ELECTED LEADER drives
 # sagas (runs steps, writes checkpoints) so two pods never double-apply a
 # deployment. Running 2+ replicas is still correct — leader election (added with

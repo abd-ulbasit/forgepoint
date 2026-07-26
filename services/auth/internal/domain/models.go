@@ -40,7 +40,7 @@
 //	The handler layer is the ONLY place where proto ↔ domain conversion happens
 //	(the "anti-corruption layer" in Domain-Driven Design terminology).
 //
-// INTERVIEW FRAMING:
+// DESIGN NOTE:
 //
 //	Q: Why not just use the proto types directly in the service layer?
 //	A: The domain must be independently testable and decoupled from transport.
@@ -67,8 +67,8 @@ import "time"
 //     proportional benefit for a 10-service ML platform at this stage.
 //   - ABAC (AWS IAM style: resource conditions, tag-based) is more expressive
 //     but requires a policy engine (OPA, Casbin). Overkill here.
-//   - INTERVIEW: Google Zanzibar / ReBAC (relation-based access control) is
-//     what Google, Airbnb, and Carta use at scale. Reference it as the natural
+//   - ALTERNATIVE AT SCALE: Google Zanzibar / ReBAC (relation-based access
+//     control) is what Google, Airbnb, and Carta use at scale — the natural
 //     evolution path when the permission model outgrows flat RBAC.
 type Role struct {
 	ID          string
@@ -154,7 +154,7 @@ type User struct {
 //	A database breach exposes only hashes — useless without the raw key.
 //	One-time display of raw_key forces users to save it (like GitHub PATs).
 //
-// INTERVIEW: "How do you rotate an API key without downtime?"
+// ROTATING AN API KEY WITHOUT DOWNTIME:
 //
 //	Create the new key first (system accepts both old and new), update clients
 //	to use the new key, then revoke the old key. Blue/green applied to creds.
@@ -203,7 +203,7 @@ func (k APIKey) IsValid(now time.Time) bool {
 //	Handlers call ctx.Value(domain.ClaimsContextKey).(domain.TokenClaims) to
 //	read the caller's identity without making an extra RPC.
 //
-// INTERVIEW: "What's in your JWT?"
+// WHAT IS IN THE JWT:
 //
 //	Standard claims (sub, exp, iat) plus Forgepoint-specific: user_id, email,
 //	team, role. We keep the JWT payload small — the permissions list is NOT

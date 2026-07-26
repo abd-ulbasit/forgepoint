@@ -11,9 +11,9 @@
 // which wire format or which database is on the other side of a port.
 //
 // WHY THAT MATTERS HERE (the saga engine is the crown jewel): the saga state
-// machine and the DAG scheduler are the part of this service an interviewer will
-// probe hardest. Keeping them in pure Go — no transport, no persistence — means
-// they are testable as plain functions over plain structs (see the *_test.go
+// machine and the DAG scheduler are the load-bearing part of this service.
+// Keeping them in pure Go — no transport, no persistence — means they are
+// testable as plain functions over plain structs (see the *_test.go
 // files), and the correctness of compensation ordering does not depend on any
 // I/O. That is the entire payoff of the dependency rule.
 //
@@ -144,7 +144,7 @@ func (t StepType) IsKnown() bool {
 }
 
 // ============================================================================
-// ExecutionStatus — THE SAGA STATE MACHINE (interview-critical)
+// ExecutionStatus — THE SAGA STATE MACHINE
 // ============================================================================
 //
 //	PENDING ──► RUNNING ──► COMPLETED                         (happy path)
@@ -356,8 +356,8 @@ const MaxStepsPerPipeline = 256
 //     compensations against real infrastructure, tight enough that a stuck adapter
 //     surfaces rather than hangs the run.
 //
-// INTERVIEW: "A user cancels mid-saga. What context does the compensation run on?"
-// — NOT the cancelled one. We detach with context.WithoutCancel + a bounded
+// WHAT CONTEXT COMPENSATION RUNS ON WHEN A USER CANCELS MID-SAGA:
+// NOT the cancelled one. We detach with context.WithoutCancel + a bounded
 // timeout so the rollback and the CANCELLED terminal write actually persist; the
 // cancel only stops us from starting new forward steps.
 const SettlementTimeout = 60 * time.Second

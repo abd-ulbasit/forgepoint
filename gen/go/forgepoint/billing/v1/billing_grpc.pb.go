@@ -71,8 +71,8 @@
 //     - This is exactly how Stripe, Shopify, and most ledger systems publish
 //       events reliably. Debezium + Kafka Connect productize the "tail the
 //       outbox/WAL" half. Temporal sidesteps it with durable workflow state.
-//     - INTERVIEW NOTE: the classic probe is "why not just publish to NATS
-//       inside the same code path after the DB commit?" — answer: the process
+//     - WHY NOT JUST PUBLISH TO NATS inside the same code path after the DB
+//       commit: the process
 //       can die in the gap between commit and publish; the outbox moves the
 //       publish intent INTO the committed transaction so a crash loses nothing.
 //
@@ -217,7 +217,7 @@ const (
 //	acceptable for a pre-flight — the worst case is a handful of over-quota calls
 //	slip through before the cache flips, which the next RecordUsage still meters.
 //
-// ASCII DIAGRAM — the outbox metering pipeline (interview-critical):
+// ASCII DIAGRAM — the outbox metering pipeline:
 //
 //	Inference Gateway ──fp.inference.completed──► Billing NATS consumer
 //	                                                   │ (dedupe on request_id)
@@ -395,7 +395,7 @@ func (c *billingServiceClient) ListInvoices(ctx context.Context, in *ListInvoice
 //	acceptable for a pre-flight — the worst case is a handful of over-quota calls
 //	slip through before the cache flips, which the next RecordUsage still meters.
 //
-// ASCII DIAGRAM — the outbox metering pipeline (interview-critical):
+// ASCII DIAGRAM — the outbox metering pipeline:
 //
 //	Inference Gateway ──fp.inference.completed──► Billing NATS consumer
 //	                                                   │ (dedupe on request_id)

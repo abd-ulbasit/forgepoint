@@ -16,7 +16,7 @@
 // the handler understands ("run not found"). This is what lets the handler stay
 // blissfully ignorant that a database even exists.
 //
-// INTERVIEW: "Why not just return the raw DB error up the stack?"
+// WHY NOT RETURN THE RAW DB ERROR UP THE STACK:
 //
 //	Because the transport layer (gRPC) would then have to understand pgx error
 //	codes — a leak of infrastructure into the API boundary. The translation also

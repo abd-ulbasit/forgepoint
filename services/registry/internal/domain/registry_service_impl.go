@@ -395,7 +395,7 @@ func (s *registryService) MarkVersionReady(ctx context.Context, actor Actor, in 
 		return ModelVersion{}, fmt.Errorf("get version: %w", err)
 	}
 
-	// TENANCY GATE (interview-critical). GetVersion(by id) above does NOT filter by
+	// TENANCY GATE. GetVersion(by id) above does NOT filter by
 	// team — it is the generic write-store lookup. A version id is a global handle, so
 	// without this gate a JWT from ANY team could confirm/flip a version owned by
 	// another team (a cross-tenant mutation / privilege-escalation hole). We therefore
@@ -478,7 +478,7 @@ func (s *registryService) MarkVersionReady(ctx context.Context, actor Actor, in 
 
 // PromoteVersion — the stage state machine + the SINGLE-PRODUCTION invariant.
 //
-// This is the interview centerpiece. Read the steps as the answer to "walk me
+// This is the centerpiece. Read the steps as the answer to "walk me
 // through promoting a model version to production."
 func (s *registryService) PromoteVersion(ctx context.Context, actor Actor, in PromoteVersionInput) (PromoteResult, error) {
 	if strings.TrimSpace(in.VersionID) == "" {
@@ -816,8 +816,8 @@ func (s *registryService) assertVersionInTeam(ctx context.Context, actor Actor, 
 // preserved. An empty key short-circuits to done==false (the store would too, but
 // skipping the call keeps the no-key path allocation-free and obviously a no-op).
 //
-// INTERVIEW framing: "how do you make a non-creating command idempotent by key?"
-// → you cannot hang the key on a new row (there isn't one), so you keep a separate
+// MAKING A NON-CREATING COMMAND IDEMPOTENT BY KEY:
+// you cannot hang the key on a new row (there isn't one), so you keep a separate
 // (team, command, key)→entity ledger, consult it before acting, and write it with
 // the mutation in one tx. State-based idempotency ("already READY") is the fallback
 // for keyless retries; the ledger is what honors the wire contract's KEY guarantee.

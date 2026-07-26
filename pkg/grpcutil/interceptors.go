@@ -321,7 +321,7 @@ func AuthUnaryInterceptor(validator TokenValidator, opts ...AuthOption) grpc.Una
 // authenticate extracts the bearer token, validates it, and returns a context
 // carrying the resulting Claims. Shared by the unary and stream interceptors.
 //
-// ERROR NORMALIZATION (interview-worthy):
+// ERROR NORMALIZATION:
 //
 //	A validator can fail for two very different reasons:
 //	  1. The token is genuinely bad → Unauthenticated (client's fault).
@@ -585,7 +585,7 @@ func AuthStreamInterceptor(validator TokenValidator, opts ...AuthOption) grpc.St
 //   The auth service will adopt this in a follow-up (the local copy in authn/
 //   can delegate to or be replaced by this function without any call-site change).
 //
-// INTERVIEW: "Why don't you require a token to check the health endpoint?"
+// WHY THE HEALTH ENDPOINT IS UNAUTHENTICATED:
 //   K8s probes originate from the kubelet process on the node — there is no
 //   mechanism to pass a credential. The health endpoint's threat model is
 //   availability (anyone can see SERVING/NOT_SERVING), not confidentiality.

@@ -21,7 +21,7 @@
 //   List     → JOIN pipelines for the TEAM scope (executions have no team column;
 //              tenancy is a property of the parent template).
 //
-// WHY Create's atomicity matters (interview): the PENDING step rows ARE the
+// WHY Create's atomicity matters: the PENDING step rows ARE the
 // recovery map. If the execution row committed but a step row didn't, recovery
 // would see a run with fewer checkpoints than steps and either re-run or strand
 // a step. One tx for "the execution and all its checkpoints" closes that gap —

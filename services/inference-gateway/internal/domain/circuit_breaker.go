@@ -69,7 +69,7 @@ type breakerConfig struct {
 //     packet won't trip) yet trips well before a sustained outage saturates the
 //     caller. A common industry default (resilience4j uses ~50% over a window;
 //     we use a simpler consecutive-count which is easier to reason about and
-//     explain in an interview).
+//     explain).
 //   - 30s reset: long enough that we don't hammer a recovering backend, short
 //     enough that a recovered backend rejoins quickly.
 //   - 2 successes to close: one lucky probe isn't proof of recovery; two

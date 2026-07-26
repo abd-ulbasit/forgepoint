@@ -54,8 +54,7 @@ type CreateUserInput struct {
 // and calls its methods; the repository interfaces are injected into the
 // concrete impl (NewAuthService in Task 1.3).
 //
-// INTERVIEW: "How do you handle the case where you need to mock the database
-// in tests for the gRPC handler?"
+// TESTABILITY — mocking the database in tests for the gRPC handler:
 //   The handler depends on AuthService (an interface), not on AuthServiceImpl
 //   (the concrete struct). In handler tests we pass a mock that implements
 //   AuthService — zero database, zero network. This is dependency inversion
@@ -150,7 +149,7 @@ type AuthService interface {
 	//   This keeps per-RPC auth overhead below 1ms p99. The TTL is short enough
 	//   that a revoked token is rejected within ~30s even under cache.
 	//
-	// INTERVIEW: "What happens if the auth service is down?"
+	// IF THE AUTH SERVICE IS DOWN:
 	//   Other services' interceptors use fail-closed policy (deny on error) and
 	//   a circuit breaker on the auth gRPC client to stop cascading failures.
 	//   We chose fail-closed over fail-open because auth is a security boundary.

@@ -142,7 +142,7 @@ func (r *RoleRepo) GetByName(ctx context.Context, name string) (domain.Role, err
 // which we translate to ErrRepoNotFound. (The domain service pre-checks both
 // exist, so this is a defense-in-depth backstop, not the primary guard.)
 //
-// INTERVIEW: "How do you make an assignment idempotent and concurrency-safe?"
+// MAKING THE ASSIGNMENT IDEMPOTENT AND CONCURRENCY-SAFE:
 // INSERT ... ON CONFLICT DO UPDATE — let the database's unique index + row lock
 // arbitrate, rather than a read-modify-write in the app that races.
 func (r *RoleRepo) AssignToUser(ctx context.Context, userID, roleID string) error {

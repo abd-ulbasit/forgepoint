@@ -8,7 +8,7 @@
 // Each pattern is its own pure domain object (RateLimiter port, TrafficSplitter,
 // CircuitBreaker, RouteStore). This impl is the ORCHESTRATOR that runs them in
 // the right order on the hot path and records the outcome. The ordering is
-// deliberate and interview-worthy — cheap/early rejections first, the expensive
+// deliberate — cheap/early rejections first, the expensive
 // backend call last, so a request that will be rejected costs as little as
 // possible:
 //
@@ -413,7 +413,7 @@ func (s *inferenceService) UpsertRoute(ctx context.Context, team, modelName stri
 // SetTrafficSplit reweights existing versions only — the canary dial. Each
 // version must already exist; the new ACTIVE weights must sum to 10000.
 //
-// ATOMICITY (validate-then-commit) — the interview-critical property: we mutate a
+// ATOMICITY (validate-then-commit) — the critical property: we mutate a
 // CLONE of the targets, validate the full proposed set, and Upsert ONLY on
 // success. WHY this matters and what the old code got wrong: the previous version
 // wrote each new weight in place through findTarget pointers and checked the SUM

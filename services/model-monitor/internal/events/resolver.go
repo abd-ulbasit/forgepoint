@@ -24,7 +24,7 @@ import "context"
 // WHERE model_name = $1 AND state != deleted` over the SAME monitors table the
 // repository writes. Tests inject a fake.
 //
-// THE MODEL-NAME UNIQUENESS CAVEAT (an honest tradeoff, interview-worthy):
+// THE MODEL-NAME UNIQUENESS CAVEAT (an honest tradeoff):
 //   Monitors are keyed by (owner_team, model_name), so a model name is NOT globally
 //   unique — team-a/"fraud" and team-b/"fraud" are different monitors. An inference
 //   event names only the model ("fraud") plus the served version + api_key_id; it

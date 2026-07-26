@@ -33,7 +33,7 @@ import (
 )
 
 // ----------------------------------------------------------------------------
-// Hand-written mocks (no codegen — every line interview-explainable).
+// Hand-written mocks (no codegen).
 // Unset function fields panic, surfacing accidental coupling. The usage store
 // keeps in-memory state so idempotency can be asserted as REAL behavior (a
 // second call sees the first call's row), not just a returned bool.

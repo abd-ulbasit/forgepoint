@@ -1768,9 +1768,8 @@ nginx sidecar can serve them); Dockerfile + Helm chart like any other workload.
 ## Phase 15: Operability & SRE
 
 > Services that run are not the same as services you can *operate*. This phase produces the
-> operational artifacts platform-engineering interviews probe for: SLOs with error budgets,
-> actionable alerts, and a runbook. This is the layer that signals "platform engineer," not
-> "backend engineer who knows K8s." (Phase 10 added dashboards + raw alert rules; this phase
+> operational artifacts a platform team needs: SLOs with error budgets, actionable alerts, and
+> a runbook. (Phase 10 added dashboards + raw alert rules; this phase
 > makes them SLO-driven and adds the human-facing operational docs.)
 
 ---
@@ -1802,8 +1801,8 @@ budget fast enough to miss the SLO" (actionable).
 
 For each alert that pages (HighErrorRate, SagaStuck, CircuitBreakerOpen, fast-burn SLO):
 symptom → dashboards/queries to check → likely causes → mitigation steps → escalation. Link
-each Prometheus alert's annotation to its runbook URL. An interviewer asking "what happens at
-3am when this fires?" should be answerable by pointing at this doc.
+each Prometheus alert's annotation to its runbook URL. "What happens at 3am when this fires?"
+should be answerable by pointing at this doc.
 
 ### Task 15.4: Graceful Degradation + Readiness Discipline
 
@@ -1869,9 +1868,8 @@ metric and wire the report into the Web UI (Phase 14) and alerts/runbook (Phase 
 
 ## Phase 23: `fp` CLI (M4)
 
-> The design has always listed `tools/fp-cli`; this makes it real. A CLI is the best live-demo
-> artifact in an interview ("watch me deploy a model from my terminal") and forces clean,
-> scriptable API ergonomics.
+> The design has always listed `tools/fp-cli`; this makes it real. A CLI exercises the API
+> end to end from a terminal and forces clean, scriptable API ergonomics.
 
 ---
 
@@ -1934,7 +1932,7 @@ changed services via Helm, posts the preview URL as a PR comment, and tears down
 
 ## Phase 24: Backup & Disaster Recovery (M5)
 
-> "What happens when the database dies?" is a standard platform interview question. Have a real answer.
+> "What happens when the database dies?" needs a real answer, not a hopeful one.
 
 ---
 

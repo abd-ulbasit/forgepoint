@@ -12,7 +12,7 @@
 # count, every `helm upgrade` resets replicas to replicaCount and then the HPA
 # corrects it — visible flapping. With the HPA as sole owner, scaling is stable.
 #
-# SERVING-SPECIFIC (interview-probe): CPU% is a WEAK signal for an inference pod —
+# SERVING-SPECIFIC: CPU% is a WEAK signal for an inference pod —
 # it can be latency-degraded (predicts queueing) while CPU looks moderate. The
 # platform's real autoscale signal is a CUSTOM metric (p99 inference latency or
 # gRPC RPS via Prometheus-Adapter), wired through `autoscaling.customMetrics`.

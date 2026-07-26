@@ -277,7 +277,7 @@ func (h *PipelinesHandler) GetExecution(w http.ResponseWriter, r *http.Request) 
 // is exactly the shape of execution status updates (the ADR chose SSE over
 // WebSocket for this reason).
 //
-// THE BRIDGE, step by step (interview-critical):
+// THE BRIDGE, step by step:
 //  1. Set SSE headers (text/event-stream, no-cache, keep-alive) BEFORE writing.
 //  2. Open the gRPC WatchExecution stream with the caller's token forwarded.
 //  3. Loop: stream.Recv() -> marshal the update to JSON -> write one SSE frame
@@ -316,8 +316,8 @@ func (h *PipelinesHandler) GetExecution(w http.ResponseWriter, r *http.Request) 
 // heartbeat write fails → loop exits → deferred ctx cancel fires → gRPC stream
 // cancelled. Either path: zero leaked goroutines.
 //
-// INTERVIEW FRAMING: "How do you prevent goroutine leaks in a streaming proxy?"
-// Answer: tie the upstream context to the client's request context AND add a
+// PREVENTING GOROUTINE LEAKS IN A STREAMING PROXY:
+// tie the upstream context to the client's request context AND add a
 // periodic write to detect half-open TCP; both paths lead to a clean teardown.
 
 const (

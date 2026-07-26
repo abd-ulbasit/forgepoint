@@ -78,7 +78,7 @@
 //   - Kafka Connect / ClickHouse async inserts: same batch-on-ingest idea for
 //     high-cardinality time-series.
 //
-// INTERVIEW NOTE (likely probes):
+// DESIGN NOTES:
 //   - "How do you handle metric volume?" → batch consumer + back-pressure via
 //     NAK, time-partitioned Postgres table for the metrics.
 //   - "Why is LogMetrics a unary batch RPC and not a client-streaming RPC?"

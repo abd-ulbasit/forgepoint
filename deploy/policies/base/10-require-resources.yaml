@@ -22,7 +22,7 @@
 # the HPA's utilization math correct. Tradeoff: a touch more boilerplate per pod,
 # bought back by predictable scheduling and no surprise OOM evictions.
 #
-# Interview probe: "requests vs limits, and QoS classes?" → requests=reserved &
+# Requests vs limits, and QoS classes: requests=reserved &
 # scheduling; limits=hard cap & enforcement; Guaranteed (req==lim for all),
 # Burstable (some set), BestEffort (none → first to be evicted). This policy
 # pushes every fp pod to at least Burstable, usually toward Guaranteed.

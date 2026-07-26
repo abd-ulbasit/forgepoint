@@ -3,7 +3,7 @@
 #       least-privilege permission policies (S3 artifacts, Secrets Manager, KMS)
 # ============================================================================
 #
-# HOW IRSA WORKS (the interview answer):
+# HOW IRSA WORKS:
 #   1. The pod's ServiceAccount is annotated eks.amazonaws.com/role-arn=<this role>.
 #   2. EKS projects a signed OIDC JWT (audience sts.amazonaws.com) into the pod.
 #   3. The AWS SDK in the pod calls sts:AssumeRoleWithWebIdentity with that JWT.

@@ -189,7 +189,7 @@ func (s *PipelineRepository) Archive(ctx context.Context, id string) error {
 // List returns a tenancy-scoped page of LIVE pipelines (newest first) plus a
 // nextToken cursor (empty when the last page is reached).
 //
-// KEYSET PAGINATION (the WHY, interview-ready): instead of OFFSET n (which scans
+// KEYSET PAGINATION (the WHY): instead of OFFSET n (which scans
 // and discards n rows AND can skip/duplicate under concurrent inserts), we carry
 // a cursor = the (created_at, id) of the last row of the previous page and ask
 // for "rows ordered DESC that sort strictly AFTER this cursor". A composite

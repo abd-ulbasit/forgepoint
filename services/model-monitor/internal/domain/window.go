@@ -1,7 +1,7 @@
 // window.go — the SLIDING WINDOW: the streaming-aggregation half of the pattern.
 //
 // ============================================================================
-// WHAT A WINDOW IS AND WHY (interview framing)
+// WHAT A WINDOW IS AND WHY
 // ============================================================================
 //
 // The monitor consumes an unbounded stream of InferenceCompleted events. It can

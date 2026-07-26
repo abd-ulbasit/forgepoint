@@ -55,7 +55,7 @@
 // per-RPC method bodies (RegisterModel, PromoteVersion, GetModel, ...) are added in
 // the handler phase by overriding each method on *RegistryHandler.
 //
-// INTERVIEW: "How does grpc-go ensure forward compatibility of service servers?"
+// FORWARD COMPATIBILITY OF gRPC SERVICE SERVERS:
 //
 //	The mustEmbedUnimplemented... private method forces embedding the Unimplemented
 //	base; a new proto RPC then compiles fine on services that embed the base

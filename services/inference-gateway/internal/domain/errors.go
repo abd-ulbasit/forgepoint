@@ -11,8 +11,7 @@
 //   (b) gRPC status code at the edge, and
 //   (c) events.InferenceFailureReason on the async bus.
 //
-// The handler is the single translation point. The mapping (interview-critical —
-// be ready to recite it) is:
+// The handler is the single translation point. The mapping is:
 //
 //	ErrNoRoute       → NOT_FOUND          → NO_ROUTE        (model not routable)
 //	ErrRateLimited   → RESOURCE_EXHAUSTED → RATE_LIMITED    (token bucket empty)

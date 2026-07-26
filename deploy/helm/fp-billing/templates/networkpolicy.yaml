@@ -17,7 +17,7 @@
 #             uses NO Redis and NO MinIO, so NO egress is opened to them — the
 #             allow-list is exactly the data stores this service actually uses.
 #
-# ENFORCEMENT CAVEAT (interview-critical): a NetworkPolicy is only enforced if
+# ENFORCEMENT CAVEAT: a NetworkPolicy is only enforced if
 # the cluster's CNI supports it (Calico, Cilium, etc.). On a CNI without policy
 # support it is silently ignored — present but not enforced. So this is defense
 # in depth, not a substitute for authn/authz at the app layer.

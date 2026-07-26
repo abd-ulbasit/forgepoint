@@ -32,7 +32,7 @@
 //
 // PATTERN — API GATEWAY + RESILIENCE STACK:
 //   This service composes FOUR classic resilience patterns into one request
-//   path. Each is interview-namable and each is realized by a part of this API:
+//   path. Each is realized by a part of this API:
 //
 //     1. TRAFFIC SPLITTING (canary / A-B): a model has N candidate versions,
 //        each with a weight. The gateway picks one per request by weighted
@@ -377,7 +377,7 @@ func (CircuitBreakerState) EnumDescriptor() ([]byte, []int) {
 // For the external HTTP API the gateway accepts/returns JSON arrays and
 // converts; this binary form is the efficient internal/gRPC representation.
 //
-// INTERVIEW NOTE: be ready to explain "why not repeated float?" — answer:
+// WHY NOT repeated float:
 // wire size + zero-copy forwarding. shape carries dimensions (e.g., [1, 4]
 // for one iris sample of 4 features); data length must equal product(shape) *
 // sizeof(dtype), which the gateway validates.
@@ -633,7 +633,7 @@ func (x *Route) GetUpdatedAt() *timestamppb.Timestamp {
 // failure mode into an observable one. The metric
 // fp_gateway_circuit_breaker_state mirrors this for Prometheus.
 //
-// THE 3-STATE MACHINE (interview-critical):
+// THE 3-STATE MACHINE:
 //
 //	┌─────────┐  failures ≥ threshold   ┌──────┐
 //	│ CLOSED  │ ──────────────────────► │ OPEN │

@@ -28,8 +28,8 @@
 // `repository.UserRepository` still resolve and the Postgres impl can satisfy
 // either name — but the SOURCE OF TRUTH is here.
 //
-// INTERVIEW: "Where do repository interfaces belong — with the data layer or the
-// business layer?" In Hexagonal Architecture, the port is owned by the side that
+// WHERE REPOSITORY INTERFACES BELONG — with the data layer or the
+// business layer? In Hexagonal Architecture, the port is owned by the side that
 // USES it (the domain). The adapter (DB) implements the port. Defining the port
 // in the DB package and the consumer in the domain creates a cycle the moment a
 // domain type implements another domain type's contract — which is exactly what

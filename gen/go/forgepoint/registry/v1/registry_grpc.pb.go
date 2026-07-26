@@ -38,7 +38,7 @@
 //                            GetModel / ListModels / GetVersion ─┘
 //                            SearchByTag  (eventually consistent)
 //
-//   WHY CQRS HERE (interview framing):
+//   WHY CQRS HERE:
 //     - Read:write ratio is enormous. Every inference request path may ask
 //       "what's the prod version of model X?" thousands of times per second;
 //       models are registered/promoted rarely. Separating the stores lets us
@@ -176,7 +176,7 @@ const (
 //	and cacheability that a server stream does not. Contrast with the Pipeline
 //	Orchestrator's WatchExecution, which IS server-streaming because execution
 //	progress is a genuine open-ended event feed. Picking unary+pagination here
-//	is the correct, defensible call (interviewers probe this: "why not stream
+//	is the correct call ("why not stream
 //	ListModels?" → backpressure + resumable cursor + simpler caching).
 //
 // RPC GROUPS:
@@ -419,7 +419,7 @@ func (c *registryServiceClient) GetDownloadURL(ctx context.Context, in *GetDownl
 //	and cacheability that a server stream does not. Contrast with the Pipeline
 //	Orchestrator's WatchExecution, which IS server-streaming because execution
 //	progress is a genuine open-ended event feed. Picking unary+pagination here
-//	is the correct, defensible call (interviewers probe this: "why not stream
+//	is the correct call ("why not stream
 //	ListModels?" → backpressure + resumable cursor + simpler caching).
 //
 // RPC GROUPS:

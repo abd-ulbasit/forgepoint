@@ -26,7 +26,7 @@
 //	└─────────────────────────────────────────────────────────────┘
 //
 // ============================================================================
-// THE PATTERN, IN ONE PARAGRAPH (interview framing)
+// THE PATTERN, IN ONE PARAGRAPH
 // ============================================================================
 //
 // Streaming Aggregation: the monitor never stores raw inference requests. It

@@ -93,7 +93,7 @@ var (
 	// cancel a run that is already over — the request is a no-op the caller should
 	// know about. Maps to codes.FailedPrecondition.
 	//
-	// INTERVIEW: cancellation is only meaningful for PENDING/RUNNING/COMPENSATING.
+	// Cancellation is only meaningful for PENDING/RUNNING/COMPENSATING.
 	// Returning an explicit error (rather than silently succeeding) tells an
 	// automation it raced the run's natural completion.
 	ErrExecutionNotCancellable = errors.New("pipeline: execution is already in a terminal state")

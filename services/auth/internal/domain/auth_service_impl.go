@@ -2,8 +2,7 @@
 //
 // This is the platform's most security-critical code: every other service
 // trusts the claims this file produces. The teaching comments below name the
-// patterns and the attacks each measure defends against, because in an
-// interview the "why" of each line is what matters.
+// patterns and the attacks each measure defends against.
 //
 // ============================================================================
 // CLEAN ARCHITECTURE PLACEMENT
@@ -403,7 +402,7 @@ func (s *authService) CheckPermission(ctx context.Context, userID, resource, act
 	//	to consult the database to know it. This preserves the (bool, error)
 	//	contract: error means "I couldn't decide", false means "I decided: denied".
 	//
-	// INTERVIEW: "Why not return an error here instead of false?"
+	// WHY false AND NOT AN ERROR:
 	//
 	//	Because returning an error would conflate a client mistake with an
 	//	infrastructure failure. The interceptor would surface codes.Internal
@@ -576,7 +575,7 @@ func scopeMatches(scope, resource, action string) bool {
 //	GATE 0, so by the time we reach here both resource and action are non-empty.
 //	The guard here defends against empty STORED fields.
 //
-// INTERVIEW: "What's the difference between an empty string and a wildcard?"
+// EMPTY STRING vs WILDCARD:
 //
 //	A wildcard is intent; an empty string is the absence of intent. We never
 //	grant permissions by accident. Any stored field that isn't a legitimate

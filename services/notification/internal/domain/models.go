@@ -131,7 +131,7 @@ const (
 // WHY a method (not an inline `>=`): the "unspecified floor = no floor" rule is
 // a subtle business invariant. Encoding it once here means every caller (channel
 // gating, list filtering) gets it right and the rule is unit-tested in one place.
-// Interview framing: this is the classic "0 means absent, not minimum" gotcha —
+// NOTE: this is the classic "0 means absent, not minimum" gotcha —
 // if you naively did `c >= floor`, an INFO(1) notification would clear an
 // unspecified(0) floor anyway, but a CRITICAL notification would ALSO clear it,
 // so the bug only bites when someone later treats unspecified as a real rung.
@@ -340,9 +340,9 @@ func (p NotificationPreferences) ChannelFor(ch NotificationChannel) (ChannelPref
 // verbatim. The ONLY thing the domain interprets is Type (for pattern matching)
 // and the three provenance fields (for the inbox row).
 //
-// Interview framing: "How does your notification service handle a brand-new
-// event type the team adds next quarter?" → It already does, with no deploy: the
-// reactor matches Type against user patterns and forwards Payload opaquely. The
+// A brand-new event type added by another team next quarter needs no deploy
+// here: the reactor matches Type against user patterns and forwards Payload
+// opaquely. The
 // new producer needs no awareness of us; a user just writes a preference/mute
 // pattern. That is choreography vs. orchestration in one sentence.
 type InboundEvent struct {

@@ -342,7 +342,7 @@ serviceMonitor:
 #
 # There is NO Postgres / Redis / NATS egress — the BFF talks to none of them.
 #
-# ENFORCEMENT CAVEAT (interview-critical): a NetworkPolicy is only enforced if the
+# ENFORCEMENT CAVEAT: a NetworkPolicy is only enforced if the
 # CNI supports it (Calico, Cilium, ...). k3s' default Flannel does NOT, so here the
 # policy is PRESENT (GitOps-correct, enforced the moment the CNI is swapped) but a
 # no-op at runtime. Defense in depth, never a substitute for app-layer authz (the

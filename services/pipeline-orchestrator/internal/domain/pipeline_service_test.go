@@ -4,7 +4,7 @@
 // WHY THIS TEST IS THE CENTERPIECE
 // ============================================================================
 //
-// The saga ORCHESTRATOR is the interview crown jewel of this service, so these
+// The saga ORCHESTRATOR is the crown jewel of this service, so these
 // tests assert REAL BEHAVIOR, not mock-call counts:
 //
 //   - Execution order is captured in a shared, append-only trace slice; we
@@ -19,7 +19,7 @@
 //     by errors.Is against the sentinels.
 //
 // These tests are written BEFORE pipeline_service_impl.go exists. Hand-written
-// mocks (function-field structs) keep every line interview-explainable.
+// mocks (function-field structs) keep every line explicit.
 //
 // PACKAGE CHOICE: this is an IN-PACKAGE test (package domain) — unlike Auth,
 // nothing here forms a domain↔repository cycle (the ports live in domain), so we

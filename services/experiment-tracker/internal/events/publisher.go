@@ -45,10 +45,9 @@
 //     this with protojson.Unmarshal(envelope.Data, &msg).
 //
 // This keeps ONE wire contract (proto3 JSON) on both ends of every pipe while
-// still reusing all of natsutil's envelope/dedup/trace/DLQ machinery. An
-// interviewer's likely probe — "how do proto events ride your JSON envelope?" —
-// is answered exactly here: protojson for the payload, RawMessage to splice it
-// into the envelope without double-encoding.
+// still reusing all of natsutil's envelope/dedup/trace/DLQ machinery. How proto
+// events ride the JSON envelope is answered exactly here: protojson for the
+// payload, RawMessage to splice it into the envelope without double-encoding.
 package events
 
 import (

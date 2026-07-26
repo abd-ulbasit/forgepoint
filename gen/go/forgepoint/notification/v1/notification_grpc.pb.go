@@ -26,7 +26,7 @@
 //   user just authors a rule whose pattern matches the new subject. THAT is the
 //   payoff of choreography: extreme decoupling and independent evolvability.
 //
-//   THE OTHER SIDE OF THE COIN (interview tradeoff): choreography's weakness is
+//   THE OTHER SIDE OF THE COIN: choreography's weakness is
 //   that no single place describes "the whole workflow". To answer "what
 //   happens when a pipeline fails?" you must inspect every subscriber. We accept
 //   that here because notification is a leaf reaction, not a multi-step business
@@ -54,7 +54,7 @@
 //   toggles) rather than a free-form rule CRUD API, because that is the shape an
 //   end user actually wants ("email me on failures, Slack me on drift"). A
 //   richer admin rule-builder can arrive as a v2 addition without breaking this
-//   surface. This tradeoff is called out so it is defensible in an interview.
+//   surface. The tradeoff is called out explicitly rather than hidden.
 //   The plan's third RPC, GetDeliveryLog, IS honored here as ListDeliveryAttempts
 //   (the cross-notification delivery-health/audit query).
 //
@@ -124,7 +124,7 @@ const (
 //	PREFERENCES (config): GetPreferences, UpdatePreferences, TestChannel
 //	(TestChannel is a control-plane self-check, not a "send" RPC — see its doc.)
 //
-// WHY NO STREAMING RPC HERE (a deliberate choice, interview-relevant):
+// WHY NO STREAMING RPC HERE (a deliberate choice):
 //
 //	A live "watch my inbox" stream is tempting, but the natural realtime path
 //	for notifications is the very NATS stream this service already consumes and
@@ -137,7 +137,7 @@ const (
 //	WatchExecution server-stream, because there the authoritative state lives in
 //	that service and a client genuinely needs to follow one execution's lifecycle.
 //
-// IDEMPOTENCY (interview-critical, on BOTH paths):
+// IDEMPOTENCY (on BOTH paths):
 //   - Async consumer: events can be redelivered (NATS at-least-once). The
 //     consumer dedupes on EventEnvelope.id (carried into Notification.event_id)
 //     per recipient, so a redelivered event never creates a duplicate inbox row
@@ -285,7 +285,7 @@ func (c *notificationServiceClient) TestChannel(ctx context.Context, in *TestCha
 //	PREFERENCES (config): GetPreferences, UpdatePreferences, TestChannel
 //	(TestChannel is a control-plane self-check, not a "send" RPC — see its doc.)
 //
-// WHY NO STREAMING RPC HERE (a deliberate choice, interview-relevant):
+// WHY NO STREAMING RPC HERE (a deliberate choice):
 //
 //	A live "watch my inbox" stream is tempting, but the natural realtime path
 //	for notifications is the very NATS stream this service already consumes and
@@ -298,7 +298,7 @@ func (c *notificationServiceClient) TestChannel(ctx context.Context, in *TestCha
 //	WatchExecution server-stream, because there the authoritative state lives in
 //	that service and a client genuinely needs to follow one execution's lifecycle.
 //
-// IDEMPOTENCY (interview-critical, on BOTH paths):
+// IDEMPOTENCY (on BOTH paths):
 //   - Async consumer: events can be redelivered (NATS at-least-once). The
 //     consumer dedupes on EventEnvelope.id (carried into Notification.event_id)
 //     per recipient, so a redelivered event never creates a duplicate inbox row

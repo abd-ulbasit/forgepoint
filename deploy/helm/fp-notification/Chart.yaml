@@ -9,7 +9,7 @@ apiVersion: v2
 #   - data stores: Postgres (inbox / delivery_log / preferences) + Redis
 #     (IdempotencyStore — event + sync dedup with a TTL). No MinIO.
 # Keep it boringly uniform with fp-auth so the platform's deployment surface
-# stays interview-explainable and easy to audit.
+# stays uniform and easy to audit.
 name: fp-notification
 description: Forgepoint Notification service (choreography reactor — inbox, delivery, prefs) — mirrors the fp-auth reference chart.
 

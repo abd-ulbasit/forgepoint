@@ -20,7 +20,7 @@
 #     - See CloudNativePG cluster manifest in postgres-backup-cnpg.yaml for
 #       the production configuration.
 #
-# INTERVIEW TALKING POINT:
+# NOTE:
 #   "For a homelab project I used pg_dump + MinIO (simple, dependency-free).
 #    For production I'd move to CloudNativePG's WAL archiving to S3 for true
 #    PITR — the difference matters when you need to restore to 1 minute before

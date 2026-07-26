@@ -3,8 +3,8 @@
 // These tests are written BEFORE circuit_breaker.go and assert REAL state
 // transitions over a CONTROLLED clock — not mock call counts. The breaker is
 // pure domain logic (no I/O), so we drive time with an injectable now-function
-// and assert the exact state after each event. This is the interview-centerpiece
-// test: every transition edge of the machine is exercised here.
+// and assert the exact state after each event. This is the centerpiece test:
+// every transition edge of the machine is exercised here.
 //
 // We test from INSIDE the package (package domain) because the breaker is an
 // internal type with unexported fields we want to construct directly with a fake

@@ -37,7 +37,7 @@ import (
 // ModelStage — the lifecycle state machine of a *version* (not the model).
 // ============================================================================
 //
-// WHY stage lives on the version, not the model (interview framing):
+// WHY stage lives on the version, not the model:
 //
 //	"Production" is a property of a specific set of weights, not of the model
 //	name. The model "fraud-detector" always exists; what changes over time is
@@ -111,8 +111,8 @@ func (s ModelStage) IsValid() bool {
 // CanTransitionTo encodes the legal edges of the stage state machine in ONE
 // place. Centralizing the rule here (rather than scattering if-checks across the
 // service) is the whole point of modeling the lifecycle as a state machine: there
-// is a single authoritative transition validator, easy to read in an interview
-// and impossible to contradict from another call site.
+// is a single authoritative transition validator, easy to read and impossible
+// to contradict from another call site.
 //
 // THE RULES:
 //   - DEV        → STAGING | ARCHIVED
@@ -131,8 +131,7 @@ func (s ModelStage) IsValid() bool {
 //	Jumping straight to production bypasses the pre-prod validation gate. The
 //	server rejecting it is a guardrail against accidental (or malicious) promotion
 //	of an unvetted candidate — the same reason the proto marks stage server-
-//	authoritative. An interviewer probes "what stops someone shipping straight to
-//	prod?" → this method.
+//	authoritative. What stops someone shipping straight to prod is this method.
 func (s ModelStage) CanTransitionTo(target ModelStage) bool {
 	switch s {
 	case StageDev:
@@ -151,7 +150,7 @@ func (s ModelStage) CanTransitionTo(target ModelStage) bool {
 // VersionStatus — artifact readiness, ORTHOGONAL to lifecycle stage.
 // ============================================================================
 //
-// WHY separate from ModelStage (interview-critical distinction):
+// WHY separate from ModelStage (a distinction that matters):
 //
 //	Stage answers "where in the human/policy lifecycle is this version?".
 //	Status answers "are the bytes physically present and verified?". A version can

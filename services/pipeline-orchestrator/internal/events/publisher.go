@@ -220,7 +220,7 @@ func (p *Publisher) buildEvent(ev domain.StepEvent) (string, proto.Message, erro
 // page/no-page decision on this flag (a stuck saga PAGES; a clean rollback does
 // not), so getting it right is correctness, not cosmetics.
 //
-// INTERVIEW note on the tradeoff: the structurally cleaner source would be a typed
+// NOTE on the tradeoff: the structurally cleaner source would be a typed
 // CompensationFailed bool carried on domain.StepEvent set in settle() from the
 // execution's terminal step states — string-sniffing an error is a code smell in
 // isolation. We use the sentinel-message match here because it is unambiguous (the
@@ -241,7 +241,7 @@ func isCompensationFailed(errMsg string) bool {
 // The events contract DELIBERATELY re-declares its own enums (it must not import
 // any service's API). The integer values are kept aligned with the domain's, so
 // the mapping is a trivial, auditable switch. We use an explicit switch rather
-// than a raw int cast so an interviewer (and the compiler, if a value is ever
+// than a raw int cast so a reader (and the compiler, if a value is ever
 // added) sees the conversion is intentional, and an unknown value maps to the
 // safe UNSPECIFIED zero rather than smuggling a bogus integer onto the wire.
 

@@ -21,7 +21,7 @@
 // the domain for the types — domain → adapter → domain is an import CYCLE Go
 // rejects. "Consumer owns the port" is the idiomatic Go fix.
 //
-// INTERVIEW: "How does the serving domain stay free of ONNX?" It depends on an
+// HOW THE SERVING DOMAIN STAYS FREE OF ONNX: it depends on an
 // InferenceEngine INTERFACE it defines; the real onnxruntime binding satisfies
 // that interface in an outer package. The domain can be fully unit-tested with a
 // hand-written fake engine — no native library, no model file. This is the
@@ -196,7 +196,7 @@ type Clock interface {
 // misconfigured pod refuses all loads rather than accepting any URI. A malformed
 // URI, or one that does not parse into a scheme+host, is likewise denied.
 //
-// INTERVIEW: "How do you stop a path-traversal escape from an allow-list?" Parse
+// STOPPING A PATH-TRAVERSAL ESCAPE FROM AN ALLOW-LIST: parse
 // both sides, compare scheme+host exactly, reject any ".." segment in the raw path
 // (because path.Clean would absorb a root-level "/.." and hide the escape), and
 // prove the cleaned request path is a child of the allowed prefix with a

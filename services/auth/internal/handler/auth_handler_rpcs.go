@@ -653,7 +653,7 @@ var errServiceNotWired = status.Error(codes.Unimplemented, "auth service not wir
 // is used (not ==) so a wrapped sentinel (fmt.Errorf("...: %w", ErrUserNotFound))
 // still maps correctly.
 //
-// INTERVIEW: "How do you stop internal errors leaking through gRPC?" Centralize
+// KEEPING INTERNAL ERRORS OFF THE WIRE: centralize
 // the mapping; whitelist the codes you intend to expose; sanitize everything
 // else to Internal with a fixed string; never str-format the raw error into the
 // status message on the default path.

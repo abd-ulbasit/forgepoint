@@ -20,7 +20,7 @@
 #                       ▲
 #                       └── Prometheus scrapes the collector's :8889/metrics
 #
-#   Benefits (all interview-relevant):
+#   Benefits:
 #     - ONE instrumentation path, ONE config to swap backends — services never
 #       learn a backend's address. Tempo→Jaeger or Prometheus→Mimir is a
 #       collector edit, not a redeploy of 10 services.

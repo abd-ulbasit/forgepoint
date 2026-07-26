@@ -3,7 +3,7 @@ apiVersion: v2
 # fp-feature-store MIRRORS the reference chart fp-auth exactly (same templates,
 # same hardening, same labels). Only the name, image, and service-specific
 # config differ. Keeping every chart boringly uniform makes the platform's
-# deployment surface interview-explainable and easy to audit. To see the design
+# deployment surface uniform and easy to audit. To see the design
 # rationale for any template here, read the heavily-commented fp-auth chart —
 # this one is a faithful copy with feature-store's data stores wired in.
 name: fp-feature-store

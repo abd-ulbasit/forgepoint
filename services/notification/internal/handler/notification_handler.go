@@ -51,9 +51,8 @@
 // UpdatePreferences, TestChannel, ...) are added in the handler phase by defining
 // methods on *NotificationHandler that convert proto⇄domain and call svc.
 //
-// INTERVIEW: "How does grpc-go guarantee forward compatibility of service
-// servers?" → the mustEmbed... private method forces embedding the Unimplemented
-// base; a service that embeds it compiles and returns Unimplemented for any RPC
+// FORWARD COMPATIBILITY OF gRPC SERVICE SERVERS: the mustEmbed... private
+// method forces embedding the Unimplemented base; a service that embeds it compiles and returns Unimplemented for any RPC
 // added later, instead of failing to satisfy the interface.
 // ============================================================================
 package handler

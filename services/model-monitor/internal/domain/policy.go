@@ -2,10 +2,10 @@
 // monitor's config, decide whether to (a) emit the drift event and (b) fire the
 // auto-retrain action. The "act" half of sense → decide → act.
 //
-// This is split out as PURE functions so the storm-prevention logic — the part an
-// interviewer will poke at ("how do you stop it retraining every 5 seconds?") —
-// is unit-testable with no clocks or I/O: pass the report, the config, the last
-// trigger time, and `now`; get back a decision.
+// This is split out as PURE functions so the storm-prevention logic — "what
+// stops it retraining every 5 seconds?" — is unit-testable with no clocks or
+// I/O: pass the report, the config, the last trigger time, and `now`; get back
+// a decision.
 package domain
 
 import "time"
@@ -52,7 +52,7 @@ const (
 //	cooldown      — the minimum gap between retrains (the anti-storm interval)
 //	now           — injected clock
 //
-// DECISION TABLE (interview-ready):
+// DECISION TABLE:
 //
 //	severity   auto  pipeline  cooldown-elapsed │ Emit  Trigger  Suppressed
 //	────────────────────────────────────────────┼───────────────────────────

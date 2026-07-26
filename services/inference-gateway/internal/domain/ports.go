@@ -18,7 +18,7 @@
 //	   │ implements
 //	redis adapter   model-serving gRPC client   NATS publisher   (all outer)
 //
-// INTERVIEW: "Where do the rate-limiter and backend-client interfaces belong?"
+// WHERE THE RATE-LIMITER AND BACKEND-CLIENT INTERFACES BELONG:
 // With the side that USES them (the domain). The infrastructure conforms to the
 // business contract, not the other way round.
 // ============================================================================

@@ -31,7 +31,7 @@ import (
 )
 
 // ============================================================================
-// HAND-WRITTEN MOCKS / FAKES (no codegen — every line interview-explainable)
+// HAND-WRITTEN MOCKS / FAKES (no codegen)
 // ============================================================================
 //
 // fakeWriteStore is a real in-memory implementation of WriteStore (not a stub):

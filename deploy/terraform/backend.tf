@@ -6,7 +6,7 @@
 # environment must keep its state in a SEPARATE key (and ideally a separate
 # bucket/account) so a `terraform destroy` in dev can never touch prod state.
 #
-# WHY remote state at all (interview point):
+# WHY remote state at all:
 #   - SHARED + LOCKED: a team (or CI) runs Terraform from many machines. Local
 #     state on one laptop is a single point of truth/failure and invites two
 #     people applying at once and corrupting state. S3 stores it centrally;

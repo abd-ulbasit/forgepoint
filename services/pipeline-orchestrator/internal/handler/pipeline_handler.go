@@ -95,7 +95,7 @@ func NewPipelineHandler(svc domain.PipelineService) *PipelineHandler {
 // interceptor stamped onto the context after validating the caller's JWT/API
 // key. This is the SINGLE place identity enters the domain.
 //
-// WHY this matters (anti-mass-assignment / anti-IDOR, interview-critical):
+// WHY this matters (anti-mass-assignment / anti-IDOR):
 //   - CreatedBy / TriggeredBy / Team are SERVER-AUTHORITATIVE. They come from the
 //     verified token, NEVER from a request field. A client cannot author a
 //     pipeline "as" another user or list another team's runs by passing a team

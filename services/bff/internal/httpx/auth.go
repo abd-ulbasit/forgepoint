@@ -16,7 +16,7 @@ import (
 // TOKEN PROPAGATION — THE BFF FORWARDS THE CALLER'S IDENTITY, IT DOES NOT FORGE
 // ============================================================================
 //
-// THE SECURITY MODEL (interview-critical): the BFF is NOT an identity authority.
+// THE SECURITY MODEL: the BFF is NOT an identity authority.
 // It does NOT validate the JWT (the domain services do, via grpcutil's auth
 // interceptor + FP_JWT_SECRET) and it does NOT mint or rewrite claims. Its only
 // job with the token is to carry it VERBATIM from the browser's HTTP request to

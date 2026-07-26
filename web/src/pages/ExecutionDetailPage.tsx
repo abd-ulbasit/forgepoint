@@ -4,9 +4,8 @@
 // Opens the SSE stream (useExecutionWatch) and renders each step's status as it
 // changes in REAL TIME. The visual story is the saga state machine: steps move
 // PENDING → RUNNING → COMPLETED, and on failure the orchestrator COMPENSATES in
-// reverse (steps flip to COMPENSATING/COMPENSATED) — exactly the transitions an
-// interviewer probes on "how does your saga roll back?". The most-recently
-// changed step pulses so the eye follows the action.
+// reverse (steps flip to COMPENSATING/COMPENSATED) — the saga rollback made
+// visible. The most-recently changed step pulses so the eye follows the action.
 //
 // We SEED the view with a one-shot REST GetExecution (so the page isn't blank
 // before the first frame), then let the stream take over and supersede it.

@@ -61,9 +61,8 @@ SSE API **shaped for the UI's screens**.
   seam).
 - **Pro:** natural home for browser auth (cookie↔JWT bridge, CSRF, CORS) and for bridging
   gRPC server-streams → SSE.
-- **Pro:** BFF is itself a recognized, interview-grade pattern (Netflix/SoundCloud lineage),
-  and gives more idiomatic Go to write (errgroup fan-out, partial-failure degradation) —
-  aligned with the project's learning goal.
+- **Pro:** BFF is itself a recognized pattern (Netflix/SoundCloud lineage), and the Go it
+  requires is idiomatic (errgroup fan-out, partial-failure degradation).
 - **Con:** more code to write and another service to deploy.
 - **Con:** risk of accreting business logic and becoming a god-service (mitigated below).
 

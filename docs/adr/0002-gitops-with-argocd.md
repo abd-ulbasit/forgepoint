@@ -40,8 +40,8 @@ deploys. `dev` auto-syncs; `prod` is manual/PR-gated. The `helm upgrade` step is
 Phase 11.
 
 Deciding factors: self-healing reconciliation and Git-as-truth are the substantive wins, and
-ArgoCD is the more demonstrable artifact in an interview. Flux would be a fine alternative; the
-choice is about presentation and the app-of-apps ergonomics, not capability.
+ArgoCD's app-of-apps ergonomics make the delivery state legible. Flux would be a fine
+alternative; the choice is about ergonomics, not capability.
 
 ## Consequences
 

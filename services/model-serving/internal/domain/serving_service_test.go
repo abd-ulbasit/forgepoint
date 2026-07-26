@@ -36,7 +36,7 @@ import (
 )
 
 // ----------------------------------------------------------------------------
-// FAKE PORTS (hand-written; every line interview-explainable).
+// FAKE PORTS (hand-written).
 // ----------------------------------------------------------------------------
 
 // fakeFetcher records each Fetch call and returns a canned local path + digest,

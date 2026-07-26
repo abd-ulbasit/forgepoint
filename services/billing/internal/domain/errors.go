@@ -62,7 +62,7 @@ var (
 	//   line items into an invoice total, where no single item is too large but
 	//   the running total would overflow. The checked-arithmetic helpers
 	//   (addInt64Checked, mulInt64Checked) return this when bits.Add/Mul reports
-	//   a carry. It exists so an interviewer-grade audit can tell "one input was
+	//   a carry. It exists so an audit can tell "one input was
 	//   absurd" from "the sum blew the budget". Maps to codes.Internal (we
 	//   refuse to emit a wrong number) — it should be unreachable given the input
 	//   bounds, but a money service asserts it anyway (defense in depth).

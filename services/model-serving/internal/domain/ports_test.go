@@ -32,7 +32,7 @@ func TestArtifactURIAllowed(t *testing.T) {
 		uri     string
 		allow   []string
 		want    bool
-		comment string // WHY this case matters (interview framing)
+		comment string // WHY this case matters
 	}{
 		// ---- LEGITIMATE URIs (must be ALLOWED) ---------------------------------
 		{

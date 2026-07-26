@@ -19,7 +19,7 @@ import (
 // (EventEnvelope.ID). A consumer records the IDs it has processed and skips any
 // it has seen before. ProcessedStore is that record.
 //
-// THE EXACTLY-ONCE CAVEAT (important, and a common interview question):
+// THE EXACTLY-ONCE CAVEAT:
 //   A separate store gives at-least-once + dedup, NOT true exactly-once. The
 //   gap: if the handler commits its side effect, then the process crashes
 //   before MarkProcessed, the redelivery re-runs the side effect. To close that
@@ -27,7 +27,7 @@ import (
 //   effect — which only the owning service can do (e.g., INSERT into a
 //   processed_events table inside the business transaction). ProcessedStore is
 //   the library-level convenience; the transactional version is the gold
-//   standard. Say exactly this in an interview.
+//   standard.
 // ============================================================================
 
 // ProcessedStore records which event IDs have already been handled, enabling

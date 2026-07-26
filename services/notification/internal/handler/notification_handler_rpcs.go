@@ -683,7 +683,7 @@ func channelPreferencesFromProto(cps []*notificationv1.ChannelPreference) []doma
 // and return a constant "internal error" to the client. errors.Is (not ==) is used
 // so a wrapped sentinel (fmt.Errorf("...: %w", ErrNotFound)) still maps correctly.
 //
-// INTERVIEW: "How do you stop internal errors leaking through gRPC?" Centralize
+// KEEPING INTERNAL ERRORS OFF THE WIRE: centralize
 // the mapping; whitelist the codes you intend to expose; sanitize everything else
 // to Internal with a fixed string; never str-format the raw error into the status
 // message on the default path. For the two whitelisted message-forwarding cases

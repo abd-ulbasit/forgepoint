@@ -33,7 +33,7 @@
 //     and more expressive. This mirrors what high-throughput Go shops (e.g. teams
 //     at companies using Postgres heavily) standardize on.
 //
-// INTERVIEW: "pgx vs database/sql?" database/sql is a portable interface with a
+// pgx vs database/sql: database/sql is a portable interface with a
 // driver behind it; pgx is a Postgres-specific driver that ALSO offers a
 // database/sql-compatible mode, but used natively gives binary protocol, real
 // array/JSONB support, and a better pool. We use it natively.

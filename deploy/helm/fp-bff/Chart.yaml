@@ -3,7 +3,7 @@ apiVersion: v2
 # fp-bff is derived from the reference chart (fp-auth / fp-inference-gateway) and
 # kept structurally IDENTICAL (security contexts, probes, PDB, HPA, spread,
 # ServiceMonitor) so the platform's deployment surface stays boringly uniform and
-# interview-explainable. It changes only:
+# easy to audit. It changes only:
 #   - the name + image + component label
 #   - the config/env block (per-service gRPC ADDRESSES it dials + CORS origin; NO
 #     database, NO Redis, NO NATS — the BFF is a stateless HTTP↔gRPC translator)

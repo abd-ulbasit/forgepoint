@@ -31,7 +31,7 @@
 // how to NAK under load). That separation is exactly why the pattern's hard part
 // can be added later without touching these rules or their tests.
 //
-// INTERVIEW: "Walk me through what happens to a metric batch." Validate (run is
+// WHAT HAPPENS TO A METRIC BATCH: validate (run is
 // RUNNING, batch ≤ cap, values finite) → dedup intra-batch by (key,step),
 // first-wins → overwrite timestamps with the server clock (partition-key
 // integrity) → write in one INSERT that the DB de-dups across batches via a
@@ -364,7 +364,7 @@ func (s *experimentService) FinishRun(ctx context.Context, actor Actor, in Finis
 	// projection rule (latest-step-wins) PURE and unit-testable without a database,
 	// which is this service's learning goal; the loop makes it CORRECT at any size.
 	// The trade-off (full read vs. server-side DISTINCT ON) is noted for the repo
-	// phase. INTERVIEW: "Your finals were wrong for big runs — why?" Because we
+	// phase. WHY THE FINALS WERE WRONG FOR BIG RUNS: because we
 	// folded a single capped page of an ascending series, so the tail (the real
 	// final steps) was never read; the fix is to drain all pages (or push the
 	// DISTINCT ON down to SQL).
@@ -697,7 +697,7 @@ func (s *experimentService) loadRunForTeam(ctx context.Context, runID, team stri
 // empty. Two safety rails matter:
 //   - A pageToken-not-advancing guard: if an adapter returns the SAME nextToken it
 //     was given (a buggy cursor), we'd loop forever; we break instead. This is the
-//     kind of defensive bound an interviewer probes ("what if the cursor never
+//     kind of defensive bound worth having ("what if the cursor never
 //     terminates?").
 //   - A hard page-count ceiling derived from the metric cap so a pathological
 //     adapter that always returns a fresh token can't spin unbounded.
@@ -801,7 +801,7 @@ func validateParams(params []Param) error {
 // counting io.Writer with json.NewEncoder to stop early at the cap; the simple
 // Marshal is clear and the cap keeps the transient allocation small.)
 //
-// INTERVIEW: "How do you stop a client smuggling a huge blob past a size cap?"
+// STOPPING A CLIENT FROM SMUGGLING A HUGE BLOB PAST THE SIZE CAP:
 // Measure the SERIALIZED bytes, never a field-count heuristic — a heuristic that
 // charges a flat cost per value is blind to nested growth and is the classic cap
 // bypass.

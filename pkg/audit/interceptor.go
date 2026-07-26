@@ -21,7 +21,7 @@ import (
 // hands it to the sink. It is the CAPTURE half of the package's split.
 //
 // ============================================================================
-// TWO CAPTURE POINTS — and WHY one is not enough (interview-critical)
+// TWO CAPTURE POINTS — and WHY one is not enough
 // ============================================================================
 //
 // The chain the auth service wires is:
@@ -173,7 +173,7 @@ func StreamServerInterceptor(sink AuditSink, opts Options) grpc.StreamServerInte
 // request, and resulting error. It returns ok=false when the call should NOT be
 // audited (a SUCCESSFUL, non-security-relevant method — the high-volume read case).
 //
-// THE DECISION TABLE (interview-worthy):
+// THE DECISION TABLE:
 //
 //	resulting code              │ Decision │ audited?
 //	────────────────────────────┼──────────┼────────────────────────────────

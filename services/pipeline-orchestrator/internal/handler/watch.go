@@ -27,7 +27,7 @@
 //   - monotonic `sequence` per stream so a reconnecting client can detect gaps.
 //   - terminal state (COMPLETED/FAILED/CANCELLED) → emit final snapshot, close.
 //
-// WHY POLL AND NOT A SUBSCRIPTION (tradeoff, interview-ready): an in-process
+// WHY POLL AND NOT A SUBSCRIPTION (a tradeoff): an in-process
 // update channel or a NATS subscription would be push (zero poll latency), but it
 // couples the handler to the engine's internals or to the event bus. Polling
 // keeps the domain transport-free and is trivially correct; for a saga of a few

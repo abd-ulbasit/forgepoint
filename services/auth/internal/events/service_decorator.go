@@ -52,8 +52,8 @@ package events
 // process dies between the committed write and the publish, the event is LOST.
 // That is the accepted, documented posture for auth's control-plane events (see
 // publisher.go). The outbox (write the event in the SAME tx, a relay publishes)
-// is the upgrade path and is exactly what billing implements; auth names it as
-// the interview answer rather than implementing it here.
+// is the upgrade path and is exactly what billing implements; auth names it
+// rather than implementing it here.
 //
 // ----------------------------------------------------------------------------
 // PUBLISH-AFTER-COMMIT, ENFORCED BY ORDERING

@@ -25,7 +25,7 @@
 #   (A single pod can still opt OUT with `sidecar.istio.io/inject: "false"` on its
 #   pod template — used below conceptually for the migrate initContainer caveat.)
 #
-# INJECTION MODEL NOTE (interview-critical)
+# INJECTION MODEL NOTE
 #   Two injection models exist:
 #     1. `istio-injection=enabled`        → the legacy/stable label, pins to the
 #                                           SINGLE default control-plane revision.

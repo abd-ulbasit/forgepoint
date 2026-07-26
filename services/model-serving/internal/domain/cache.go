@@ -30,7 +30,7 @@
 // safe, caller-friendly choice: a confused client still gets the RIGHT answer
 // for its actual inputs instead of a wrong cached one or a hard failure.
 //
-// CRITICAL FRAMING (interview): this is a LATENCY/COMPUTE optimization, and the
+// CRITICAL FRAMING: this is a LATENCY/COMPUTE optimization, and the
 // input-fingerprint binding is what makes it correctness-SAFE. Billing is the
 // gateway's job (off events.InferenceCompleted); the serving pod emits nothing,
 // so a cache hit vs. a recompute has no metering consequence. We flag from_cache
