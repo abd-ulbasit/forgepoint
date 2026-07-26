@@ -1,4 +1,4 @@
-# ADR 0007: One distributed-systems pattern per service (the teaching thesis)
+# ADR 0007: One distributed-systems pattern per service
 
 **Status:** Accepted
 **Date:** 2026-06-17
@@ -19,7 +19,7 @@ a production version would, the patterns would smear across the codebase — no 
 the clean place to read any single one, and "where is X implemented?" would have no crisp
 answer.
 
-The question: how do we map the 10 services to patterns so that each pattern has exactly one
+The question: how do we map the services to patterns so that each pattern has exactly one
 canonical home, readable end-to-end, without the result feeling contrived?
 
 ## Options Considered
@@ -59,7 +59,7 @@ Standalone demos, one per pattern, not wired into a lifecycle.
 ## Decision
 
 Adopt **Option B**: **one headline distributed-systems pattern per service**, deliberately, so
-each pattern has a clean canonical home, while the 10 services still compose one working closed-
+each pattern has a clean canonical home, while the services still compose one working closed-
 loop platform.
 
 The mapping:
@@ -69,12 +69,12 @@ The mapping:
 | **auth** | **Centralized auth — JWT + RBAC** | One service mints/validates JWTs and owns roles/permissions; every other service trusts its claims (identity from claims, never request fields). |
 | **registry** | **CQRS** | Write model (Postgres, source of truth, idempotency ledgers) split from a read projection (Redis) fed by emitted events — the dual-write problem avoided by emit-then-project. |
 | **inference-gateway** | **Circuit breaker + rate limiting + traffic splitting** | The edge of the serving path: trips on failing model backends, enforces per-tenant quotas, and weight-splits canary↔stable traffic. |
-| **model-serving** | **Sidecar + HPA on custom metrics** | Model runtime (ONNX) scaled by a custom-metrics HPA; the deploy/runtime concerns isolated from platform logic. |
+| **model-serving** | **Replaceable runtime behind a port + custom-metric HPA** | The ONNX runtime sits behind the domain's `InferenceEngine`/`ModelFetcher` ports, so the domain never imports ONNX; load/unload are driven by consumed events, and the chart templates a custom-metric HPA (`autoscaling.customMetrics`). Note: the chart ships a single container — "sidecar" describes the *role* the runtime plays, not a second container in the pod. |
 | **pipeline-orchestrator** | **Saga (orchestration + compensation) + DAG execution** | Multi-step deploy/retrain workflows with ordered compensation on failure; owns the deploy lifecycle outcomes. |
 | **feature-store** | **Event sourcing** | Append-only feature-write log as the source of truth; online/offline views are materializations of that log. |
-| **experiment-tracker** | **Event-driven (async batch ingestion)** | A passive sink: subscribes broadly across `fp.>` and ingests runs/metrics asynchronously; takes no platform action. |
+| **experiment-tracker** | **Event-driven (async batch ingestion)** | A passive sink: subscribes across the per-domain streams (`fp.models.>`, `fp.pipelines.>`, `fp.inference.>`, …) and ingests runs/metrics asynchronously; takes no platform action. |
 | **billing** | **Outbox pattern** | State change + event written in one transaction; a relay publishes — reliable, exactly-once-effect event publishing for money. |
-| **notification** | **Choreography** | A pure event reactor — subscribes to `fp.>` and fans out alerts; no service calls it, it issues no commands. |
+| **notification** | **Choreography** | An event reactor — subscribes to a curated subject set bound to the per-domain streams (a single `fp.>` consumer would overlap them) and fans out alerts; no service calls it, it issues no commands. Its gRPC surface is user-facing preferences/delivery-log reads only. |
 | **model-monitor** | **Streaming drift detection + closed-loop retrain** | Windowed streaming aggregation over `InferenceCompleted` → emits `ModelDriftDetected` → triggers the retrain saga, closing serve → monitor → retrain (see ADR 0003). |
 
 Deciding factor: the goal is depth per pattern, and a one-pattern-per-service map is what
@@ -84,7 +84,7 @@ codebase optimizes for one legible implementation of each pattern.
 
 ## Consequences
 
-- **Positive:** a single canonical, line-by-line-explainable home for each of 10 patterns;
+- **Positive:** a single canonical, line-by-line-explainable home for each pattern;
   small, polishable services; the patterns still cooperate in one working closed-loop platform
   (not a disconnected catalog).
 - **Negative:** **deliberately less realistic than production** — real services blend patterns
@@ -97,3 +97,12 @@ codebase optimizes for one legible implementation of each pattern.
 - **Follow-ups:** cross-pattern seams are documented where they touch — e.g. the registry's
   `ProjectionEmitter` port (ADR 0005) is noted as the exact seam an outbox-backed adapter
   (billing's pattern) would slot into without changing the service.
+
+## Addendum (M7, 2026-06)
+
+M7 added an 11th service, **ai-gateway**, which deliberately breaks the one-pattern rule: it
+*reuses* patterns already built rather than introducing a new one — circuit-breaker failover
+across LLM providers, a distributed rate limiter as per-tenant token budgets, traffic splitting
+for prompt/model A-B, and outbox-published usage for cost metering. That is the point of the
+addition: it tests whether the M0–M6 patterns transfer to a different workload without being
+re-derived. See `docs/plans/forgepoint-llmops-extension-design.md`.
