@@ -112,8 +112,9 @@ type Permission struct {
 //
 //	Forgepoint serves ML engineering teams inside a company. Team-level
 //	multi-tenancy (isolate experiments, models, and billing per team) is the
-//	natural boundary for this portfolio stage. A full org hierarchy with nested
-//	sub-teams is scope for a later multi-tenant expansion.
+//	boundary every downstream service already scopes by, so it is the one that
+//	has to exist. A nested org hierarchy would make every authorization check a
+//	tree walk; that cost is only worth paying once a real customer needs it.
 type User struct {
 	ID           string
 	Email        string // unique; used as the login identifier

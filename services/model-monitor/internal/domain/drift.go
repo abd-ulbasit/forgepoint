@@ -341,7 +341,7 @@ func NewNumericHistogram(edges []float64, values []float64) Histogram {
 					idx = nbins - 1
 				}
 			} else {
-				idx = idx - 1
+				idx--
 			}
 		}
 		h.Counts[idx]++

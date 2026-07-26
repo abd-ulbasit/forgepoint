@@ -25,8 +25,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/abd-ulbasit/forgepoint/services/model-monitor/internal/domain"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/abd-ulbasit/forgepoint/services/model-monitor/internal/domain"
 )
 
 // EvalRepository is the Postgres adapter for domain.EvalStore. It holds the shared

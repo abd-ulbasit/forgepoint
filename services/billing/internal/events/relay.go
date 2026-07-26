@@ -8,9 +8,10 @@ import (
 	"log/slog"
 	"time"
 
+	"google.golang.org/protobuf/types/known/timestamppb"
+
 	eventsv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/events/v1"
 	"github.com/abd-ulbasit/forgepoint/services/billing/internal/domain"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // ============================================================================

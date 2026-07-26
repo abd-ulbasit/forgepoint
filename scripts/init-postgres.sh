@@ -25,7 +25,7 @@ set -e
 echo "Creating per-service databases..."
 
 # Authoritative DB list (8 databases, one per service — matches the K8s ConfigMap
-# in deploy/k8s/infra/postgres/postgres.yaml and the 10-service table in CLAUDE.md).
+# in deploy/k8s/infra/postgres/postgres.yaml and the per-service database list above).
 # Drift history: fp_feature → fp_featurestore (correct name), fp_monitor added.
 # Local docker-compose and cluster must be in sync so connection strings are identical.
 for db in fp_auth fp_registry fp_pipeline fp_featurestore fp_experiment fp_billing fp_notification fp_monitor; do

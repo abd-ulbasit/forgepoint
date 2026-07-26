@@ -50,16 +50,17 @@ import (
 	"testing"
 	"time"
 
-	commonv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/common/v1"
-	experimentv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/experiment/v1"
-	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
-	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
-	"github.com/abd-ulbasit/forgepoint/services/experiment-tracker/internal/domain"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
+
+	commonv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/common/v1"
+	experimentv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/experiment/v1"
+	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
+	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
+	"github.com/abd-ulbasit/forgepoint/services/experiment-tracker/internal/domain"
 )
 
 // ----------------------------------------------------------------------------
@@ -121,14 +122,14 @@ type mockService struct {
 	updateExperimentFn func(ctx context.Context, actor domain.Actor, in domain.UpdateExperimentInput) (domain.Experiment, error)
 	archiveFn          func(ctx context.Context, actor domain.Actor, id string) (domain.Experiment, error)
 
-	startRunFn func(ctx context.Context, actor domain.Actor, in domain.StartRunInput) (domain.Run, error)
+	startRunFn  func(ctx context.Context, actor domain.Actor, in domain.StartRunInput) (domain.Run, error)
 	finishRunFn func(ctx context.Context, actor domain.Actor, in domain.FinishRunInput) (domain.Run, error)
-	getRunFn   func(ctx context.Context, actor domain.Actor, id string) (domain.Run, error)
-	listRunsFn func(ctx context.Context, actor domain.Actor, experimentID string, statusFilter domain.RunStatus, opts domain.ListOptions) ([]domain.Run, string, error)
+	getRunFn    func(ctx context.Context, actor domain.Actor, id string) (domain.Run, error)
+	listRunsFn  func(ctx context.Context, actor domain.Actor, experimentID string, statusFilter domain.RunStatus, opts domain.ListOptions) ([]domain.Run, string, error)
 	deleteRunFn func(ctx context.Context, actor domain.Actor, runID, idempotencyKey string) error
 
-	logMetricsFn func(ctx context.Context, actor domain.Actor, in domain.LogMetricsInput) (domain.LogMetricsResult, error)
-	logParamsFn  func(ctx context.Context, actor domain.Actor, in domain.LogParamsInput) (domain.LogParamsResult, error)
+	logMetricsFn   func(ctx context.Context, actor domain.Actor, in domain.LogMetricsInput) (domain.LogMetricsResult, error)
+	logParamsFn    func(ctx context.Context, actor domain.Actor, in domain.LogParamsInput) (domain.LogParamsResult, error)
 	setArtifactsFn func(ctx context.Context, actor domain.Actor, in domain.SetArtifactsInput) (domain.Run, error)
 
 	getHistoryFn  func(ctx context.Context, actor domain.Actor, in domain.GetMetricHistoryInput) ([]domain.MetricSeries, string, error)
@@ -308,7 +309,7 @@ func assertNoLeak(t *testing.T, msg string) {
 		"repository:", // storage-layer sentinel text
 		"sql",         // SQL fragments
 		"pgx", "pq:",  // driver internals
-		"goroutine",   // stack-trace leak
+		"goroutine", // stack-trace leak
 		"connection string",
 		"panic",
 		"password=", // any credential echo

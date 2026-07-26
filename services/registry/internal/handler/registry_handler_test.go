@@ -44,17 +44,18 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/structpb"
+
 	commonv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/common/v1"
 	registryv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/registry/v1"
 	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
 	"github.com/abd-ulbasit/forgepoint/services/registry/internal/domain"
 	"github.com/abd-ulbasit/forgepoint/services/registry/internal/handler"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/types/known/structpb"
 )
 
 // ============================================================================

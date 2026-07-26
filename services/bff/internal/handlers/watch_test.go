@@ -37,7 +37,7 @@ func (s *fakeWatchStream) Recv() (*pipelinev1.WatchExecutionResponse, error) {
 
 // Context is part of the streaming client surface; the relay doesn't call it but
 // the embedded interface requires it to exist.
-func (s *fakeWatchStream) Context() context.Context { return context.Background() }
+func (s *fakeWatchStream) Context() context.Context     { return context.Background() }
 func (s *fakeWatchStream) Header() (metadata.MD, error) { return nil, nil }
 func (s *fakeWatchStream) Trailer() metadata.MD         { return nil }
 func (s *fakeWatchStream) CloseSend() error             { return nil }
@@ -136,7 +136,7 @@ func (s *blockingWatchStream) Recv() (*pipelinev1.WatchExecutionResponse, error)
 	return nil, s.streamCtx.Err()
 }
 
-func (s *blockingWatchStream) Context() context.Context { return s.streamCtx }
+func (s *blockingWatchStream) Context() context.Context     { return s.streamCtx }
 func (s *blockingWatchStream) Header() (metadata.MD, error) { return nil, nil }
 func (s *blockingWatchStream) Trailer() metadata.MD         { return nil }
 func (s *blockingWatchStream) CloseSend() error             { return nil }

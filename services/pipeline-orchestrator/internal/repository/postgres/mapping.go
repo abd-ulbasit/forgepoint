@@ -77,14 +77,14 @@ func unmarshalMap(b []byte) (map[string]any, error) {
 // what we want to round-trip losslessly.
 
 type stepDefRow struct {
-	ID                 string          `json:"id"`
-	Name               string          `json:"name"`
-	Type               int             `json:"type"`
-	DependsOn          []string        `json:"depends_on,omitempty"`
-	CompensationStepID string          `json:"compensation_step_id,omitempty"`
-	Config             map[string]any  `json:"config,omitempty"`
-	Timeout            int64           `json:"timeout_ns,omitempty"` // time.Duration as ns
-	MaxRetries         int             `json:"max_retries,omitempty"`
+	ID                 string         `json:"id"`
+	Name               string         `json:"name"`
+	Type               int            `json:"type"`
+	DependsOn          []string       `json:"depends_on,omitempty"`
+	CompensationStepID string         `json:"compensation_step_id,omitempty"`
+	Config             map[string]any `json:"config,omitempty"`
+	Timeout            int64          `json:"timeout_ns,omitempty"` // time.Duration as ns
+	MaxRetries         int            `json:"max_retries,omitempty"`
 }
 
 // marshalSteps encodes the template's step graph to JSONB. The graph is NOT NULL

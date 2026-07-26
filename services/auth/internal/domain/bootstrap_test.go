@@ -28,9 +28,10 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
 	"github.com/abd-ulbasit/forgepoint/services/auth/internal/domain"
 	"github.com/abd-ulbasit/forgepoint/services/auth/internal/repository"
-	"golang.org/x/crypto/bcrypt"
 )
 
 // bootstrapper narrows the service to the bootstrap capability. The production

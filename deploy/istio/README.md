@@ -79,7 +79,7 @@ istioctl version
 ## Install Istio (demo profile — fine for a non-prod cluster)
 
 The **demo** profile installs istiod + an ingress gateway + an egress gateway with
-generous defaults and full telemetry — ideal for learning/validation. (Use the
+generous defaults and full telemetry — the right profile for validating policy. (Use the
 **default** profile for a leaner prod-ish install; `minimal` for control-plane-only.)
 
 ```bash
@@ -215,7 +215,7 @@ each canary step. (Authored, not wired, to keep the static 90/10 demonstrable.)
 
 ## Production TLS at the edge (homelab has none)
 
-`40-gateway-bff.yaml` ships an HTTP (port 80) server so it's demoable without DNS/certs.
+`40-gateway-bff.yaml` ships an HTTP (port 80) server so it installs without DNS/certs.
 For a real domain (ties to **M5 Terraform**: ACM/Route53 on EKS), add an HTTPS server
 and force redirect:
 
@@ -237,7 +237,7 @@ servers:
 ## Assumptions & notes
 
 - **model-serving namespace = `fp-models`** (authoritative, now consistent everywhere).
-  The CLAUDE.md namespace map, the BFF config (`FP_MODEL_SERVING_ADDR=
+  The namespace map (`deploy/istio/00-namespaces.yaml`), the BFF config (`FP_MODEL_SERVING_ADDR=
   fp-model-serving.fp-models…`), the inference-gateway + BFF NetworkPolicy egress
   allow-lists, and these mesh objects all target `fp-models`. The Helm chart itself is
   **namespace-agnostic** — every template renders `metadata.namespace:

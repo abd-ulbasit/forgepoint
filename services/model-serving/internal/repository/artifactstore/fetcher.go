@@ -185,7 +185,7 @@ func NewFileFetcher(destDir string, allowedRoots ...string) *FileFetcher {
 // so the service can render the "artifact not found" reason distinctly.
 func (f *FileFetcher) Fetch(ctx context.Context, uri string) (localPath string, digest string, err error) {
 	// Honor an already-cancelled context before doing any work.
-	if err = ctx.Err(); err != nil {
+	if err := ctx.Err(); err != nil {
 		return "", "", err
 	}
 
@@ -197,7 +197,7 @@ func (f *FileFetcher) Fetch(ctx context.Context, uri string) (localPath string, 
 	// Adapter-level traversal guard: the resolved absolute path must sit under an
 	// allowed root. EvalSymlinks defeats a symlink that points outside the root.
 	if len(f.allowedRoots) > 0 {
-		if err = f.checkUnderRoot(srcPath); err != nil {
+		if err := f.checkUnderRoot(srcPath); err != nil {
 			return "", "", err
 		}
 	}
@@ -388,7 +388,7 @@ func NewHTTPFetcher(destDir string, opts ...HTTPOption) *HTTPFetcher {
 // transport errors are returned as generic fetch errors (which the service maps
 // to a generic StateFailed reason).
 func (f *HTTPFetcher) Fetch(ctx context.Context, uri string) (localPath string, digest string, err error) {
-	if err = ctx.Err(); err != nil {
+	if err := ctx.Err(); err != nil {
 		return "", "", err
 	}
 

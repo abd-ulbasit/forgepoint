@@ -22,13 +22,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	"google.golang.org/protobuf/encoding/protojson"
+
 	eventsv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/events/v1"
 	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
 	"github.com/abd-ulbasit/forgepoint/services/billing/internal/domain"
 	"github.com/abd-ulbasit/forgepoint/services/billing/internal/events"
-	"github.com/google/uuid"
-	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // TestRelay_PublishesAndMarks proves the relay publishes one stored row of EACH

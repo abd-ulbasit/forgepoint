@@ -6,7 +6,7 @@ package auth_test
 //
 // These tests are the specification for NewJWTValidator and its Validate method.
 // They were written first (failing) then the implementation was written to make
-// them pass — that is the TDD flow documented in CLAUDE.md.
+// them pass — that is the TDD flow described in docs/design/service-architecture.md.
 //
 // WHAT IS COVERED:
 //   ✓ Happy path: valid HS256 token with all claims maps correctly
@@ -36,10 +36,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/forgepoint/pkg/auth"
 	"github.com/golang-jwt/jwt/v5"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/abd-ulbasit/forgepoint/pkg/auth"
 )
 
 // ── Test helpers ─────────────────────────────────────────────────────────────

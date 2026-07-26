@@ -81,7 +81,7 @@ spec:
 
   destination:
     server: https://kubernetes.default.svc
-    # Platform services live in fp-system (per CLAUDE.md namespace map). Must be
+    # Platform services live in fp-system (per the namespace map in `deploy/istio/00-namespaces.yaml`). Must be
     # an allowed destination in the AppProject, or sync is refused.
     namespace: fp-system
 

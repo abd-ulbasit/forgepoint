@@ -8,7 +8,7 @@
 #   (adapted from deploy/grafana/provisioning) so the stack is usable on first
 #   boot with zero manual UI clicking.
 #
-# SECURITY — the docker-compose hardening lesson, applied harder:
+# SECURITY — the docker-compose hardening, applied harder:
 #   The local stack allowed ANONYMOUS access (Viewer role) for dev convenience.
 #   In-cluster we DISABLE anonymous access entirely and require login. The admin
 #   password comes from a Secret (placeholder here; real value via External
@@ -262,7 +262,7 @@ spec:
           # for provisioning-format or datasource-API breaking changes.
           image: grafana/grafana:11.5.1
           env:
-            # ---- SECURITY HARDENING (the docker-compose lesson) -------------
+            # ---- SECURITY HARDENING (same as docker-compose) ----------------
             # Admin password injected from the Secret — NOT hardcoded, NOT the
             # well-known "admin" default.
             - name: GF_SECURITY_ADMIN_USER

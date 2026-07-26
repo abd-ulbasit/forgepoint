@@ -23,12 +23,13 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/encoding/protojson"
+
 	eventsv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/events/v1"
 	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
 	"github.com/abd-ulbasit/forgepoint/services/experiment-tracker/internal/domain"
 	"github.com/abd-ulbasit/forgepoint/services/experiment-tracker/internal/events"
-	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // TestEnsureStream_CreatesExperimentsStreamOverFullTree proves EnsureStream

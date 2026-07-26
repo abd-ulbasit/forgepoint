@@ -548,7 +548,7 @@ func (s *experimentService) LogParams(ctx context.Context, actor Actor, in LogPa
 		have[p.Key] = p.Value
 	}
 
-	var toWrite []Param
+	toWrite := make([]Param, 0, len(in.Params))
 	for _, p := range in.Params {
 		if cur, ok := have[p.Key]; ok {
 			if cur != p.Value {

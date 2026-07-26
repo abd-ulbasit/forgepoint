@@ -78,7 +78,7 @@ type GetUsageInput struct {
 // and reporting. The handler holds a value of this interface.
 type BillingService interface {
 	// -----------------------------------------------------------------------
-	// METERING (the outbox write path — the teaching centerpiece)
+	// METERING (the outbox write path — the centerpiece)
 	// -----------------------------------------------------------------------
 
 	// RecordUsage meters one billable action: it resolves the team's plan, prices

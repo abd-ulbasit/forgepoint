@@ -128,7 +128,7 @@ import "forgepoint/common/v1/common.proto";
 // service's NATS publisher/consumer code (Go-side), which maps this proto's
 // domain enums to/from the events enums at the publish boundary. This .proto
 // stays a pure RPC-contract surface; the event contract is referenced only in
-// the teaching comments below. (struct.proto IS used — config/output/input fields.)
+// the design comments below. (struct.proto IS used — config/output/input fields.)
 
 // ============================================================================
 // ENUMS

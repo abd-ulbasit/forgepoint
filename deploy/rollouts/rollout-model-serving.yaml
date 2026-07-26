@@ -46,7 +46,7 @@ metadata:
   name: fp-model-serving
   # NAMESPACE: fp-models — model-serving's authoritative home (see the namespace note
   # below). UNLIKE inference-gateway (fp-system), the serving workload deploys to
-  # fp-models: the CLAUDE.md namespace map, the Helm chart's NetworkPolicy, the BFF
+  # fp-models: the namespace map (deploy/istio/00-namespaces.yaml), the Helm chart's NetworkPolicy, the BFF
   # config (FP_MODEL_SERVING_ADDR=fp-model-serving.fp-models…), the gateway/BFF egress
   # allow-lists, and the Istio mesh objects (deploy/istio/*-fp-models.yaml) ALL target
   # fp-models. This file previously pinned fp-system — a bug that put serving outside

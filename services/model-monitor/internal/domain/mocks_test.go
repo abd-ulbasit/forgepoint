@@ -99,8 +99,8 @@ func (f *fakeMonitorRepo) List(_ context.Context, ff FleetFilter, _ ListOptions)
 // belongs to another team reads as ErrRepoNotFound (no IDOR, no enumeration oracle).
 type fakeReportRepo struct {
 	mu       sync.Mutex
-	byID     map[string]DriftReport // id → report (lookup still by id, then team-checked)
-	byWindow map[string]DriftReport // window_id → report (idempotency key)
+	byID     map[string]DriftReport   // id → report (lookup still by id, then team-checked)
+	byWindow map[string]DriftReport   // window_id → report (idempotency key)
 	byScope  map[string][]DriftReport // team|model → reports (tenant-partitioned history)
 }
 

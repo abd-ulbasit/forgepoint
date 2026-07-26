@@ -16,9 +16,10 @@ import (
 	"testing"
 	"time"
 
+	goredis "github.com/redis/go-redis/v9"
+
 	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
 	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/domain"
-	goredis "github.com/redis/go-redis/v9"
 )
 
 // newTestCache spins up a real Redis and returns a cache adapter + the raw client (for

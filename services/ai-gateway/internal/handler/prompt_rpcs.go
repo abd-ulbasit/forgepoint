@@ -33,10 +33,11 @@ package handler
 import (
 	"context"
 
-	aiv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/ai/v1"
-	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/prompt"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	aiv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/ai/v1"
+	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/prompt"
 )
 
 // errPromptsNotWired is the FIXED message returned when a prompt RPC runs without a

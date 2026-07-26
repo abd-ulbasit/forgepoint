@@ -162,13 +162,13 @@ func (t StepType) IsKnown() bool {
 type ExecutionStatus int
 
 const (
-	ExecutionStatusUnspecified ExecutionStatus = iota
-	ExecutionStatusPending                     // durably created, not yet scheduled
-	ExecutionStatusRunning                     // executing steps
-	ExecutionStatusCompensating                // a step failed (or cancelled): undoing in reverse
-	ExecutionStatusCompleted                   // all steps succeeded (terminal)
-	ExecutionStatusFailed                      // a step failed AND compensation finished (terminal)
-	ExecutionStatusCancelled                   // user-requested stop, compensation done (terminal)
+	ExecutionStatusUnspecified  ExecutionStatus = iota
+	ExecutionStatusPending                      // durably created, not yet scheduled
+	ExecutionStatusRunning                      // executing steps
+	ExecutionStatusCompensating                 // a step failed (or cancelled): undoing in reverse
+	ExecutionStatusCompleted                    // all steps succeeded (terminal)
+	ExecutionStatusFailed                       // a step failed AND compensation finished (terminal)
+	ExecutionStatusCancelled                    // user-requested stop, compensation done (terminal)
 )
 
 // IsTerminal reports whether the execution has reached a state from which it
@@ -209,7 +209,8 @@ func (s ExecutionStatus) String() string {
 //
 // Forward run:   PENDING ──► RUNNING ──► COMPLETED / FAILED / SKIPPED
 // Compensation:  COMPLETED ──► COMPENSATING ──► COMPENSATED
-//                                          └──► COMPENSATION_FAILED   (danger!)
+//
+//	└──► COMPENSATION_FAILED   (danger!)
 //
 // COMPENSATION_FAILED is the worst case in any saga: we could not undo a side
 // effect (e.g. failed to destroy a serving instance). It is a "stuck saga"
@@ -371,13 +372,13 @@ const SettlementTimeout = 60 * time.Second
 // (author a pipeline "as" another user). CreatedBy/Team derive from the
 // authenticated principal in the handler/service, not from request fields.
 type PipelineDefinition struct {
-	ID        string         // UUID v4, server-assigned, immutable (primary key)
-	Name      string         // human-readable; unique per team
-	Type      PipelineType   // saga / DAG / batch — the execution strategy
+	ID        string       // UUID v4, server-assigned, immutable (primary key)
+	Name      string       // human-readable; unique per team
+	Type      PipelineType // saga / DAG / batch — the execution strategy
 	Steps     []StepDefinition
-	CreatedBy string         // SERVER-AUTHORITATIVE: authenticated creator's user id
-	CreatedAt time.Time      // SERVER-AUTHORITATIVE: immutable creation time
-	Team      string         // SERVER-AUTHORITATIVE: owning team (tenancy/RBAC scope)
+	CreatedBy string    // SERVER-AUTHORITATIVE: authenticated creator's user id
+	CreatedAt time.Time // SERVER-AUTHORITATIVE: immutable creation time
+	Team      string    // SERVER-AUTHORITATIVE: owning team (tenancy/RBAC scope)
 
 	// Archived marks a soft-deleted template: hidden from ListPipelines and not
 	// triggerable, but kept so past Executions' lineage (pipeline name) still

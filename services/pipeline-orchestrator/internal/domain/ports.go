@@ -79,9 +79,9 @@ type ListExecutionsFilter struct {
 // ListPipelinesFilter narrows a ListPipelines query. Same tenancy discipline:
 // Team is server-set; Archived pipelines are excluded unless explicitly asked.
 type ListPipelinesFilter struct {
-	Team    string       // SERVER-SET from auth claims — never client input
-	Type    PipelineType // optional: only this type (Unspecified = any)
-	List    ListOptions
+	Team string       // SERVER-SET from auth claims — never client input
+	Type PipelineType // optional: only this type (Unspecified = any)
+	List ListOptions
 }
 
 // ============================================================================
@@ -315,14 +315,14 @@ type StepEvent struct {
 	ExecutionID  string
 	PipelineID   string
 	PipelineType PipelineType
-	StepID       string    // empty for execution-level events
-	StepType     StepType  // zero for execution-level events
-	TriggeredBy  string    // who/what started the run (for PipelineStarted)
-	Error        string    // failing-step reason (StepFailed / PipelineFailed)
-	Attempts     int       // attempts made (StepFailed)
-	Endpoint     string    // server-resolved serving address (ModelDeployed only)
+	StepID       string         // empty for execution-level events
+	StepType     StepType       // zero for execution-level events
+	TriggeredBy  string         // who/what started the run (for PipelineStarted)
+	Error        string         // failing-step reason (StepFailed / PipelineFailed)
+	Attempts     int            // attempts made (StepFailed)
+	Endpoint     string         // server-resolved serving address (ModelDeployed only)
 	Output       map[string]any // step output (StepCompleted)
-	OccurredAt   time.Time // producer clock
+	OccurredAt   time.Time      // producer clock
 }
 
 // ============================================================================

@@ -9,7 +9,7 @@
 #
 #   pg_dump (homelab CronJob):
 #   + Simple: no operator, no CRDs, no extra cluster components.
-#   + Sufficient for a portfolio project (homelab RPO = 24h is acceptable).
+#   + Sufficient for the single-node k3s homelab, where RPO = 24h is acceptable.
 #   - Snapshot-only: you can restore to dump time, not to an arbitrary second.
 #   - No WAL archiving: a crash between two dumps loses those hours of data.
 #

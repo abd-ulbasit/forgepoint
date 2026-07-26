@@ -23,7 +23,7 @@
 //     adapter; the per-batch *business* logic (validate, dedup, project finals)
 //     lives HERE so both paths share one implementation and one set of tests.
 //
-// The lesson the comments keep returning to: the domain doesn't care whether a
+// The point the comments keep returning to: the domain doesn't care whether a
 // batch came from a gRPC call or a NATS flush. It validates and dedups a slice
 // of points. That transport-independence is precisely why the pattern's hard
 // part (batching/back-pressure) can be added in the events layer WITHOUT

@@ -6,12 +6,13 @@ import (
 	"log/slog"
 	"strings"
 
-	eventsv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/events/v1"
-	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
-	"github.com/abd-ulbasit/forgepoint/services/pipeline-orchestrator/internal/domain"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
+
+	eventsv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/events/v1"
+	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
+	"github.com/abd-ulbasit/forgepoint/services/pipeline-orchestrator/internal/domain"
 )
 
 // ============================================================================

@@ -9,16 +9,17 @@ import (
 	"testing"
 	"time"
 
-	eventsv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/events/v1"
-	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
-	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
-	"github.com/abd-ulbasit/forgepoint/services/model-monitor/internal/domain"
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go/jetstream"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
+
+	eventsv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/events/v1"
+	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
+	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
+	"github.com/abd-ulbasit/forgepoint/services/model-monitor/internal/domain"
 )
 
 // errAlwaysFail forces ObserveInference to fail on every delivery (drives the

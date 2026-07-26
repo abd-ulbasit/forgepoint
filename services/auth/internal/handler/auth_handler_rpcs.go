@@ -53,31 +53,24 @@ import (
 	"fmt"
 	"time"
 
-	authv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/auth/v1"
-	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
-	"github.com/abd-ulbasit/forgepoint/services/auth/internal/domain"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
+
+	authv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/auth/v1"
+	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
+	"github.com/abd-ulbasit/forgepoint/services/auth/internal/domain"
 )
 
 // ============================================================================
 // PAGINATION CONSTANTS
 // ============================================================================
 
-const (
-	// defaultPageSize is applied when the client omits page_size (sends 0).
-	// 20 mirrors the proto's documented default for PaginationRequest.
-	defaultPageSize = 20
-
-	// maxPageSize caps page_size to prevent a client from requesting a
-	// multi-thousand-row page that would pin memory and starve other callers.
-	// 100 mirrors the proto's documented max. We CLAMP rather than reject an
-	// over-large request: a client asking for "as much as possible" should get
-	// the maximum we'll serve, not an error. (Rejecting would also be defensible;
-	// clamping is friendlier and is what Google's AIP-158 recommends.)
-	maxPageSize = 100
-)
+// The proto documents page_size as defaulting to 20 and capping at 100. Those
+// numbers are NOT constants here yet: the only paginated RPC (ListUsers) is still
+// Unimplemented, so nothing would read them and an unused constant is worse than
+// a documented intention. When the domain gains List, normalization lands with it
+// — clamping rather than rejecting an over-large page_size, per AIP-158.
 
 // ============================================================================
 // Login
@@ -156,42 +149,46 @@ func (h *AuthHandler) Login(ctx context.Context, req *authv1.LoginRequest) (*aut
 //
 // CONTRACT — requireAdmin(ctx, resource):
 //
-//	1. AUTHN: pull the caller's claims that the authentication interceptor injected.
-//	   No claims => the call bypassed authn (or carried no/invalid token, which the
-//	   interceptor would already have rejected) => fail closed with Unauthenticated.
-//	2. AUTHZ: ask the domain "may THIS caller perform 'admin' on <resource>?"
-//	   via the same CheckPermission the (future) interceptor would call.
-//	     - err != nil  => "couldn't decide" (DB down) => Internal (fail closed),
-//	       sanitized via toStatusError so no infra detail leaks.
-//	     - allowed==false => authoritative DENY => PermissionDenied.
-//	     - allowed==true  => return the claims so the caller can reuse them.
+//  1. AUTHN: pull the caller's claims that the authentication interceptor injected.
+//     No claims => the call bypassed authn (or carried no/invalid token, which the
+//     interceptor would already have rejected) => fail closed with Unauthenticated.
 //
-//	The action is always "admin" because these are administrative RPCs; "admin"
-//	is the strongest action in the model (auth.proto: "full control including
-//	granting the resource to others"). A role holding resource="*"/action="*"
-//	(platform admin) matches via the domain's wildcard semantics.
-func (h *AuthHandler) requireAdmin(ctx context.Context, resource string) (*grpcutil.Claims, error) {
+//  2. AUTHZ: ask the domain "may THIS caller perform 'admin' on <resource>?"
+//     via the same CheckPermission the (future) interceptor would call.
+//     - err != nil  => "couldn't decide" (DB down) => Internal (fail closed),
+//     sanitized via toStatusError so no infra detail leaks.
+//     - allowed==false => authoritative DENY => PermissionDenied.
+//     - allowed==true  => nil; the RPC proceeds. It returns only an error: a
+//     caller that also needs the claims calls grpcutil.ClaimsFromContext itself
+//     (which is what this does internally), rather than every call site
+//     discarding a second return value.
+//
+//     The action is always "admin" because these are administrative RPCs; "admin"
+//     is the strongest action in the model (auth.proto: "full control including
+//     granting the resource to others"). A role holding resource="*"/action="*"
+//     (platform admin) matches via the domain's wildcard semantics.
+func (h *AuthHandler) requireAdmin(ctx context.Context, resource string) error {
 	claims, ok := grpcutil.ClaimsFromContext(ctx)
 	if !ok || claims == nil || claims.UserID == "" {
 		// No authenticated identity: the request did not pass the authentication
 		// interceptor (or carried no token). Fail closed — we never run an authz
 		// check for an anonymous caller.
-		return nil, status.Error(codes.Unauthenticated, "missing authentication")
+		return status.Error(codes.Unauthenticated, "missing authentication")
 	}
 
 	allowed, err := h.svc.CheckPermission(ctx, claims.UserID, resource, "admin")
 	if err != nil {
 		// Infrastructure failure ("couldn't decide") -> sanitized Internal. This is
 		// the fail-closed posture: we never proceed when authz could not be evaluated.
-		return nil, toStatusError(err)
+		return toStatusError(err)
 	}
 	if !allowed {
 		// Authoritative deny. PermissionDenied (NOT Unauthenticated): the caller IS
 		// authenticated, they simply lack the admin grant. We do not echo the
 		// resource/action in a way that aids probing beyond the generic statement.
-		return nil, status.Error(codes.PermissionDenied, "admin permission required")
+		return status.Error(codes.PermissionDenied, "admin permission required")
 	}
-	return claims, nil
+	return nil
 }
 
 // ============================================================================
@@ -210,7 +207,7 @@ func (h *AuthHandler) CreateUser(ctx context.Context, req *authv1.CreateUserRequ
 
 	// AUTHZ GATE (fail-closed). Provisioning users is an admin action; enforce it
 	// here until the platform-wide authz interceptor lands.
-	if _, err := h.requireAdmin(ctx, "users"); err != nil {
+	if err := h.requireAdmin(ctx, "users"); err != nil {
 		return nil, err
 	}
 
@@ -256,12 +253,12 @@ func (h *AuthHandler) CreateUser(ctx context.Context, req *authv1.CreateUserRequ
 // ListUsers
 // ============================================================================
 //
-// PAGINATION is the interesting part: we normalize the client's page_size
-// (default when 0, clamp when over the cap) and forward the opaque cursor.
-// The domain returns a nextToken which we echo back so the client can request
-// the following page. TotalCount is left at 0 (the domain's List does not
-// compute it — see ListOptions; computing an exact total can require a full
-// scan, which the proto's PaginationResponse explicitly allows omitting).
+// PAGINATION: this RPC is wired and validated but not yet implemented (the domain
+// has no List method — see the body). What is enforced today is the contract's
+// error case: a negative page_size is InvalidArgument. Normalization (default when
+// 0, clamp at the cap) and the opaque cursor land with the domain method, along
+// with TotalCount staying 0 — the proto's PaginationResponse explicitly allows
+// omitting a total, which an exact count would otherwise require a full scan for.
 //
 // AUTHORIZATION: the proto says "Requires admin role." Listing all users is an
 // administrative, tenant-wide read; we gate it on CheckPermission(caller,
@@ -274,7 +271,7 @@ func (h *AuthHandler) ListUsers(ctx context.Context, req *authv1.ListUsersReques
 
 	// AUTHZ GATE (fail-closed) before validation: an unauthorized caller must not
 	// be able to distinguish a valid from an invalid pagination request.
-	if _, err := h.requireAdmin(ctx, "users"); err != nil {
+	if err := h.requireAdmin(ctx, "users"); err != nil {
 		return nil, err
 	}
 
@@ -393,7 +390,7 @@ func (h *AuthHandler) CreateAPIKey(ctx context.Context, req *authv1.CreateAPIKey
 // arrives with the repository phase (APIKeyRepository.Revoke exists, but the
 // service-level method to call it does not). We VALIDATE the request and return
 // Unimplemented honestly until that method lands, keeping the RPC wired.
-func (h *AuthHandler) RevokeAPIKey(ctx context.Context, req *authv1.RevokeAPIKeyRequest) (*authv1.RevokeAPIKeyResponse, error) {
+func (h *AuthHandler) RevokeAPIKey(_ context.Context, req *authv1.RevokeAPIKeyRequest) (*authv1.RevokeAPIKeyResponse, error) {
 	if h.svc == nil {
 		return nil, errServiceNotWired
 	}
@@ -518,7 +515,7 @@ func (h *AuthHandler) CheckPermission(ctx context.Context, req *authv1.CheckPerm
 // (an attacker who could self-assign "admin" would own the platform), so the
 // gate runs FIRST, fail-closed, before any validation or domain work.
 //
-// ERROR MAPPING is the teaching point: the domain distinguishes ErrUserNotFound
+// ERROR MAPPING is the subtle part: the domain distinguishes ErrUserNotFound
 // (the target user is gone) from ErrRoleNotFound (the named role doesn't exist).
 // Both are codes.NotFound but the message differs, so the caller knows WHICH
 // thing was missing. toStatusError handles both via the table.
@@ -529,7 +526,7 @@ func (h *AuthHandler) AssignRole(ctx context.Context, req *authv1.AssignRoleRequ
 
 	// AUTHZ GATE (fail-closed). Assigning roles changes a user's authority; it is
 	// admin-only. Enforce here until the platform-wide authz interceptor lands.
-	if _, err := h.requireAdmin(ctx, "users"); err != nil {
+	if err := h.requireAdmin(ctx, "users"); err != nil {
 		return nil, err
 	}
 

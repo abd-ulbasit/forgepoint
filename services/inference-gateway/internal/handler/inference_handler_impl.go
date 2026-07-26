@@ -4,7 +4,7 @@
 // WHAT THIS FILE IS (and why it's split from inference_handler.go)
 // ============================================================================
 //
-// inference_handler.go holds the TYPE + constructor + the long teaching block on
+// inference_handler.go holds the TYPE + constructor + the long design block on
 // why we embed Unimplemented. THIS file holds the actual RPC implementations:
 // the proto↔domain conversion, the validation, the call into the domain service,
 // and the sentinel→status mapping. Splitting keeps the "what is this handler"
@@ -229,33 +229,6 @@ func statusFromDomainErr(err error) error {
 	// ---- anything unrecognized: SANITIZED Internal (never echo err.Error()) ----
 	default:
 		return status.Error(codes.Internal, "internal error")
-	}
-}
-
-// failureReasonToProto maps the domain's resilience taxonomy to the canonical
-// events.v1 enum used on the sync surface (BatchPredictResult.failure_reason).
-// The two are deliberately 1:1 (the domain mirrors the event enum to stay free of
-// gen/go imports); this is the trivial, TOTAL mapping at the boundary.
-func failureReasonToProto(r domain.FailureReason) eventsv1.InferenceFailureReason {
-	switch r {
-	case domain.FailureReasonNoRoute:
-		return eventsv1.InferenceFailureReason_INFERENCE_FAILURE_REASON_NO_ROUTE
-	case domain.FailureReasonRateLimited:
-		return eventsv1.InferenceFailureReason_INFERENCE_FAILURE_REASON_RATE_LIMITED
-	case domain.FailureReasonBulkheadFull:
-		return eventsv1.InferenceFailureReason_INFERENCE_FAILURE_REASON_BULKHEAD_FULL
-	case domain.FailureReasonCircuitOpen:
-		return eventsv1.InferenceFailureReason_INFERENCE_FAILURE_REASON_CIRCUIT_OPEN
-	case domain.FailureReasonUpstreamError:
-		return eventsv1.InferenceFailureReason_INFERENCE_FAILURE_REASON_UPSTREAM_ERROR
-	case domain.FailureReasonTimeout:
-		return eventsv1.InferenceFailureReason_INFERENCE_FAILURE_REASON_TIMEOUT
-	case domain.FailureReasonInvalidInput:
-		return eventsv1.InferenceFailureReason_INFERENCE_FAILURE_REASON_INVALID_INPUT
-	case domain.FailureReasonQuotaExceeded:
-		return eventsv1.InferenceFailureReason_INFERENCE_FAILURE_REASON_QUOTA_EXCEEDED
-	default:
-		return eventsv1.InferenceFailureReason_INFERENCE_FAILURE_REASON_UNSPECIFIED
 	}
 }
 

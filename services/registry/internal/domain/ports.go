@@ -14,7 +14,7 @@
 // implement these one-way. (A thin repository alias shim is optional sugar.)
 //
 // ============================================================================
-// THE CQRS SPLIT — WHY *TWO* STORE PORTS, NOT ONE (the teaching centerpiece)
+// THE CQRS SPLIT — WHY *TWO* STORE PORTS, NOT ONE (the centerpiece)
 // ============================================================================
 //
 // CQRS (Command Query Responsibility Segregation) separates the WRITE model from

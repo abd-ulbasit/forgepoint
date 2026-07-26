@@ -5,9 +5,10 @@ import (
 	"net/http"
 	"time"
 
+	"google.golang.org/protobuf/types/known/timestamppb"
+
 	monitorv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/monitor/v1"
 	"github.com/abd-ulbasit/forgepoint/services/bff/internal/httpx"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // MonitorsHandler maps /api/v1/monitors and /api/v1/drift-reports onto the

@@ -8,13 +8,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go/jetstream"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+
 	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
 	"github.com/abd-ulbasit/forgepoint/services/notification/internal/domain"
 	"github.com/abd-ulbasit/forgepoint/services/notification/internal/events"
-	"github.com/nats-io/nats.go/jetstream"
-	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/proto"
 )
 
 // ============================================================================
@@ -222,7 +223,8 @@ func buildEnvelope(t *testing.T, id, fullSubject, source string, payload proto.M
 }
 
 // deriveType mirrors natsutil's deriveEventType: strip the "fp.<svc>." prefix.
-//   fp.pipelines.failed → failed ; fp.models.drift.detected → drift.detected
+//
+//	fp.pipelines.failed → failed ; fp.models.drift.detected → drift.detected
 func deriveType(subject string) string {
 	parts := strings.SplitN(subject, ".", 3)
 	if len(parts) >= 3 {
@@ -272,7 +274,9 @@ func (f *fakeRouter) Route(env natsutil.EventEnvelope) (events.RoutedRecipient, 
 }
 
 // fakePrefs is a PreferenceLoader returning fixed prefs (default fall-back built in).
-type fakePrefs struct{ prefs domain.NotificationPreferences }
+type fakePrefs struct {
+	prefs domain.NotificationPreferences
+}
 
 func (f *fakePrefs) LoadPreferences(_ context.Context, userID string) (domain.NotificationPreferences, error) {
 	p := f.prefs
@@ -291,9 +295,9 @@ type fakeExecutor struct {
 	calls      []domain.RoutingDecision
 	events     []domain.InboundEvent
 	result     events.ExecutionResult
-	failalways bool  // every Execute returns a poison error
-	failN      int   // first N Execute calls fail (poison); rest succeed
-	n          int   // call counter
+	failalways bool // every Execute returns a poison error
+	failN      int  // first N Execute calls fail (poison); rest succeed
+	n          int  // call counter
 }
 
 func (f *fakeExecutor) Execute(_ context.Context, decision domain.RoutingDecision, ev domain.InboundEvent) (events.ExecutionResult, error) {

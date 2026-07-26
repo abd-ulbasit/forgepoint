@@ -49,8 +49,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/forgepoint/services/model-serving/internal/domain"
 	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
+	"github.com/abd-ulbasit/forgepoint/services/model-serving/internal/domain"
 )
 
 // sha256Hex computes the canonical "sha256:<hex>" digest of b independently of

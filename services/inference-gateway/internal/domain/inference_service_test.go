@@ -265,12 +265,6 @@ func deployStable(t *testing.T, svc domain.InferenceService, model, version, end
 	}
 }
 
-// predictAs is a small helper: a Predict from testTeam with the given api key. Most
-// tests don't care about the api key value, only that the team matches the deploy.
-func predictAs(svc domain.InferenceService, apiKey string, in domain.PredictInput) (domain.PredictOutput, error) {
-	return svc.Predict(context.Background(), domain.Principal{APIKeyID: apiKey, Team: testTeam}, in)
-}
-
 func basicInput(model string) domain.PredictInput {
 	return domain.PredictInput{
 		ModelName: model,

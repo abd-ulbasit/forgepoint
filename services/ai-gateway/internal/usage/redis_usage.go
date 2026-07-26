@@ -41,8 +41,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/domain"
 	goredis "github.com/redis/go-redis/v9"
+
+	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/domain"
 )
 
 const (

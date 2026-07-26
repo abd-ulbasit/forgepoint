@@ -29,7 +29,7 @@
 // isn't available. The handler is the single proto↔domain anti-corruption layer.
 //
 // ============================================================================
-// THE PATTERN THIS PACKAGE TEACHES — "model runtime registry" (Sidecar/HPA)
+// THE PATTERN THIS PACKAGE IMPLEMENTS — "model runtime registry" (Sidecar/HPA)
 // ============================================================================
 //
 // A serving pod is "the model": a thin runtime that loads ONE model version's

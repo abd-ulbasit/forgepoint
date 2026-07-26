@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"time"
 
-	eventsv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/events/v1"
-	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
-	"github.com/abd-ulbasit/forgepoint/services/inference-gateway/internal/domain"
 	"github.com/nats-io/nats.go/jetstream"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+
+	eventsv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/events/v1"
+	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
+	"github.com/abd-ulbasit/forgepoint/services/inference-gateway/internal/domain"
 )
 
 // ============================================================================

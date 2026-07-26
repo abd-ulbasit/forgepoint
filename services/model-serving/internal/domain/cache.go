@@ -26,6 +26,7 @@
 //   - key present BUT fingerprint differs → key REUSE with different inputs →
 //     treated as a MISS (the engine recomputes the correct answer for THESE
 //     inputs, and the new (key,inputs) result overwrites the stale entry).
+//
 // Treating the collision as a miss (recompute) rather than an error is the
 // safe, caller-friendly choice: a confused client still gets the RIGHT answer
 // for its actual inputs instead of a wrong cached one or a hard failure.

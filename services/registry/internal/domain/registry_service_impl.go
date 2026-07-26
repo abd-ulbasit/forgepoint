@@ -478,8 +478,8 @@ func (s *registryService) MarkVersionReady(ctx context.Context, actor Actor, in 
 
 // PromoteVersion — the stage state machine + the SINGLE-PRODUCTION invariant.
 //
-// This is the centerpiece. Read the steps as the answer to "walk me
-// through promoting a model version to production."
+// This is the centerpiece: the ordering below is load-bearing, not incidental
+// (see the demote-before-promote note inside).
 func (s *registryService) PromoteVersion(ctx context.Context, actor Actor, in PromoteVersionInput) (PromoteResult, error) {
 	if strings.TrimSpace(in.VersionID) == "" {
 		return PromoteResult{}, fmt.Errorf("%w: version id is required", ErrValidation)

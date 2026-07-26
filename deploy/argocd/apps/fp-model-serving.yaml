@@ -72,7 +72,7 @@ spec:
 
   destination:
     server: https://kubernetes.default.svc
-    # Model-serving workloads live in fp-models (per CLAUDE.md namespace map —
+    # Model-serving workloads live in fp-models (per the namespace map in `deploy/istio/00-namespaces.yaml` —
     # "fp-models: Model serving workloads, dynamic per model version"). Must be
     # an allowed destination in the AppProject, or sync is refused.
     namespace: fp-models

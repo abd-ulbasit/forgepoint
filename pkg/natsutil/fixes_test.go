@@ -15,7 +15,6 @@ package natsutil
 import (
 	"context"
 	"os"
-	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -215,14 +214,4 @@ func TestMemoryProcessedStore_OKInDev(t *testing.T) {
 	if store == nil {
 		t.Fatal("NewMemoryProcessedStore() returned nil in dev environment")
 	}
-}
-
-// ============================================================================
-// GOROUTINE COUNT HELPER (sanity)
-// ============================================================================
-
-// currentGoroutines is a convenience that returns the current goroutine count.
-// Used by the leak test above to assert the watcher goroutine eventually exits.
-func currentGoroutines() int {
-	return runtime.NumGoroutine()
 }

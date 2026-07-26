@@ -46,12 +46,12 @@ import (
 // SQLSTATE. We centralize the codes that carry a domain meaning here (not as magic
 // strings scattered through queries) so the mapping is auditable in one place.
 const (
-	// 23505 unique_violation — a duplicate key. On drift_reports it is the
-	// window_id uniqueness firing (concurrent double-score of one window); Save
-	// treats it as "already inserted" and refetches the existing row, which is the
-	// idempotency contract. On monitors it would be the (owner_team, model_name)
-	// partial-unique index; Upsert avoids it entirely via ON CONFLICT.
-	pgUniqueViolation = "23505"
+	// NOTE: 23505 unique_violation is deliberately absent. Every write in this
+	// adapter resolves its duplicate-key case IN SQL — drift_reports with
+	// ON CONFLICT (window_id) DO NOTHING, eval scores with ON CONFLICT (request_id)
+	// DO NOTHING, monitors with ON CONFLICT on the partial index — so a 23505 never
+	// reaches Go and a helper for it would be dead code. Contrast the registry and
+	// ai-gateway adapters, which DO map 23505 because they retry on conflict.
 
 	// 23503 foreign_key_violation — inserting a drift_report under a monitor_id
 	// that doesn't exist. We map it to ErrRepoNotFound for the referenced monitor
@@ -124,17 +124,6 @@ type DriftReportRepository struct{ pool *pgxpool.Pool }
 // ============================================================================
 // ERROR MAPPING — pgx error → domain vocabulary
 // ============================================================================
-
-// isUniqueViolation reports whether err is a Postgres unique_violation (23505) and,
-// if so, on which constraint. The constraint name lets a call site distinguish (e.g.)
-// the window_id idempotency conflict from any other.
-func isUniqueViolation(err error) (constraint string, ok bool) {
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
-		return pgErr.ConstraintName, true
-	}
-	return "", false
-}
 
 // isForeignKeyViolation reports whether err is a Postgres foreign_key_violation
 // (23503) — used to turn a report insert against a missing monitor into

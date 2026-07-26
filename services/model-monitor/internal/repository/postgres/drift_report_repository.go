@@ -5,25 +5,26 @@
 // THE TWO DEFINING MECHANICS
 // ============================================================================
 //
-// 1) IDEMPOTENT Save on window_id — the persistence half of exactly-once.
-//    Each closed window has a stable UUID (Window.ID). Save does
-//    INSERT … ON CONFLICT (window_id) DO NOTHING RETURNING *. A FRESH window
-//    inserts and RETURNING yields the row (inserted=true). A REDELIVERED /
-//    double-scored window hits the conflict, DO NOTHING suppresses the write, and
-//    RETURNING yields ZERO rows — so we refetch the EXISTING row by window_id and
-//    return it with inserted=false. The caller emits the ModelDriftDetected event
-//    ONLY on inserted=true, so the event fires exactly once per window even under
-//    stream redelivery. This is the same idempotency-key discipline every consumer
-//    on the platform follows.
+//  1. IDEMPOTENT Save on window_id — the persistence half of exactly-once.
+//     Each closed window has a stable UUID (Window.ID). Save does
+//     INSERT … ON CONFLICT (window_id) DO NOTHING RETURNING *. A FRESH window
+//     inserts and RETURNING yields the row (inserted=true). A REDELIVERED /
+//     double-scored window hits the conflict, DO NOTHING suppresses the write, and
+//     RETURNING yields ZERO rows — so we refetch the EXISTING row by window_id and
+//     return it with inserted=false. The caller emits the ModelDriftDetected event
+//     ONLY on inserted=true, so the event fires exactly once per window even under
+//     stream redelivery. This is the same idempotency-key discipline every consumer
+//     on the platform follows.
 //
-// 2) TENANCY on EVERY read/purge — owner_team is part of the key, never optional.
-//    Because monitors are keyed by (owner_team, model_name), a model name is not
-//    globally unique. So List/LatestByModel filter on (owner_team, model_name)
-//    TOGETHER, GetByID filters on (id, owner_team) TOGETHER, and PurgeByModel
-//    deletes on (owner_team, model_name) TOGETHER. A guessed/leaked report id from
-//    another tenant returns ErrRepoNotFound — INDISTINGUISHABLE from "no such id"
-//    — so an attacker gets no enumeration oracle (anti-IDOR), and a purge can never
-//    destroy another team's same-named model's history.
+//  2. TENANCY on EVERY read/purge — owner_team is part of the key, never optional.
+//     Because monitors are keyed by (owner_team, model_name), a model name is not
+//     globally unique. So List/LatestByModel filter on (owner_team, model_name)
+//     TOGETHER, GetByID filters on (id, owner_team) TOGETHER, and PurgeByModel
+//     deletes on (owner_team, model_name) TOGETHER. A guessed/leaked report id from
+//     another tenant returns ErrRepoNotFound — INDISTINGUISHABLE from "no such id"
+//     — so an attacker gets no enumeration oracle (anti-IDOR), and a purge can never
+//     destroy another team's same-named model's history.
+//
 // ============================================================================
 package postgres
 

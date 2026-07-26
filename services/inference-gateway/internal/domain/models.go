@@ -213,6 +213,7 @@ func (r Route) IsServing() bool {
 //   - DATA RACE: the hot path (Predict → splitter.Pick) reads those same slice
 //     elements concurrently with event reactions. Copy-on-write + atomic Upsert
 //     means a reader always sees a fully-formed, immutable snapshot.
+//
 // findTarget therefore stays a pure read helper (selectTarget reads through it);
 // no method writes through the returned pointer.
 func (r *Route) findTarget(version string) *RouteTarget {

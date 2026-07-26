@@ -5,8 +5,9 @@ import (
 	"testing"
 	"time"
 
-	pkgaudit "github.com/abd-ulbasit/forgepoint/pkg/audit"
 	"github.com/google/uuid"
+
+	pkgaudit "github.com/abd-ulbasit/forgepoint/pkg/audit"
 )
 
 // makeRecord builds a deterministic-but-distinct audit record for chain tests.

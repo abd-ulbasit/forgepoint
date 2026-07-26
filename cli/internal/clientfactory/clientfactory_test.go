@@ -126,15 +126,15 @@ func TestIsLoopback(t *testing.T) {
 		// Loopback — must be accepted in plaintext mode.
 		{"localhost", true},
 		{"127.0.0.1", true},
-		{"127.0.0.2", true},    // whole 127.0.0.0/8 range
+		{"127.0.0.2", true}, // whole 127.0.0.0/8 range
 		{"127.255.255.255", true},
-		{"::1", true},          // IPv6 loopback
+		{"::1", true}, // IPv6 loopback
 		// Non-loopback — must be refused in plaintext mode.
 		{"example.com", false},
 		{"gateway.internal", false},
-		{"10.0.0.1", false},    // RFC1918 private, but not loopback
+		{"10.0.0.1", false}, // RFC1918 private, but not loopback
 		{"192.168.1.1", false},
-		{"0.0.0.0", false},     // unspecified, not loopback
+		{"0.0.0.0", false},        // unspecified, not loopback
 		{"::ffff:1.2.3.4", false}, // IPv4-mapped IPv6, not loopback
 	}
 	for _, c := range cases {

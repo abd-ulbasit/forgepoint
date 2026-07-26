@@ -2,16 +2,16 @@ package events
 
 import (
 	"context"
-	"encoding/json"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nats.go/jetstream"
+	"google.golang.org/protobuf/encoding/protojson"
 
 	eventsv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/events/v1"
 	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
 	"github.com/abd-ulbasit/forgepoint/services/model-monitor/internal/domain"
-	"github.com/nats-io/nats.go/jetstream"
-	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // ============================================================================
@@ -230,7 +230,7 @@ func TestPublishDrift_DualFormatDecoderRoundTrips(t *testing.T) {
 	}
 
 	var got eventsv1.ModelDriftDetected
-	if err := decodeCanonical(json.RawMessage(raw), &got); err != nil {
+	if err := decodeCanonical(raw, &got); err != nil {
 		t.Fatalf("decodeCanonical round-trip: %v", err)
 	}
 	if got.GetReportId() != report.ID || got.GetModelName() != report.ModelName {

@@ -45,16 +45,17 @@ import (
 	"testing"
 	"time"
 
-	authv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/auth/v1"
-	commonv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/common/v1"
-	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
-	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
-	"github.com/abd-ulbasit/forgepoint/services/auth/internal/domain"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
+
+	authv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/auth/v1"
+	commonv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/common/v1"
+	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
+	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
+	"github.com/abd-ulbasit/forgepoint/services/auth/internal/domain"
 )
 
 // ----------------------------------------------------------------------------
@@ -213,12 +214,6 @@ var adminClaims = &grpcutil.Claims{UserID: "admin-uuid", Role: "admin"}
 //
 // It records nothing extra (the mock already records the last triple); it simply
 // returns the decision the test wants.
-func allowAdmin(resource string) func(ctx context.Context, userID, res, action string) (bool, error) {
-	return func(ctx context.Context, userID, res, action string) (bool, error) {
-		return res == resource && action == "admin", nil
-	}
-}
-
 // allowAll is a checkPermFn that grants every authorization decision. Used by
 // admin-RPC tests whose focus is conversion/validation/error-mapping, not the
 // authz gate itself (which has its own dedicated tests below).

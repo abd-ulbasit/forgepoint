@@ -4,10 +4,11 @@ import (
 	"context"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
 	"github.com/abd-ulbasit/forgepoint/services/pipeline-orchestrator/internal/events"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // ============================================================================

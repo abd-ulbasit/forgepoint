@@ -655,7 +655,7 @@ func (s *publishingService) WriteFeatures(ctx context.Context, p domain.Principa
 	// The event needs the view's id+name; the result doesn't carry them. Fetch the
 	// view (team-scoped via the same Principal). If the read fails we still return
 	// the successful write — the publish is best-effort, never a write-path failure.
-	view, viewErr := s.FeatureStoreService.GetFeatureViewByID(ctx, p, in.FeatureViewID)
+	view, viewErr := s.GetFeatureViewByID(ctx, p, in.FeatureViewID)
 	if viewErr != nil {
 		s.logger.Warn("skip publish FeaturesWritten: could not load view (write is durable)",
 			slog.String("feature_view_id", in.FeatureViewID),

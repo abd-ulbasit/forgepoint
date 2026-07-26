@@ -12,19 +12,19 @@
 //
 // STARTUP SEQUENCE:
 //
-//	1. Structured logger (slog JSON → stdout → Loki)
-//	2. Load config (FP_* env vars → BFFConfig: HTTP port + per-service gRPC
-//	   addresses + CORS origins)
-//	3. Setup OpenTelemetry (traces → Tempo, metrics → Prom)
-//	4. Dial the downstream gRPC services (lazy, connection-reusing) — does NOT
-//	   block on reachability, so a down service can't stop BFF startup
-//	5. Construct handlers (each given the minimal typed stub it needs)
-//	6. Build the HTTP mux (Go 1.22 ServeMux pattern routing) + middleware chain
-//	   (recover → log → CORS; auth on the protected sub-tree)
-//	7. Health server endpoints (/healthz liveness; /readyz checks it can reach
-//	   auth + registry)
-//	8. Serve, blocking until SIGTERM/SIGINT
-//	9. Graceful shutdown: stop accepting HTTP, drain, then close gRPC conns
+//  1. Structured logger (slog JSON → stdout → Loki)
+//  2. Load config (FP_* env vars → BFFConfig: HTTP port + per-service gRPC
+//     addresses + CORS origins)
+//  3. Setup OpenTelemetry (traces → Tempo, metrics → Prom)
+//  4. Dial the downstream gRPC services (lazy, connection-reusing) — does NOT
+//     block on reachability, so a down service can't stop BFF startup
+//  5. Construct handlers (each given the minimal typed stub it needs)
+//  6. Build the HTTP mux (Go 1.22 ServeMux pattern routing) + middleware chain
+//     (recover → log → CORS; auth on the protected sub-tree)
+//  7. Health server endpoints (/healthz liveness; /readyz checks it can reach
+//     auth + registry)
+//  8. Serve, blocking until SIGTERM/SIGINT
+//  9. Graceful shutdown: stop accepting HTTP, drain, then close gRPC conns
 //
 // WHY NO JWT SECRET HERE: unlike auth, the BFF does NOT validate tokens — it
 // FORWARDS the caller's token to the services, which validate it with the shared

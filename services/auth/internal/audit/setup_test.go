@@ -15,8 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
 )
 
 // newTestPool starts a Postgres container, applies ALL up-migrations (so the

@@ -7,9 +7,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/nats-io/nats.go/jetstream"
+
 	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/services/notification/internal/domain"
-	"github.com/nats-io/nats.go/jetstream"
 )
 
 // ============================================================================
@@ -67,7 +68,7 @@ import (
 //       documented on DecisionExecutor.
 //   Belt-and-suspenders: (a) makes the common case cheap, (b) makes correctness
 //   per-recipient, (c) makes it independent of the store's reach. This is the
-//   standard answer to "how do you avoid double-processing at-least-once delivery?".
+//   standard way to avoid double-processing under at-least-once delivery.
 //
 // ============================================================================
 // DLQ (poison messages)

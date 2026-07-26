@@ -2,7 +2,7 @@
 # POSTGRESQL — Primary data store, DATABASE-PER-SERVICE
 # ============================================================================
 #
-# CLAUDE.md standard: "Each service owns its Postgres database and migrations.
+# DATABASE-PER-SERVICE: "Each service owns its Postgres database and migrations.
 # No cross-service DB access." We run ONE Postgres server (homelab economy) but
 # carve out an isolated database per service. In production these could be
 # separate RDS instances; the connection-string boundary is the same either way.

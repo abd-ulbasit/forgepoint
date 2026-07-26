@@ -79,7 +79,7 @@ func (s *RatePlanStore) CreatePlan(ctx context.Context, plan domain.RatePlan, id
 		// constraint in this tx besides the PK). Map it to the domain duplicate
 		// sentinel so the service re-reads the winner; the PK collision (a UUID
 		// clash) is astronomically unlikely and also surfaces as a duplicate.
-		if _, ok := isUniqueViolation(err); ok {
+		if isUniqueViolation(err) {
 			return domain.RatePlan{}, domain.ErrRepoDuplicate
 		}
 		return domain.RatePlan{}, fmt.Errorf("create rate plan: %w", err)
@@ -143,7 +143,7 @@ func (s *RatePlanStore) AssignPlanToTeam(ctx context.Context, team, ratePlanID s
 // query above) into a domain.RatePlan, hydrating the three JSONB maps. It accepts
 // a pgx.Row (the single-row QueryRow result) so all four read paths share one
 // scan + JSONB-decode site — column order and map decoding are written once.
-func (s *RatePlanStore) scanPlan(ctx context.Context, row pgx.Row) (domain.RatePlan, error) {
+func (s *RatePlanStore) scanPlan(_ context.Context, row pgx.Row) (domain.RatePlan, error) {
 	var (
 		plan        domain.RatePlan
 		unitPricesB []byte

@@ -3,7 +3,7 @@
 # ============================================================================
 #
 # WHY Loki: "Prometheus, but for logs" — it indexes only labels (not full text),
-#   so it's cheap to run and pairs naturally with Grafana. CLAUDE.md names Loki
+#   so it's cheap to run and pairs naturally with Grafana. The observability stack names Loki
 #   as the log sink for the platform's structured JSON logs.
 #
 # LOG FLOW (who sends what):

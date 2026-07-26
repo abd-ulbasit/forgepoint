@@ -468,7 +468,7 @@ func (h *ServingHandler) GetModelStatus(ctx context.Context, req *servingv1.GetM
 // GetServingMetrics returns the point-in-time metrics snapshot (the HPA signal).
 // It never errors at the domain level (the snapshot is always available), so the
 // only failure mode is the nil-svc guard.
-func (h *ServingHandler) GetServingMetrics(ctx context.Context, req *servingv1.GetServingMetricsRequest) (*servingv1.GetServingMetricsResponse, error) {
+func (h *ServingHandler) GetServingMetrics(ctx context.Context, _ *servingv1.GetServingMetricsRequest) (*servingv1.GetServingMetricsResponse, error) {
 	if h.svc == nil {
 		return nil, status.Error(codes.Unimplemented, errServiceNotWired)
 	}

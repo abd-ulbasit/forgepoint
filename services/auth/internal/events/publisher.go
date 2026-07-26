@@ -74,7 +74,12 @@ func NewPublisher(pub *natsutil.Publisher) *Publisher {
 // failed, consumers would act on a user that does not exist (a "phantom event").
 // The accepted tradeoff is the inverse, far-less-harmful failure mode: the commit
 // succeeds but this publish fails → the event is LOST (at-most-once for that hop).
-// For a portfolio control-plane this is acceptable; the gold-standard fix is the
+// That is survivable HERE and only here: the auth subjects have no consumer that
+// derives state from them (nothing subscribes to fp.auth.> today — notification's
+// ConsumedSubjects binds models/pipelines/inference/billing/experiments), and the
+// user row in Postgres is the source of truth either way, so a lost event costs a
+// notification, never a divergent replica. The moment a consumer projects off
+// these events that reasoning expires. The gold-standard fix is the
 // TRANSACTIONAL OUTBOX (write the event to an outbox table IN the same tx, a relay
 // publishes it) — which is exactly the pattern the BILLING service implements.
 // Auth deliberately uses the simpler publish-after-commit here; the outbox is

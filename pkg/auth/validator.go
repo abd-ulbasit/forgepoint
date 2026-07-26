@@ -5,21 +5,21 @@
 // DESIGN D2 — LOCAL JWT VERIFICATION (WHY NO RPC ON THE HOT PATH)
 // ============================================================================
 //
-// Every authenticated gRPC call on every one of the 9 non-auth services must
-// verify a token. There are two architecturally valid strategies:
+// Every authenticated gRPC call on every non-auth service must verify a token.
+// There are two architecturally valid strategies:
 //
-//   D1 — REMOTE: call auth.ValidateToken over gRPC for every request.
-//        PRO: handles API-key revocation and JWT revocation instantly.
-//        CON: every RPC now has a synchronous network hop to auth service.
-//             auth service becomes a reliability single-point-of-failure.
-//             A 1ms auth call on a 5ms handler is 20% overhead.
+//	D1 — REMOTE: call auth.ValidateToken over gRPC for every request.
+//	     PRO: handles API-key revocation and JWT revocation instantly.
+//	     CON: every RPC now has a synchronous network hop to auth service.
+//	          auth service becomes a reliability single-point-of-failure.
+//	          A 1ms auth call on a 5ms handler is 20% overhead.
 //
-//   D2 — LOCAL: verify the JWT signature in-process with the shared secret.
-//        PRO: zero network, zero latency overhead — a pure SHA-256 HMAC op.
-//             auth service unavailability does NOT block in-flight RPCs.
-//        CON: a revoked JWT is still accepted until it expires (stateless JWTs).
-//             API keys (prefix "fp_") have their validity in auth's database and
-//             cannot be resolved locally — those still require the D1 path.
+//	D2 — LOCAL: verify the JWT signature in-process with the shared secret.
+//	     PRO: zero network, zero latency overhead — a pure SHA-256 HMAC op.
+//	          auth service unavailability does NOT block in-flight RPCs.
+//	     CON: a revoked JWT is still accepted until it expires (stateless JWTs).
+//	          API keys (prefix "fp_") have their validity in auth's database and
+//	          cannot be resolved locally — those still require the D1 path.
 //
 // DECISION: D2 for JWTs, with short TTLs (15m default) to bound the revocation
 // window. Every non-auth service uses THIS validator for the JWT hot path. API keys
@@ -39,41 +39,47 @@
 // rejects the same malformed tokens in the same way.
 //
 // GATE 1 — keyfunc type assertion:
-//   The keyfunc receives the *jwt.Token after header decode but before signature
-//   verification. It asserts token.Method is *jwt.SigningMethodHMAC AND is the
-//   exact signingMethod instance (HS256). This rejects:
-//     • alg=none  (whose method is *jwt.signingMethodNone, a different type)
-//     • HS384, HS512 (different *jwt.SigningMethodHMAC instances)
-//     • RS256, ES256 (different types entirely)
+//
+//	The keyfunc receives the *jwt.Token after header decode but before signature
+//	verification. It asserts token.Method is *jwt.SigningMethodHMAC AND is the
+//	exact signingMethod instance (HS256). This rejects:
+//	  • alg=none  (whose method is *jwt.signingMethodNone, a different type)
+//	  • HS384, HS512 (different *jwt.SigningMethodHMAC instances)
+//	  • RS256, ES256 (different types entirely)
 //
 // GATE 2 — WithValidMethods(["HS256"]):
-//   The parser rejects any token whose alg header is not in this list before the
-//   keyfunc even runs. Belt-and-suspenders: two independent, ordered checks.
+//
+//	The parser rejects any token whose alg header is not in this list before the
+//	keyfunc even runs. Belt-and-suspenders: two independent, ordered checks.
 //
 // GATE 3 — WithExpirationRequired():
-//   A token with no exp claim is rejected outright. Without this, a buggy or
-//   malicious minter could issue a never-expiring token.
+//
+//	A token with no exp claim is rejected outright. Without this, a buggy or
+//	malicious minter could issue a never-expiring token.
 //
 // GATE 4 — >=32-byte secret enforcement:
-//   Mirrors domain.validateHMACSecret — weak secrets are rejected at
-//   construction time, not silently accepted.
+//
+//	Mirrors domain.validateHMACSecret — weak secrets are rejected at
+//	construction time, not silently accepted.
 //
 // ALGORITHM CONFUSION:
-//   The attacker changes the alg header in a JWT to trick the verifier into
-//   using a different algorithm than the signer intended. Prevention: pin the
-//   algorithm on the VERIFIER side (never trust the token's alg header); assert
-//   the concrete signing method type inside the keyfunc AND use WithValidMethods
-//   as a second, earlier gate. Reject alg=none unconditionally.
+//
+//	The attacker changes the alg header in a JWT to trick the verifier into
+//	using a different algorithm than the signer intended. Prevention: pin the
+//	algorithm on the VERIFIER side (never trust the token's alg header); assert
+//	the concrete signing method type inside the keyfunc AND use WithValidMethods
+//	as a second, earlier gate. Reject alg=none unconditionally.
 package auth
 
 import (
 	"context"
 	"fmt"
 
-	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
 	"github.com/golang-jwt/jwt/v5"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
 )
 
 // signingMethod is the ONE algorithm this validator accepts — identical to the
@@ -105,12 +111,12 @@ const minHMACSecretBytes = 32
 // package is shared, the build will fail at every consumer simultaneously, making
 // the drift impossible to miss.
 type jwtClaims struct {
-	jwt.RegisteredClaims        // sub, exp, iat, nbf, iss, aud, jti
-	Email             string   `json:"email,omitempty"`
-	Name              string   `json:"name,omitempty"`
-	Team              string   `json:"team,omitempty"`
-	Role              string   `json:"role,omitempty"`
-	Scopes            []string `json:"scopes,omitempty"`
+	jwt.RegisteredClaims          // sub, exp, iat, nbf, iss, aud, jti
+	Email                string   `json:"email,omitempty"`
+	Name                 string   `json:"name,omitempty"`
+	Team                 string   `json:"team,omitempty"`
+	Role                 string   `json:"role,omitempty"`
+	Scopes               []string `json:"scopes,omitempty"`
 }
 
 // jwtValidator is the concrete implementation of grpcutil.TokenValidator that
@@ -184,7 +190,7 @@ func NewJWTValidator(secret []byte) (grpcutil.TokenValidator, error) {
 // verifier does not need network or DB access, so ctx is unused here. If this
 // validator is ever upgraded to the D1 (RPC) path for API-key support, ctx
 // will carry the deadline and cancellation signal for the outbound call.
-func (v *jwtValidator) Validate(ctx context.Context, tokenString string) (*grpcutil.Claims, error) {
+func (v *jwtValidator) Validate(_ context.Context, tokenString string) (*grpcutil.Claims, error) {
 	claims := &jwtClaims{}
 
 	// keyFunc is called by the JWT parser after decoding the header but BEFORE

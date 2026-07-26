@@ -1,7 +1,7 @@
 // auth_service_impl.go — the concrete AuthService implementation.
 //
 // This is the platform's most security-critical code: every other service
-// trusts the claims this file produces. The teaching comments below name the
+// trusts the claims this file produces. The comments below name the
 // patterns and the attacks each measure defends against.
 //
 // ============================================================================

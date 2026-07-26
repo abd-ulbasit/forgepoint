@@ -631,7 +631,7 @@ func (s *servingService) validateInputs(inputs map[string]Tensor) error {
 // Introspection: status / info / list / metrics / health
 // ============================================================================
 
-func (s *servingService) GetModelStatus(ctx context.Context, ref ModelRef) (ModelStatus, error) {
+func (s *servingService) GetModelStatus(_ context.Context, ref ModelRef) (ModelStatus, error) {
 	resolved, err := s.resolveRef(ref)
 	if err != nil {
 		return ModelStatus{}, err
@@ -641,7 +641,7 @@ func (s *servingService) GetModelStatus(ctx context.Context, ref ModelRef) (Mode
 	return s.registry[resolved].Status(), nil
 }
 
-func (s *servingService) GetModelInfo(ctx context.Context, ref ModelRef) (LoadedModel, error) {
+func (s *servingService) GetModelInfo(_ context.Context, ref ModelRef) (LoadedModel, error) {
 	resolved, err := s.resolveRef(ref)
 	if err != nil {
 		return LoadedModel{}, err
@@ -653,7 +653,7 @@ func (s *servingService) GetModelInfo(ctx context.Context, ref ModelRef) (Loaded
 	return *s.registry[resolved], nil
 }
 
-func (s *servingService) ListLoadedModels(ctx context.Context, opts ListOptions) ([]ModelStatus, string, error) {
+func (s *servingService) ListLoadedModels(_ context.Context, opts ListOptions) ([]ModelStatus, string, error) {
 	// Clamp the page size — the contract cap (page_size ∈ [1, maxPageSize]).
 	pageSize := opts.PageSize
 	if pageSize <= 0 {
@@ -681,7 +681,7 @@ func (s *servingService) ListLoadedModels(ctx context.Context, opts ListOptions)
 	return out, "", nil
 }
 
-func (s *servingService) GetServingMetrics(ctx context.Context) ServingMetrics {
+func (s *servingService) GetServingMetrics(_ context.Context) ServingMetrics {
 	return s.metrics.snapshot()
 }
 
@@ -689,7 +689,7 @@ func (s *servingService) GetServingMetrics(ctx context.Context) ServingMetrics {
 // resolved model is StateReady AND the most recent inference latency is within
 // the liveness threshold (when one is configured). This single function is the
 // authority both the readinessProbe and the gateway's routing trust.
-func (s *servingService) HealthCheck(ctx context.Context, modelName string) (HealthVerdict, ModelState, time.Duration) {
+func (s *servingService) HealthCheck(_ context.Context, modelName string) (HealthVerdict, ModelState, time.Duration) {
 	last := s.metrics.lastInferenceLatency()
 
 	resolved, err := s.resolveRef(ModelRef{Name: modelName})

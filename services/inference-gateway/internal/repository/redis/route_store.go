@@ -18,6 +18,7 @@
 //   - The table is small (tens–hundreds of models), so one hash is the right
 //     cardinality; a hash with millions of fields would argue for key-per-entry,
 //     but that is not this workload.
+//
 // We store each Route as JSON in the field. JSON (not gob/proto) keeps the mirror
 // human-inspectable with `redis-cli HGETALL` during an incident and avoids
 // dragging a codec into the adapter; the table is tiny so JSON's size/CPU cost is

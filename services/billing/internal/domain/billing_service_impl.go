@@ -1,7 +1,7 @@
 // billing_service_impl.go — the concrete BillingService implementation.
 //
 // This is the platform's "money truth": the code here decides what a customer is
-// charged. The teaching comments name each pattern (Outbox, idempotent consumer,
+// charged. The comments name each pattern (Outbox, idempotent consumer,
 // server-authoritative pricing) and the financial bug each guard prevents.
 //
 // ============================================================================
@@ -70,7 +70,7 @@ func NewBillingService(
 var _ BillingService = (*billingService)(nil)
 
 // ============================================================================
-// RecordUsage — THE OUTBOX WRITE PATH (the teaching centerpiece)
+// RecordUsage — THE OUTBOX WRITE PATH (the centerpiece)
 // ============================================================================
 //
 // ASCII — the exactly-once-in-effect pipeline this method anchors:

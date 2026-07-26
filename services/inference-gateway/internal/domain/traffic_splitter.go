@@ -17,13 +17,13 @@
 //
 // THE ALGORITHM — cumulative-weight scan over ELIGIBLE targets:
 //
-//	1. Sum the weights of ELIGIBLE (active) targets → total. Draining/unhealthy
-//	   targets are excluded (effective weight 0), so a draining canary stops
-//	   receiving traffic the instant its status flips, before any reweight.
-//	2. Draw an integer d in [0, total) from the injected source.
-//	3. Walk the targets accumulating weight; the first target whose running sum
-//	   exceeds d is the winner. d lands in exactly one [lo, hi) band of width =
-//	   that target's weight, so P(target) = weight/total. ← the whole guarantee.
+//  1. Sum the weights of ELIGIBLE (active) targets → total. Draining/unhealthy
+//     targets are excluded (effective weight 0), so a draining canary stops
+//     receiving traffic the instant its status flips, before any reweight.
+//  2. Draw an integer d in [0, total) from the injected source.
+//  3. Walk the targets accumulating weight; the first target whose running sum
+//     exceeds d is the winner. d lands in exactly one [lo, hi) band of width =
+//     that target's weight, so P(target) = weight/total. ← the whole guarantee.
 //
 // WHY integer bps + integer draw (no floats): deterministic across platforms
 // (no FP rounding), exact band boundaries (no 0.1+0.2 drift), and it makes the

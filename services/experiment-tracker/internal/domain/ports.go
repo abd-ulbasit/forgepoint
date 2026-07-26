@@ -3,7 +3,7 @@
 // Hexagonal "consumer owns the port" rule.
 //
 // ============================================================================
-// WHY THE PORTS LIVE IN THE DOMAIN (not in repository/)  — the cycle lesson
+// WHY THE PORTS LIVE IN THE DOMAIN (not in repository/)  — the import cycle
 // ============================================================================
 //
 // The Auth service learned this the hard way (see services/auth/internal/domain/

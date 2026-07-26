@@ -259,7 +259,6 @@ func (p *OllamaProvider) streamBody(ctx context.Context, resp *http.Response, re
 	// 64KB token; raise the cap so a big chunk doesn't error the scan.
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
-	var sawDone bool
 	for scanner.Scan() {
 		// Stop promptly if the caller went away (client disconnect / shutdown).
 		if ctx.Err() != nil {
@@ -278,7 +277,6 @@ func (p *OllamaProvider) streamBody(ctx context.Context, resp *http.Response, re
 		}
 
 		if parsed.Done {
-			sawDone = true
 			usage := domain.TokenUsage{
 				PromptTokens:     parsed.PromptEvalCount,
 				CompletionTokens: parsed.EvalCount,
@@ -307,10 +305,9 @@ func (p *OllamaProvider) streamBody(ctx context.Context, resp *http.Response, re
 		}
 	}
 
-	// Reached here without a Done frame (scanner ended / errored): if we never saw
-	// done=true, the channel closes with no terminal frame and streamOne fails over.
-	// scanner.Err() being non-nil (a read error) lands here too — same handling.
-	_ = sawDone
+	// Reached here without a Done frame (scanner ended / errored): the channel closes
+	// with no terminal frame and streamOne fails over. scanner.Err() being non-nil (a
+	// read error) lands here too — same handling.
 }
 
 // roleToOllama maps the domain role to Ollama's role string. Unspecified defaults to

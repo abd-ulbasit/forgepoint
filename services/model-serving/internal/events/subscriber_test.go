@@ -9,14 +9,15 @@ import (
 	"testing"
 	"time"
 
-	eventsv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/events/v1"
-	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
-	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
-	"github.com/abd-ulbasit/forgepoint/services/model-serving/internal/domain"
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go/jetstream"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+
+	eventsv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/events/v1"
+	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
+	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
+	"github.com/abd-ulbasit/forgepoint/services/model-serving/internal/domain"
 )
 
 // errTransient is a non-domain error used by the DLQ test to force the handler to
@@ -332,7 +333,7 @@ func TestModelDeployed_ReconcilesFromRememberedArtifact(t *testing.T) {
 		uri    = "s3://fp-models/iris/v2.onnx"
 		digest = "sha256:cafe"
 	)
-	// 1) version.ready teaches the pod the artifact location.
+	// 1) version.ready tells the pod the artifact location.
 	if err := h.pub.Publish(ctx, subjectModelVersionReady, &eventsv1.ModelVersionReady{
 		ModelName: name, Version: ver, ArtifactPath: uri, ArtifactDigest: digest,
 	}); err != nil {

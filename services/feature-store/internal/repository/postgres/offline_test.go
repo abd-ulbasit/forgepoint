@@ -184,13 +184,13 @@ func TestOffline_ValueCodecAllKinds(t *testing.T) {
 	ts := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
 
 	values := map[string]domain.FeatureValue{
-		"i":      {Kind: domain.FeatureTypeInt64, Int: 42},
-		"d":      {Kind: domain.FeatureTypeDouble, Double: 3.14159},
-		"s":      {Kind: domain.FeatureTypeString, Str: "hello; DROP TABLE feature_events;--"}, // injection-shaped data stays data
-		"b":      {Kind: domain.FeatureTypeBool, Bool: true},
-		"t":      {Kind: domain.FeatureTypeTimestamp, Time: ts},
-		"embed":  {Kind: domain.FeatureTypeDoubleList, List: []float64{0.1, 0.2, 0.3}},
-		"meta":   {Kind: domain.FeatureTypeStruct, Struct: map[string]any{"k": "v", "n": float64(7)}},
+		"i":     {Kind: domain.FeatureTypeInt64, Int: 42},
+		"d":     {Kind: domain.FeatureTypeDouble, Double: 3.14159},
+		"s":     {Kind: domain.FeatureTypeString, Str: "hello; DROP TABLE feature_events;--"}, // injection-shaped data stays data
+		"b":     {Kind: domain.FeatureTypeBool, Bool: true},
+		"t":     {Kind: domain.FeatureTypeTimestamp, Time: ts},
+		"embed": {Kind: domain.FeatureTypeDoubleList, List: []float64{0.1, 0.2, 0.3}},
+		"meta":  {Kind: domain.FeatureTypeStruct, Struct: map[string]any{"k": "v", "n": float64(7)}},
 	}
 	in := vec("e1", 1, ts, values)
 	if err := store.Rebuild(ctx, viewID, map[string]domain.FeatureVector{"e1": in}); err != nil {

@@ -18,13 +18,15 @@
 // proto-tag/field-name bugs and stream-wiring bugs a direct method call would miss.
 //
 // FOR EACH RPC we assert:
-//   (a) HAPPY PATH: the request is converted to the right domain input, and the
-//       domain result is converted to the right proto response (field by field).
-//   (b) VALIDATION: a malformed request is rejected with InvalidArgument BEFORE
-//       the domain is called (we assert the mock was NOT invoked).
-//   (c) ERROR MAPPING: each domain sentinel maps to the documented status code.
-//   (d) NO LEAK: an unknown/internal error yields codes.Internal with a fixed
-//       sanitized message that does not contain the raw error text.
+//
+//	(a) HAPPY PATH: the request is converted to the right domain input, and the
+//	    domain result is converted to the right proto response (field by field).
+//	(b) VALIDATION: a malformed request is rejected with InvalidArgument BEFORE
+//	    the domain is called (we assert the mock was NOT invoked).
+//	(c) ERROR MAPPING: each domain sentinel maps to the documented status code.
+//	(d) NO LEAK: an unknown/internal error yields codes.Internal with a fixed
+//	    sanitized message that does not contain the raw error text.
+//
 // ============================================================================
 package handler
 

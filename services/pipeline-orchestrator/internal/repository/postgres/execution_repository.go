@@ -8,18 +8,18 @@
 // CHECKPOINTS the engine relies on for crash recovery. This adapter persists
 // both, mapping the domain's two-granularity port to two write paths:
 //
-//   Create   → INSERT the execution + ALL its PENDING step rows in ONE tx
-//              (atomic: a run is never half-created; its checkpoints exist the
-//              instant the run does). Idempotent on the trigger key.
-//   Save     → UPDATE the COARSE execution-level state (status, current_step,
-//              completed_at, error) — the saga state-machine transition.
-//   SaveStep → UPSERT one step checkpoint (the FINE-grained transition the
-//              recovery path reads). Called before a step runs and after it
-//              settles.
-//   GetByID  → SELECT the execution + its steps (ordered) — what recovery and
-//              GetExecution both read.
-//   List     → JOIN pipelines for the TEAM scope (executions have no team column;
-//              tenancy is a property of the parent template).
+//	Create   → INSERT the execution + ALL its PENDING step rows in ONE tx
+//	           (atomic: a run is never half-created; its checkpoints exist the
+//	           instant the run does). Idempotent on the trigger key.
+//	Save     → UPDATE the COARSE execution-level state (status, current_step,
+//	           completed_at, error) — the saga state-machine transition.
+//	SaveStep → UPSERT one step checkpoint (the FINE-grained transition the
+//	           recovery path reads). Called before a step runs and after it
+//	           settles.
+//	GetByID  → SELECT the execution + its steps (ordered) — what recovery and
+//	           GetExecution both read.
+//	List     → JOIN pipelines for the TEAM scope (executions have no team column;
+//	           tenancy is a property of the parent template).
 //
 // WHY Create's atomicity matters: the PENDING step rows ARE the
 // recovery map. If the execution row committed but a step row didn't, recovery
@@ -122,7 +122,7 @@ func (s *ExecutionRepository) Create(ctx context.Context, e domain.Execution, id
 	if err != nil {
 		// Race recovery: a concurrent trigger with the same key committed between
 		// our lookup and our insert. Re-read and return the winner's execution.
-		if _, ok := isUniqueViolation(err); ok && idempotencyKey != "" {
+		if isUniqueViolation(err) && idempotencyKey != "" {
 			if existing, found, lerr := s.executionByKey(ctx, team, idempotencyKey); lerr == nil && found {
 				return existing, nil
 			}
@@ -346,11 +346,11 @@ func (s *ExecutionRepository) List(ctx context.Context, f domain.ListExecutionsF
 // the column order is defined once.
 func (s *ExecutionRepository) scanExecution(row rowScanner) (domain.Execution, error) {
 	var (
-		e            domain.Execution
-		status       int16
-		currentStep  *string
-		inputJSON    []byte
-		errText      *string
+		e           domain.Execution
+		status      int16
+		currentStep *string
+		inputJSON   []byte
+		errText     *string
 	)
 	if err := row.Scan(
 		&e.ID, &e.PipelineID, &status, &currentStep, &e.TriggeredBy,

@@ -35,7 +35,7 @@ import (
 // HAND-WRITTEN MOCK PORTS
 // ============================================================================
 //
-// WHY hand-written rather than a mock-gen library: per CLAUDE.md the tests verify
+// WHY hand-written rather than a mock-gen library: the tests verify
 // REAL behavior. A hand-written stub backed by a map (mockNotificationRepo) lets
 // us assert the actual stored state, not just "Create was called with X". Each
 // mock also records call counts so we can prove a NEGATIVE — e.g. that an SSRF

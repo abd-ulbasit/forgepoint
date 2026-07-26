@@ -7,15 +7,16 @@ import (
 	"testing"
 	"time"
 
-	eventsv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/events/v1"
-	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
-	"github.com/abd-ulbasit/forgepoint/services/pipeline-orchestrator/internal/domain"
-	"github.com/abd-ulbasit/forgepoint/services/pipeline-orchestrator/internal/events"
 	"github.com/nats-io/nats.go/jetstream"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
+
+	eventsv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/events/v1"
+	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
+	"github.com/abd-ulbasit/forgepoint/services/pipeline-orchestrator/internal/domain"
+	"github.com/abd-ulbasit/forgepoint/services/pipeline-orchestrator/internal/events"
 )
 
 // ============================================================================
@@ -40,7 +41,7 @@ type fakeService struct {
 	mu        sync.Mutex
 	triggers  []domain.TriggerInput
 	actors    []domain.Actor
-	err       error                                                                 // returned from TriggerExecution
+	err       error                                                                      // returned from TriggerExecution
 	onTrigger func(actor domain.Actor, in domain.TriggerInput) (domain.Execution, error) // optional override
 }
 

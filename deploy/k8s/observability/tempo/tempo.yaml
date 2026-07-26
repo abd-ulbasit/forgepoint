@@ -19,7 +19,7 @@
 #   A Deployment's interchangeable pods would race on one RWO PVC.
 #
 # SINGLE-BINARY MODE: all Tempo components (distributor, ingester, querier,
-#   compactor) run in ONE process. Appropriate for a homelab/portfolio; prod
+#   compactor) run in ONE process. Appropriate at homelab trace volume; prod
 #   would split components into a microservices deployment behind a gateway and
 #   back storage with S3/GCS (see M5 Terraform plan).
 # ============================================================================

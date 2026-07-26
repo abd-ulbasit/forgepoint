@@ -73,6 +73,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	goredis "github.com/redis/go-redis/v9"
 
+	"github.com/nats-io/nats.go/jetstream"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/metric"
+
 	billingv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/billing/v1"
 	fpauth "github.com/abd-ulbasit/forgepoint/pkg/auth"
 	"github.com/abd-ulbasit/forgepoint/pkg/config"
@@ -84,9 +88,6 @@ import (
 	"github.com/abd-ulbasit/forgepoint/services/billing/internal/events"
 	"github.com/abd-ulbasit/forgepoint/services/billing/internal/handler"
 	"github.com/abd-ulbasit/forgepoint/services/billing/internal/repository/postgres"
-	"github.com/nats-io/nats.go/jetstream"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/metric"
 )
 
 // depConnectTimeout bounds how long we wait, AT BOOT, for each datastore's
@@ -779,22 +780,23 @@ func (s *redisProcessedStore) MarkProcessed(ctx context.Context, eventID string)
 // fp.dlq.billing. Those events are NOT lost — they are PARKED on the DLQ stream and
 // must be REPLAYED once the real resolver lands, or the usage they represent is
 // never billed. Procedure:
-//   1. WATCH the signal: alert on billing_unwired_team_resolver_active > 0 (the
-//      counter incremented at startup below) AND on the depth/rate of fp.dlq.billing.
-//      Both being non-zero in a running pod = "billing is meter-dead, DLQ filling".
-//   2. WIRE the resolvers: replace unwiredTeamResolver / unwiredVersionTeamResolver
-//      with the real Auth/registry gRPC clients, set FP_BILLING_UNWIRED_RESOLVER_
-//      FAIL_CLOSED=false, deploy. The counter goes to 0 and new events meter
-//      normally (the live path, no replay needed for traffic after this point).
-//   3. REPLAY the parked DLQ: the DLQ stream retains the ORIGINAL EventEnvelopes
-//      (same envelope ids). Re-publish each fp.dlq.billing message back onto its
-//      source subject (fp.inference.completed / fp.models.version.ready). Idempotency
-//      makes replay SAFE: the consumer-side ProcessedStore dedupes on envelope id
-//      and domain.RecordUsage dedupes on (team, idempotency_key = request_id /
-//      version_id+":storage"), so a message that somehow already metered is a no-op.
-//   4. VERIFY: fp.dlq.billing drains to ~0 and the usage ledger now contains the
-//      previously-DLQ'd records. (Tooling for step 3 — a `fp dlq replay` command — is
-//      an M4 CLI concern; until then it is a manual `nats` CLI republish.)
+//  1. WATCH the signal: alert on billing_unwired_team_resolver_active > 0 (the
+//     counter incremented at startup below) AND on the depth/rate of fp.dlq.billing.
+//     Both being non-zero in a running pod = "billing is meter-dead, DLQ filling".
+//  2. WIRE the resolvers: replace unwiredTeamResolver / unwiredVersionTeamResolver
+//     with the real Auth/registry gRPC clients, set FP_BILLING_UNWIRED_RESOLVER_
+//     FAIL_CLOSED=false, deploy. The counter goes to 0 and new events meter
+//     normally (the live path, no replay needed for traffic after this point).
+//  3. REPLAY the parked DLQ: the DLQ stream retains the ORIGINAL EventEnvelopes
+//     (same envelope ids). Re-publish each fp.dlq.billing message back onto its
+//     source subject (fp.inference.completed / fp.models.version.ready). Idempotency
+//     makes replay SAFE: the consumer-side ProcessedStore dedupes on envelope id
+//     and domain.RecordUsage dedupes on (team, idempotency_key = request_id /
+//     version_id+":storage"), so a message that somehow already metered is a no-op.
+//  4. VERIFY: fp.dlq.billing drains to ~0 and the usage ledger now contains the
+//     previously-DLQ'd records. (Tooling for step 3 — a `fp dlq replay` command — is
+//     an M4 CLI concern; until then it is a manual `nats` CLI republish.)
+//
 // As a stop-gap BEFORE the resolver lands, set FP_BILLING_METERING_ENABLED=false so
 // the consumers are not registered at all and the DLQ does not fill in the first
 // place (the relay + read APIs still run).

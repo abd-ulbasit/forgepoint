@@ -43,17 +43,18 @@
 // ============================================================================
 //
 // Two layers make a redelivered event a no-op:
-//   (a) TRANSPORT: a natsutil ProcessedStore dedupes on EventEnvelope.id — a
-//       redelivered envelope id is ACKed without re-running the handler (the cheap
-//       fast-path, mirroring every other consumer on the platform).
-//   (b) SEMANTIC: every handler is LOAD-MERGE-UPSERT — it reconstructs the target
-//       entity's full projected state and writes it wholesale. Applying the SAME
-//       event twice yields the SAME Redis state (the upsert is deterministic), and
-//       a STALE/out-of-order event is guarded by an event-time check (we never let
-//       an older event overwrite a newer projection — see applyIfNewer). So even a
-//       duplicate that slips past (a) — e.g. redelivered to a different replica
-//       with its own memory store — cannot corrupt the projection. (b) is the
-//       authoritative guard; (a) is the optimization.
+//
+//	(a) TRANSPORT: a natsutil ProcessedStore dedupes on EventEnvelope.id — a
+//	    redelivered envelope id is ACKed without re-running the handler (the cheap
+//	    fast-path, mirroring every other consumer on the platform).
+//	(b) SEMANTIC: every handler is LOAD-MERGE-UPSERT — it reconstructs the target
+//	    entity's full projected state and writes it wholesale. Applying the SAME
+//	    event twice yields the SAME Redis state (the upsert is deterministic), and
+//	    a STALE/out-of-order event is guarded by an event-time check (we never let
+//	    an older event overwrite a newer projection — see applyIfNewer). So even a
+//	    duplicate that slips past (a) — e.g. redelivered to a different replica
+//	    with its own memory store — cannot corrupt the projection. (b) is the
+//	    authoritative guard; (a) is the optimization.
 //
 // DECODE DIALECT: the registry publishes proto events via natsutil.Publisher, which
 // marshals proto messages with protojson (the canonical proto-JSON dialect). So we
@@ -70,12 +71,13 @@ import (
 	"sync"
 	"time"
 
-	eventsv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/events/v1"
-	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
-	"github.com/abd-ulbasit/forgepoint/services/registry/internal/domain"
 	"github.com/nats-io/nats.go/jetstream"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+
+	eventsv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/events/v1"
+	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
+	"github.com/abd-ulbasit/forgepoint/services/registry/internal/domain"
 )
 
 // ProjectionWriter is the narrow port the projection needs from the Redis read

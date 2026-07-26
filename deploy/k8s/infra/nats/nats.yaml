@@ -13,7 +13,7 @@
 #
 # REAL-WORLD COMPARISON: NATS JetStream ≈ Kafka's durable log, but lighter — no
 #   ZooKeeper/KRaft, file-based store, at-least-once with explicit acks. We use it
-#   for the `fp.{service}.{event}` subject hierarchy (CLAUDE.md async contract).
+#   for the `fp.{service}.{event}` subject hierarchy (see docs/design/event-contract.md).
 # ============================================================================
 apiVersion: v1
 kind: ConfigMap

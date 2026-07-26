@@ -82,10 +82,10 @@
 //     - One-Deployment-per-version gives independent scaling, independent
 //       rollout/rollback, blast-radius isolation, and per-model HPA — which is
 //       exactly what the gateway's traffic-splitting (canary) needs.
-//     - Tradeoff: more pods, higher baseline cost, slower cold start. For a
-//       portfolio platform demonstrating K8s autoscaling patterns, the
-//       isolation story is worth more than the bin-packing efficiency. KEDA
-//       scale-to-zero (M6) recovers idle cost.
+//     - Tradeoff: more pods, higher baseline cost, slower cold start. Here
+//       isolation is worth more than bin-packing efficiency: sharing a pod
+//       makes every rollout a multi-model risk, which is the failure this
+//       design exists to avoid. KEDA scale-to-zero (M6) recovers idle cost.
 //
 //   HOW THE HPA KNOWS TO SCALE: the pod
 //   publishes inflight_requests via GetServingMetrics + a /metrics Prometheus

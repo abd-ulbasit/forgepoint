@@ -36,6 +36,7 @@
 //     never a client value → no SSRF; an override naming an unknown version is
 //     refused rather than dialed.
 //   - overflow-safe weight math (weights are bounded int bps; sums checked).
+//
 // ============================================================================
 package domain
 
@@ -50,15 +51,15 @@ import (
 // (vs a long positional constructor) keeps wiring readable and lets us add a
 // dependency later without breaking every caller's call site.
 type ServiceDeps struct {
-	Routes     RouteStore
-	Limiter    RateLimiter
-	Backend    ModelServerClient
-	Publisher  EventPublisher
-	Quota      QuotaChecker
-	Breakers   BreakerRegistry
-	RandSource RandSource    // randomness for the traffic splitter (math/rand in prod)
-	Now        func() time.Time // injectable clock (timestamps + latency); prod: time.Now
-	CallTimeout time.Duration // per-backend-call deadline; 0 → defaultCallTimeout
+	Routes      RouteStore
+	Limiter     RateLimiter
+	Backend     ModelServerClient
+	Publisher   EventPublisher
+	Quota       QuotaChecker
+	Breakers    BreakerRegistry
+	RandSource  RandSource       // randomness for the traffic splitter (math/rand in prod)
+	Now         func() time.Time // injectable clock (timestamps + latency); prod: time.Now
+	CallTimeout time.Duration    // per-backend-call deadline; 0 → defaultCallTimeout
 }
 
 // defaultCallTimeout bounds a single backend call. WHY a deadline at all: a hung

@@ -24,7 +24,7 @@
 //	read-after-write. In production the same methods are called by the NATS consumer.
 //
 // ============================================================================
-// THE REDIS KEY/DATA-STRUCTURE DESIGN (the teaching centerpiece of the read side)
+// THE REDIS KEY/DATA-STRUCTURE DESIGN (the centerpiece of the read side)
 // ============================================================================
 //
 //	fp:reg:model:{id}                  HASH   — the projected model (all fields).

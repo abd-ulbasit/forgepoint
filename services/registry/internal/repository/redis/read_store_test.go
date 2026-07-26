@@ -365,7 +365,6 @@ func TestListVersions_StageFilterAcrossPages(t *testing.T) {
 
 	// 6 versions alternating PRODUCTION/DEV; we filter PRODUCTION with a small page size
 	// to prove the filter holds ACROSS pages (the adapter over-fetches to fill a page).
-	var wantProd []string
 	for i := 0; i < 6; i++ {
 		stage := domain.StageDev
 		if i%2 == 0 {
@@ -375,11 +374,8 @@ func TestListVersions_StageFilterAcrossPages(t *testing.T) {
 		if err := store.UpsertVersion(ctx, projVersion(id, "m-1", id, stage, base.Add(time.Duration(i)*time.Minute))); err != nil {
 			t.Fatalf("upsert: %v", err)
 		}
-		if stage == domain.StageProduction {
-			wantProd = append(wantProd, id)
-		}
 	}
-	// wantProd in newest-first order: v-4, v-2, v-0.
+	// The PRODUCTION versions (even i) in newest-first order.
 	wantNewestFirst := []string{"v-4", "v-2", "v-0"}
 
 	var seen []string

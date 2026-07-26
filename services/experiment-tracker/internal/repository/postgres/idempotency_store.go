@@ -10,8 +10,8 @@
 // references the SAME result instead of creating a duplicate. This is exactly how
 // Stripe's Idempotency-Key header works.
 //
-//   Lookup(op, key)  → the recorded result_id, or (·, false) on a miss.
-//   Record(op, key, result_id) → store the mapping AFTER the mutation succeeds.
+//	Lookup(op, key)  → the recorded result_id, or (·, false) on a miss.
+//	Record(op, key, result_id) → store the mapping AFTER the mutation succeeds.
 //
 // (operation, key) is the composite PRIMARY KEY, so the same client-generated
 // UUID reused across different RPCs never collides — keys are scoped PER-RPC.

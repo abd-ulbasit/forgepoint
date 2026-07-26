@@ -34,9 +34,10 @@ import (
 	"errors"
 	"fmt"
 
-	pkgaudit "github.com/abd-ulbasit/forgepoint/pkg/audit"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	pkgaudit "github.com/abd-ulbasit/forgepoint/pkg/audit"
 )
 
 // auditChainLockKey is the application-chosen key for pg_advisory_xact_lock. Any

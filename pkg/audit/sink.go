@@ -37,11 +37,9 @@ type AuditSink interface {
 // stringly-typed drift between emit and persist).
 const SubjectRecorded = "fp.audit.recorded"
 
-// auditEnvelopeType is the EventEnvelope.Type derived for audit records. natsutil
-// derives the type from the subject by stripping "fp.{service}." — for
-// "fp.audit.recorded" that yields "recorded". We keep this constant as the
-// documented expectation; the publisher computes it from the subject.
-const auditEnvelopeType = "recorded"
+// The EventEnvelope.Type for audit records is "recorded": natsutil derives the
+// type from the subject by stripping "fp.{service}.", and SubjectRecorded above is
+// "fp.audit.recorded". It is computed at publish time, not declared here.
 
 // NATSAuditSink publishes audit records to NATS JetStream on fp.audit.recorded.
 //

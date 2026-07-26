@@ -5,11 +5,12 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
-	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
+	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 )
 
 // ============================================================================

@@ -7,7 +7,7 @@
 // WHY HAND-ROLLED DISPATCH OVER COBRA
 // ============================================================================
 //
-// cobra is excellent, but it's a heavy dependency for a portfolio CLI whose
+// cobra is excellent, but it pulls a dependency tree into a binary whose
 // charter is "stdlib plumbing only." The stdlib `flag` package already gives us
 // per-command FlagSets; all we add is a two-level dispatcher (command →
 // subcommand) and a usage printer. The result is ~the same ergonomics for our

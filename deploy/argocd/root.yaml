@@ -25,7 +25,7 @@
 #   Compare to alternatives: an ApplicationSet generator could template these
 #   children from a list, which scales to dozens of near-identical apps. We use
 #   plain app-of-apps here because the children are still few and individually
-#   commented for learning; ApplicationSet is the natural next step once the
+#   individually commented; ApplicationSet is the natural next step once the
 #   per-service apps are truly uniform (noted in README).
 #
 #                          ┌─────────────────────────┐

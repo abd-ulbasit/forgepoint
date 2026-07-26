@@ -56,7 +56,7 @@
 //   ALTERNATIVES CONSIDERED:
 //     - Single store (Postgres only), read and write from the same tables:
 //       simplest, strongly consistent, no projection lag. Rejected as the
-//       teaching vehicle (the whole point of this service is to demonstrate
+//       the vehicle here (the point of this service is to implement
 //       CQRS) AND because the hot read ("prod version of X") would hammer
 //       Postgres on the inference path.
 //     - Event Sourcing (store events, not state): more powerful (full audit,

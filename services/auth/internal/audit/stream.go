@@ -4,8 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	pkgaudit "github.com/abd-ulbasit/forgepoint/pkg/audit"
 	"github.com/nats-io/nats.go/jetstream"
+
+	pkgaudit "github.com/abd-ulbasit/forgepoint/pkg/audit"
 )
 
 // ============================================================================

@@ -82,9 +82,9 @@ func (g *seqIDGen) NewID() string {
 // returns the SAME pipeline (proving the dedup contract for real, not via a
 // call-count assertion).
 type memPipelineRepo struct {
-	mu     sync.Mutex
-	byID   map[string]PipelineDefinition
-	byKey  map[string]string // idempotencyKey -> pipeline id
+	mu    sync.Mutex
+	byID  map[string]PipelineDefinition
+	byKey map[string]string // idempotencyKey -> pipeline id
 }
 
 func newMemPipelineRepo() *memPipelineRepo {
@@ -159,10 +159,10 @@ func (r *memPipelineRepo) List(_ context.Context, f ListPipelinesFilter) ([]Pipe
 // observable after a run — the test asserts the FINAL persisted state matches
 // the returned Execution (durability is real, not faked).
 type memExecutionRepo struct {
-	mu       sync.Mutex
-	byID     map[string]Execution
-	byKey    map[string]string
-	saveErr  error // optional injected failure on Save (durability-failure test)
+	mu      sync.Mutex
+	byID    map[string]Execution
+	byKey   map[string]string
+	saveErr error // optional injected failure on Save (durability-failure test)
 }
 
 func newMemExecutionRepo() *memExecutionRepo {
@@ -254,13 +254,13 @@ func cloneExec(e Execution) Execution {
 // let a test make a specific step fail. failUntilAttempt makes a step fail on
 // early attempts and succeed later (retry/idempotency test).
 type recordingExecutor struct {
-	stepID          string
-	trace           *traceLog
-	failExecute     bool
-	failCompensate  bool
+	stepID           string
+	trace            *traceLog
+	failExecute      bool
+	failCompensate   bool
 	failUntilAttempt int            // 0 = never; otherwise Execute fails while attempt < this
-	output          map[string]any // optional output to return
-	endpoint        string         // optional resolved endpoint (DEPLOY)
+	output           map[string]any // optional output to return
+	endpoint         string         // optional resolved endpoint (DEPLOY)
 }
 
 func (e *recordingExecutor) Execute(_ context.Context, in StepInput) (StepResult, error) {
@@ -974,7 +974,7 @@ func TestTriggerExecution_DAGFailure_SkipsDependents(t *testing.T) {
 	// preprocess fails; its dependents (train, register) are SKIPPED. A DAG does
 	// NOT compensate (no compensation pointers) — it propagates failure.
 	reg := &perStepRegistry{byType: map[StepType]*recordingExecutor{
-		StepTypeValidate: {stepID: "fetch", trace: trace},             // reuse VALIDATE type as "fetch"
+		StepTypeValidate: {stepID: "fetch", trace: trace}, // reuse VALIDATE type as "fetch"
 		StepTypeBuild:    {stepID: "preprocess", trace: trace, failExecute: true},
 		StepTypeTrain:    {stepID: "train", trace: trace},
 		StepTypeRegister: {stepID: "register", trace: trace},

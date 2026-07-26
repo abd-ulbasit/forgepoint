@@ -1,25 +1,25 @@
 // pipeline_service_impl.go — the SAGA ORCHESTRATOR + DAG EXECUTOR.
 //
 // ============================================================================
-// THIS FILE IS THE TEACHING CENTERPIECE OF THE SERVICE
+// THIS FILE IS THE CORE OF THE SERVICE
 // ============================================================================
 //
 // It implements PipelineService. Two execution strategies live behind one
 // engine, selected by PipelineType:
 //
-//   1. SAGA (DeploymentSaga) — runStepsSaga: steps run SEQUENTIALLY in
-//      topological order; on the FIRST failure, the engine COMPENSATES every
-//      already-COMPLETED step in REVERSE completion order, then settles the run
-//      to FAILED (or CANCELLED if the user cancelled). This is the distributed-
-//      transaction-without-2PC pattern: instead of holding locks across
-//      services, each step has an UNDO and we roll forward, compensating on
-//      failure. (Garcia-Molina & Salem, 1987.)
+//  1. SAGA (DeploymentSaga) — runStepsSaga: steps run SEQUENTIALLY in
+//     topological order; on the FIRST failure, the engine COMPENSATES every
+//     already-COMPLETED step in REVERSE completion order, then settles the run
+//     to FAILED (or CANCELLED if the user cancelled). This is the distributed-
+//     transaction-without-2PC pattern: instead of holding locks across
+//     services, each step has an UNDO and we roll forward, compensating on
+//     failure. (Garcia-Molina & Salem, 1987.)
 //
-//   2. DAG (TrainingDAG / BatchInference) — runStepsDAG: steps run in
-//      topological LEVELS; independent steps within a level run in PARALLEL
-//      (fan-out). A failed step PROPAGATES failure to its dependents, which are
-//      marked SKIPPED. A DAG does NOT compensate (no global rollback) — training
-//      steps are typically idempotent and re-runnable.
+//  2. DAG (TrainingDAG / BatchInference) — runStepsDAG: steps run in
+//     topological LEVELS; independent steps within a level run in PARALLEL
+//     (fan-out). A failed step PROPAGATES failure to its dependents, which are
+//     marked SKIPPED. A DAG does NOT compensate (no global rollback) — training
+//     steps are typically idempotent and re-runnable.
 //
 // THE STATE MACHINE (asserted exhaustively in the tests):
 //
@@ -147,13 +147,13 @@ func (s *pipelineService) CreatePipeline(ctx context.Context, actor Actor, input
 	steps := cloneStepsClamped(input.Steps)
 
 	p := PipelineDefinition{
-		ID:        s.ids.NewID(),    // SERVER-AUTHORITATIVE
+		ID:        s.ids.NewID(), // SERVER-AUTHORITATIVE
 		Name:      input.Name,
 		Type:      input.Type,
 		Steps:     steps,
-		CreatedBy: actor.Subject,    // SERVER-AUTHORITATIVE: from auth claims, NOT input
-		CreatedAt: s.clock.Now(),    // SERVER-AUTHORITATIVE
-		Team:      actor.Team,       // SERVER-AUTHORITATIVE: tenancy from claims
+		CreatedBy: actor.Subject, // SERVER-AUTHORITATIVE: from auth claims, NOT input
+		CreatedAt: s.clock.Now(), // SERVER-AUTHORITATIVE
+		Team:      actor.Team,    // SERVER-AUTHORITATIVE: tenancy from claims
 	}
 	created, err := s.pipelines.Create(ctx, p, input.IdempotencyKey)
 	if err != nil {
@@ -220,7 +220,7 @@ func (s *pipelineService) DeletePipeline(ctx context.Context, actor Actor, id st
 // actor here — never from the request — so a client cannot list another team's
 // pipelines. page size is capped server-side.
 func (s *pipelineService) ListPipelines(ctx context.Context, actor Actor, f ListPipelinesFilter) ([]PipelineDefinition, string, error) {
-	f.Team = actor.Team                          // SERVER-SET tenancy scope
+	f.Team = actor.Team // SERVER-SET tenancy scope
 	f.List.PageSize = clampPageSize(f.List.PageSize)
 	return s.pipelines.List(ctx, f)
 }
@@ -292,7 +292,7 @@ func (s *pipelineService) GetExecution(ctx context.Context, actor Actor, executi
 // CancelExecution requests a graceful stop. If the run is currently executing in
 // THIS process, we trip its cancel func (so the running engine transitions it to
 // COMPENSATING → CANCELLED). If it is already terminal, we reject.
-func (s *pipelineService) CancelExecution(ctx context.Context, actor Actor, executionID, reason string) (Execution, error) {
+func (s *pipelineService) CancelExecution(ctx context.Context, actor Actor, executionID, _ string) (Execution, error) {
 	e, err := s.executions.GetByID(ctx, executionID)
 	if err != nil {
 		if errors.Is(err, ErrRepoNotFound) {
@@ -331,7 +331,7 @@ func (s *pipelineService) CancelExecution(ctx context.Context, actor Actor, exec
 
 // ListExecutions returns a tenancy-scoped page. Team is set from the actor.
 func (s *pipelineService) ListExecutions(ctx context.Context, actor Actor, f ListExecutionsFilter) ([]Execution, string, error) {
-	f.Team = actor.Team                          // SERVER-SET tenancy scope
+	f.Team = actor.Team // SERVER-SET tenancy scope
 	f.List.PageSize = clampPageSize(f.List.PageSize)
 	return s.executions.List(ctx, f)
 }
@@ -548,17 +548,13 @@ func (s *pipelineService) runStepsSaga(ctx context.Context, p *PipelineDefinitio
 		// adapter does not reject the SKIPPED checkpoints with context.Canceled.
 		// (compensate() detaches its OWN persistence context internally, so we hand it
 		// the live ctx and it remains safe regardless of caller — see compensate.)
-		// DURABILITY CONTEXT (Finding 1): the SKIPPED markers are writes we are
-		// OBLIGATED to persist even when the user cancelled (which cancels ctx). Detach
-		// here — context.WithoutCancel + a bounded SettlementTimeout — so a real pgx
-		// adapter does not reject the SKIPPED checkpoints with context.Canceled.
-		// (compensate() detaches its OWN persistence context internally, so we hand it
-		// the live ctx and it remains safe regardless of caller — see compensate.)
 		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), SettlementTimeout)
-		defer cancel()
 
 		// Mark any not-yet-run steps as SKIPPED (they are after the failure).
 		s.skipRemaining(persistCtx, exec, order, stepID, errs)
+		// Released here rather than deferred: persistCtx is used by that one call, and
+		// a defer inside the loop body would hold it until the function returns.
+		cancel()
 		return s.compensate(ctx, p, exec, byID, cause, errs)
 	}
 	return nil // all steps completed
@@ -597,11 +593,8 @@ func (s *pipelineService) compensate(ctx context.Context, p *PipelineDefinition,
 	errs.record(s.executions.Save(compCtx, *exec))
 
 	completed := exec.completedStepsInOrder() // forward completion order
-	// Build the rollback PLAN (ids in reverse) for the CompensationTriggered event.
-	plan := make([]string, 0, len(completed))
-	for i := len(completed) - 1; i >= 0; i-- {
-		plan = append(plan, completed[i].StepID)
-	}
+	// NOTE: CompensationTriggered is an execution-level event — StepEvent carries no
+	// per-step list, so the rollback order below is not published, only executed.
 	s.emit(compCtx, StepEvent{
 		Type: EventCompensationTriggered, ExecutionID: exec.ID, PipelineID: p.ID,
 		PipelineType: p.Type, OccurredAt: s.clock.Now(),
@@ -1046,10 +1039,10 @@ func (s *pipelineService) buildStepInput(exec *Execution, def *StepDefinition, a
 // the caller (Create) and are the durability checkpoints crash recovery reads.
 func (s *pipelineService) newPendingExecution(actor Actor, p PipelineDefinition, input TriggerInput) Execution {
 	exec := Execution{
-		ID:          s.ids.NewID(),    // SERVER-AUTHORITATIVE
+		ID:          s.ids.NewID(), // SERVER-AUTHORITATIVE
 		PipelineID:  p.ID,
 		Status:      ExecutionStatusPending,
-		TriggeredBy: actor.Subject,    // SERVER-AUTHORITATIVE: who/what triggered (user or service)
+		TriggeredBy: actor.Subject, // SERVER-AUTHORITATIVE: who/what triggered (user or service)
 		StartedAt:   s.clock.Now(),
 		Input:       input.Input,
 	}
@@ -1217,7 +1210,7 @@ func validateGraph(_ PipelineType, steps []StepDefinition) error {
 func topoLevels(steps []StepDefinition) ([][]string, error) {
 	indeg := make(map[string]int, len(steps))
 	dependents := make(map[string][]string, len(steps)) // parent -> children
-	order := make([]string, 0, len(steps))               // stable id order for determinism
+	order := make([]string, 0, len(steps))              // stable id order for determinism
 
 	for _, st := range steps {
 		if _, seen := indeg[st.ID]; !seen {

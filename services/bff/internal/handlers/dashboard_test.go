@@ -93,7 +93,7 @@ func TestDashboard_PartialFailure_DegradesOneTile(t *testing.T) {
 	if resp.RecentDrift.Error == "" {
 		t.Errorf("recentDrift tile should carry an error message")
 	}
-	if got := string(w.Body.Bytes()); contains(got, "connection refused") {
+	if got := w.Body.String(); contains(got, "connection refused") {
 		t.Errorf("dashboard leaked downstream detail: %s", got)
 	}
 

@@ -18,7 +18,7 @@
 // testable with a hand-written in-memory log and no infrastructure at all.
 //
 // ============================================================================
-// PATTERN — EVENT SOURCING (the teaching centerpiece of this service)
+// PATTERN — EVENT SOURCING (the centerpiece of this service)
 // ============================================================================
 //
 // The core inversion: we do NOT store current state and mutate it in place.

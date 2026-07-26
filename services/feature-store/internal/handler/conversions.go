@@ -32,11 +32,12 @@ import (
 	"fmt"
 	"time"
 
+	"google.golang.org/protobuf/types/known/structpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
 	commonv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/common/v1"
 	featurestorev1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/featurestore/v1"
 	"github.com/abd-ulbasit/forgepoint/services/feature-store/internal/domain"
-	"google.golang.org/protobuf/types/known/structpb"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // rfc3339 is the canonical text encoding for TIMESTAMP-typed feature values on

@@ -28,6 +28,7 @@
 //   - A LUA SCRIPT — Redis runs it atomically (single-threaded execution model:
 //     no other command interleaves while the script runs), in ONE round trip, with
 //     the refill math done server-side against the Redis clock.
+//
 // We use Lua: fewer round trips on the hot path, no client-side retry loop, and the
 // time source is the Redis server clock (TIME) so all replicas agree on "now" —
 // they can't disagree about how much the bucket refilled. This is precisely how

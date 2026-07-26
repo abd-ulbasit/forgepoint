@@ -124,7 +124,7 @@ func (s *InvoiceStore) SaveInvoiceTx(ctx context.Context, invoice domain.Invoice
 		// invoice_number carries a UNIQUE constraint; a 23505 means a duplicate
 		// invoice number (a generation bug or a retried finalize). Surface it as the
 		// duplicate sentinel so the caller can decide; other errors are infra.
-		if _, ok := isUniqueViolation(err); ok {
+		if isUniqueViolation(err) {
 			return domain.Invoice{}, domain.ErrRepoDuplicate
 		}
 		return domain.Invoice{}, fmt.Errorf("save invoice tx: %w", err)

@@ -250,8 +250,8 @@ func TestSubscriber_DuplicateRedeliveryIsIdempotent(t *testing.T) {
 	store := natsutil.NewMemoryProcessedStore()
 
 	var mu sync.Mutex
-	effectCount := 0          // counts ACTUAL side effects performed
-	deliveries := 0           // counts handler invocations (should be >= 2)
+	effectCount := 0 // counts ACTUAL side effects performed
+	deliveries := 0  // counts handler invocations (should be >= 2)
 	firstDeliveryDone := make(chan struct{})
 	idempotentDone := make(chan struct{})
 

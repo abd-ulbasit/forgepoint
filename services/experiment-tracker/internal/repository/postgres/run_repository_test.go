@@ -105,8 +105,8 @@ func TestAppendMetricsBatchAndIdempotency(t *testing.T) {
 
 	// A partly-overlapping batch: only the genuinely new (key,step) lands.
 	mixed := []domain.MetricPoint{
-		mp("loss", 2, 0.7),    // duplicate (key,step) → dropped
-		mp("loss", 3, 0.5),    // new
+		mp("loss", 2, 0.7),     // duplicate (key,step) → dropped
+		mp("loss", 3, 0.5),     // new
 		mp("accuracy", 2, 0.6), // new
 	}
 	n, err := s.Runs().AppendMetrics(ctx, run.ID, mixed)

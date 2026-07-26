@@ -480,7 +480,7 @@ func main() {
 	// If NATS is down the pod can still serve cached/loaded predictions, but it can
 	// no longer react to lifecycle events — surface that as not-ready so traffic
 	// drains to a replica with a live control path.
-	healthHandler.AddCheck("nats", func(ctx context.Context) error {
+	healthHandler.AddCheck("nats", func(_ context.Context) error {
 		if !natsConn.IsConnected() {
 			return errors.New("nats connection is not established")
 		}

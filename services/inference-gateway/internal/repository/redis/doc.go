@@ -49,5 +49,5 @@
 //	quota_checker.go QuotaChecker     — eventually-consistent per-team blocked flag
 //	breaker_store.go (shared breaker) — cross-replica circuit-breaker counters
 //
-// Each file carries the WHY/HOW/tradeoff teaching comments; this doc is the map.
+// Each file carries its own WHY/HOW/tradeoff comments; this doc is the map.
 package redisrepo

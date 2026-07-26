@@ -1,7 +1,7 @@
 // featurestore_service_impl.go — the concrete, event-sourced FeatureStoreService.
 //
 // ============================================================================
-// THE EVENT-SOURCING WRITE/READ ORCHESTRATION (the teaching centerpiece)
+// THE EVENT-SOURCING WRITE/READ ORCHESTRATION (the centerpiece)
 // ============================================================================
 //
 // This file is where the pattern becomes a service. It NEVER mutates state in

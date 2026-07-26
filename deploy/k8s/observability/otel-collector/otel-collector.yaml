@@ -3,7 +3,7 @@
 # ============================================================================
 #
 # WHY a collector at all (vs services talking to Tempo/Prometheus/Loki direct):
-#   CLAUDE.md observability contract + pkg/observability/setup.go both make ONE
+#   The observability contract and pkg/observability/setup.go both make ONE
 #   decision explicit: every service PUSHES OTLP (traces + metrics) to a single
 #   endpoint — otel-collector.fp-infra:4317. The collector is the fan-out hub:
 #
@@ -23,7 +23,7 @@
 #   Benefits:
 #     - ONE instrumentation path, ONE config to swap backends — services never
 #       learn a backend's address. Tempo→Jaeger or Prometheus→Mimir is a
-#       collector edit, not a redeploy of 10 services.
+#       collector edit, not a redeploy of every service.
 #     - Keeps the Prometheus PULL model intact: the collector re-exposes pushed
 #       OTLP metrics on a /metrics endpoint that Prometheus scrapes — so the
 #       Prometheus/Alertmanager ecosystem (ServiceMonitors, recording rules)

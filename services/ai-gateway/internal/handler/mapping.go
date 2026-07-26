@@ -11,13 +11,14 @@ import (
 	"errors"
 	"log/slog"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
 	aiv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/ai/v1"
 	commonv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/common/v1"
 	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/domain"
 	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/prompt"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // chatRequestToDomain maps the proto request to the domain form, stamping the

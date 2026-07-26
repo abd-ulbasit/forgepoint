@@ -24,12 +24,13 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
 	eventsv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/events/v1"
 	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/services/registry/internal/domain"
 	"github.com/abd-ulbasit/forgepoint/services/registry/internal/events"
-	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // memProjectionWriter is an in-memory events.ProjectionWriter: it records the models

@@ -11,8 +11,8 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
-	commonv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/common/v1"
 	billingv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/billing/v1"
+	commonv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/common/v1"
 	monitorv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/monitor/v1"
 	pipelinev1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/pipeline/v1"
 	registryv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/registry/v1"

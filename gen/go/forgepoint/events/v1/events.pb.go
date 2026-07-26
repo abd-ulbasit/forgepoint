@@ -32,7 +32,7 @@
 //   1. NO IMPORT CYCLES / NO COUPLING. If FeaturesWritten embedded
 //      featurestore.FeatureView, then the Experiment Tracker (a consumer) would
 //      have to compile-depend on the Feature Store's API proto just to read an
-//      event. Multiply across 9 services and the "decoupled microservices" claim
+//      event. Multiply across every service and the "decoupled microservices" claim
 //      collapses into one giant proto blob. Flat events keep each consumer
 //      depending ONLY on this events package + common.
 //

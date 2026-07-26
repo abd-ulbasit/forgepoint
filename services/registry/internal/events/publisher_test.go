@@ -14,22 +14,22 @@
 //
 // COVERAGE MAP (mirrors the task's verification list):
 //
-//	1. EACH produced event lands on the RIGHT subject with a correct ENVELOPE
-//	   (source="registry", derived type) and a correct PAYLOAD (fields mapped
-//	   from the domain object; the promote enum mapping is checked end-to-end).
-//	   → TestEmit_AllEventsPublishToCorrectSubjectWithEnvelopeAndPayload
+//  1. EACH produced event lands on the RIGHT subject with a correct ENVELOPE
+//     (source="registry", derived type) and a correct PAYLOAD (fields mapped
+//     from the domain object; the promote enum mapping is checked end-to-end).
+//     → TestEmit_AllEventsPublishToCorrectSubjectWithEnvelopeAndPayload
 //
-//	2. A subscriber CONSUMES and DISPATCHES the decoded payload correctly.
-//	   → same test (the handler decodes + asserts the eventsv1 fields).
+//  2. A subscriber CONSUMES and DISPATCHES the decoded payload correctly.
+//     → same test (the handler decodes + asserts the eventsv1 fields).
 //
-//	3. DUPLICATE redelivery is IDEMPOTENT: the same EventEnvelope.id handled
-//	   twice produces a SINGLE effect (consumer-side ProcessedStore dedup), AND
-//	   JetStream's publish-window dedup drops a re-publish of the same Msg-Id.
-//	   → TestConsume_DuplicateRedeliveryIsIdempotent
+//  3. DUPLICATE redelivery is IDEMPOTENT: the same EventEnvelope.id handled
+//     twice produces a SINGLE effect (consumer-side ProcessedStore dedup), AND
+//     JetStream's publish-window dedup drops a re-publish of the same Msg-Id.
+//     → TestConsume_DuplicateRedeliveryIsIdempotent
 //
-//	4. A POISON message (handler always fails) is routed to the DLQ after the
-//	   retry budget is exhausted — bounded, not an infinite redelivery loop.
-//	   → TestConsume_PoisonMessageGoesToDLQ
+//  4. A POISON message (handler always fails) is routed to the DLQ after the
+//     retry budget is exhausted — bounded, not an infinite redelivery loop.
+//     → TestConsume_PoisonMessageGoesToDLQ
 //
 // Registry PRODUCES these events and CONSUMES none, so the only adapter under
 // test is the Publisher (events.Publisher implements domain.ProjectionEmitter).
@@ -423,7 +423,7 @@ func TestConsume_PoisonMessageGoesToDLQ(t *testing.T) {
 
 	const (
 		poisonSubject = "fp.models.registered" // a real registry subject
-		dlqSubject    = "fp.models.dlq"         // backed by the same MODELS stream
+		dlqSubject    = "fp.models.dlq"        // backed by the same MODELS stream
 		maxRetries    = 2
 	)
 

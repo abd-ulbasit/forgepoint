@@ -59,14 +59,15 @@ import (
 	"errors"
 	"math"
 
-	commonv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/common/v1"
-	experimentv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/experiment/v1"
-	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
-	"github.com/abd-ulbasit/forgepoint/services/experiment-tracker/internal/domain"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
+
+	commonv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/common/v1"
+	experimentv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/experiment/v1"
+	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
+	"github.com/abd-ulbasit/forgepoint/services/experiment-tracker/internal/domain"
 )
 
 // ============================================================================

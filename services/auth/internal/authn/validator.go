@@ -25,19 +25,19 @@
 // domain.TokenClaims into the grpcutil.Claims the interceptor injects.
 //
 // ============================================================================
-// REUSABLE PATTERN (this is the template for the OTHER 9 services)
+// REUSABLE PATTERN (this is the template every other service follows)
 // ============================================================================
 //
 //   - The AUTH service is special: it OWNS the token logic, so its validator
 //     reuses the in-process domain.ValidateToken directly (no network hop, no
 //     circular dependency). It is the source of truth.
 //
-//   - The OTHER 9 services do NOT own the token logic. They will implement the
+//   - Other services do NOT own the token logic. They implement the
 //     SAME grpcutil.TokenValidator interface but back it with EITHER:
-//       (a) local JWT verification using the shared FP_JWT_SECRET (design D2 —
-//           pure crypto, no DB, the hot path), OR
-//       (b) a gRPC call to auth.ValidateToken (needed for "fp_" API keys, whose
-//           validity lives in auth's database).
+//     (a) local JWT verification using the shared FP_JWT_SECRET (design D2 —
+//     pure crypto, no DB, the hot path), OR
+//     (b) a gRPC call to auth.ValidateToken (needed for "fp_" API keys, whose
+//     validity lives in auth's database).
 //     In every case the wiring in main.go is identical: build a TokenValidator,
 //     pass it to grpcutil.WithAuthValidator(validator, skipMethods...), and list
 //     the public methods + health/reflection in the skip set. See main.go.
@@ -47,10 +47,11 @@ import (
 	"context"
 	"errors"
 
-	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
-	"github.com/abd-ulbasit/forgepoint/services/auth/internal/domain"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
+	"github.com/abd-ulbasit/forgepoint/services/auth/internal/domain"
 )
 
 // tokenValidator is the NARROW dependency this adapter needs from the domain.

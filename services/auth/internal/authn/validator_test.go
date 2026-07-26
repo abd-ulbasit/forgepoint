@@ -19,9 +19,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/forgepoint/services/auth/internal/domain"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/abd-ulbasit/forgepoint/services/auth/internal/domain"
 )
 
 // stubTokenService is a minimal domain.TokenValidator stub. We only need the one

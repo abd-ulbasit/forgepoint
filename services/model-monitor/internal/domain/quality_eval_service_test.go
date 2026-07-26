@@ -31,12 +31,6 @@ func (j *fakeJudge) Score(_ context.Context, _ Completion) (JudgeScores, error) 
 	return j.scores, nil
 }
 
-func (j *fakeJudge) callCount() int {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	return j.calls
-}
-
 // fakeEvalStore is an in-memory EvalStore with REAL request_id idempotency and REAL
 // (team, model) tenant partitioning — exactly the invariants the Postgres adapter
 // must hold. Keying by request_id (idempotency) and by (team|model) for the rolling

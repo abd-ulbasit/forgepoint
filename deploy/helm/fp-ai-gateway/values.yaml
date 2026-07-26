@@ -98,7 +98,7 @@ config:
   env: "local"
   logLevel: "info"
   # In-cluster service DNS. fp-infra is the namespace hosting shared infra
-  # (NATS, Redis, OTel collector) per CLAUDE.md K8s namespaces.
+  # (NATS, Redis, OTel collector) per the namespace map in deploy/istio/00-namespaces.yaml.
   otelEndpoint: "otel-collector.fp-infra.svc.cluster.local:4317"
   natsUrl: "nats://nats.fp-infra.svc.cluster.local:4222"
 
@@ -503,7 +503,7 @@ networkPolicy:
       enabled: true
       namespace: fp-infra
       port: 4317
-    # Ollama serving lives in fp-ml (per CLAUDE.md namespace map): the gateway
+    # Ollama serving lives in fp-ml (per the namespace map in `deploy/istio/00-namespaces.yaml`): the gateway
     # forwards every completion to Ollama over HTTP on 11434. The URL is SERVER-
     # configured (FP_OLLAMA_URL), never client-supplied (anti-SSRF). Allowing the
     # fp-ml namespace on 11434 is the right grain (Ollama is the only backend there).

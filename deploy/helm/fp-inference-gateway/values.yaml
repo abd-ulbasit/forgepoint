@@ -97,7 +97,7 @@ config:
   env: "local"
   logLevel: "info"
   # In-cluster service DNS. fp-infra is the namespace hosting shared infra
-  # (NATS, Redis, OTel collector) per CLAUDE.md K8s namespaces.
+  # (NATS, Redis, OTel collector) per the namespace map in deploy/istio/00-namespaces.yaml.
   otelEndpoint: "otel-collector.fp-infra.svc.cluster.local:4317"
   natsUrl: "nats://nats.fp-infra.svc.cluster.local:4222"
 
@@ -413,7 +413,7 @@ networkPolicy:
       enabled: true
       namespace: fp-infra
       port: 4317
-    # model-serving backends live in fp-models (per CLAUDE.md namespace map): the
+    # model-serving backends live in fp-models (per the namespace map in `deploy/istio/00-namespaces.yaml`): the
     # gateway forwards every prediction to a model-serving pod over gRPC on the
     # standard service gRPC port. The endpoint is SERVER-resolved from the route
     # target (anti-SSRF), so allowing the whole fp-models namespace on the gRPC

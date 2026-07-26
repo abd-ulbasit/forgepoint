@@ -46,16 +46,17 @@ import (
 	"testing"
 	"time"
 
-	billingv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/billing/v1"
-	commonv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/common/v1"
-	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
-	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
-	"github.com/abd-ulbasit/forgepoint/services/billing/internal/domain"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
+
+	billingv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/billing/v1"
+	commonv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/common/v1"
+	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
+	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
+	"github.com/abd-ulbasit/forgepoint/services/billing/internal/domain"
 )
 
 // ----------------------------------------------------------------------------

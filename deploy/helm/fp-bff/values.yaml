@@ -362,7 +362,7 @@ networkPolicy:
       enabled: true
       namespace: fp-system
       port: 9090
-    # Model-serving backends live in fp-models (per the CLAUDE.md namespace map).
+    # Model-serving backends live in fp-models (per the namespace map in `deploy/istio/00-namespaces.yaml`).
     modelServing:
       enabled: true
       namespace: fp-models

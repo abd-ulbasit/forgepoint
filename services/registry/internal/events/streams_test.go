@@ -15,12 +15,12 @@
 // JetStream. They would FAIL against the pre-fix code (no EnsureStream existed; a
 // raw Emit with no stream returns the 10073 error), so they pin the fix.
 //
-//	1. EnsureStream creates MODELS over fp.models.> — verified via stream info.
-//	2. EnsureStream is idempotent + convergent — a second call (and a concurrent
-//	   model-monitor declaring the same stream) is a no-op, not an error.
-//	3. After ONLY EnsureStream (no hand-rolled CreateStream), the real
-//	   events.Publisher can Emit a lifecycle event successfully and a subscriber
-//	   receives it — the end-to-end production wiring main.go now performs.
+//  1. EnsureStream creates MODELS over fp.models.> — verified via stream info.
+//  2. EnsureStream is idempotent + convergent — a second call (and a concurrent
+//     model-monitor declaring the same stream) is a no-op, not an error.
+//  3. After ONLY EnsureStream (no hand-rolled CreateStream), the real
+//     events.Publisher can Emit a lifecycle event successfully and a subscriber
+//     receives it — the end-to-end production wiring main.go now performs.
 package events_test
 
 import (
@@ -30,12 +30,13 @@ import (
 
 	"github.com/nats-io/nats.go/jetstream"
 
+	"google.golang.org/protobuf/encoding/protojson"
+
 	eventsv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/events/v1"
 	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
 	"github.com/abd-ulbasit/forgepoint/services/registry/internal/domain"
 	"github.com/abd-ulbasit/forgepoint/services/registry/internal/events"
-	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // dialNATSRaw connects to a fresh testcontainers NATS WITHOUT declaring any stream.

@@ -8,10 +8,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/testcontainers/testcontainers-go"
 	natscontainer "github.com/testcontainers/testcontainers-go/modules/nats"
+
+	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 )
 
 // skipIfNoDocker skips the test if Docker daemon is not available.

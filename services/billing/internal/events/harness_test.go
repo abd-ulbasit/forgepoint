@@ -16,9 +16,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go/jetstream"
+
 	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
-	"github.com/nats-io/nats.go/jetstream"
 )
 
 // newJetStream starts a real NATS (JetStream) container and returns a connected

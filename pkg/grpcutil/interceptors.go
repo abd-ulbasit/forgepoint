@@ -569,27 +569,28 @@ func AuthStreamInterceptor(validator TokenValidator, opts ...AuthOption) grpc.St
 //
 // WHERE THIS FUNCTION LIVES (and why here, not in services/auth/internal/authn):
 //
-//   services/auth/internal/authn/skip.go defines an identical HealthAndReflection-
-//   Methods() locally. That was the right place BEFORE this shared package
-//   existed — but it means every service would need to either import auth's
-//   internal package (a Clean Architecture violation) or duplicate the list.
+//	services/auth/internal/authn/skip.go defines an identical HealthAndReflection-
+//	Methods() locally. That was the right place BEFORE this shared package
+//	existed — but it means every service would need to either import auth's
+//	internal package (a Clean Architecture violation) or duplicate the list.
 //
-//   By moving the canonical copy here, into the package that already owns
-//   the skip-list mechanism (WithSkipMethods, AuthOption), we give every
-//   service a single import-free source of truth:
+//	By moving the canonical copy here, into the package that already owns
+//	the skip-list mechanism (WithSkipMethods, AuthOption), we give every
+//	service a single import-free source of truth:
 //
-//     grpcutil.WithAuthValidator(validator,
-//         append(servicePublicMethods, grpcutil.HealthAndReflectionMethods()...)...,
-//     )
+//	  grpcutil.WithAuthValidator(validator,
+//	      append(servicePublicMethods, grpcutil.HealthAndReflectionMethods()...)...,
+//	  )
 //
-//   The auth service will adopt this in a follow-up (the local copy in authn/
-//   can delegate to or be replaced by this function without any call-site change).
+//	The auth service will adopt this in a follow-up (the local copy in authn/
+//	can delegate to or be replaced by this function without any call-site change).
 //
 // WHY THE HEALTH ENDPOINT IS UNAUTHENTICATED:
-//   K8s probes originate from the kubelet process on the node — there is no
-//   mechanism to pass a credential. The health endpoint's threat model is
-//   availability (anyone can see SERVING/NOT_SERVING), not confidentiality.
-//   Requiring auth there would make the service undeployable in Kubernetes.
+//
+//	K8s probes originate from the kubelet process on the node — there is no
+//	mechanism to pass a credential. The health endpoint's threat model is
+//	availability (anyone can see SERVING/NOT_SERVING), not confidentiality.
+//	Requiring auth there would make the service undeployable in Kubernetes.
 func HealthAndReflectionMethods() []string {
 	return []string{
 		"/grpc.health.v1.Health/Check",

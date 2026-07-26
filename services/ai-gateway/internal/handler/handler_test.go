@@ -23,14 +23,15 @@ import (
 	"io"
 	"testing"
 
-	aiv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/ai/v1"
-	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
-	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
-	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/domain"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+
+	aiv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/ai/v1"
+	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
+	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
+	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/domain"
 )
 
 // --- fake domain service ----------------------------------------------------

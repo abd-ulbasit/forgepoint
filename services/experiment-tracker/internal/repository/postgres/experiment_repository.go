@@ -19,6 +19,7 @@
 //
 //   - List is KEYSET (cursor) paginated on (created_at, id), newest-first, scoped
 //     by team (the anti-IDOR boundary the service fills from auth claims).
+//
 // ============================================================================
 package postgres
 

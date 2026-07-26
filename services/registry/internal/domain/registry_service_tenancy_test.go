@@ -47,7 +47,7 @@ func newFakeReadStore() *fakeReadStore {
 	return &fakeReadStore{models: map[string]Model{}, versions: map[string]ModelVersion{}}
 }
 
-func (r *fakeReadStore) putModel(m Model)     { r.models[m.ID] = m }
+func (r *fakeReadStore) putModel(m Model)          { r.models[m.ID] = m }
 func (r *fakeReadStore) putVersion(v ModelVersion) { r.versions[v.ID] = v }
 
 // GetModelByID mirrors the Redis adapter: load the model, then enforce the team gate —

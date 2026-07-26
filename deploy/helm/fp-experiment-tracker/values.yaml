@@ -84,7 +84,7 @@ config:
   env: "local"
   logLevel: "info"
   # In-cluster service DNS. fp-infra is the namespace hosting shared infra
-  # (NATS, Postgres, OTel collector) per CLAUDE.md K8s namespaces.
+  # (NATS, Postgres, OTel collector) per the namespace map in deploy/istio/00-namespaces.yaml.
   otelEndpoint: "otel-collector.fp-infra.svc.cluster.local:4317"
   # NATS JetStream is LOAD-BEARING for this service (not just for events emitted
   # on success): the async batch-ingestion consumer SUBSCRIBES here. Without NATS

@@ -328,7 +328,7 @@ func main() {
 	// interceptor never authorizes; the handler never re-authenticates.
 	//
 	// WHY LOCAL VERIFY (D2) AND NOT AN RPC TO AUTH (D1): every authenticated RPC on
-	// all 9 non-auth services must check a token. A synchronous auth.ValidateToken
+	// every non-auth service must check a token. A synchronous auth.ValidateToken
 	// call per request would put auth's latency and availability in this service's
 	// hot path and make auth a platform-wide SPOF. A local HMAC verify is a few µs
 	// and survives an auth outage. The cost is that a revoked JWT stays valid until

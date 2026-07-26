@@ -19,7 +19,7 @@ class ExperimentTrackerServiceStub:
     final_metrics so a leaderboard/Notification consumer ranks/alerts with
     NO GetRun callback — see events.proto's RunFinished).
 
-    WHY NOT here (the lesson): the previous version defined local RunCreatedEvent
+    WHY NOT here: the previous version defined local RunCreatedEvent
     / RunFinishedEvent messages. That is exactly the pattern that caused
     platform-wide event-schema DRIFT (a producer and a consumer ending up with
     two incompatible shapes for the "same" event). The events package is now the
@@ -188,7 +188,7 @@ class ExperimentTrackerServiceServicer:
     final_metrics so a leaderboard/Notification consumer ranks/alerts with
     NO GetRun callback — see events.proto's RunFinished).
 
-    WHY NOT here (the lesson): the previous version defined local RunCreatedEvent
+    WHY NOT here: the previous version defined local RunCreatedEvent
     / RunFinishedEvent messages. That is exactly the pattern that caused
     platform-wide event-schema DRIFT (a producer and a consumer ending up with
     two incompatible shapes for the "same" event). The events package is now the
@@ -489,7 +489,7 @@ class ExperimentTrackerService:
     final_metrics so a leaderboard/Notification consumer ranks/alerts with
     NO GetRun callback — see events.proto's RunFinished).
 
-    WHY NOT here (the lesson): the previous version defined local RunCreatedEvent
+    WHY NOT here: the previous version defined local RunCreatedEvent
     / RunFinishedEvent messages. That is exactly the pattern that caused
     platform-wide event-schema DRIFT (a producer and a consumer ending up with
     two incompatible shapes for the "same" event). The events package is now the

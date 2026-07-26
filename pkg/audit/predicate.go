@@ -54,15 +54,11 @@ var authVerbs = []string{
 	"Login", "Logout", "Authenticate",
 }
 
-// readVerbs are leaf-name prefixes for pure reads we SKIP on success. We keep this
-// explicit (rather than "anything not mutating") so an unrecognized verb defaults
-// to NOT audited — quiet by default, an operator opts a new verb in by either
-// naming it with a mutating prefix or supplying a custom predicate. (A DENY on any
-// of these is still audited by the interceptor; this only governs ALLOW.)
-var readVerbs = []string{
-	"Get", "List", "Watch", "Describe", "Check", "Validate", "Query",
-	"Search", "Stream", "Lookup", "Resolve", "Count",
-}
+// NOTE ON READS: there is deliberately no readVerbs allow-list. Read prefixes
+// (Get/List/Watch/Describe/Query/Search/...) take the same path as any verb the
+// predicate does not recognize — the final `return false` below. Enumerating them
+// would suggest an unlisted read is audited, which is not the case. (A DENY on a
+// read is still audited by the interceptor; this predicate only governs ALLOW.)
 
 // DefaultSecurityRelevant is the platform's default audit predicate. It returns
 // true for mutating and auth methods, false for reads/health/reflection and any

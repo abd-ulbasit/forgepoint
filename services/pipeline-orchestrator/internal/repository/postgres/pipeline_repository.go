@@ -18,6 +18,7 @@
 //   - List is KEYSET (cursor) paginated, not LIMIT/OFFSET, so a page is stable
 //     under concurrent inserts (OFFSET can skip/duplicate rows when the set
 //     shifts). The cursor is (created_at, id) — the same tuple the index orders.
+//
 // ============================================================================
 package postgres
 
@@ -95,12 +96,11 @@ func (s *PipelineRepository) Create(ctx context.Context, p domain.PipelineDefini
 		// Step 3: a racer beat us to the key between our lookup and our insert.
 		// The unique_violation is on the idempotency PK (team, idempotency_key);
 		// the winner's pipeline is now committed, so re-read and return IT.
-		if constraint, ok := isUniqueViolation(err); ok && idempotencyKey != "" {
+		if isUniqueViolation(err) && idempotencyKey != "" {
 			if existing, found, lookupErr := s.pipelineByKey(ctx, p.Team, idempotencyKey); lookupErr == nil && found {
 				return existing, nil
 			}
 			// Fall through to a generic error if the re-read also failed.
-			_ = constraint
 		}
 		return domain.PipelineDefinition{}, fmt.Errorf("insert pipeline: %w", err)
 	}
@@ -161,7 +161,7 @@ func (s *PipelineRepository) Update(ctx context.Context, p domain.PipelineDefini
 		// A duplicate live name (the partial unique index) surfaces here as a
 		// unique_violation; map it to a generic error — the service validates
 		// names before reaching us, so this is a defensive backstop.
-		if _, ok := isUniqueViolation(err); ok {
+		if isUniqueViolation(err) {
 			return domain.PipelineDefinition{}, fmt.Errorf("update pipeline: name conflict: %w", err)
 		}
 		return domain.PipelineDefinition{}, fmt.Errorf("update pipeline: %w", err)

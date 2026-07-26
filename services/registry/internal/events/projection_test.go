@@ -34,6 +34,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	goredis "github.com/redis/go-redis/v9"
 
+	"google.golang.org/protobuf/types/known/timestamppb"
+
 	eventsv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/events/v1"
 	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
@@ -42,7 +44,6 @@ import (
 	"github.com/abd-ulbasit/forgepoint/services/registry/internal/repository/postgres"
 	redisstore "github.com/abd-ulbasit/forgepoint/services/registry/internal/repository/redis"
 	"github.com/abd-ulbasit/forgepoint/services/registry/migrations"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // newRedisReadStore spins up Redis and returns a *redisstore.ReadStore (which

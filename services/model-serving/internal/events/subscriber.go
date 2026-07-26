@@ -18,13 +18,13 @@
 //
 //   - It CONSUMES five lifecycle events and reconciles its resident model:
 //
-//       SUBJECT                        PAYLOAD             → DOMAIN REACTION
-//       ───────────────────────────────────────────────────────────────────
-//       fp.models.version.ready        ModelVersionReady   → EnsureLoaded
-//       fp.pipelines.model.deployed    ModelDeployed       → EnsureLoaded
-//       fp.models.promoted             ModelPromoted       → EnsureLoaded
-//       fp.pipelines.model.undeployed  ModelUndeployed     → Unload
-//       fp.models.archived             ModelArchived       → Unload
+//     SUBJECT                        PAYLOAD             → DOMAIN REACTION
+//     ───────────────────────────────────────────────────────────────────
+//     fp.models.version.ready        ModelVersionReady   → EnsureLoaded
+//     fp.pipelines.model.deployed    ModelDeployed       → EnsureLoaded
+//     fp.models.promoted             ModelPromoted       → EnsureLoaded
+//     fp.pipelines.model.undeployed  ModelUndeployed     → Unload
+//     fp.models.archived             ModelArchived       → Unload
 //
 // (Grounded in docs/design/event-contract.md → the per-service migration note
 // for "serving": consume ModelVersionReady, ModelDeployed, ModelUndeployed,
@@ -38,10 +38,10 @@
 // is a controller that reconciles the pod's actual loaded model toward the
 // desired state the events describe:
 //
-//   load-class events (version.ready / deployed / promoted) → "this version
-//       SHOULD be resident and Ready" → EnsureLoaded (idempotent).
-//   unload-class events (undeployed / archived)             → "this version
-//       should NOT be resident" → Unload (idempotent).
+//	load-class events (version.ready / deployed / promoted) → "this version
+//	    SHOULD be resident and Ready" → EnsureLoaded (idempotent).
+//	unload-class events (undeployed / archived)             → "this version
+//	    should NOT be resident" → Unload (idempotent).
 //
 // Because EnsureLoaded/Unload are idempotent (domain-enforced: a re-load of an
 // already-Ready identical artifact is a no-op; an unload of an absent model is a
@@ -49,8 +49,9 @@
 // which is exactly what at-least-once delivery requires. We ALSO layer a
 // transport-level dedupe (ProcessedStore on EventEnvelope.id) so a duplicate is
 // recognized before the handler even runs. Belt and braces:
-//   at-least-once delivery + idempotent reaction + envelope-id dedupe
-//     = exactly-once IN EFFECT.
+//
+//	at-least-once delivery + idempotent reaction + envelope-id dedupe
+//	  = exactly-once IN EFFECT.
 //
 // ============================================================================
 // THE ARTIFACT-URI PROBLEM — WHY THIS ADAPTER KEEPS A SMALL DESIRED-ARTIFACT MAP
@@ -102,11 +103,12 @@ import (
 	"log/slog"
 	"sync"
 
+	"github.com/nats-io/nats.go/jetstream"
+	"google.golang.org/protobuf/encoding/protojson"
+
 	eventsv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/events/v1"
 	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/services/model-serving/internal/domain"
-	"github.com/nats-io/nats.go/jetstream"
-	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // ============================================================================

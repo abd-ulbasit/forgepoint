@@ -10,7 +10,7 @@
 #   add the `istio-proxy` container + the `istio-init` container that programs the
 #   pod's iptables so ALL inbound/outbound TCP is transparently routed through Envoy.
 #
-#   We OWN these namespaces already (CLAUDE.md K8s namespace map):
+#   These are the platform's four namespaces (this file is their source of truth):
 #     fp-system  → the platform services (auth, registry, bff, gateway, ...)
 #     fp-models  → model-serving workloads (fp-model-serving)
 #     fp-infra   → NATS / Postgres / Redis / MinIO / OTel collector (DELIBERATELY

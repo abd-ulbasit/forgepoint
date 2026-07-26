@@ -21,30 +21,30 @@
 // THE SINGLE DESIGN DECISION WORTH DEFENDING — protojson, not
 // encoding/json, for the event payloads:
 //
-//   pkg/natsutil.Publisher serializes whatever payload it is handed with
-//   encoding/json. The forgepoint.events.v1 messages are PROTOBUF messages, and
-//   encoding/json does NOT understand the well-known types they embed:
-//     - google.protobuf.Timestamp would marshal as {"seconds":..,"nanos":..}
-//       instead of the canonical RFC-3339 string,
-//     - enums would marshal as integers instead of their string names,
-//     - google.protobuf.Struct would not round-trip at all.
-//   That would make the event bus a Go-only, non-canonical contract — exactly
-//   what the events.proto DESIGN block forbids (the event is a PUBLISHED, cross-
-//   language schema, like an Avro record in a schema registry).
+//	pkg/natsutil.Publisher serializes whatever payload it is handed with
+//	encoding/json. The forgepoint.events.v1 messages are PROTOBUF messages, and
+//	encoding/json does NOT understand the well-known types they embed:
+//	  - google.protobuf.Timestamp would marshal as {"seconds":..,"nanos":..}
+//	    instead of the canonical RFC-3339 string,
+//	  - enums would marshal as integers instead of their string names,
+//	  - google.protobuf.Struct would not round-trip at all.
+//	That would make the event bus a Go-only, non-canonical contract — exactly
+//	what the events.proto DESIGN block forbids (the event is a PUBLISHED, cross-
+//	language schema, like an Avro record in a schema registry).
 //
-//   So we marshal each payload OURSELVES with protojson into a json.RawMessage
-//   and hand THAT to natsutil.Publisher. Because json.RawMessage implements
-//   json.Marshaler as a verbatim passthrough, the canonical proto-JSON bytes
-//   survive natsutil's inner json.Marshal untouched and land in
-//   EventEnvelope.data exactly as protojson produced them. Consumers read
-//   env.Data (a json.RawMessage) and protojson.Unmarshal it back into the same
-//   generated type — one canonical contract, both ends of every pipe.
+//	So we marshal each payload OURSELVES with protojson into a json.RawMessage
+//	and hand THAT to natsutil.Publisher. Because json.RawMessage implements
+//	json.Marshaler as a verbatim passthrough, the canonical proto-JSON bytes
+//	survive natsutil's inner json.Marshal untouched and land in
+//	EventEnvelope.data exactly as protojson produced them. Consumers read
+//	env.Data (a json.RawMessage) and protojson.Unmarshal it back into the same
+//	generated type — one canonical contract, both ends of every pipe.
 //
-//   WHY NOT LET THE JSON PUBLISHER MARSHAL THE PROTO:
-//   proto well-known types (Timestamp/Struct/enum) don't serialize correctly
-//   under encoding/json; protojson is the canonical, cross-language encoding the
-//   published event contract requires. We pre-encode and pass the raw bytes
-//   through.
+//	WHY NOT LET THE JSON PUBLISHER MARSHAL THE PROTO:
+//	proto well-known types (Timestamp/Struct/enum) don't serialize correctly
+//	under encoding/json; protojson is the canonical, cross-language encoding the
+//	published event contract requires. We pre-encode and pass the raw bytes
+//	through.
 package events
 
 import (

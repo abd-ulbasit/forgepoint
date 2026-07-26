@@ -4,7 +4,7 @@
 // the adapters (Postgres / Redis / NATS / a gRPC client) implement them.
 //
 // ============================================================================
-// WHY PORTS LIVE HERE AND NOT IN repository/ (the import-cycle lesson)
+// WHY PORTS LIVE HERE AND NOT IN repository/ (the import cycle)
 // ============================================================================
 //
 // If these interfaces lived in `internal/repository` they would reference domain

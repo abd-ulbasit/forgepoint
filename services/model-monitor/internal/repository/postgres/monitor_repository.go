@@ -17,6 +17,7 @@
 //     never-existing) monitor returns nil, so a retried DeleteMonitor is safe.
 //   - List is team-scoped keyset pagination with optional state/severity filters,
 //     built with PARAMETERIZED placeholders only (no string-concatenated values).
+//
 // ============================================================================
 package postgres
 
@@ -118,6 +119,7 @@ func scanMonitor(row rowScanner) (domain.Monitor, error) {
 //     branch runs and a brand-new live row is created (`created` true), leaving the
 //     tombstone for audit. That is the intended "re-configure a previously deleted
 //     monitor" behavior.
+//
 // ============================================================================
 func (r *MonitorRepository) Upsert(ctx context.Context, m domain.Monitor) (domain.Monitor, bool, error) {
 	thresholdsJSON, err := encodeThresholds(m.Thresholds)

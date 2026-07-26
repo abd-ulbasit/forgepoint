@@ -8,27 +8,28 @@
 // all three tables (runs, run_params, run_metrics) plus the read paths the
 // analysis RPCs need. The interesting persistence semantics:
 //
-//   AppendMetrics   — the HIGH-THROUGHPUT write the whole event-driven pattern
-//                     optimizes. ONE multi-row INSERT per batch with
-//                     ON CONFLICT (run_id,key,step) DO NOTHING: a retried/
-//                     redelivered batch double-writes NOTHING, and the returned
-//                     row count is exactly how many points were NEW
-//                     (accepted_count). One INSERT, not one-per-point.
+//	AppendMetrics   — the HIGH-THROUGHPUT write the whole event-driven pattern
+//	                  optimizes. ONE multi-row INSERT per batch with
+//	                  ON CONFLICT (run_id,key,step) DO NOTHING: a retried/
+//	                  redelivered batch double-writes NOTHING, and the returned
+//	                  row count is exactly how many points were NEW
+//	                  (accepted_count). One INSERT, not one-per-point.
 //
-//   UpdateRunStatus — the terminal transition + the CQRS projection in ONE write:
-//                     status, ended_at, and the denormalized final_metrics JSONB
-//                     are stamped together so a reader never sees a FINISHED run
-//                     without its finals (no torn state).
+//	UpdateRunStatus — the terminal transition + the CQRS projection in ONE write:
+//	                  status, ended_at, and the denormalized final_metrics JSONB
+//	                  are stamped together so a reader never sees a FINISHED run
+//	                  without its finals (no torn state).
 //
-//   AppendParams    — write-once params. The service has already rejected changed
-//                     values; the adapter inserts the new keys with ON CONFLICT
-//                     (run_id,key) DO NOTHING as the storage backstop against a
-//                     racing double-log.
+//	AppendParams    — write-once params. The service has already rejected changed
+//	                  values; the adapter inserts the new keys with ON CONFLICT
+//	                  (run_id,key) DO NOTHING as the storage backstop against a
+//	                  racing double-log.
 //
-//   GetMetricHistory — keyset-paginated, ordered (key, step, ts) scan over the
-//                     time-series, with optional key/step-range filters. This is
-//                     what GetMetricHistory/CompareRuns and FinishRun's
-//                     finals-drain read.
+//	GetMetricHistory — keyset-paginated, ordered (key, step, ts) scan over the
+//	                  time-series, with optional key/step-range filters. This is
+//	                  what GetMetricHistory/CompareRuns and FinishRun's
+//	                  finals-drain read.
+//
 // ============================================================================
 package postgres
 
@@ -405,14 +406,14 @@ func (r *RunRepository) DeleteRunIdem(ctx context.Context, runID, operation, ide
 // SINGLE INSERT with a multi-row VALUES list ($1..$N parameterized — never
 // concatenated) and append ON CONFLICT (run_id, key, step) DO NOTHING. That gives:
 //
-//   * THROUGHPUT: one network round-trip and one transaction per batch instead of
+//   - THROUGHPUT: one network round-trip and one transaction per batch instead of
 //     N. For a training flush of hundreds of points per step this is the
 //     difference between a snappy LogMetrics and a chatty one.
-//   * CROSS-BATCH IDEMPOTENCY: a retried batch (same client retry, a redelivered
+//   - CROSS-BATCH IDEMPOTENCY: a retried batch (same client retry, a redelivered
 //     NATS message) hits the unique index and DO NOTHING drops the duplicates —
 //     double-writing nothing. This is the DB half of the idempotency guarantee
 //     the domain's DedupMetricPoints starts in memory.
-//   * ACCURATE accepted_count: pgx's CommandTag.RowsAffected() after an
+//   - ACCURATE accepted_count: pgx's CommandTag.RowsAffected() after an
 //     INSERT ... ON CONFLICT DO NOTHING reports ONLY the rows actually inserted
 //     (conflicting rows are not counted), which is precisely the "how many NEW
 //     points landed" the service surfaces.

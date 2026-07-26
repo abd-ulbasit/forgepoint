@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 )
 
 // ============================================================================

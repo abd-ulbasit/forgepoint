@@ -13,24 +13,24 @@
 //
 // THE STATE MACHINE (this file IS the machine — read it alongside the test):
 //
-//	┌─────────┐  consecutive failures ≥ failureThreshold   ┌──────┐
-//	│ CLOSED  │ ──────────────────────────────────────────►│ OPEN │
-//	│ (normal)│ ◄── successes ≥ successThreshold ───┐       │(fast │
-//	└─────────┘                                     │       │ fail)│
-//	     ▲                                          │       └──────┘
-//	     │                                   ┌──────────┐      │ after resetTimeout,
-//	     │                                   │ HALF_OPEN│◄─────┘ first Allow() admits
-//	     └────────── any probe failure ──────│ (probing)│        up to halfOpenMaxProbes
-//	                  (→ OPEN, restart timer) └──────────┘
+//		┌─────────┐  consecutive failures ≥ failureThreshold   ┌──────┐
+//		│ CLOSED  │ ──────────────────────────────────────────►│ OPEN │
+//		│ (normal)│ ◄── successes ≥ successThreshold ───┐       │(fast │
+//		└─────────┘                                     │       │ fail)│
+//		     ▲                                          │       └──────┘
+//		     │                                   ┌──────────┐      │ after resetTimeout,
+//		     │                                   │ HALF_OPEN│◄─────┘ first Allow() admits
+//		     └────────── any probe failure ──────│ (probing)│        up to halfOpenMaxProbes
+//		                  (→ OPEN, restart timer) └──────────┘
 //
-//   CLOSED    — requests pass; count CONSECUTIVE failures; a success resets the
-//               count. failureThreshold consecutive failures → OPEN.
-//   OPEN      — Allow() returns false (fail fast) until resetTimeout elapses from
-//               the last transition; the first Allow() after that admits a probe
-//               and moves to HALF_OPEN.
-//   HALF_OPEN — admit at most halfOpenMaxProbes concurrent probes. Each success
-//               counts toward successThreshold (→ CLOSED); ANY failure → OPEN and
-//               restarts the timer (pessimistic: a flapping backend stays out).
+//	  CLOSED    — requests pass; count CONSECUTIVE failures; a success resets the
+//	              count. failureThreshold consecutive failures → OPEN.
+//	  OPEN      — Allow() returns false (fail fast) until resetTimeout elapses from
+//	              the last transition; the first Allow() after that admits a probe
+//	              and moves to HALF_OPEN.
+//	  HALF_OPEN — admit at most halfOpenMaxProbes concurrent probes. Each success
+//	              counts toward successThreshold (→ CLOSED); ANY failure → OPEN and
+//	              restarts the timer (pessimistic: a flapping backend stays out).
 //
 // ============================================================================
 // CONCURRENCY MODEL

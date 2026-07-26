@@ -1,7 +1,7 @@
 // usage_store.go — the Postgres adapter for domain.UsageStore.
 //
 // ============================================================================
-// THE OUTBOX TRANSACTIONAL BOUNDARY (the teaching centerpiece of this service)
+// THE OUTBOX TRANSACTIONAL BOUNDARY (the centerpiece of this service)
 // ============================================================================
 //
 // RecordUsageTx is THE outbox commit point: it INSERTs the usage_records row AND
@@ -130,7 +130,7 @@ func (s *UsageStore) RecordUsageTx(ctx context.Context, record domain.UsageRecor
 		// The (team, idempotency_key) partial UNIQUE index is the only business
 		// unique constraint touched here. A 23505 means a concurrent writer won;
 		// report the domain duplicate sentinel so the service re-reads the winner.
-		if _, ok := isUniqueViolation(err); ok {
+		if isUniqueViolation(err) {
 			return domain.UsageRecord{}, domain.ErrRepoDuplicate
 		}
 		return domain.UsageRecord{}, fmt.Errorf("record usage tx: %w", err)

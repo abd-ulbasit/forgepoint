@@ -162,24 +162,25 @@ func WithPreAuthStreamInterceptors(interceptors ...grpc.StreamServerInterceptor)
 // (25 seconds).
 //
 // WHY THIS MATTERS FOR K8S ROLLING DEPLOYS:
-//   When K8s sends SIGTERM, it gives the pod terminationGracePeriodSeconds (30s
-//   by default) to finish up. Our Serve() catches ctx.Done(), marks the server
-//   NOT_SERVING (so probes fail → pod leaves Service endpoints), then calls
-//   GracefulStop. GracefulStop blocks until ALL in-flight RPCs finish — but a
-//   single slow streaming RPC (e.g., a long-running WatchExecution with no
-//   client deadline) can hold GracefulStop open indefinitely, causing the pod to
-//   be SIGKILL'd mid-stream anyway (ugly) AND blocking the rolling update.
 //
-//   The bounded drain: GracefulStop races against the timeout. If the timeout
-//   fires first, we hard-Stop (clients get UNAVAILABLE — reconnect-able) and
-//   return. This ensures pods finish within terminationGracePeriodSeconds even
-//   under pathological streaming clients.
+//	When K8s sends SIGTERM, it gives the pod terminationGracePeriodSeconds (30s
+//	by default) to finish up. Our Serve() catches ctx.Done(), marks the server
+//	NOT_SERVING (so probes fail → pod leaves Service endpoints), then calls
+//	GracefulStop. GracefulStop blocks until ALL in-flight RPCs finish — but a
+//	single slow streaming RPC (e.g., a long-running WatchExecution with no
+//	client deadline) can hold GracefulStop open indefinitely, causing the pod to
+//	be SIGKILL'd mid-stream anyway (ugly) AND blocking the rolling update.
 //
-//   TRADEOFF: A client that holds a stream open longer than the drain timeout
-//   sees a hard disconnect. The alternative — no timeout — risks blocking the
-//   entire rolling update. Setting the client's RPC deadline < drainTimeout
-//   eliminates this entirely (well-behaved clients), so the timeout is only
-//   a safety net for misbehaving or stuck clients.
+//	The bounded drain: GracefulStop races against the timeout. If the timeout
+//	fires first, we hard-Stop (clients get UNAVAILABLE — reconnect-able) and
+//	return. This ensures pods finish within terminationGracePeriodSeconds even
+//	under pathological streaming clients.
+//
+//	TRADEOFF: A client that holds a stream open longer than the drain timeout
+//	sees a hard disconnect. The alternative — no timeout — risks blocking the
+//	entire rolling update. Setting the client's RPC deadline < drainTimeout
+//	eliminates this entirely (well-behaved clients), so the timeout is only
+//	a safety net for misbehaving or stuck clients.
 func WithDrainTimeout(d time.Duration) ServerOption {
 	return func(cfg *serverConfig) {
 		cfg.drainTimeout = d

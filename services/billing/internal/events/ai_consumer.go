@@ -5,9 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/nats-io/nats.go/jetstream"
+
 	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/services/billing/internal/domain"
-	"github.com/nats-io/nats.go/jetstream"
 )
 
 // ============================================================================

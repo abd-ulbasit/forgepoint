@@ -14,11 +14,11 @@
 // The fix puts BOTH writes in ONE pgx.BeginFunc (the *Idem repo methods, calling
 // RecordTx on the same tx). These tests assert the two invariants that gives:
 //
-//   1. COMMIT-TOGETHER: after a successful *Idem call, the effect AND its
-//      idempotency row are BOTH present (queried straight off the pool).
-//   2. ROLLBACK-TOGETHER: when the enclosing tx fails (here, via the StartRun
-//      natural-key backstop runs_idempotency_uniq), NEITHER a second effect NOR a
-//      second key row lands — there is no partial write a retry could misread.
+//  1. COMMIT-TOGETHER: after a successful *Idem call, the effect AND its
+//     idempotency row are BOTH present (queried straight off the pool).
+//  2. ROLLBACK-TOGETHER: when the enclosing tx fails (here, via the StartRun
+//     natural-key backstop runs_idempotency_uniq), NEITHER a second effect NOR a
+//     second key row lands — there is no partial write a retry could misread.
 //
 // We can't kill the process mid-tx deterministically, so we exercise the same
 // atomic boundary through a forced unique-violation: it rolls back the WHOLE tx

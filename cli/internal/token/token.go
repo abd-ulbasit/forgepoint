@@ -23,9 +23,10 @@
 // `kubectl` stores credentials in ~/.kube/config; `aws` in ~/.aws/credentials.
 // We follow the same "dotfile dir under $HOME, owner-only perms" convention.
 //
-// SECURITY NOTE: a file is less secure than an OS keychain. The
-// honest tradeoff for a portfolio CLI is simplicity + cross-platform behavior
-// over keychain integration. Production hardening would shell out to the macOS
+// SECURITY NOTE: a file is less secure than an OS keychain. The tradeoff taken
+// here is one code path on every OS over three platform-specific keychain
+// integrations, at the cost of a token readable by any process running as the
+// user. Hardening this means shelling out to the macOS
 // Keychain / libsecret / Windows Credential Manager (e.g. via the `keyring`
 // pattern `docker login` uses).
 // ============================================================================

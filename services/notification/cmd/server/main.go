@@ -418,7 +418,7 @@ func main() {
 	//     it does not authorize. That handler-side authZ is unchanged by this wiring.
 	//
 	// fpauth.NewJWTValidator returns the shared grpcutil.TokenValidator (the SAME
-	// local-verify implementation all 9 non-auth services use) and ERRORS on a weak
+	// local-verify implementation every non-auth service uses) and ERRORS on a weak
 	// (<32-byte) secret — we fail startup on that rather than boot a pod that would
 	// accept forgeable tokens.
 	//

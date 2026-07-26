@@ -42,7 +42,7 @@ variable "engine_version" {
 }
 
 variable "instance_class" {
-  description = "RDS instance class. Dev: db.t3.micro (burstable, ~free-tier-ish, fine for a portfolio). Prod tunes to db.m6g/db.r6g with provisioned IOPS."
+  description = "RDS instance class. Dev: db.t3.micro (burstable, free-tier eligible). Prod tunes to db.m6g/db.r6g with provisioned IOPS."
   type        = string
   default     = "db.t3.micro"
 }

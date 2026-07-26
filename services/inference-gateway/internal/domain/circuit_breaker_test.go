@@ -22,14 +22,15 @@ import (
 // transition deterministic and instant.
 type fakeClock struct{ t time.Time }
 
-func (c *fakeClock) now() time.Time   { return c.t }
+func (c *fakeClock) now() time.Time          { return c.t }
 func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
 
 // newTestBreaker builds a breaker with small thresholds and the fake clock.
-//   failureThreshold=3  → 3 consecutive failures trips CLOSED→OPEN
-//   successThreshold=2  → 2 consecutive HALF_OPEN successes close it
-//   resetTimeout=10s    → OPEN waits 10s before allowing a HALF_OPEN probe
-//   halfOpenMaxProbes=1 → only 1 in-flight probe allowed in HALF_OPEN
+//
+//	failureThreshold=3  → 3 consecutive failures trips CLOSED→OPEN
+//	successThreshold=2  → 2 consecutive HALF_OPEN successes close it
+//	resetTimeout=10s    → OPEN waits 10s before allowing a HALF_OPEN probe
+//	halfOpenMaxProbes=1 → only 1 in-flight probe allowed in HALF_OPEN
 func newTestBreaker(clk *fakeClock) *CircuitBreaker {
 	return newCircuitBreaker(breakerConfig{
 		failureThreshold:  3,

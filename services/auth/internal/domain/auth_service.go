@@ -19,11 +19,12 @@
 //     struct that implements this interface) — no real DB, no real JWT library.
 //
 // WHAT'S NOT HERE (and why):
-//   The concrete implementation (AuthServiceImpl) and its constructor
-//   NewAuthService(userRepo, apiKeyRepo, roleRepo, jwtSecret) arrive in Task 1.3
-//   once the repository interfaces (Task 1.4) are in place for it to depend on.
-//   Keeping the interface here and the impl separate means Task 1.4 (handler
-//   scaffold) can compile and run today while the business logic is still coming.
+//
+//	The concrete implementation (AuthServiceImpl) and its constructor
+//	NewAuthService(userRepo, apiKeyRepo, roleRepo, jwtSecret) arrive in Task 1.3
+//	once the repository interfaces (Task 1.4) are in place for it to depend on.
+//	Keeping the interface here and the impl separate means Task 1.4 (handler
+//	scaffold) can compile and run today while the business logic is still coming.
 //
 // ============================================================================
 package domain
@@ -55,10 +56,11 @@ type CreateUserInput struct {
 // concrete impl (NewAuthService in Task 1.3).
 //
 // TESTABILITY — mocking the database in tests for the gRPC handler:
-//   The handler depends on AuthService (an interface), not on AuthServiceImpl
-//   (the concrete struct). In handler tests we pass a mock that implements
-//   AuthService — zero database, zero network. This is dependency inversion
-//   at work: the handler never knows (or cares) what's behind the interface.
+//
+//	The handler depends on AuthService (an interface), not on AuthServiceImpl
+//	(the concrete struct). In handler tests we pass a mock that implements
+//	AuthService — zero database, zero network. This is dependency inversion
+//	at work: the handler never knows (or cares) what's behind the interface.
 type AuthService interface {
 	// -----------------------------------------------------------------------
 	// IDENTITY MANAGEMENT

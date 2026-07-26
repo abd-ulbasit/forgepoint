@@ -5,12 +5,13 @@ package handler
 import (
 	"context"
 
-	aiv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/ai/v1"
-	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
-	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/domain"
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	aiv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/ai/v1"
+	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
+	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/domain"
 )
 
 // ============================================================================

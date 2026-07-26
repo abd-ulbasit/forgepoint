@@ -367,24 +367,26 @@ func (s *Subscriber) handleFailure(ctx context.Context, msg jetstream.Msg, envel
 // the message is Term'd (dropped) to stop an infinite redelivery loop.
 //
 // POISON-MESSAGE + DLQ CONTRACT:
-//   A "poison message" is one that will ALWAYS fail processing (corrupt data,
-//   unresolvable dependency, handler bug). Without a bound, it loops forever:
-//     deliver → fail → NAK → wait AckWait → deliver → fail → NAK → ...
 //
-//   This function is called only when the MaxDeliver threshold is reached
-//   (NumDelivered >= maxRetries+1), so JetStream won't redeliver again after
-//   this call regardless of what we ACK/NAK/Term. But we Term explicitly to:
-//   (a) immediately remove it from the stream's pending set, and
-//   (b) make the intent clear in code.
+//	A "poison message" is one that will ALWAYS fail processing (corrupt data,
+//	unresolvable dependency, handler bug). Without a bound, it loops forever:
+//	  deliver → fail → NAK → wait AckWait → deliver → fail → NAK → ...
+//
+//	This function is called only when the MaxDeliver threshold is reached
+//	(NumDelivered >= maxRetries+1), so JetStream won't redeliver again after
+//	this call regardless of what we ACK/NAK/Term. But we Term explicitly to:
+//	(a) immediately remove it from the stream's pending set, and
+//	(b) make the intent clear in code.
 //
 // DLQ PUBLISH FAILURE (the subtle case):
-//   OLD: if DLQ publish fails → NAK → JetStream redelivers → routeToDLQ again
-//   → DLQ publish fails → NAK → loop forever. A broken DLQ subject (wrong
-//   permissions, subject not in any stream) caused infinite redelivery.
 //
-//   FIX: if DLQ publish fails → Term() the message (drop it) and log an error.
-//   The message is lost, but the loop is bounded. An alert on DLQ-publish errors
-//   in Grafana signals the broken subject for ops to fix and replay.
+//	OLD: if DLQ publish fails → NAK → JetStream redelivers → routeToDLQ again
+//	→ DLQ publish fails → NAK → loop forever. A broken DLQ subject (wrong
+//	permissions, subject not in any stream) caused infinite redelivery.
+//
+//	FIX: if DLQ publish fails → Term() the message (drop it) and log an error.
+//	The message is lost, but the loop is bounded. An alert on DLQ-publish errors
+//	in Grafana signals the broken subject for ops to fix and replay.
 //
 // The "what happens when the DLQ is also broken?" case.
 // The correct answer: drop and alert, don't loop. Kafka uses the same pattern

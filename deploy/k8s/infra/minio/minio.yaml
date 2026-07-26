@@ -7,8 +7,9 @@
 # storage adapter needed. Endpoint: minio.fp-infra.svc.cluster.local:9000.
 #
 # WHY a StatefulSet: object data must persist on a PVC bound to a stable identity.
-# Single-node, single-drive MinIO (no erasure coding) — appropriate for a homelab
-# portfolio; prod would use a distributed MinIO StatefulSet or real S3.
+# Single-node, single-drive MinIO (no erasure coding) — appropriate for a
+# single-node homelab cluster, where erasure coding across one drive buys
+# nothing; prod would use a distributed MinIO StatefulSet or real S3.
 #
 # The bucket is created by a separate Kubernetes Job (mc) — the cluster analogue
 # of the docker-compose `minio-init` service. A Job (not an initContainer) keeps

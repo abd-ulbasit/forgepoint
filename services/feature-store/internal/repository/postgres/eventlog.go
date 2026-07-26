@@ -26,11 +26,11 @@
 // non-transactional, so a rolled-back append burns numbers, leaving holes. So we
 // assign the version ourselves inside the transaction:
 //
-//   1. SELECT pg_advisory_xact_lock(<view-derived key>)   -- serialize writers to a view
-//   2. SELECT COALESCE(MAX(version),0) FROM feature_events  -- current head
-//   3. assign version = head+1, head+2, ... for the batch
-//   4. INSERT the rows
-//   5. COMMIT (the advisory lock auto-releases at tx end)
+//  1. SELECT pg_advisory_xact_lock(<view-derived key>)   -- serialize writers to a view
+//  2. SELECT COALESCE(MAX(version),0) FROM feature_events  -- current head
+//  3. assign version = head+1, head+2, ... for the batch
+//  4. INSERT the rows
+//  5. COMMIT (the advisory lock auto-releases at tx end)
 //
 // WHY a transaction-scoped advisory lock and not SELECT ... FOR UPDATE on a counter
 // row: we want a GLOBAL gap-free sequence (version is unique across all views — it
@@ -167,13 +167,13 @@ func (l *EventLog) Append(ctx context.Context, idempotencyKey string, events []d
 	for i := range events {
 		e := events[i]
 		e.Version = head + int64(i) + 1
-		if err = l.insertEvent(ctx, tx, e); err != nil {
+		if err := l.insertEvent(ctx, tx, e); err != nil {
 			return nil, 0, false, err
 		}
 		// Maintain the catalog projection in the SAME tx for definition/deletion
 		// events, so a GetFeatureView/List right after a define is read-your-writes.
 		if e.Type == domain.FeatureEventViewDefined || e.Type == domain.FeatureEventViewDeleted {
-			if err = l.upsertNameIndex(ctx, tx, e); err != nil {
+			if err := l.upsertNameIndex(ctx, tx, e); err != nil {
 				return nil, 0, false, err
 			}
 		}
@@ -183,12 +183,12 @@ func (l *EventLog) Append(ctx context.Context, idempotencyKey string, events []d
 
 	// Record the idempotency range so a retry replays instead of re-appending.
 	if idempotencyKey != "" {
-		if err = l.recordIdempotency(ctx, tx, idempotencyKey, viewID, out[0].Version, writtenThrough, out[0].AppendedAt); err != nil {
+		if err := l.recordIdempotency(ctx, tx, idempotencyKey, viewID, out[0].Version, writtenThrough, out[0].AppendedAt); err != nil {
 			return nil, 0, false, err
 		}
 	}
 
-	if err = tx.Commit(ctx); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return nil, 0, false, fmt.Errorf("commit append tx: %w", err)
 	}
 	return out, writtenThrough, false, nil

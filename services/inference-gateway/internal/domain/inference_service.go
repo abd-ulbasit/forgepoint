@@ -13,14 +13,15 @@
 // because it IS business logic.
 //
 // The methods fall into three groups that mirror the proto's RPC categories:
-//   DATA PLANE      — Predict (the hot path; the resilience stack runs here)
-//   CONTROL PLANE   — UpsertRoute / SetTrafficSplit / DeleteRoute / Get*/List*
-//   EVENT REACTIONS — ApplyModelDeployed/Undeployed/Promoted/Archived (the
-//                     routing table is driven by events, not API writes)
+//
+//	DATA PLANE      — Predict (the hot path; the resilience stack runs here)
+//	CONTROL PLANE   — UpsertRoute / SetTrafficSplit / DeleteRoute / Get*/List*
+//	EVENT REACTIONS — ApplyModelDeployed/Undeployed/Promoted/Archived (the
+//	                  routing table is driven by events, not API writes)
 //
 // Batch/stream predict and the circuit observability reads are intentionally a
 // thin orchestration over Predict + the breaker registry; they are added when
-// the handler/adapters land (noted in the impl). The teaching centerpiece — the
+// the handler/adapters land (noted in the impl). The centerpiece — the
 // resilience CORE — is fully realized here at the domain level.
 // ============================================================================
 package domain

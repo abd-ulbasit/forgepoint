@@ -201,14 +201,14 @@ func unmarshalValues(b []byte) (map[string]domain.FeatureValue, error) {
 // from the domain struct so a domain refactor never silently changes the on-disk
 // format without touching this codec (the place tests pin).
 type jsonViewDef struct {
-	ID            string          `json:"id"`
-	Name          string          `json:"name"`
-	Description   string          `json:"description,omitempty"`
-	Entity        jsonEntity      `json:"entity"`
-	Features      []jsonSpec      `json:"features"`
-	SchemaVersion int64           `json:"schema_version"`
-	OwnerUserID   string          `json:"owner_user_id"`
-	OwnerTeam     string          `json:"owner_team"`
+	ID            string     `json:"id"`
+	Name          string     `json:"name"`
+	Description   string     `json:"description,omitempty"`
+	Entity        jsonEntity `json:"entity"`
+	Features      []jsonSpec `json:"features"`
+	SchemaVersion int64      `json:"schema_version"`
+	OwnerUserID   string     `json:"owner_user_id"`
+	OwnerTeam     string     `json:"owner_team"`
 }
 
 type jsonEntity struct {

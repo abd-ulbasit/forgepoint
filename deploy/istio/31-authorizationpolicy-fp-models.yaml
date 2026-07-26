@@ -16,7 +16,7 @@
 #        registry empty today) but intended; encoded so the mesh is ready.
 #
 #   NOTE ON NAMESPACE: serving's AUTHORITATIVE namespace is fp-models, and every
-#   consumer agrees: the CLAUDE.md namespace map ("fp-models → model-serving"), the
+#   consumer agrees: the namespace map in 00-namespaces.yaml ("fp-models → model-serving"), the
 #   00-namespaces.yaml mesh injection note, the BFF config (FP_MODEL_SERVING_ADDR=
 #   fp-model-serving.fp-models…), and the inference-gateway + BFF NetworkPolicy egress
 #   allow-lists (egress.modelServing.namespace: fp-models) all target fp-models.

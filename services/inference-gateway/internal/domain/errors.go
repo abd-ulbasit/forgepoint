@@ -7,9 +7,10 @@
 // Unlike a CRUD service whose errors are mostly "not found / invalid input",
 // this gateway's failure vocabulary IS its resilience story: each sentinel
 // corresponds to one pattern deciding to reject, and each maps to a distinct
-//   (a) operational response,
-//   (b) gRPC status code at the edge, and
-//   (c) events.InferenceFailureReason on the async bus.
+//
+//	(a) operational response,
+//	(b) gRPC status code at the edge, and
+//	(c) events.InferenceFailureReason on the async bus.
 //
 // The handler is the single translation point. The mapping is:
 //

@@ -16,7 +16,7 @@
 # nodes pulling "the same" image can run different bits, rollbacks become
 # impossible, and a poisoned upstream tag silently lands in prod. Pinned tags
 # (and ideally digests) make deployments reproducible and auditable — this is a
-# 12-Factor "build, release, run" separation and a CLAUDE.md "hermetic builds"
+# 12-Factor "build, release, run" separation and a "hermetic builds"
 # requirement. Our infra images are already pinned (postgres:17, redis:7,
 # nats:2.11, minio/...:RELEASE.<date>); fp-auth uses appVersion as the tag.
 #
@@ -112,7 +112,7 @@ spec:
 #     TODAY (values.yaml). Keeping it prevents the current platform from
 #     regressing the moment we flip to Enforce.
 #   - gcr.io/distroless/*                          → distroless runtime base
-#     (CLAUDE.md hermetic-builds requirement).
+#     (the hermetic-builds requirement).
 #   - the PINNED infra images: docker.io/library/{postgres,redis,nats} and
 #     docker.io/minio/{minio,mc}. We pin the FULL repo path (not a bare
 #     "docker.io/*") so only these specific, reviewed infra images are allowed —

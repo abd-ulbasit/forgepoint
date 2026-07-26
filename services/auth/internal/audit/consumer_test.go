@@ -5,10 +5,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	pkgaudit "github.com/abd-ulbasit/forgepoint/pkg/audit"
 	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // TestEndToEnd_PublishConsumePersist is the full PERSIST-side integration: a real

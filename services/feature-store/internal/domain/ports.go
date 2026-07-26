@@ -3,7 +3,7 @@
 // port").
 //
 // ============================================================================
-// WHY THE PORTS LIVE HERE (not in internal/repository) — the import-cycle lesson
+// WHY THE PORTS LIVE HERE (not in internal/repository) — the import cycle
 // ============================================================================
 //
 // The service impl (featurestore_service_impl.go) lives in `domain` and must
@@ -40,7 +40,7 @@
 // domain (pure business logic + the fold + the service impl that orchestrates
 // these ports) and TDD against in-memory mocks. The real Postgres EventLog +
 // Postgres/Redis view stores are a subsequent phase that implements exactly these
-// interfaces. The teaching comments below specify the contract that phase fulfills.
+// interfaces. The comments below specify the contract that phase fulfills.
 package domain
 
 import (

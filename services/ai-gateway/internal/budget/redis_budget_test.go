@@ -1,7 +1,7 @@
 // redis_budget_test.go — UNIT tests for the budget store's PURE branches.
 //
 // The Redis-backed Lua path needs a real Redis (integration territory — excluded
-// here, the thinkpad is RAM-tight). These tests cover the logic that runs WITHOUT
+// here; the single-node cluster is RAM-tight). These tests cover the logic that runs WITHOUT
 // Redis: the UNLIMITED (budget=0) short-circuits and the refill-rate derivation.
 // They prove the unlimited contract (never block, report budget 0) and that the
 // constructor's window math is correct, with no external dependency.

@@ -13,12 +13,13 @@ import (
 	"log/slog"
 	"testing"
 
+	"google.golang.org/grpc"
+
 	aiv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/ai/v1"
 	pkgaudit "github.com/abd-ulbasit/forgepoint/pkg/audit"
 	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
 	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/domain"
 	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/events"
-	"google.golang.org/grpc"
 )
 
 // quietLogger discards output so a test that exercises a logging path stays silent.

@@ -19,11 +19,12 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+
+	"github.com/abd-ulbasit/forgepoint/pkg/grpcutil"
 )
 
 // stubValidator lets each test control what Validate returns without depending
@@ -201,7 +202,7 @@ func TestLoggingInterceptor_LogsConstantForNonStatusError(t *testing.T) {
 		t.Fatalf("log parse error: %v (raw: %s)", err, buf.String())
 	}
 
-	errVal, _ := entry["grpc.error"]
+	errVal := entry["grpc.error"]
 	errStr, _ := errVal.(string)
 
 	// Must NOT log the raw error string.

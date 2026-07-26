@@ -7,9 +7,10 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/nats-io/nats.go/jetstream"
+
 	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/services/model-monitor/internal/domain"
-	"github.com/nats-io/nats.go/jetstream"
 )
 
 // ============================================================================

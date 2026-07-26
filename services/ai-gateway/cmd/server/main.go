@@ -52,6 +52,8 @@ import (
 	"strings"
 	"time"
 
+	goredis "github.com/redis/go-redis/v9"
+
 	aiv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/ai/v1"
 	pkgaudit "github.com/abd-ulbasit/forgepoint/pkg/audit"
 	fpauth "github.com/abd-ulbasit/forgepoint/pkg/auth"
@@ -70,7 +72,6 @@ import (
 	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/providers"
 	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/repository/postgres"
 	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/usage"
-	goredis "github.com/redis/go-redis/v9"
 )
 
 // serviceName is the canonical identity for telemetry, the NATS event source, and

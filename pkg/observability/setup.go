@@ -88,11 +88,11 @@ import (
 //
 // WHY: OTel's global providers (otel.SetTracerProvider, otel.SetMeterProvider)
 // are package-level singletons. Calling Setup() a second time would:
-//   1. Replace the existing providers, orphaning their exporters/batchers.
-//      Those goroutines keep running (leaked) and may continue flushing
-//      to a now-redundant connection.
-//   2. Lose any spans/metrics created after the first Setup but before the
-//      second (the old provider's buffer is abandoned).
+//  1. Replace the existing providers, orphaning their exporters/batchers.
+//     Those goroutines keep running (leaked) and may continue flushing
+//     to a now-redundant connection.
+//  2. Lose any spans/metrics created after the first Setup but before the
+//     second (the old provider's buffer is abandoned).
 //
 // TESTS: call ResetForTest() before each test that calls Setup(), so tests
 // are independent of each other regardless of execution order.
@@ -145,7 +145,7 @@ type Config struct {
 //
 //	Every service needs the exact same initialization sequence. Without this,
 //	each service's main.go would have 50+ lines of boilerplate OTel setup.
-//	One function, one import, consistent behavior across all 9 services.
+//	One function, one import, consistent behavior across every service.
 //
 // RETURNS:
 //
@@ -166,6 +166,7 @@ type Config struct {
 //     dropped when buffer fills. Service continues running — observability
 //     is never a hard dependency (you don't want monitoring to cause outages).
 //   - Invalid config: Returns error immediately (fail fast).
+//
 // ResetForTest resets the single-init guard so Setup() can be called again.
 // MUST only be called from test code — it is a test-only escape hatch.
 // Normal application code should never call this.

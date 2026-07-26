@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go/jetstream"
 	"go.opentelemetry.io/otel"
@@ -13,6 +12,8 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
+
+	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 )
 
 // ============================================================================
@@ -126,7 +127,7 @@ func (p *RelayPublisher) PublishWithID(ctx context.Context, subject, envelopeID 
 // In practice the relay's publishRow type-asserts idPublisher and calls
 // PublishWithID, so this method is never hit in production; it exists only so
 // *RelayPublisher satisfies the narrower interface for wiring flexibility.
-func (p *RelayPublisher) Publish(ctx context.Context, subject string, payload any) error {
+func (p *RelayPublisher) Publish(_ context.Context, subject string, _ any) error {
 	return fmt.Errorf("events: RelayPublisher requires an explicit envelope id; use PublishWithID (subject=%s)", subject)
 }
 

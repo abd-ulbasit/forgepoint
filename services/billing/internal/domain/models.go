@@ -23,7 +23,7 @@
 // any of those exist.
 //
 // ============================================================================
-// THE OUTBOX PATTERN — where it lives in the domain (the teaching centerpiece)
+// THE OUTBOX PATTERN — where it lives in the domain (the centerpiece)
 // ============================================================================
 //
 // The dual-write problem: RecordUsage must (1) persist the priced UsageRecord

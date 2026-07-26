@@ -84,7 +84,7 @@ config:
   env: "local"
   logLevel: "info"
   # In-cluster service DNS. fp-infra is the namespace hosting shared infra
-  # (NATS, OTel collector, MinIO) per CLAUDE.md K8s namespaces.
+  # (NATS, OTel collector, MinIO) per the namespace map in deploy/istio/00-namespaces.yaml.
   otelEndpoint: "otel-collector.fp-infra.svc.cluster.local:4317"
   # FP_NATS_URL — the lifecycle event bus. main.go DOES connect to NATS (it
   # subscribes to fp.models.* / fp.pipelines.* deploy/promote/archive events to

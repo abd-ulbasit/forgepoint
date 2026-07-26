@@ -142,17 +142,17 @@ const (
 	SubjectModelArchived      = "fp.models.archived"
 
 	// fp.pipelines.* — owned by stream PIPELINES (producer: pipeline-orchestrator).
-	SubjectPipelineFailed        = "fp.pipelines.failed"
-	SubjectPipelineStepFailed    = "fp.pipelines.step.failed"
-	SubjectPipelineCompensation  = "fp.pipelines.compensation.triggered"
-	SubjectPipelineCompleted     = "fp.pipelines.completed"
+	SubjectPipelineFailed       = "fp.pipelines.failed"
+	SubjectPipelineStepFailed   = "fp.pipelines.step.failed"
+	SubjectPipelineCompensation = "fp.pipelines.compensation.triggered"
+	SubjectPipelineCompleted    = "fp.pipelines.completed"
 
 	// fp.inference.* — owned by stream INFERENCE (producer: inference-gateway).
 	SubjectInferenceFailed = "fp.inference.failed"
 
 	// fp.billing.* — owned by stream BILLING (producer: billing).
-	SubjectBillingQuotaExceeded     = "fp.billing.quota.exceeded"
-	SubjectBillingInvoiceGenerated  = "fp.billing.invoice.generated"
+	SubjectBillingQuotaExceeded    = "fp.billing.quota.exceeded"
+	SubjectBillingInvoiceGenerated = "fp.billing.invoice.generated"
 
 	// fp.experiments.* — owned by stream EXPERIMENTS (producer: experiment-tracker).
 	SubjectExperimentRunCreated  = "fp.experiments.run.created"
@@ -233,17 +233,17 @@ const Source = "notification"
 // Notification owns TWO streams (the rule is "the producer owns the stream for the
 // subject tree it produces"):
 //
-//   1. NOTIFICATIONS (fp.notifications.>) — its DOMAIN stream. Notification is the
-//      OWNER and sole producer of fp.notifications.delivered / fp.notifications.failed
-//      (the delivery-health feed). JetStream REJECTS a publish whose subject no stream
-//      captures (10073), so without this stream every delivery-health event was dropped
-//      AND experiment-tracker's wide lineage sink (which binds a consumer to the
-//      NOTIFICATIONS stream) had no stream to bind. We ensure it at boot, like every
-//      other domain-stream producer.
+//  1. NOTIFICATIONS (fp.notifications.>) — its DOMAIN stream. Notification is the
+//     OWNER and sole producer of fp.notifications.delivered / fp.notifications.failed
+//     (the delivery-health feed). JetStream REJECTS a publish whose subject no stream
+//     captures (10073), so without this stream every delivery-health event was dropped
+//     AND experiment-tracker's wide lineage sink (which binds a consumer to the
+//     NOTIFICATIONS stream) had no stream to bind. We ensure it at boot, like every
+//     other domain-stream producer.
 //
-//   2. NOTIFICATION_DLQ (fp_dlq.notification) — its private DLQ SINK, rooted at
-//      "fp_dlq.*" (outside every fp.<domain>.> tree, so it overlaps nothing). Ops
-//      drain/replay from it out-of-band; no reactor consumer reads it.
+//  2. NOTIFICATION_DLQ (fp_dlq.notification) — its private DLQ SINK, rooted at
+//     "fp_dlq.*" (outside every fp.<domain>.> tree, so it overlaps nothing). Ops
+//     drain/replay from it out-of-band; no reactor consumer reads it.
 const (
 	// StreamName is the JetStream stream notification OWNS for the subject tree it
 	// PRODUCES: the durable home of the fp.notifications.* delivery-health feed.

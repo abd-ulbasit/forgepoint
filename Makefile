@@ -38,7 +38,7 @@ IMAGE_TAG ?= dev
 # Helm install namespace, DERIVED from SVC.
 # ----------------------------------------------------------------------------
 # Almost every service lives in fp-system, but model-serving deploys to fp-models
-# (the CLAUDE.md namespace map, the chart's NetworkPolicy, the BFF config
+# (the namespace map in deploy/istio/00-namespaces.yaml, the chart's NetworkPolicy, the BFF config
 # FP_MODEL_SERVING_ADDR=fp-model-serving.fp-models…, the gateway/BFF egress
 # allow-lists, and the Istio mesh objects in deploy/istio/*-fp-models.yaml ALL
 # target fp-models). The chart itself is namespace-agnostic (every template uses
@@ -211,7 +211,7 @@ lint: ## Run golangci-lint across all modules
 #   The Dockerfile therefore needs go.work + those sibling modules in its build
 #   context, so the context is the repo root (".") and we point at the per-service
 #   Dockerfile with -f. A repo-root .dockerignore keeps that context small.
-#   See the teaching block at the top of services/auth/Dockerfile.
+#   See the design block at the top of services/auth/Dockerfile.
 #
 # DOCKER_BUILDKIT=1: the Dockerfiles use `--mount=type=cache` for /go/pkg/mod and
 #   the Go build cache (fast incremental rebuilds). Those require BuildKit, which

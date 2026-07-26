@@ -322,7 +322,7 @@ func (x *ChatMessage) GetContent() string {
 }
 
 // TokenUsage is the accounting unit — prompt + completion tokens and the derived
-// cost. Cost is in micro-USD (int64) to avoid float money errors (same lesson as
+// cost. Cost is in micro-USD (int64) to avoid float money errors (same reasoning as
 // billing): 1 USD = 1_000_000 micro-USD.
 type TokenUsage struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`

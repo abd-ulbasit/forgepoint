@@ -21,11 +21,11 @@ func TestCORS_LockedToAllowlist(t *testing.T) {
 	h := mw(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
 
 	cases := []struct {
-		name           string
-		method         string
-		origin         string
-		wantStatus     int
-		wantAllowOrig  string
+		name          string
+		method        string
+		origin        string
+		wantStatus    int
+		wantAllowOrig string
 	}{
 		{"allowed origin echoed", http.MethodGet, "https://ui.forgepoint.dev", http.StatusOK, "https://ui.forgepoint.dev"},
 		{"disallowed origin not echoed", http.MethodGet, "https://evil.example", http.StatusOK, ""},

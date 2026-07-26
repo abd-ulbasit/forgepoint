@@ -21,8 +21,8 @@ import (
 	"testing"
 	"time"
 
-	authevents "github.com/abd-ulbasit/forgepoint/services/auth/internal/events"
 	"github.com/abd-ulbasit/forgepoint/services/auth/internal/domain"
+	authevents "github.com/abd-ulbasit/forgepoint/services/auth/internal/events"
 )
 
 // ----------------------------------------------------------------------------

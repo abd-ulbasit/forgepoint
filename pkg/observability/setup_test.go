@@ -5,9 +5,10 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/abd-ulbasit/forgepoint/pkg/observability"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
+
+	"github.com/abd-ulbasit/forgepoint/pkg/observability"
 )
 
 // ============================================================================

@@ -11,7 +11,9 @@ import (
 // platform's common.v1.PaginationRequest, which every list RPC accepts.
 //
 // THE CONTRACT (cursor-based, per common.proto): the client sends
-//   ?page_size=N&page_token=<opaque cursor>
+//
+//	?page_size=N&page_token=<opaque cursor>
+//
 // and receives next_page_token in the response (relayed straight through as
 // JSON). The BFF does NOT interpret the token — it is an opaque server-issued
 // cursor; treating it as opaque is what keeps cursor pagination working across

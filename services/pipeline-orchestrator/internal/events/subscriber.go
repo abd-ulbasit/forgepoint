@@ -58,9 +58,12 @@ import (
 // the constant keeps the wiring and the tests referencing one name.
 const driftStream = "MODELS"
 
-// retrainGroup is the durable consumer name for the auto-retrain consumer. Stable
-// across restarts/replicas so it forms ONE consumer group.
-const retrainGroup = "pipeline-orchestrator-retrain"
+// RetrainGroup is the durable consumer name for the auto-retrain consumer. Stable
+// across restarts/replicas so it forms ONE consumer group. Exported because the
+// composition root passes it to natsutil.WithConsumerGroup — a durable name that
+// drifts between the wiring and this package silently creates a SECOND consumer,
+// which would double-trigger every retrain.
+const RetrainGroup = "pipeline-orchestrator-retrain"
 
 // DriftRetrainSubscriber consumes ModelDriftDetected and triggers the auto-retrain
 // saga. It depends ONLY on the domain's primary port (PipelineService) — it knows

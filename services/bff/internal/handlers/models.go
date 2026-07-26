@@ -58,7 +58,7 @@ func (h *ModelsHandler) Get(w http.ResponseWriter, r *http.Request) {
 // registerModelRequest is the SPA-facing JSON body for model registration.
 type registerModelRequest struct {
 	Name           string            `json:"name"`
-	Description     string            `json:"description"`
+	Description    string            `json:"description"`
 	Framework      string            `json:"framework"`
 	TaskType       string            `json:"taskType"`
 	Tags           map[string]string `json:"tags"`

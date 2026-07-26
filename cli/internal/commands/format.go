@@ -67,16 +67,3 @@ func orDash(s string) string {
 	}
 	return s
 }
-
-// truncate shortens long free-text fields (descriptions) for table display so a
-// single long cell doesn't blow out column alignment. JSON output is never
-// truncated — only the human table.
-func truncate(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	if max <= 1 {
-		return s[:max]
-	}
-	return s[:max-1] + "…"
-}

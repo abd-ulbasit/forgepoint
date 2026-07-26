@@ -128,7 +128,7 @@ func (h *Handler) AddCheck(name string, check CheckFunc) {
 // Always returns 200 OK. The process is alive if it can respond to HTTP.
 // Never checks external dependencies — that would cause unnecessary restarts.
 func (h *Handler) LivenessHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"}) //nolint:errcheck

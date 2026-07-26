@@ -63,6 +63,8 @@ import (
 	"os/signal"
 	"time"
 
+	goredis "github.com/redis/go-redis/v9"
+
 	inferencev1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/inference/v1"
 	fpauth "github.com/abd-ulbasit/forgepoint/pkg/auth"
 	"github.com/abd-ulbasit/forgepoint/pkg/config"
@@ -74,7 +76,6 @@ import (
 	"github.com/abd-ulbasit/forgepoint/services/inference-gateway/internal/events"
 	"github.com/abd-ulbasit/forgepoint/services/inference-gateway/internal/handler"
 	redisrepo "github.com/abd-ulbasit/forgepoint/services/inference-gateway/internal/repository/redis"
-	goredis "github.com/redis/go-redis/v9"
 )
 
 // serviceName is the canonical identity used for telemetry resource attributes,
@@ -313,7 +314,7 @@ func main() {
 		// (load distribution, not security); the domain injects it so tests can make
 		// the split deterministic. rand.Intn panics on n<=0, but the splitter only
 		// calls it with n>0 (the eligible-weight total), per its contract.
-		RandSource: func(n int) int { return rand.Intn(n) }, //nolint:gosec // non-crypto traffic split
+		RandSource: rand.Intn, //nolint:gosec // non-crypto traffic split
 		Now:        time.Now,
 	})
 	logger.Info("inference domain service constructed")

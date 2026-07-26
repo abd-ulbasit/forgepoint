@@ -24,8 +24,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/abd-ulbasit/forgepoint/services/experiment-tracker/internal/domain"
 	"github.com/google/uuid"
+
+	"github.com/abd-ulbasit/forgepoint/services/experiment-tracker/internal/domain"
 )
 
 // ----------------------------------------------------------------------------

@@ -32,7 +32,7 @@
 // ============================================================================
 //
 // This service's defining trait is HOW metrics get in, not just the gRPC API.
-// Two ingestion paths exist and the asymmetry is the whole lesson:
+// Two ingestion paths exist and the asymmetry is the whole point:
 //
 //   1) SYNC (this proto, the LogMetrics RPC): a training job's SDK calls
 //      LogMetrics directly to push the loss/accuracy curve it's producing.

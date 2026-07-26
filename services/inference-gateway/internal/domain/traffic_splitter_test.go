@@ -25,8 +25,9 @@ func activeTarget(version string, bps int, stable bool) RouteTarget {
 // correctness property (a boundary off-by-one would silently skew a canary).
 //
 // Layout for stable=9000, canary=1000 (total 10000), scanned in target order:
-//   draw in [0, 9000)     → stable
-//   draw in [9000, 10000) → canary
+//
+//	draw in [0, 9000)     → stable
+//	draw in [9000, 10000) → canary
 func TestSplit_BoundaryMapping(t *testing.T) {
 	targets := []RouteTarget{
 		activeTarget("stable", 9000, true),
@@ -37,10 +38,10 @@ func TestSplit_BoundaryMapping(t *testing.T) {
 		draw int
 		want string
 	}{
-		{0, "stable"},      // very first value → first band
-		{8999, "stable"},   // last value of the stable band
-		{9000, "canary"},   // first value of the canary band (boundary)
-		{9999, "canary"},   // last valid value
+		{0, "stable"},    // very first value → first band
+		{8999, "stable"}, // last value of the stable band
+		{9000, "canary"}, // first value of the canary band (boundary)
+		{9999, "canary"}, // last valid value
 	}
 	for _, c := range cases {
 		got, err := selectByDraw(targets, c.draw)

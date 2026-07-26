@@ -24,7 +24,7 @@
 // structurally impossible even where we assemble an optional WHERE clause.
 //
 // ============================================================================
-// THE OUTBOX BOUNDARY LIVES IN THIS ADAPTER (the teaching centerpiece)
+// THE OUTBOX BOUNDARY LIVES IN THIS ADAPTER (the centerpiece)
 // ============================================================================
 //
 // The domain's UsageStore.RecordUsageTx / InvoiceStore.SaveInvoiceTx are CONTRACT
@@ -141,15 +141,14 @@ type InvoiceStore struct{ pool *pgxpool.Pool }
 // ERROR MAPPING — pgx error → domain vocabulary
 // ============================================================================
 
-// isUniqueViolation reports whether err is a Postgres unique_violation (23505)
-// and, if so, on which constraint. The constraint name lets a call site
-// distinguish (e.g.) a duplicate idempotency key from a duplicate invoice number.
-func isUniqueViolation(err error) (constraint string, ok bool) {
+// isUniqueViolation reports whether err is a Postgres unique_violation (23505).
+// It does NOT return the constraint name: every call site here has exactly one
+// unique index in play on the statement it guards, so the code alone is enough.
+// A call site that needs to tell two constraints apart should match on
+// pgErr.ConstraintName directly rather than widen this helper.
+func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
-		return pgErr.ConstraintName, true
-	}
-	return "", false
+	return errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation
 }
 
 // isNoRows reports whether err is pgx's "no rows" sentinel — the signal a

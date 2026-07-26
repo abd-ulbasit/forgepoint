@@ -5,12 +5,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go/jetstream"
+
 	eventsv1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/events/v1"
 	"github.com/abd-ulbasit/forgepoint/pkg/natsutil"
 	"github.com/abd-ulbasit/forgepoint/pkg/testutil"
 	"github.com/abd-ulbasit/forgepoint/services/pipeline-orchestrator/internal/domain"
 	"github.com/abd-ulbasit/forgepoint/services/pipeline-orchestrator/internal/events"
-	"github.com/nats-io/nats.go/jetstream"
 )
 
 // ============================================================================

@@ -115,9 +115,9 @@ func TestSetup_InsecureField_NoOTLPEndpoint(t *testing.T) {
 	observability.ResetForTest()
 
 	cfg := observability.Config{
-		ServiceName:   "test-svc",
-		Environment:   "test",
-		OTLPInsecure:  false, // secure (but no endpoint → stdout anyway)
+		ServiceName:  "test-svc",
+		Environment:  "test",
+		OTLPInsecure: false, // secure (but no endpoint → stdout anyway)
 	}
 
 	shutdown, err := observability.Setup(context.Background(), cfg)

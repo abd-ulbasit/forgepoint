@@ -26,7 +26,7 @@ import (
 
 // marshaler is configured once; protojson.MarshalOptions is safe to reuse.
 var marshaler = protojson.MarshalOptions{
-	EmitUnpopulated: true, // stable JSON shape for the SPA (no disappearing keys)
+	EmitUnpopulated: true,  // stable JSON shape for the SPA (no disappearing keys)
 	UseProtoNames:   false, // lowerCamelCase JSON names (JS-idiomatic)
 }
 

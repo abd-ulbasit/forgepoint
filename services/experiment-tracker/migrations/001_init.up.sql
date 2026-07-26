@@ -252,7 +252,7 @@ CREATE TABLE run_params (
 -- enforces dedup within the hot partition). SCALING PATH: declarative RANGE
 -- partitioning on ts (monthly), drop old
 -- partitions for retention; the (run,key,step) uniqueness becomes a per-partition
--- local index. We left it unpartitioned to keep the teaching schema readable.
+-- local index. We left it unpartitioned to keep the schema readable.
 CREATE TABLE run_metrics (
     run_id  TEXT             NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
     key     TEXT             NOT NULL,

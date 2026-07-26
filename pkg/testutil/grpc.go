@@ -93,7 +93,7 @@ func NewTestGRPCServer(t *testing.T, register func(s *grpc.Server), serverOpts .
 	// Create client connection through the bufconn dialer.
 	conn, err := grpc.NewClient(
 		"passthrough:///bufconn",
-		grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
 			return lis.DialContext(ctx)
 		}),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),

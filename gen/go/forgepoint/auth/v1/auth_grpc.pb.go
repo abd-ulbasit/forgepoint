@@ -27,7 +27,9 @@
 //     a blacklist on every call.
 //   - The AuthService can cache ValidateToken results in Redis with a short
 //     TTL (~30s), keeping p99 latency acceptable without sacrificing revocability.
-//   - Portfolio clarity: one service owns auth, every other service is a client.
+//   - One service owns auth; every other service is a client, so the token
+//     format, the claim set and the revocation policy each have exactly one
+//     place to change.
 //
 // REAL-WORLD COMPARISON:
 //   - HashiCorp Vault: Centralized secrets + auth, revocation-first design

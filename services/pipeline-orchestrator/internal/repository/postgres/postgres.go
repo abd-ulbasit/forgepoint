@@ -135,12 +135,9 @@ type ExecutionRepository struct{ pool *pgxpool.Pool }
 // isUniqueViolation reports whether err is a Postgres unique_violation (23505)
 // and, if so, on which constraint. The constraint name lets a call site
 // distinguish (e.g.) a duplicate idempotency key from a duplicate template name.
-func isUniqueViolation(err error) (constraint string, ok bool) {
+func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
-		return pgErr.ConstraintName, true
-	}
-	return "", false
+	return errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation
 }
 
 // isForeignKeyViolation reports whether err is a Postgres foreign_key_violation

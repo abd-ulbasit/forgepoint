@@ -74,7 +74,7 @@ message ChatMessage {
 }
 
 // TokenUsage is the accounting unit — prompt + completion tokens and the derived
-// cost. Cost is in micro-USD (int64) to avoid float money errors (same lesson as
+// cost. Cost is in micro-USD (int64) to avoid float money errors (same reasoning as
 // billing): 1 USD = 1_000_000 micro-USD.
 message TokenUsage {
   int32 prompt_tokens = 1;

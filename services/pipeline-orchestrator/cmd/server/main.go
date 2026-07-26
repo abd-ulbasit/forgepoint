@@ -63,7 +63,7 @@
 // served by many replicas, but only the ELECTED LEADER should DRIVE sagas (run
 // steps, write checkpoints) so two pods never double-apply a deployment. Read RPCs
 // (Get/List/Watch) are served by any replica from the shared DB. The drift
-// consumer already forms a consumer GROUP (retrainGroup), so a drift event triggers
+// consumer already forms a consumer GROUP (events.RetrainGroup), so a drift event triggers
 // a retrain on exactly ONE replica; full leader election for the synchronous gRPC
 // TriggerExecution path is a later (M3) hardening step layered on the same durable
 // store — it does not change this composition root.
@@ -82,6 +82,8 @@ import (
 
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/google/uuid"
+
 	pipelinev1 "github.com/abd-ulbasit/forgepoint/gen/go/forgepoint/pipeline/v1"
 	fpauth "github.com/abd-ulbasit/forgepoint/pkg/auth"
 	"github.com/abd-ulbasit/forgepoint/pkg/config"
@@ -93,7 +95,6 @@ import (
 	"github.com/abd-ulbasit/forgepoint/services/pipeline-orchestrator/internal/events"
 	"github.com/abd-ulbasit/forgepoint/services/pipeline-orchestrator/internal/handler"
 	"github.com/abd-ulbasit/forgepoint/services/pipeline-orchestrator/internal/repository/postgres"
-	"github.com/google/uuid"
 )
 
 // depConnectTimeout bounds how long we wait, AT BOOT, for each datastore's
@@ -462,8 +463,9 @@ func main() {
 	//
 	// The natsutil.Subscriber options encode the three delivery guarantees the
 	// subscriber's package doc promises:
-	//   - WithConsumerGroup(retrainGroup): durable name → survives restarts AND forms
-	//     a consumer group so a drift event triggers a retrain on exactly ONE replica.
+	//   - WithConsumerGroup(events.RetrainGroup): durable name → survives restarts AND
+	//     forms a consumer group, so a drift event triggers a retrain on exactly ONE
+	//     replica. The name lives in the events package so wiring and consumer agree.
 	//   - WithMaxRetries(5) + WithDLQSubject: a poison drift (names a missing/archived
 	//     pipeline) is retried a bounded number of times then parked on the DLQ for an
 	//     operator instead of NAK-looping forever.
@@ -494,7 +496,7 @@ func main() {
 		os.Exit(1)
 	}
 	driftSub := natsutil.NewSubscriber(js,
-		natsutil.WithConsumerGroup("pipeline-orchestrator-retrain"),
+		natsutil.WithConsumerGroup(events.RetrainGroup),
 		natsutil.WithMaxRetries(5),
 		natsutil.WithDLQSubject("fp.dlq.pipelines.retrain"),
 		natsutil.WithIdempotencyStore(processedStore),

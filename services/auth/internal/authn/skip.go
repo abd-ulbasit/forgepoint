@@ -53,7 +53,7 @@ func PublicMethods() []string {
 //     token. (In production reflection is typically disabled entirely; when it is
 //     enabled, it must be exempt or discovery breaks.)
 //
-// These are constant across ALL 10 services, so they live here once and every
+// These are constant across every service, so they live here once and every
 // service appends them to its own PublicMethods() when wiring the validator.
 func HealthAndReflectionMethods() []string {
 	return []string{

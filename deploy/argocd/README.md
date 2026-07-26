@@ -39,7 +39,7 @@ deploy/argocd/
                                         │
                                         ├─ fp-infra (wave -1) ─► fp-infra ns
                                         └─ fp-auth  (wave  0) ─► fp-system ns
-                                              ... +9 services, one file each
+                                              ... one file per remaining service
 ```
 
 **Pull, not push:** nothing outside the cluster reaches in to deploy. The
@@ -138,7 +138,7 @@ Recommendation: Image Updater on **dev** (continuous), CI-commit + PR on **prod*
 
 ## Dev vs Prod sync strategy (values-per-env)
 
-CLAUDE.md M6: **dev auto-syncs; prod is manual / PR-gated.** Same manifests, a
+ADR 0002: **dev auto-syncs; prod is manual / PR-gated.** Same manifests, a
 different `syncPolicy`. The dev variant is what's committed in `apps/`.
 
 | Aspect            | **dev** (`apps/*.yaml`, committed) | **prod** (overlay / branch)              |
