@@ -22,7 +22,7 @@
 //             cannot be resolved locally — those still require the D1 path.
 //
 // DECISION: D2 for JWTs, with short TTLs (15m default) to bound the revocation
-// window. The other 9 services use THIS validator for the JWT hot path. API keys
+// window. Every non-auth service uses THIS validator for the JWT hot path. API keys
 // will be handled by a separate RPCValidator in a future pkg/auth/rpc package.
 //
 // REAL-WORLD COMPARISON:

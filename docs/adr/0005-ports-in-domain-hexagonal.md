@@ -69,7 +69,7 @@ The domain defines the interfaces it needs (`domain/ports.go`); the adapters in
 
 Adopt **Option B**: **repository and external-collaborator PORT interfaces live IN the
 `domain` package** (`internal/domain/ports.go`); **adapters in `internal/repository/…` (and
-`internal/events/`) implement them**. This is binding for every one of the 10 services and is
+`internal/events/`) implement them**. This is binding for every service and is
 the worked example in `docs/design/service-architecture.md`.
 
 A thin `internal/repository` package may exist as **optional sugar** — type aliases that

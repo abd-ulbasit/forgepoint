@@ -113,13 +113,11 @@ func TestNewEnvelope_SetsFields(t *testing.T) {
 func TestEnvelope_JSONRoundTrip(t *testing.T) {
 	original := natsutil.NewEnvelope("test.event", "test", []byte(`{"foo":"bar"}`))
 
-	// Marshal
 	bytes, err := json.Marshal(original)
 	if err != nil {
 		t.Fatalf("marshal error: %v", err)
 	}
 
-	// Unmarshal
 	var decoded natsutil.EventEnvelope
 	if err := json.Unmarshal(bytes, &decoded); err != nil {
 		t.Fatalf("unmarshal error: %v", err)
@@ -141,7 +139,6 @@ func TestPublishAndSubscribe(t *testing.T) {
 	skipIfNoDocker(t)
 	url := startNATS(t)
 
-	// Connect to NATS
 	conn, js, err := natsutil.Connect(url)
 	if err != nil {
 		t.Fatalf("connect error: %v", err)

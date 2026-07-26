@@ -1,10 +1,11 @@
 # Forgepoint — C4 Architecture Model
 
 > **What this is.** A [C4 model](https://c4model.com/) of Forgepoint at three zoom levels —
-> **Context** (the system in its world), **Container** (the 10 services + the data/async
+> **Context** (the system in its world), **Container** (the M0–M6 services + the data/async
 > infra and how they talk), and **Component** (the inside of the three most interesting
 > services) — plus a sequence for the **closed ML loop** that is the whole point of the
-> platform. Each diagram has a short teaching paragraph; read those, not just the boxes.
+> platform. The M7 AI Gateway is not drawn here yet. Each diagram has a short explanatory
+> paragraph; read those, not just the boxes.
 >
 > **Sources of truth.** Services, communication, and infra come from
 > [`docs/plans/forgepoint-platform-design.md`](../plans/forgepoint-platform-design.md). Every

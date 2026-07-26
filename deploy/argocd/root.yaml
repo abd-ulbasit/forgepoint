@@ -10,7 +10,7 @@
 # From there everything is GitOps. The root app doesn't deploy any workloads
 # itself — its job is to watch deploy/argocd/apps/ and create/update/delete the
 # CHILD Applications it finds there. Each child then deploys an actual component
-# (infra, fp-auth, ... the other 9 services as they land).
+# (infra, fp-auth, ... one child Application per service).
 #
 # APP-OF-APPS PATTERN — why this shape:
 #   * One bootstrap, N managed apps. Adding a service = drop one YAML file in
@@ -35,7 +35,7 @@
 #                 watches apps/ dir, renders child Applications
 #                          ┌────────────┴─────────────┐
 #                  ┌───────▼───────┐          ┌────────▼────────┐
-#                  │ infra (kustom)│          │ fp-auth (Helm)  │   ... +9 later
+#                  │ infra (kustom)│          │ fp-auth (Helm)  │   ... one per svc
 #                  │ → fp-infra ns │          │ → fp-system ns  │
 #                  └───────────────┘          └─────────────────┘
 # ============================================================================

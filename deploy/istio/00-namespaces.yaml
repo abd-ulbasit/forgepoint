@@ -11,7 +11,7 @@
 #   pod's iptables so ALL inbound/outbound TCP is transparently routed through Envoy.
 #
 #   We OWN these namespaces already (CLAUDE.md K8s namespace map):
-#     fp-system  → the 10 platform services (auth, registry, bff, gateway, ...)
+#     fp-system  → the platform services (auth, registry, bff, gateway, ...)
 #     fp-models  → model-serving workloads (fp-model-serving)
 #     fp-infra   → NATS / Postgres / Redis / MinIO / OTel collector (DELIBERATELY
 #                  NOT meshed — see the long note below)
@@ -49,7 +49,7 @@
 # =============================================================================
 
 ---
-# fp-system — the 10 platform services. Every east-west gRPC hop here must be
+# fp-system — the platform services. Every east-west gRPC hop here must be
 # mTLS-encrypted and identity-checked, so the whole namespace joins the mesh.
 apiVersion: v1
 kind: Namespace

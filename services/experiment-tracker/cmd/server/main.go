@@ -362,7 +362,7 @@ func main() {
 	// CheckPermission RPCs; this service has no analog.)
 	//
 	// HealthAndReflectionMethods() lives in pkg/grpcutil so the exact health +
-	// reflection full-method strings stay defined once for all 10 services.
+	// reflection full-method strings stay defined once for every service.
 	var publicMethods []string // intentionally empty — no public business RPCs
 	srv := grpcutil.NewServer(
 		grpcutil.WithLogger(logger),

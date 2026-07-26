@@ -9,7 +9,7 @@ Replicas:  {{ if .Values.autoscaling.enabled }}autoscaled {{ .Values.autoscaling
 PORTS
   HTTP API (SPA: JSON + SSE):   {{ .Values.ports.http }}  (in-cluster only — ClusterIP; reach via your ingress)
   HTTP health:                  {{ .Values.ports.health }}  (/healthz, /readyz{{ if .Values.serviceMonitor.enabled }}, {{ .Values.serviceMonitor.path }}{{ end }})
-  (No gRPC port — the BFF is a gRPC CLIENT of the 10 services, not a server.)
+  (No gRPC port — the BFF is a gRPC CLIENT of the domain services, not a server.)
 
 CORS allowed origins:  {{ .Values.config.corsAllowedOrigins }}
 

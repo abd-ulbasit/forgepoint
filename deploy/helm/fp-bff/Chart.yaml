@@ -16,7 +16,7 @@ apiVersion: v2
 #   - NO migrate initContainer (NO database to migrate)
 # See fp-auth/Chart.yaml for the rationale behind each structural field.
 name: fp-bff
-description: Forgepoint BFF (Backend-for-Frontend) — stateless HTTP/SSE-to-gRPC gateway for the SPA; forwards the caller's JWT to the 10 domain services.
+description: Forgepoint BFF (Backend-for-Frontend) — stateless HTTP/SSE-to-gRPC gateway for the SPA; forwards the caller's JWT to the domain services it fronts.
 
 # CHART TYPE: "application" renders into deployable K8s objects (what we want);
 # "library" would be reusable templates only, never installed directly.

@@ -12,7 +12,7 @@
 #   ── THE BFF HAS NO DATABASE ──────────────────────────────────────────────
 #   Every other service COPYs its golang-migrate SQL into /migrations so the same
 #   image can run schema migrations from an initContainer. The BFF is a STATELESS
-#   HTTP↔gRPC translator (a gRPC CLIENT of the 10 domain services that forwards the
+#   HTTP↔gRPC translator (a gRPC CLIENT of the domain services it fronts, forwarding the
 #   caller's JWT) — it owns NO relational schema. So we DROP the `COPY .../migrations`
 #   line entirely. There is nothing to migrate, and the Helm chart renders no
 #   migrate initContainer (migrations.enabled=false), so the image never needs that
@@ -97,7 +97,7 @@ FROM gcr.io/distroless/static-debian12:nonroot@sha256:d093aa3e30dbadd3efe1310db0
 # OCI metadata — discoverable provenance for registries and scanners.
 LABEL org.opencontainers.image.source="https://github.com/abd-ulbasit/forgepoint" \
       org.opencontainers.image.title="forgepoint-bff" \
-      org.opencontainers.image.description="Forgepoint BFF (Backend-for-Frontend): stateless HTTP/SSE↔gRPC gateway for the SPA; forwards the caller's JWT to the 10 services"
+      org.opencontainers.image.description="Forgepoint BFF (Backend-for-Frontend): stateless HTTP/SSE↔gRPC gateway for the SPA; forwards the caller's JWT to the domain services it fronts"
 
 WORKDIR /
 

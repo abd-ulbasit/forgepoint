@@ -28,7 +28,7 @@ Pattern headline: **Centralized authentication, stateless JWT propagation, RBAC.
 - **Chosen:** services verify the JWT signature locally with the shared secret/public key;
   they do **not** call Auth on every request.
 - **Why:** a remote `ValidateToken` call per request would make Auth a latency- and
-  availability-bottleneck on the hot path of all 10 services. Local verification is O(1) crypto.
+  availability-bottleneck on the hot path of every service. Local verification is O(1) crypto.
 - **Tradeoff:** revocation is not instant — a JWT is valid until `exp`. Mitigation: short TTLs
   (minutes), and `ValidateToken` RPC still exists for the API-key path and for callers that
   want centralized checks. This is the classic **JWT vs opaque-token-introspection** tradeoff:

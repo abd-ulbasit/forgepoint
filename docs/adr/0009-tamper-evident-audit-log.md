@@ -18,7 +18,7 @@ facts other services react to). Three forces shape the design:
 2. **It must be trustworthy after a breach.** If an attacker who gains write access can
    silently rewrite history, the log is worthless precisely when it matters. The log needs
    to make tampering **detectable**.
-3. **It must be cheap to adopt across all 10 services** without coupling every service to the
+3. **It must be cheap to adopt across every service** without coupling every service to the
    audit database (database-per-service forbids cross-service DB access) and without putting a
    synchronous Postgres write on every RPC's hot path.
 
@@ -216,9 +216,9 @@ without coupling services to the audit DB or adding a synchronous write to every
   service's `FP_DATABASE_URL` at the non-owner `fp_audit_app` role so the migration's REVOKE +
   triggers become fully binding (the role and grants now exist; switching the DSN is the remaining
   operational step); add an `/audit/verify` admin path that re-walks and reports the first broken
-  link; roll the two interceptors out to the other 9 services (snippet below).
+  link; roll the two interceptors out to the remaining services (snippet below).
 
-### One-line rollout for the other 9 services
+### One-line rollout for the remaining services
 
 Each remaining service adds **only the interceptors** (no repository, no consumer, no stream — auth
 hosts all of those) by reusing its existing `natsutil.Publisher`. In the service's `main.go`, where

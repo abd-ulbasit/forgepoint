@@ -74,7 +74,7 @@ find deploy/argocd -name '*.yaml' -print0 | xargs -0 -I{} sh -c \
 
 ---
 
-## Adding the other 9 services — a one-file copy
+## Adding another service — a one-file copy
 
 `apps/fp-auth.yaml` is the template (Chart.yaml already says every service
 mirrors the `fp-auth` chart; the delivery layer mirrors it too):

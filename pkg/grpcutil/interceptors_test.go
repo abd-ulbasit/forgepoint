@@ -222,7 +222,6 @@ func TestAuthInterceptor_ValidToken(t *testing.T) {
 
 	interceptor := grpcutil.AuthUnaryInterceptor(validator)
 
-	// Set authorization metadata
 	md := metadata.Pairs("authorization", "Bearer valid-token")
 	ctx := metadata.NewIncomingContext(context.Background(), md)
 

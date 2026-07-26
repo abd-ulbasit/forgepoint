@@ -5,7 +5,8 @@
 // ============================================================================
 //
 // The BFF is the browser's single entry point to the platform: it speaks
-// JSON/HTTP + SSE to the SPA and gRPC to the 10 domain services (ADR 0001). It
+// JSON/HTTP + SSE to the SPA and gRPC to the domain services it fronts (ADR
+// 0001). It
 // holds ZERO business logic — only composition, protocol/stream translation, and
 // browser-session concerns (CORS, token forwarding).
 //

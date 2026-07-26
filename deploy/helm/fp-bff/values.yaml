@@ -10,7 +10,7 @@
 #   - image.repository → ghcr.io/abd-ulbasit/forgepoint/bff
 #   - ports            → an HTTP API port for the SPA (http=8081) + a health port
 #                        (health=8080). NO gRPC SERVER port (9090): the BFF is a
-#                        gRPC CLIENT of the 10 services, not a gRPC server.
+#                        gRPC CLIENT of the domain services, not a gRPC server.
 #   - config.*         → the per-service gRPC DIAL ADDRESSES the BFF connects to
 #                        (FP_AUTH_ADDR, FP_REGISTRY_ADDR, ...) + the CORS allowlist
 #                        (FP_CORS_ALLOWED_ORIGINS = the UI origin). NO DATABASE_URL,

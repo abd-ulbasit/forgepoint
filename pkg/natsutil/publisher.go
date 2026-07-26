@@ -87,7 +87,6 @@ func (p *Publisher) Publish(ctx context.Context, subject string, payload any) er
 	envelope.CorrelationID = correlationIDForPublish(ctx)
 	injectTraceContext(ctx, &envelope)
 
-	// Serialize the complete envelope.
 	envBytes, err := json.Marshal(envelope)
 	if err != nil {
 		return fmt.Errorf("natsutil: marshal envelope: %w", err)

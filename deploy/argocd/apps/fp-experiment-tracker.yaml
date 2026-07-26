@@ -1,7 +1,7 @@
 # ============================================================================
 # CHILD APPLICATION — fp-experiment-tracker (Helm)
 # ============================================================================
-# A copy of the fp-auth child-app template (the reference for all 10 services).
+# A copy of the fp-auth child-app template (the reference for every service app).
 # Managed BY the root app-of-apps. Deploys the Experiment Tracker service from
 # its Helm chart at deploy/helm/fp-experiment-tracker. ArgoCD renders the chart
 # with `helm template` (it does NOT run `helm install` / Tiller — there is no

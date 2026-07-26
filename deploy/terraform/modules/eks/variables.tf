@@ -42,7 +42,7 @@ variable "public_access_cidrs" {
 
 # --- Managed node group sizing (dev defaults are small/cheap) ---------------
 variable "node_instance_types" {
-  description = "EC2 instance types for the managed node group. Dev: t3.medium (2 vCPU/4GiB) — enough to run the 10 services + infra add-ons cheaply. Prod tunes up (m5.large+) and may add a second node group."
+  description = "EC2 instance types for the managed node group. Dev: t3.medium (2 vCPU/4GiB) — enough to run the platform services + infra add-ons cheaply. Prod tunes up (m5.large+) and may add a second node group."
   type        = list(string)
   default     = ["t3.medium"]
 }

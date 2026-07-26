@@ -222,7 +222,6 @@ func newHarness(t *testing.T, loggedIn bool) *harness {
 	go func() { _ = srv.Serve(lis) }()
 	t.Cleanup(srv.Stop)
 
-	// Token store in a temp dir.
 	tokens := token.New(t.TempDir())
 	if loggedIn {
 		if err := tokens.Save(token.Stored{

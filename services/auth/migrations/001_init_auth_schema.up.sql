@@ -7,7 +7,7 @@
 -- writes these tables; cross-service data is exchanged over gRPC/NATS, never by
 -- a shared database. That isolation is what lets Auth evolve its schema (add a
 -- column, change an index) without coordinating a lock-step migration across
--- all 10 services — the core operational payoff of database-per-service.
+-- every service — the core operational payoff of database-per-service.
 --
 -- ============================================================================
 -- golang-migrate FILE FORMAT
