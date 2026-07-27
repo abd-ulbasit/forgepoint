@@ -24,12 +24,17 @@
 #     signature + Rekor transparency-log entry let anyone verify the image came
 #     from THIS repo's release workflow.
 #
-# STRUCTURE — "adding a service is trivial":
-#   The image jobs are a MATRIX keyed on `service`. To onboard a new service,
-#   add one line to the `service` list (its name == services/<name> dir == the
-#   image repo suffix). Everything else (Dockerfile path, image ref, scan, SBOM,
-#   sign) is derived from that single value. The Dockerfile template is shared
-#   (see services/auth/Dockerfile), so the build args are identical per service.
+# STRUCTURE — onboarding a service costs nothing here:
+#   Both matrices are RESOLVED FROM THE REPO by the `matrix` job below —
+#   modules from go.work, services from services/*/Dockerfile — so a new service
+#   is covered the moment it exists. The earlier version of this file asked you
+#   to "add one line" to two hand-written lists and nobody ever did; the result
+#   was a gate that scanned 3 of 15 modules and built 1 of 12 images while
+#   presenting as full coverage. A service's name is its services/<name> dir and
+#   its image repo suffix; everything else (Dockerfile path, image ref, scan,
+#   SBOM, sign) derives from that one value, and the Dockerfile template is
+#   shared (see services/auth/Dockerfile) so build args are identical per
+#   service.
 # =============================================================================
 
 name: Security
@@ -66,21 +71,60 @@ env:
 
 jobs:
   # ===========================================================================
+  # 0. matrix — derive the module and service lists FROM THE REPO.
+  # ===========================================================================
+  # Both matrices below used to be hand-written lists under a comment reading
+  # "ADD A SERVICE: append one line here". Nobody ever did. govulncheck covered
+  # 3 of 15 modules and the image job covered 1 of 12 services, so `Security`
+  # reported on a fifth of the codebase and looked like it covered all of it.
+  # services/registry and services/bff were each carrying reachable CVEs the
+  # whole time (verified: exit 3, 8 and 7 vulns respectively) with nothing red.
+  #
+  # An instruction in a comment is not a mechanism. go.work and services/*/
+  # already know the answer, so this job asks them:
+  #   modules  — every `use` entry in go.work (the same list ci.yml matrixes on)
+  #   services — every services/<name>/ that has a Dockerfile
+  # Adding a service now requires nothing here at all.
+  matrix:
+    name: resolve matrix
+    runs-on: ubuntu-latest
+    outputs:
+      modules: ${{ steps.set.outputs.modules }}
+      services: ${{ steps.set.outputs.services }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve
+        id: set
+        run: |
+          set -euo pipefail
+          modules=$(awk '/^use \(/{f=1;next} /^\)/{f=0} f{gsub(/[ \t]/,""); if ($0 != "") print}' go.work \
+            | sed 's|^\./||' | jq -R . | jq -sc .)
+          services=$(find services -mindepth 2 -maxdepth 2 -name Dockerfile \
+            | cut -d/ -f2 | sort | jq -R . | jq -sc .)
+          # Fail loudly rather than silently matrixing over an empty list — an
+          # empty matrix skips every leg and reports the workflow as green.
+          [ "$(jq -r 'length' <<<"$modules")" -gt 0 ] || { echo "no modules resolved from go.work" >&2; exit 1; }
+          [ "$(jq -r 'length' <<<"$services")" -gt 0 ] || { echo "no services with a Dockerfile" >&2; exit 1; }
+          echo "modules=$modules" >> "$GITHUB_OUTPUT"
+          echo "services=$services" >> "$GITHUB_OUTPUT"
+          echo "modules: $modules"
+          echo "services: $services"
+
+  # ===========================================================================
   # 1. govulncheck — Go vulnerability scan, one leg per module.
   # ===========================================================================
+  # gen/go is generated, but it is still scanned: it pulls in
+  # google.golang.org/protobuf + grpc, which do get CVEs.
   govulncheck:
     name: govulncheck (${{ matrix.module }})
     runs-on: ubuntu-latest
+    needs: [matrix]
     strategy:
       fail-fast: false
       matrix:
-        # ADD A SERVICE: append its module path. gen/go is generated; we still
-        # scan it because it pulls in google.golang.org/protobuf + grpc, which
-        # do get CVEs.
-        module:
-          - pkg
-          - gen/go
-          - services/auth
+        module: ${{ fromJSON(needs.matrix.outputs.modules) }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -147,13 +191,11 @@ jobs:
   image:
     name: image (${{ matrix.service }})
     runs-on: ubuntu-latest
-    needs: [govulncheck, trivy-fs]
+    needs: [matrix, govulncheck, trivy-fs]
     strategy:
       fail-fast: false
       matrix:
-        # ADD A SERVICE: one line here wires up build + scan + SBOM + sign.
-        service:
-          - auth
+        service: ${{ fromJSON(needs.matrix.outputs.services) }}
     permissions:
       contents: read
       # Push images to GHCR (only used on push/tag, see the `if` on push/sign).
