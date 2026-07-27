@@ -132,7 +132,7 @@ docker-compose.yaml   Local infrastructure
 
 I build with coding agents running in parallel — one per milestone in the table above — and I review, test and integrate what comes back. Commits an agent drafted carry a `Co-authored-by: Claude` trailer: `git log --grep='^Co-authored-by: Claude' -i --oneline | wc -l` against `git log --oneline | wc -l` gives the ratio at any moment. The trailer convention was adopted partway through this repo, so that number is a floor rather than a total.
 
-The parts that decided the shape of the platform were not generated. Every bullet in [The parts worth reading](#the-parts-worth-reading) is a specific failure someone had to find first — the cancelled saga that answers `CANCELLED` while the row stays `RUNNING`, the partial unique index that cannot be `DEFERRABLE` so every intermediate state has to be legal on its own — and the Status section above lists what is missing instead of quietly omitting it. Read those two sections and `docs/adr/` if you want to judge the engineering rather than the tooling.
+Judge the output rather than the tooling, and the places to do it are already in this README. Every bullet in [The parts worth reading](#the-parts-worth-reading) is a specific failure that had to be found before it could be closed — the cancelled saga that answers `CANCELLED` while the durable row stays `RUNNING`, the partial unique index that cannot be `DEFERRABLE` in Postgres so every intermediate state has to be legal on its own — and [Status](#status) names what is missing rather than omitting it. Those, and `docs/adr/`, are where the engineering is.
 
 ---
 
