@@ -10,14 +10,31 @@
 #     2. Backward-incompatible API change → `buf breaking` at FILE level (the
 #        strictest level: even a field rename, which is wire-compatible, is
 #        rejected because it breaks generated Go).
-#   This is the "contract test" tier of docs/design/service-architecture.md —
-#   run on every PR so a breaking change can't reach main unnoticed.
+#   This is the "contract test" tier of docs/design/service-architecture.md.
 #
-# WHY compare against the BASE branch (not the previous commit):
-#   "Breaking" is only meaningful relative to what's already shipped. We diff
-#   the PR's proto against the PR's target branch (origin/<base>), exactly the
-#   buf-breaking-action's `against` semantics. On a push to main there is no
-#   base to diff, so the breaking job is PR-only; lint still runs everywhere.
+# WHY THIS WORKFLOW RUNS ON EVERY PUSH TO MAIN, NOT ONLY ON PROTO CHANGES:
+#   The first version of this file was gated on `paths: proto/**` for BOTH
+#   triggers and made `buf breaking` pull_request-only. Between June and July
+#   2026 three commits changed proto/ and the workflow still recorded ZERO runs
+#   (`gh api .../actions/workflows/<id>/runs` → total_count 0), while CI and
+#   Security ran on the same pushes. A contract gate that has never executed
+#   proves nothing about the contract, and the path filter was the only thing
+#   standing between "gate exists" and "gate runs".
+#
+#   So: push to main runs unconditionally. `buf lint` is a few seconds against
+#   ~10 files — the compute saved by the filter was never worth an unverified
+#   gate. PRs keep a path filter (there the signal-to-noise tradeoff is real,
+#   and a PR that does not touch proto genuinely does not need this).
+#
+# WHY `buf breaking` NEEDS A DIFFERENT `--against` PER EVENT:
+#   "Breaking" is only meaningful relative to what is already shipped.
+#     - pull_request: diff against the PR's target branch (origin/<base>) —
+#       "would merging this break consumers of main?"
+#     - push to main: there is no base branch to diff, so diff against the
+#       parent commit — "did what just landed break consumers?" This is the
+#       same comparison the Makefile's `proto-breaking` target makes locally.
+#   The repo has had zero pull requests to date, so the PR-only version of this
+#   job had never executed either. Both paths now exercise.
 # =============================================================================
 
 name: Proto
@@ -25,16 +42,14 @@ name: Proto
 on:
   push:
     branches: [main]
-    # Only run when proto config or definitions actually change — a Go-only PR
-    # doesn't need the proto gate.
-    paths:
-      - "proto/**"
-      - ".github/workflows/proto.yml"
   pull_request:
     branches: [main]
     paths:
       - "proto/**"
       - ".github/workflows/proto.yml"
+  # On-demand: lets a reviewer (or the author) prove the gate works without
+  # having to push a proto change.
+  workflow_dispatch:
 
 # SECURITY: read-only. The proto gate only reads the repo; it posts no comments
 # and pushes nothing.
@@ -45,6 +60,12 @@ concurrency:
   group: proto-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+env:
+  # Pin the buf CLI so lint/breaking results are reproducible: a new buf release
+  # can add rules, and a gate that changes verdict without a code change is not
+  # a gate. Bump deliberately.
+  BUF_VERSION: 1.72.0
+
 jobs:
   # ---------------------------------------------------------------------------
   # Lint — STANDARD rules over the proto module.
@@ -54,18 +75,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # buf-setup installs a pinned buf CLI on PATH for the lint/breaking actions
-      # (and any raw `buf` calls). Pinning the action by SHA AND pinning the buf
-      # version makes the whole proto gate reproducible.
+      # bufbuild/buf-action is the maintained successor to buf-setup-action
+      # (which is still on the deprecated Node 20 runtime and has had no release
+      # since August 2025). `setup_only` makes it behave exactly like the old
+      # setup action — install a pinned buf on PATH — so the explicit `buf`
+      # invocations below stay readable and match the Makefile targets.
       - name: Set up buf
-        uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
+        uses: bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3 # v1.5.0
         with:
-          version: 1.50.0
-          # Avoids the action's unauthenticated GitHub API rate limit when
-          # resolving the release; not a secret-bearing token usage.
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          version: ${{ env.BUF_VERSION }}
+          setup_only: true
 
       # The buf module lives in proto/ (buf.yaml is there), so scope the lint to
       # that input. STANDARD lint rules come from proto/buf.yaml.
@@ -74,34 +95,57 @@ jobs:
         working-directory: proto
 
   # ---------------------------------------------------------------------------
-  # Breaking — diff the PR's proto against the base branch.
+  # Breaking — diff protos against the right baseline for this event.
   # ---------------------------------------------------------------------------
   breaking:
     name: buf breaking
     runs-on: ubuntu-latest
-    # Only meaningful on a PR (there is a base to diff against). Skipped on push.
-    if: github.event_name == 'pull_request'
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # buf breaking needs git history to materialize the base ref. Full
-          # history (fetch-depth: 0) guarantees origin/<base> is available to
-          # diff against; a shallow clone could miss the base commit.
+          # buf breaking materializes the baseline from git history. Full history
+          # guarantees both baselines are present: origin/<base> for a PR, and
+          # HEAD^ for a push (a default shallow clone has neither).
           fetch-depth: 0
 
       - name: Set up buf
-        uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
+        uses: bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3 # v1.5.0
         with:
-          version: 1.50.0
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          version: ${{ env.BUF_VERSION }}
+          setup_only: true
 
-      # `--against` points at the SAME proto subdir on the PR's base branch.
-      #   .git#branch=<base>,subdir=proto  → buf reads proto/ as it exists on the
-      #   target branch and reports any FILE-level incompatibility vs the PR.
-      # Mirrors the Makefile's `proto-breaking` target so local and CI agree.
-      - name: Breaking change check
+      # Resolve the baseline as a buf git input:
+      #   PR   → ../.git#branch=<base>,subdir=proto  (what merging would change)
+      #   push → ../.git#ref=HEAD^,subdir=proto      (what this push changed)
+      #
+      # The path is `../.git`, not `.git`: the buf module lives in proto/ so the
+      # `buf breaking` step runs with working-directory: proto, and buf resolves
+      # a git input relative to the CWD — it does not walk up to find the repo
+      # root. The previous `.git#...` form in this file would have died with
+      # "could not clone .../proto/.git ... does not appear to be a git
+      # repository" the first time it ran. It never ran. The Makefile's
+      # proto-breaking target already used ../.git; this now matches it.
+      #
+      # The first commit in a repo has no HEAD^; skip rather than fail on it.
+      - name: Resolve baseline
+        id: baseline
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          buf breaking \
-            --against ".git#branch=${{ github.base_ref }},subdir=proto"
+          if [ "${EVENT}" = "pull_request" ]; then
+            echo "against=../.git#branch=${BASE_REF},subdir=proto" >> "$GITHUB_OUTPUT"
+          elif git rev-parse --verify --quiet HEAD^ >/dev/null; then
+            echo "against=../.git#ref=HEAD^,subdir=proto" >> "$GITHUB_OUTPUT"
+          else
+            echo "against=" >> "$GITHUB_OUTPUT"
+            echo "No parent commit to diff against; nothing to check." >&2
+          fi
+
+      - name: Breaking change check
+        if: steps.baseline.outputs.against != ''
+        env:
+          AGAINST: ${{ steps.baseline.outputs.against }}
+        run: buf breaking --against "${AGAINST}"
         working-directory: proto
