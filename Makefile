@@ -28,8 +28,26 @@ SHELL := /bin/bash
 # Service name passed via `make <target> SVC=auth`
 SVC ?=
 
-# All services in the monorepo (updated as services are added)
-SERVICES := auth
+# All services in the monorepo, DERIVED from the filesystem rather than
+# hand-listed. The previous `SERVICES := auth` was written when auth was the
+# only service and was never updated; `make build-all` and `make
+# docker-build-all` silently covered 1 of 12 services and reported success.
+# A list that has to be maintained by hand is a list that goes stale.
+SERVICES := $(sort $(notdir $(patsubst %/,%,$(dir $(wildcard services/*/Dockerfile)))))
+
+# Every Go module in the workspace, DERIVED from go.work — the same single
+# source of truth ci.yml's matrix is kept in step with.
+#
+# WHY THIS EXISTS AT ALL: there is no go.mod at the repo root (this is a
+# workspace of 15 independent modules), so a root-level `go test ./...` or
+# `golangci-lint run ./...` cannot resolve anything:
+#
+#   pattern ./...: directory prefix . does not contain modules listed in
+#   go.work or their selected dependencies
+#
+# `make test` and `make lint` — the two commands the README names — both died
+# on that in under a second. Commands run per-module instead.
+GO_MODULES := $(patsubst ./%,%,$(shell awk '/^use \(/{f=1;next} /^\)/{f=0} f{gsub(/[ \t]/,""); if ($$0 != "") print}' go.work))
 
 # Docker image registry prefix (override for GHCR/ECR in CI)
 REGISTRY ?= fp
@@ -122,7 +140,7 @@ build: ## Build a service binary: make build SVC=auth
 build-all: ## Build all service binaries
 	@for svc in $(SERVICES); do \
 		echo "==> Building $$svc..."; \
-		cd services/$$svc && go build $(LDFLAGS) -o ../../bin/$$svc ./cmd/server && cd ../..; \
+		( cd services/$$svc && go build $(LDFLAGS) -o ../../bin/$$svc ./cmd/server ) || exit 1; \
 	done
 
 # ============================================================================
@@ -136,6 +154,12 @@ build-all: ## Build all service binaries
 #
 # WHY -timeout: Integration tests with testcontainers can be slow on first
 # run (pulling Docker images). 5 minutes prevents CI timeouts on cold cache.
+#
+# WHY A LOOP AND NOT `go test ./...`: see GO_MODULES at the top of this file.
+# There is no root module, so `./...` from the repo root resolves to nothing and
+# exits 1. Each module is entered in a subshell — mirroring what ci.yml's
+# per-module matrix already did correctly — and the first failure stops the run
+# with a non-zero status, so `make test` cannot report success on a red module.
 # ============================================================================
 
 .PHONY: test
@@ -144,8 +168,10 @@ test: ## Run tests: make test [SVC=auth]
 		echo "==> Testing $(SVC)..."; \
 		cd services/$(SVC) && go test -race -v ./...; \
 	else \
-		echo "==> Testing all modules..."; \
-		go test -race -v ./...; \
+		for m in $(GO_MODULES); do \
+			echo "==> Testing $$m..."; \
+			( cd $$m && go test -race -v ./... ) || exit 1; \
+		done; \
 	fi
 
 .PHONY: test-integration
@@ -154,23 +180,32 @@ test-integration: ## Run integration tests (requires Docker for testcontainers)
 		echo "==> Integration testing $(SVC)..."; \
 		cd services/$(SVC) && go test -race -v -tags=integration -timeout 300s ./...; \
 	else \
-		echo "==> Integration testing all modules..."; \
-		go test -race -v -tags=integration -timeout 300s ./...; \
+		for m in $(GO_MODULES); do \
+			echo "==> Integration testing $$m..."; \
+			( cd $$m && go test -race -v -tags=integration -timeout 300s ./... ) || exit 1; \
+		done; \
 	fi
 
+# E2E is a shell harness against a LIVE cluster, not a Go test tag: it drives
+# the assembled platform through the BFF with kubectl + an in-cluster curl pod
+# (see tools/e2e/README.md). This target used to run `go test ./test/e2e/...`,
+# a directory that does not exist in this repo and never has.
 .PHONY: test-e2e
-test-e2e: ## Run E2E tests on Kind cluster
+test-e2e: ## Run the cross-service E2E against the live cluster (needs kubectl context)
 	@echo "==> Running E2E tests..."
-	go test -race -v -tags=e2e -timeout 600s ./test/e2e/...
+	./tools/e2e/e2e.sh
 
 .PHONY: test-cover
 test-cover: ## Run tests with coverage report
 	@if [ -n "$(SVC)" ]; then \
 		cd services/$(SVC) && go test -race -coverprofile=cover.out ./... && go tool cover -html=cover.out -o cover.html; \
 	else \
-		go test -race -coverprofile=cover.out ./... && go tool cover -html=cover.out -o cover.html; \
+		for m in $(GO_MODULES); do \
+			echo "==> Covering $$m..."; \
+			( cd $$m && go test -race -coverprofile=cover.out ./... && go tool cover -html=cover.out -o cover.html ) || exit 1; \
+		done; \
 	fi
-	@echo "==> Coverage report: cover.html"
+	@echo "==> Coverage report: cover.html (one per module, alongside its go.mod)"
 
 # ============================================================================
 # Linting
@@ -180,12 +215,19 @@ test-cover: ## Run tests with coverage report
 #   - Runs 50+ linters in parallel with shared AST parsing
 #   - Single config file (.golangci.yml) controls everything
 #   - 5-10x faster than running linters individually
+#
+# Per-module for the same reason as `make test`: `golangci-lint run ./...` from
+# the repo root exits 7 with "directory prefix . does not contain modules listed
+# in go.work". gen/go is skipped — .golangci.yml already excludes generated code,
+# so a leg there has nothing to lint (ci.yml's lint matrix omits it too).
 # ============================================================================
 
 .PHONY: lint
 lint: ## Run golangci-lint across all modules
-	@echo "==> Linting..."
-	golangci-lint run ./...
+	@for m in $(filter-out gen/go,$(GO_MODULES)); do \
+		echo "==> Linting $$m..."; \
+		( cd $$m && golangci-lint run ./... ) || exit 1; \
+	done
 
 .PHONY: proto-lint
 # (defined above in Proto section)
@@ -237,7 +279,7 @@ docker-build-all: ## Build Docker images for all services
 		DOCKER_BUILDKIT=1 docker build \
 			-t $(REGISTRY)-$$svc:$(IMAGE_TAG) \
 			-f services/$$svc/Dockerfile \
-			$(REPO_ROOT); \
+			$(REPO_ROOT) || exit 1; \
 	done
 
 # ============================================================================
@@ -341,14 +383,16 @@ clean: ## Remove build artifacts
 	@echo "==> Cleaning..."
 	rm -rf bin/ cover.out cover.html
 
+# `go mod tidy` deliberately ignores go.work, so in each module the imports of
+# sibling modules (pkg, gen/go) cannot be resolved locally and tidy reaches for
+# the network. -e keeps it going past that instead of aborting, which is what
+# lets it still prune genuinely-unused requires.
 .PHONY: tidy
-tidy: ## Run go mod tidy on all modules
-	@for svc in $(SERVICES); do \
-		echo "==> Tidying services/$$svc..."; \
-		cd services/$$svc && go mod tidy && cd ../..; \
+tidy: ## Run go mod tidy on every module in go.work
+	@for m in $(GO_MODULES); do \
+		echo "==> Tidying $$m..."; \
+		( cd $$m && go mod tidy -e ) || exit 1; \
 	done
-	@echo "==> Tidying pkg..."
-	cd pkg && go mod tidy
 
 .PHONY: help
 help: ## Show this help
