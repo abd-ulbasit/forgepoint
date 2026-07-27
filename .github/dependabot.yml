@@ -1,0 +1,104 @@
+# =============================================================================
+# DEPENDABOT — automated dependency updates
+# =============================================================================
+#
+# WHY THIS FILE EXISTS:
+#   Every dependency in this repo was last bumped by hand. Five weeks of drift
+#   later, govulncheck found ten reachable CVEs in pkg alone and the Security
+#   workflow had never once been green. The fix for those CVEs is a one-time
+#   event; this file is the mechanism that stops it recurring. Without it, any
+#   security fix in this repo has a shelf life measured in weeks.
+#
+# WHAT IT COVERS:
+#   - gomod: all 15 modules in go.work. Go modules are per-directory, so
+#     Dependabot needs each one listed — a single root entry would find no
+#     go.mod (this is a workspace; there is no root module).
+#   - npm: web/ — the React UI, whose lockfile carries advisories that only
+#     surface when someone looks.
+#   - github-actions: every `uses:` in .github/workflows. This is the entry
+#     that would have caught the failure that kept Security red for a month:
+#     the pinned trivy-action v0.29.0 referenced aquasecurity/setup-trivy@v0.2.2,
+#     a tag upstream deleted, so the job died in "Set up job" in four seconds.
+#
+# WHY GROUPED UPDATES:
+#   15 modules x N dependencies of individual PRs is noise nobody reads, and
+#   unread PRs are how drift happens in the first place. Patch and minor
+#   updates are grouped per ecosystem into one PR; majors stay separate,
+#   because a major is a decision, not a chore.
+#
+# NOTE ON open-pull-requests-limit: the default is 5 per ecosystem. With 15 Go
+# modules that ceiling is hit immediately and the rest go silently unproposed,
+# so gomod gets a higher one.
+# =============================================================================
+
+version: 2
+
+updates:
+  # ---------------------------------------------------------------------------
+  # Go modules — one entry, every module directory in go.work.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: gomod
+    directories:
+      - /cli
+      - /gen/go
+      - /pkg
+      - /services/ai-gateway
+      - /services/auth
+      - /services/bff
+      - /services/billing
+      - /services/experiment-tracker
+      - /services/feature-store
+      - /services/inference-gateway
+      - /services/model-monitor
+      - /services/model-serving
+      - /services/notification
+      - /services/pipeline-orchestrator
+      - /services/registry
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 15
+    commit-message:
+      prefix: deps
+    groups:
+      go-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # ---------------------------------------------------------------------------
+  # npm — the React/TypeScript web UI.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps(web)
+    groups:
+      npm-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # ---------------------------------------------------------------------------
+  # GitHub Actions — the `uses:` pins in .github/workflows.
+  # ---------------------------------------------------------------------------
+  # Dependabot rewrites the SHA and the trailing `# vX.Y.Z` comment together,
+  # so pinning by digest stays pinned by digest — the supply-chain property is
+  # preserved, it just stops being a manual chore.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: ci
+    groups:
+      actions-minor-and-patch:
+        update-types:
+          - minor
+          - patch
