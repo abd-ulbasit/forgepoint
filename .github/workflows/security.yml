@@ -83,10 +83,10 @@ jobs:
           - services/auth
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: ${{ matrix.module }}/go.sum
@@ -111,10 +111,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # WHY v0.36.0 AND NOT THE OLDER PIN: trivy-action is a COMPOSITE action —
+      # pinning it by SHA pins the file, not the actions it calls. v0.29.0
+      # internally referenced `aquasecurity/setup-trivy@v0.2.2`, and upstream
+      # deleted that tag. Every run of this job then died in "Set up job" in
+      # four seconds with "Unable to resolve action aquasecurity/setup-trivy@v0.2.2,
+      # unable to find version v0.2.2" — before a single line of Trivy ran, and
+      # taking the whole `image` job (which `needs` this one) with it. v0.36.0
+      # references setup-trivy by digest (v0.2.6), so a deleted tag upstream
+      # cannot break this gate the same way again.
       - name: Trivy filesystem scan
-        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947b394f2dd8c87dbb0 # v0.29.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -155,19 +164,19 @@ jobs:
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Buildx gives us the modern BuildKit builder (cache mounts in the
       # Dockerfile, multi-stage, provenance) used by build-push-action.
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@6524bf65af31da8d45b59e8c27de4bd072b392f5 # v3.8.0
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       # Derive tags/labels from git context. On a PR we build but do NOT push
       # (no login below); on push/tag we push and sign. metadata-action emits a
       # canonical ${{ steps.meta.outputs.tags }} + OCI labels.
       - name: Docker metadata
         id: meta
-        uses: docker/metadata-action@369eb591f429131d6889c46b94e711f089e6ca96 # v5.6.1
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/forgepoint-${{ matrix.service }}
           tags: |
@@ -181,7 +190,7 @@ jobs:
       # keeps PR runs read-only and avoids a useless auth attempt.
       - name: Log in to GHCR
         if: github.event_name == 'push'
-        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -198,7 +207,7 @@ jobs:
       #     so the signature is immutable even if the tag is later re-pointed).
       - name: Build image
         id: build
-        uses: docker/build-push-action@48aba3b46d1b1fec4febb7c5d0c644b249a11355 # v6.10.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: services/${{ matrix.service }}/Dockerfile
@@ -233,7 +242,7 @@ jobs:
           echo "image=${ref}" >> "$GITHUB_OUTPUT"
 
       - name: Trivy image scan
-        uses: aquasecurity/trivy-action@18f2510ee396bbf400402947b394f2dd8c87dbb0 # v0.29.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: image
           image-ref: ${{ steps.target.outputs.image }}
@@ -260,7 +269,7 @@ jobs:
           upload-release-assets: false
 
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4.6.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: sbom-${{ matrix.service }}
           path: sbom-${{ matrix.service }}.cyclonedx.json
