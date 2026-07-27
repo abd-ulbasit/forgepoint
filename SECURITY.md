@@ -42,6 +42,31 @@ carries two MODERATE advisories whose only fix is the 7.x major. Neither ships i
 the production bundle; the `npm audit` gate is scoped to production dependencies
 for that reason, and Dependabot proposes the majors as reviewable PRs.
 
+## Open findings
+
+The Trivy filesystem gate had never executed before 2026-07-27 — it referenced
+an action tag that upstream deleted, so the job died in setup. The first run
+that got past setup surfaced eight HIGH **IaC misconfigurations**, all
+pre-existing. They are listed here rather than suppressed, and the gate stays
+red until they are resolved:
+
+| Rule | Where | Fix |
+|---|---|---|
+| KSV-0014 | `deploy/k8s/infra/postgres/postgres.yaml`, `deploy/backup/postgres-backup-cronjob.yaml`, `deploy/k8s/observability/grafana/grafana.yaml`, `deploy/llm/ollama.yaml` | `securityContext.readOnlyRootFilesystem: true` plus writable `emptyDir` mounts for each image's scratch paths |
+| KSV-0118 | `deploy/llm/ollama.yaml` | give the ollama pod/container a non-default `securityContext` |
+| AWS-0164 (x3) | `deploy/terraform/modules/network/main.tf:79` | `map_public_ip_on_launch = false` on the public subnets |
+| AWS-0132 | `deploy/terraform/modules/state-backend/main.tf:33-41` | SSE-KMS with a customer-managed key instead of SSE-S3 |
+
+Three of the KSV-0014 sites carry in-file comments saying `readOnlyRootFilesystem`
+was left unset on purpose because the upstream image does not cleanly support it,
+with non-root, `drop: ["ALL"]` and `allowPrivilegeEscalation: false` as
+compensating controls. Either those comments or this gate is wrong; resolving
+that needs a cluster to test against, so it is open rather than decided.
+
+The `image` job `needs` this one, so build → SBOM → cosign does not run while
+these stand. That is the honest state: the signing pipeline is wired and
+unblocked at the action level, but it has not yet produced a Rekor entry.
+
 ## Supply chain
 
 On a `v*` tag the image job additionally:
