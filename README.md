@@ -68,7 +68,7 @@ It runs on a single-node k3s cluster at home, which is not publicly reachable �
 
 Three gaps, stated rather than buried:
 
-- **AI Gateway (M7) is not in the app-of-apps.** It is built, tested and Helm-charted, but `deploy/argocd/apps/` holds 10 service Applications, not 11 — so it deploys by `helm install`, not by GitOps.
+- **Two services are not in the app-of-apps: the AI Gateway (M7) and the BFF.** Both are built, tested and Helm-charted — `deploy/helm/` holds 12 charts — but `deploy/argocd/apps/` holds 10 service Applications plus `infra.yaml`. Those two deploy by `helm install`, not by GitOps.
 - **The testcontainers tests self-skip without a Docker engine.** On a machine with no reachable engine they skip rather than fail, and they are ~18% of the suite — concentrated in exactly the persistence and event layers. `go test ./...` coming back green on such a machine is not evidence those ran; check the skip count.
 - **`docs/diagrams/c4-architecture.md` covers M0–M6 only.** The AI Gateway is not yet in the container diagram.
 
@@ -125,6 +125,14 @@ docs/
   diagrams/   C4 diagrams (M0–M6)
 docker-compose.yaml   Local infrastructure
 ```
+
+---
+
+## How this was built
+
+I build with coding agents running in parallel — one per milestone in the table above — and I review, test and integrate what comes back. Commits an agent drafted carry a `Co-authored-by: Claude` trailer: `git log --grep='^Co-authored-by: Claude' -i --oneline | wc -l` against `git log --oneline | wc -l` gives the ratio at any moment. The trailer convention was adopted partway through this repo, so that number is a floor rather than a total.
+
+The parts that decided the shape of the platform were not generated. Every bullet in [The parts worth reading](#the-parts-worth-reading) is a specific failure someone had to find first — the cancelled saga that answers `CANCELLED` while the row stays `RUNNING`, the partial unique index that cannot be `DEFERRABLE` so every intermediate state has to be legal on its own — and the Status section above lists what is missing instead of quietly omitting it. Read those two sections and `docs/adr/` if you want to judge the engineering rather than the tooling.
 
 ---
 
