@@ -94,10 +94,10 @@ jobs:
       # actions/checkout pinned to a full commit SHA (supply-chain: a moved tag
       # can't swap the action out from under us). Version in the trailing comment.
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           # Cache keyed on THIS module's go.sum so each leg has an independent,
@@ -155,10 +155,10 @@ jobs:
           - services/bff
     steps:
       - name: Checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: ${{ matrix.module }}/go.sum
@@ -171,3 +171,65 @@ jobs:
         with:
           version: v2.12.2
           working-directory: ${{ matrix.module }}
+
+  # ---------------------------------------------------------------------------
+  # web — typecheck + production build of the React/TypeScript UI.
+  # ---------------------------------------------------------------------------
+  # web/ is 48 tracked files of TypeScript that every Go gate above ignores.
+  # Until this job existed no workflow in the repo mentioned node or npm, so
+  # `tsc -b && vite build` — the command that produces the UI — had never once
+  # been run by CI. A type error or a broken import in the dashboard would have
+  # reached main with every check green.
+  #
+  # There is no test runner in web/package.json, so this job gates what is
+  # actually there: the lockfile installs, the project typechecks, and the
+  # production bundle builds. That is a real gate, not a placeholder — the
+  # build is the artifact users get.
+  web:
+    name: web (typecheck · build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # 22 is the active LTS and is what vite 5 supports; pinned to the
+          # major so a Node 23/24 change can't silently alter the bundle.
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # `npm ci` (not `npm install`): installs exactly the lockfile, fails if
+      # package.json and package-lock.json have drifted apart. A CI that can
+      # silently resolve a different dependency tree than the developer's is
+      # not reproducing anything.
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      # Supply-chain gate for the code that actually ships to a browser.
+      #
+      # WHY --omit=dev: the build toolchain (vite, esbuild) carries advisories
+      # for its DEV SERVER — path traversal reachable only by someone who can
+      # reach `vite dev` on a developer's machine. None of it is in the bundle.
+      # Gating the whole tree on those would mean either a permanently red job
+      # or a `continue-on-error` that trains people to ignore it. Scoping to
+      # production dependencies makes the HIGH/CRITICAL threshold enforceable
+      # and honest.
+      #
+      # Known and NOT hidden by this scoping: react-router 6.x carries two
+      # MODERATE advisories whose only fix is the 7.x major. Dependabot (see
+      # .github/dependabot.yml) opens that PR; taking a breaking router upgrade
+      # on a UI with no tests is a reviewed change, not a CI side effect.
+      - name: npm audit (production dependencies)
+        run: npm audit --omit=dev --audit-level=high
