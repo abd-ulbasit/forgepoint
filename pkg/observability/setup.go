@@ -80,7 +80,14 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	"go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.39.0"
+
+	// The semconv version MUST match the one baked into the SDK's
+	// resource.Default() for this otel release — resource.Merge() rejects two
+	// resources whose Schema URLs differ ("conflicting Schema URL"), and
+	// Setup() would fail at runtime, not at compile time. otel 1.42's
+	// resource.Default() carries schema 1.40.0, so this import tracks it.
+	// Bump both together on an otel upgrade.
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
 )
 
 // setupCalled (guarded by setupMu) ensures Setup() runs at most once per process.
