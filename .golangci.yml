@@ -111,6 +111,19 @@ linters:
       - path: cmd/server/main\.go
         text: exitAfterDefer
 
+      # prealloc on `publicMethods`: every service declares an explicitly-empty
+      # slice of RPCs that skip authentication, so that a new RPC added to the
+      # proto is authenticated by default and making one public is a conscious,
+      # reviewable edit in one obvious place. The slice is empty on purpose and
+      # is appended to exactly once, with the constant health+reflection set.
+      # Preallocating it would mean writing a capacity for a list whose whole
+      # point is that it has no entries, which hides the default-deny stance the
+      # named variable exists to advertise. Nothing is allocated in a loop here.
+      - path: cmd/server/main\.go
+        text: Consider preallocating publicMethods
+        linters:
+          - prealloc
+
 formatters:
   enable:
     - gofmt

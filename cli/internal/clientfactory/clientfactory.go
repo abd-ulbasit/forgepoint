@@ -218,8 +218,10 @@ func Dial(addr, token string, useTLS bool) (*grpc.ClientConn, error) {
 		transport = grpc.WithTransportCredentials(insecure.NewCredentials())
 	}
 
-	opts := []grpc.DialOption{transport}
-	opts = append(opts, TokenDialOptions(token)...)
+	tokenOpts := TokenDialOptions(token)
+	opts := make([]grpc.DialOption, 0, 1+len(tokenOpts))
+	opts = append(opts, transport)
+	opts = append(opts, tokenOpts...)
 
 	// grpc.NewClient is the modern, non-deprecated constructor (replaces
 	// grpc.Dial/DialContext). It creates the ClientConn lazily; the first RPC
