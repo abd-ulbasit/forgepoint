@@ -211,7 +211,7 @@ jobs:
       # Buildx gives us the modern BuildKit builder (cache mounts in the
       # Dockerfile, multi-stage, provenance) used by build-push-action.
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # Derive tags/labels from git context. On a PR we build but do NOT push
       # (no login below); on push/tag we push and sign. metadata-action emits a
@@ -232,7 +232,7 @@ jobs:
       # keeps PR runs read-only and avoids a useless auth attempt.
       - name: Log in to GHCR
         if: github.event_name == 'push'
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -249,7 +249,7 @@ jobs:
       #     so the signature is immutable even if the tag is later re-pointed).
       - name: Build image
         id: build
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: services/${{ matrix.service }}/Dockerfile
@@ -301,7 +301,7 @@ jobs:
       # Syft; CycloneDX is the format policy engines + `cosign attest` consume.
       # Uploaded as an artifact (and as a release asset on a tag).
       - name: Generate CycloneDX SBOM (Syft)
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ${{ steps.target.outputs.image }}
           format: cyclonedx-json
@@ -311,7 +311,7 @@ jobs:
           upload-release-assets: false
 
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sbom-${{ matrix.service }}
           path: sbom-${{ matrix.service }}.cyclonedx.json
