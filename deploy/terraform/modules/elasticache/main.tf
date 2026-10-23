@@ -80,9 +80,11 @@ resource "aws_security_group_rule" "redis_ingress" {
 # results, the replication group's auth_token and the secret_string below are
 # all persisted). Unlike RDS there is no AWS-managed password for ElastiCache,
 # and AWS provider 5.x has no write-only auth_token. Mitigations: the state
-# bucket is SSE-KMS with a CMK and restricted to the Terraform roles
-# (modules/state-backend). The longer-term fix is ElastiCache RBAC users with
-# IAM authentication, which needs a client change (short-lived IAM auth tokens).
+# bucket is SSE-KMS with a CMK, and restricted to the roles listed in
+# state_access_principal_arns once that is set (it defaults to [], which adds
+# no restriction; modules/state-backend). The longer-term fix is ElastiCache
+# RBAC users with IAM authentication, which needs a client change (short-lived
+# IAM auth tokens).
 #
 # DRIFT HAZARD: the replication group ignores auth_token changes (below) but the
 # secret version does not. If the token is ever rotated outside Terraform, the
