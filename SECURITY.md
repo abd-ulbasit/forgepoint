@@ -110,13 +110,24 @@ image scan read it. Each entry must have:
 
 ## Supply chain
 
-On a `v*` tag the image job additionally:
+Every image is `ghcr.io/abd-ulbasit/forgepoint/<service>`, the name the Helm
+charts, the Rollouts and the Kyverno allowlist use. The pipeline is split so
+that nothing reaches the registry unscanned:
 
-1. builds the service image from the repo root context (distroless runtime, no
-   shell, no package manager),
-2. generates a CycloneDX SBOM with Syft and uploads it as a build artifact,
-3. signs the image **by digest** with `cosign` in keyless mode, and
-4. attaches the SBOM as a signed CycloneDX attestation.
+1. **`image`** (every run, `contents: read` only): builds the service image from
+   the repo root context (distroless runtime, no shell, no package manager) into
+   a local tarball, scans **that tarball** with Trivy (HIGH/CRITICAL fail), and
+   generates a CycloneDX SBOM of it with Syft. It never pushes.
+2. **`publish`** (pushes to `main` and `v*` tags only; the only job with
+   `packages: write` and `id-token: write`): refuses a `v*` tag whose commit is
+   not on `main`, checks the tarball's config digest against the one that was
+   scanned, pushes it, checks the registry's manifest still points at that
+   config, then signs the image **by digest** with `cosign` in keyless mode and
+   attaches the SBOM as a signed CycloneDX attestation.
+
+Pull requests build and scan but never push or sign. Every published image,
+`main` builds included, is signed, so the cluster can require a signature on
+any image from this repository.
 
 Keyless means there is no long-lived signing key to leak: cosign exchanges the
 workflow's GitHub OIDC token for a short-lived Fulcio certificate, and the
@@ -128,10 +139,12 @@ To verify a published image:
 
 ```sh
 cosign verify \
-  --certificate-identity-regexp '^https://github.com/abd-ulbasit/forgepoint/\.github/workflows/security\.yml@refs/tags/v' \
+  --certificate-identity-regexp '^https://github\.com/abd-ulbasit/forgepoint/\.github/workflows/security\.yml@refs/(heads/main|tags/v.*)$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  ghcr.io/abd-ulbasit/forgepoint-<service>@<digest>
+  ghcr.io/abd-ulbasit/forgepoint/<service>@<digest>
 ```
+
+Use `@refs/tags/v.*$` instead to accept release builds only.
 
 ## Keeping it that way
 
