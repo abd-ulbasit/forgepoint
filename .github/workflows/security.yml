@@ -66,8 +66,14 @@ on:
 permissions:
   contents: read
 
+# The event is part of the group. GitHub keeps at most one PENDING run per
+# group and cancels it when another run queues, whatever cancel-in-progress
+# says. Without the event, the weekly schedule run (ref = main) could queue
+# behind an in-progress push run and cancel a pending push run, so that commit
+# would never be published or signed. Schedule and dispatch runs now queue in
+# their own groups and never displace a push.
 concurrency:
-  group: security-${{ github.workflow }}-${{ github.ref }}
+  group: security-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
