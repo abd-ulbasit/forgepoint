@@ -126,6 +126,11 @@ spec:
 #     docker.io/minio/{minio,mc}. We pin the FULL repo path (not a bare
 #     "docker.io/*") so only these specific, reviewed infra images are allowed —
 #     not all of Docker Hub.
+#   - the PINNED observability images in fp-infra (deploy/k8s/observability):
+#     grafana/{grafana,loki,tempo}, prom/prometheus and
+#     otel/opentelemetry-collector-contrib. They were missing, so flipping to
+#     Enforce would have blocked the whole observability plane. Same rule: one
+#     full repo path each, never "grafana/*" or "docker.io/*".
 #
 # HOW THE CHECK WORKS: for each container we test whether its image matches ANY
 # entry in `allowedRegistries`. JMESPath has no "matches any glob" builtin, so we
@@ -205,13 +210,27 @@ spec:
               # golang-migrate initContainer in the fp-* charts.
               - "migrate/migrate:*"
               - "docker.io/migrate/migrate:*"
+              # Pinned observability images (deploy/k8s/observability, fp-infra).
+              - "grafana/grafana:*"
+              - "docker.io/grafana/grafana:*"
+              - "grafana/loki:*"
+              - "docker.io/grafana/loki:*"
+              - "grafana/tempo:*"
+              - "docker.io/grafana/tempo:*"
+              - "prom/prometheus:*"
+              - "docker.io/prom/prometheus:*"
+              - "otel/opentelemetry-collector-contrib:*"
+              - "docker.io/otel/opentelemetry-collector-contrib:*"
       validate:
         message: >-
           Image registry is not allowlisted. Allowed:
           ghcr.io/abd-ulbasit/forgepoint, gcr.io/distroless, migrate/migrate,
-          and the pinned infra images (postgres, redis, nats, minio/minio,
-          minio/mc). ECR is allowed only for the single account added by the
-          EKS overlay. Edit restrict-image-registries to add one.
+          the pinned infra images (postgres, redis, nats, minio/minio,
+          minio/mc) and the pinned observability images (grafana/grafana,
+          grafana/loki, grafana/tempo, prom/prometheus,
+          otel/opentelemetry-collector-contrib). ECR is allowed only for the
+          single account added by the EKS overlay. Edit
+          restrict-image-registries to add one.
         # foreach + deny: for each container, count how many allowlist globs the
         # image matches; deny when ZERO match.
         #

@@ -25,7 +25,7 @@ This is part of milestone **M6 — Platform security, GitOps & autoscaling**
 | `require-seccomp-runtimedefault` | `seccompProfile.type` is `RuntimeDefault`/`Localhost` | all pods' podSecurityContext |
 | `require-resource-requests-and-limits` | cpu+memory **requests AND limits** on every container | fp-auth `resources`; all infra pods |
 | `disallow-latest-tag` | image is tagged and not `:latest` | pinned infra tags; appVersion tag |
-| `restrict-image-registries` | image from the **allowlist** (parameterized) | ghcr, distroless, migrate, pinned infra; ECR only per-account in the EKS overlay |
+| `restrict-image-registries` | image from the **allowlist** (parameterized) | ghcr, distroless, migrate, pinned infra and observability images; ECR only per-account in the EKS overlay |
 | `verify-image-signatures` | `ghcr.io/abd-ulbasit/forgepoint/*` carries a cosign **keyless** signature from this repo's `security.yml` on `main` or a `v*` tag | the Security workflow's `publish` job |
 | `require-part-of-label` | `app.kubernetes.io/part-of=forgepoint` on pod templates | recommended labels everywhere |
 | `disallow-host-namespaces` | no `hostPID`/`hostIPC`/`hostNetwork` | (none of ours use them) |
@@ -75,6 +75,13 @@ single list. It currently allows:
   charts (previously missing: Enforce would have blocked every migration)
 - the **specific pinned infra images**: `postgres`, `redis`, `nats`,
   `minio/minio`, `minio/mc` (both short and `docker.io/...` spellings)
+- the **specific pinned observability images** in `fp-infra`:
+  `grafana/grafana`, `grafana/loki`, `grafana/tempo`, `prom/prometheus`,
+  `otel/opentelemetry-collector-contrib` (both spellings; previously missing, so
+  Enforce would have blocked the whole observability plane)
+
+`ollama/ollama` (`deploy/llm`) runs in `fp-ml`, which these policies do not
+match, so it needs no entry unless the scope grows.
 
 There is deliberately **no ECR entry** in the base. The old
 `*.dkr.ecr.*.amazonaws.com/*` glob matched any AWS account's registry, an
