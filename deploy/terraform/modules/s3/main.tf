@@ -21,18 +21,41 @@ resource "aws_s3_bucket_versioning" "artifacts" {
   }
 }
 
-# SSE-KMS by default. If a KMS key ARN was supplied we use aws:kms with that CMK
-# (customer-controlled key, auditable via CloudTrail). If not, fall back to SSE-S3
-# (AES256) — still encrypted at rest, just with the AWS-managed key. bucket_key
-# reduces KMS API calls (and cost) by caching a bucket-level data key.
+# DEDICATED CMK for the artifacts bucket (unless the caller passes one in).
+# WHY a key of its own: the dev composition used to pass the RDS key, so every
+# workload allowed to read model artifacts also held kms:Decrypt on the key that
+# wraps the database credential secret. One later IAM mistake (a broad
+# secretsmanager:GetSecretValue) would then have been a credential read. One key
+# per data class keeps the blast radius of a decrypt grant to that class.
+resource "aws_kms_key" "artifacts" {
+  count                   = var.kms_key_arn == "" ? 1 : 0
+  description             = "${var.name_prefix} model-artifacts bucket SSE-KMS key"
+  enable_key_rotation     = true
+  deletion_window_in_days = 30
+  tags                    = merge(var.tags, { Name = "${var.name_prefix}-artifacts-kms" })
+}
+
+resource "aws_kms_alias" "artifacts" {
+  count         = var.kms_key_arn == "" ? 1 : 0
+  name          = "alias/${var.name_prefix}-artifacts"
+  target_key_id = aws_kms_key.artifacts[0].key_id
+}
+
+locals {
+  artifacts_kms_key_arn = var.kms_key_arn != "" ? var.kms_key_arn : aws_kms_key.artifacts[0].arn
+}
+
+# SSE-KMS with the artifacts CMK (customer-controlled key, auditable via
+# CloudTrail). bucket_key reduces KMS API calls (and cost) by caching a
+# bucket-level data key.
 resource "aws_s3_bucket_server_side_encryption_configuration" "artifacts" {
   bucket = aws_s3_bucket.artifacts.id
   rule {
     apply_server_side_encryption_by_default {
-      sse_algorithm     = var.kms_key_arn != "" ? "aws:kms" : "AES256"
-      kms_master_key_id = var.kms_key_arn != "" ? var.kms_key_arn : null
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = local.artifacts_kms_key_arn
     }
-    bucket_key_enabled = var.kms_key_arn != ""
+    bucket_key_enabled = true
   }
 }
 

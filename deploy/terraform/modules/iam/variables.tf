@@ -58,6 +58,12 @@ variable "artifacts_bucket_arn" {
   default     = ""
 }
 
+variable "artifacts_kms_key_arn" {
+  description = "ARN of the KMS key encrypting the artifacts bucket (from the s3 module). Roles with s3_artifact_access get kms:Decrypt on it, plus kms:GenerateDataKey for readwrite (needed to PUT an SSE-KMS object). Keeps artifact access from needing a hand-maintained kms_key_arns entry."
+  type        = string
+  default     = ""
+}
+
 variable "tags" {
   description = "Additional tags (Project/Environment/ManagedBy via provider default_tags)."
   type        = map(string)

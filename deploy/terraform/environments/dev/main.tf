@@ -110,15 +110,14 @@ module "elasticache" {
 # ----------------------------------------------------------------------------
 # (5) S3 — model-artifacts bucket
 # ----------------------------------------------------------------------------
-# Bucket names are globally unique, so suffix with the account id. We reuse the
-# RDS KMS key for SSE-KMS to avoid spinning up yet another CMK in dev; prod could
-# pass a dedicated artifacts key.
+# Bucket names are globally unique, so suffix with the account id. The module
+# creates a dedicated CMK for the bucket. (It used to reuse the RDS key, which
+# gave every artifact reader kms:Decrypt on the key that wraps the DB secrets.)
 module "s3" {
   source = "../../modules/s3"
 
   name_prefix = local.name_prefix
   bucket_name = "${local.name_prefix}-model-artifacts-${data.aws_caller_identity.current.account_id}"
-  kms_key_arn = module.rds.kms_key_arn
 }
 
 # ----------------------------------------------------------------------------
@@ -141,9 +140,11 @@ module "ecr" {
 # Helm chart fullnames (e.g. fp-registry) in the fp-system namespace.
 #
 # Roles modeled here (extend as services gain AWS needs):
-#   - registry       : read/write model artifacts in S3 + read its DB secret
-#   - model-serving  : READ model artifacts from S3 (pulls weights) + read DB? no.
-#                      serving holds models in-memory; it only needs S3 read.
+#   - registry       : read/write model artifacts in S3
+#   - model-serving  : READ model artifacts from S3 (pulls weights)
+#   NOTE: no service code uses S3 yet (no AWS SDK in any go.mod; model-serving
+#   fetches file:// and http(s):// URLs). These two roles are the intended
+#   shape; they grant nothing until a ServiceAccount is annotated with them.
 #   - external-secrets: the External Secrets Operator's controller SA — reads the
 #                      RDS + Redis secrets from Secrets Manager and projects them
 #                      into K8s Secrets for every service. Central, so each app
@@ -151,10 +152,11 @@ module "ecr" {
 module "iam" {
   source = "../../modules/iam"
 
-  name_prefix          = local.name_prefix
-  oidc_provider_arn    = module.eks.oidc_provider_arn
-  oidc_provider_url    = module.eks.oidc_provider_url
-  artifacts_bucket_arn = module.s3.bucket_arn
+  name_prefix           = local.name_prefix
+  oidc_provider_arn     = module.eks.oidc_provider_arn
+  oidc_provider_url     = module.eks.oidc_provider_url
+  artifacts_bucket_arn  = module.s3.bucket_arn
+  artifacts_kms_key_arn = module.s3.kms_key_arn
 
   roles = {
     # Model Registry: writes artifacts on RegisterVersion, reads on serve-prep.
@@ -163,9 +165,9 @@ module "iam" {
       service_account_name = "fp-registry"
       s3_artifact_access   = "readwrite"
       secret_arns          = []
-      # The artifacts bucket uses the RDS CMK for SSE-KMS (see module "s3"), so
-      # reading/writing objects needs kms:Decrypt on that key.
-      kms_key_arns = [module.rds.kms_key_arn]
+      # KMS for the artifacts key comes from artifacts_kms_key_arn above; this
+      # role needs no other key.
+      kms_key_arns = []
     }
 
     # Model Serving: pulls (reads) model weights from S3 on startup. Read-only.
@@ -174,7 +176,7 @@ module "iam" {
       service_account_name = "fp-model-serving"
       s3_artifact_access   = "read"
       secret_arns          = []
-      kms_key_arns         = [module.rds.kms_key_arn]
+      kms_key_arns         = []
     }
 
     # External Secrets Operator controller: the ONE workload allowed to read the
