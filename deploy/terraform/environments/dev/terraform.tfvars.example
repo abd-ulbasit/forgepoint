@@ -16,10 +16,18 @@ az_count           = 3
 single_nat_gateway = true # PROD: false (one NAT per AZ for egress resilience)
 
 # ---- EKS -------------------------------------------------------------------
-cluster_version   = "1.30"
-eks_public_access = true # PROD: false (reach the API via VPN/bastion only)
-# SECURITY: replace with your office/VPN egress CIDR. 0.0.0.0/0 = open to the world.
-eks_public_access_cidrs = ["0.0.0.0/0"]
+cluster_version = "1.30"
+# Kubernetes API endpoint. Same secure default as variables.tf: private only,
+# reached from inside the VPC (bastion / VPN / SSM port-forward).
+eks_public_access       = false
+eks_public_access_cidrs = []
+# Need kubectl from a laptop on a throwaway cluster? Enable the public endpoint
+# AND restrict it to your own egress IP (curl -s https://checkip.amazonaws.com):
+#   eks_public_access       = true
+#   eks_public_access_cidrs = ["203.0.113.10/32"]
+# Never 0.0.0.0/0: that puts the API server on the internet, guarded only by
+# authentication. (Trivy does not scan *.tfvars.example files, so nothing in CI
+# would have caught this file doing exactly that.)
 
 node_instance_types = ["t3.medium"]
 node_desired_size   = 2
