@@ -124,25 +124,37 @@ None of the Kubernetes fixes has been run against a cluster yet. Verify postgres
 (synced by the `fp-infra` Argo CD app), grafana and ollama after rollout.
 
 **Still red after this triage (2026-10-24):** the same scan reports HIGH
-dependency CVEs. They are dependency bumps, left to the open Dependabot PRs so
-the two do not conflict, but those PRs do **not** fully clear the gate as they
-stand:
+dependency CVEs in the Go modules, and govulncheck fails every module on the
+reachable subset of them. They are dependency bumps, left to the open
+Dependabot PR so the two do not conflict, but #17 does **not** fully clear
+either gate as it stands:
 
 | Package | Fixed in | Open Dependabot PR brings it to |
 |---|---|---|
-| `golang.org/x/crypto` | 0.55.0 | 0.55.0 (#17) |
+| `golang.org/x/crypto` | 0.55.0 (Trivy); **0.56.0** for govulncheck (GO-2026-6354, GO-2026-6355, reachable from `pkg`) | 0.55.0 (#17), still red in govulncheck |
 | `golang.org/x/text` | 0.41.0 | 0.41.0 (#17) |
 | `google.golang.org/grpc` | 1.83.1 | 1.83.2 (#17) |
 | `golang.org/x/net` | **0.60.0** (one CVE; another is fixed in 0.56.0) | 0.58.0 (#17), still vulnerable |
+| `go.opentelemetry.io/otel/sdk`, `.../exporters/otlp/otlptrace` | 1.45.0 (govulncheck only, GO-2026-6505) | 1.46.0 (#17) |
 | `github.com/klauspost/compress` | **1.18.7** | 1.18.6 (#17), still vulnerable |
 | `github.com/moby/go-archive` | **0.3.0** | unchanged |
-| `axios` (web) | **1.20.0** | 1.19.0 (#10), still vulnerable |
-| `follow-redirects` (web) | **1.16.1** | unchanged |
 
 #17 also leaves out `cli/`, `gen/go` and `services/bff`, which carry the same
-`x/net`, `x/text` and `grpc` advisories. After merging #17 and #10, bump the
-remaining packages by hand (or let Dependabot's next run propose them), then
-re-run Security.
+`x/net`, `x/text` and `grpc` advisories (and, in `bff`, the `otel` one). After
+merging #17, bump the remaining packages by hand (or let Dependabot's next run
+propose them), then re-run Security.
+
+Fixed on this branch rather than left to Dependabot:
+
+- the web findings: `axios` 1.20.0 and `follow-redirects` 1.16.1 (#10 only
+  reached axios 1.19.0, still vulnerable);
+- the standard-library finding govulncheck reported in every module,
+  GO-2026-6809 (`crypto/x509`, Go 1.26.9). Go is pinned to **1.26.10** in
+  `go.work`, every `go.mod`, `GO_VERSION` in both workflows and the
+  `golang:1.26.10-alpine` builder digest in every Dockerfile. With
+  `GOTOOLCHAIN=local` (setup-go and the golang image both set it) an older
+  toolchain now refuses to build instead of silently compiling on an unpatched
+  standard library.
 
 **Known defect, not a scanner finding:** `postgres-backup-cronjob.yaml` cannot
 succeed as written. It runs as uid 999 but `apk add`s packages and writes `mc`
