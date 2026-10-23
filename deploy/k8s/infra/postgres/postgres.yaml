@@ -143,10 +143,16 @@ spec:
               containerPort: 5432
           securityContext:
             allowPrivilegeEscalation: false
-            # readOnlyRootFilesystem is NOT set: the postgres entrypoint writes to
-            # /var/run/postgresql (socket) and a few transient paths. We give it a
-            # writable emptyDir for the socket dir instead of a fully-read-only FS,
-            # which the image doesn't cleanly support. Data still lives on the PVC.
+            # Read-only root FS (Trivy KSV-0014). Running as uid 999 the entrypoint
+            # skips its root-only chown/gosu step, and everything it and the server
+            # write lands on one of three mounts: PGDATA on the PVC, the unix socket
+            # in /var/run/postgresql, and /tmp (bash heredoc spill files, nss_wrapper
+            # if the uid were ever not in /etc/passwd). Both of the latter are
+            # emptyDirs below. Earlier revisions left this unset on the belief the
+            # image could not run read-only; it can, as long as those paths are
+            # writable. VERIFY on the cluster after rollout: `kubectl -n fp-infra
+            # logs postgres-0` should show "database system is ready".
+            readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
           resources:
@@ -184,6 +190,8 @@ spec:
               readOnly: true
             - name: run
               mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: init
           configMap:
@@ -195,6 +203,9 @@ spec:
             # triggers parse errors in strict YAML-1.1 tooling (e.g. some linters).
         - name: run
           emptyDir: {}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
   volumeClaimTemplates:
     - metadata:
         name: data

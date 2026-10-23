@@ -371,21 +371,18 @@ spec:
 
 ---
 # -----------------------------------------------------------------------------
-# require-readonly-rootfs  (WITH a documented exception for stateful infra)
+# require-readonly-rootfs  (no exceptions)
 # -----------------------------------------------------------------------------
 # readOnlyRootFilesystem=true means the container can't write to its own image
 # layers — it must mount an emptyDir/PVC for any writable path. This neuters a
 # whole class of attacks (dropping a binary, tampering with config) and is set
-# on fp-auth, redis, nats, and minio.
+# on fp-auth, redis, nats, minio and postgres.
 #
-# THE EXCEPTION (read the postgres manifest): the official postgres image's
-# entrypoint writes to a few transient paths and does not cleanly support a
-# fully read-only root FS, so postgres deliberately omits readOnlyRootFilesystem
-# and instead confines writes to a PVC + an emptyDir socket dir. We encode that
-# as a precondition-based exclusion keyed on the well-known label
-# app.kubernetes.io/name=postgres, so the exception is NARROW, named, and
-# auditable — not a blanket hole. If we add another image that genuinely can't
-# run read-only, we extend this allowlist explicitly (and document why).
+# There used to be a label-selected exception for postgres, on the belief that
+# the official image could not run read-only. It can (PGDATA on the PVC, the
+# socket dir and /tmp on emptyDirs; see deploy/k8s/infra/postgres/postgres.yaml),
+# so the exception is gone. If an image genuinely cannot run read-only, add a
+# NARROW, label-selected exclusion here and document why next to it.
 apiVersion: kyverno.io/v1
 kind: ClusterPolicy
 metadata:
@@ -396,10 +393,7 @@ metadata:
     policies.kyverno.io/severity: medium
     policies.kyverno.io/subject: Pod
     policies.kyverno.io/description: >-
-      Containers must set securityContext.readOnlyRootFilesystem=true. A narrow,
-      documented exception applies to stateful infra whose image cannot run with
-      a read-only root FS (currently: postgres), selected by the
-      app.kubernetes.io/name label.
+      Containers must set securityContext.readOnlyRootFilesystem=true.
 spec:
   validationFailureAction: Audit
   background: true
@@ -422,18 +416,10 @@ spec:
                 - kube-system
                 - kube-node-lease
                 - kube-public
-          # DOCUMENTED EXCEPTION: postgres cannot run read-only (see
-          # deploy/k8s/infra/postgres/postgres.yaml comments). Exclude by its
-          # platform label so the carve-out is explicit and greppable.
-          - resources:
-              selector:
-                matchLabels:
-                  app.kubernetes.io/name: postgres
       validate:
         message: >-
           readOnlyRootFilesystem must be true on every container. Mount an
-          emptyDir/PVC for any writable path (e.g. /tmp). Documented exception:
-          stateful infra labeled app.kubernetes.io/name=postgres.
+          emptyDir/PVC for any writable path (e.g. /tmp).
         pattern:
           spec:
             =(ephemeralContainers):

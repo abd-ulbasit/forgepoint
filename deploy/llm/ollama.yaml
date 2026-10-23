@@ -58,6 +58,15 @@ spec:
     spec:
       # Terminate fast on scale-down so the node reclaims RAM quickly.
       terminationGracePeriodSeconds: 20
+      # Ollama never calls the Kubernetes API.
+      automountServiceAccountToken: false
+      # Pod-level hardening (Trivy KSV-0118: the pod previously ran with an
+      # entirely default security context). seccomp RuntimeDefault filters the
+      # syscall surface. The process still runs as uid 0 - see the container
+      # securityContext for why and for what it no longer has.
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: ollama
           image: ollama/ollama:0.30.10
@@ -65,6 +74,21 @@ spec:
           ports:
             - name: http
               containerPort: 11434
+          # STILL ROOT (uid 0), deliberately, for now: the existing ollama-models
+          # PVC was populated by a root process (including the 0600 id_ed25519
+          # key Ollama reads at startup), and local-path volumes ignore fsGroup,
+          # so switching uid here would crash the pod on its own data. Moving to
+          # a non-root uid needs a one-time chown of the PVC; tracked in
+          # deploy/llm/README.md. Meanwhile root is defanged: ALL capabilities
+          # dropped (no CAP_DAC_OVERRIDE, CAP_CHOWN, CAP_NET_RAW, ...), no
+          # privilege escalation, and a read-only root FS (Trivy KSV-0014) so a
+          # compromised runner cannot modify the image's binaries. Writes go to
+          # the model PVC (/root/.ollama) and /tmp only.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           env:
             # Keep a model warm for 2m between requests so rapid embed/judge/chat
             # calls don't each cold-load from disk (which timed out the cache embed
@@ -95,6 +119,8 @@ spec:
           volumeMounts:
             - name: models
               mountPath: /root/.ollama
+            - name: tmp
+              mountPath: /tmp
           # The model loads lazily on the first request (keep_alive=0), so readiness
           # is just the HTTP server being up, not a model being resident.
           readinessProbe:
@@ -113,6 +139,9 @@ spec:
         - name: models
           persistentVolumeClaim:
             claimName: ollama-models
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi
 ---
 apiVersion: v1
 kind: Service

@@ -21,7 +21,7 @@ This is part of milestone **M6 — Platform security, GitOps & autoscaling**
 | `require-run-as-nonroot` | `runAsNonRoot=true` (pod or every container) | fp-auth podSecurityContext; infra `runAsUser` 999/1000 |
 | `disallow-privilege-escalation` | `allowPrivilegeEscalation=false` on all containers | every container securityContext |
 | `drop-all-capabilities` | `capabilities.drop` contains `ALL` | every container securityContext |
-| `require-readonly-rootfs` | `readOnlyRootFilesystem=true` (**exception:** `app.kubernetes.io/name=postgres`) | fp-auth, redis, nats, minio |
+| `require-readonly-rootfs` | `readOnlyRootFilesystem=true` (no exceptions) | fp-auth, redis, nats, minio, postgres |
 | `require-seccomp-runtimedefault` | `seccompProfile.type` is `RuntimeDefault`/`Localhost` | all pods' podSecurityContext |
 | `require-resource-requests-and-limits` | cpu+memory **requests AND limits** on every container | fp-auth `resources`; all infra pods |
 | `disallow-latest-tag` | image is tagged and not `:latest` | pinned infra tags; appVersion tag |
@@ -51,16 +51,14 @@ audit** trail):
   it's disallowed in non-dev. `fp-dev` is excluded so the permissive dev default stays
   frictionless locally.
 
-### The documented `readOnlyRootFilesystem` exception
+### No `readOnlyRootFilesystem` exception
 
-`require-readonly-rootfs` **excludes** pods labeled
-`app.kubernetes.io/name=postgres`. The official `postgres` image's entrypoint
-writes to transient paths and does not cleanly support a fully read-only root FS
-(see the comments in `deploy/k8s/infra/postgres/postgres.yaml`), so postgres
-confines writes to its PVC + an emptyDir socket dir instead. The carve-out is a
-**narrow, named, label-selected** exclusion — not a blanket hole. Adding another
-genuinely-incompatible image means extending that exclusion explicitly and
-documenting why.
+`require-readonly-rootfs` used to exclude pods labeled
+`app.kubernetes.io/name=postgres`, on the belief that the official image could not
+run with a read-only root FS. It can: PGDATA lives on the PVC and the socket dir
+and `/tmp` are emptyDirs (see `deploy/k8s/infra/postgres/postgres.yaml`), so the
+exception was removed. If an image genuinely cannot run read-only, add a
+**narrow, named, label-selected** exclusion and document why next to it.
 
 ### The parameterized registry allowlist
 
@@ -162,7 +160,7 @@ These Kyverno policies **complement** — they don't replace — PodSecurity:
 | | Pod Security admission | Kyverno (these policies) |
 |---|---|---|
 | Granularity | 3 fixed profiles, all-or-nothing per namespace | per-rule, fine-grained, individually toggled |
-| Exceptions | none built in (exempt = whole namespace) | **narrow, labeled** (e.g. postgres readonly-rootfs) |
+| Exceptions | none built in (exempt = whole namespace) | **narrow, labeled** (selector-based `exclude`) |
 | Coverage | pod securityContext only | + **registries, image tags, resource limits, labels, hostPort** |
 | Reporting | deny only (no "audit-but-allow" inventory of *all* violations) | rich PolicyReports, background scan of existing objects |
 | Custom rules | not possible | yes (any field, JMESPath conditions) |
@@ -189,7 +187,7 @@ deploy/policies/
 ├── base/                          ← all policies, validationFailureAction: Audit
 │   ├── kustomization.yaml
 │   ├── 00-pod-security.yaml        ← nonroot, no-priv-esc, drop-all-caps,
-│   │                                  readonly-rootfs (+postgres exception),
+│   │                                  readonly-rootfs,                  
 │   │                                  seccomp RuntimeDefault
 │   ├── 10-require-resources.yaml   ← requests + limits (cpu & memory)
 │   ├── 20-image-policies.yaml      ← disallow-latest-tag, restrict-registries

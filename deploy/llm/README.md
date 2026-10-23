@@ -56,3 +56,26 @@ kubectl --kubeconfig $KC -n fp-ml exec deploy/ollama -- \
   TTS + cluster unharmed).
 - Scale-to-zero `ScaledObject`: **authored**, applied together with the L1 AI Gateway
   (which creates the `AI_REQUESTS` stream + publishes the warm signal).
+
+## Security context, and the move off root
+
+The pod runs with seccomp `RuntimeDefault`, every Linux capability dropped, no
+privilege escalation and a read-only root filesystem (writes go to the model PVC
+at `/root/.ollama` and an emptyDir at `/tmp`). It still runs as **uid 0**: the
+`ollama-models` PVC was populated by a root process, including the `0600`
+`id_ed25519` key Ollama reads at startup, and the k3s `local-path` provisioner
+ignores `fsGroup`, so changing the uid in the manifest alone would crash the pod
+on its own data.
+
+To finish the job (one-time, on the cluster):
+
+1. Scale to zero: `kubectl -n fp-ml scale deploy/ollama --replicas=0`.
+2. Chown the volume to the target uid, e.g. with a throwaway pod that mounts
+   `ollama-models` and runs `chown -R 65532:65532 /data`.
+3. In `ollama.yaml` set `runAsUser`/`runAsGroup: 65532`, `runAsNonRoot: true`,
+   `HOME=/home/ollama` and `OLLAMA_MODELS=/home/ollama/.ollama/models`, and move
+   the PVC mount to `/home/ollama/.ollama`.
+4. Scale back up and confirm `ollama list` still shows the pulled model.
+
+`fp-ml` is also outside the namespaces the Kyverno policies match
+(`deploy/policies`), so none of this is checked at admission yet.

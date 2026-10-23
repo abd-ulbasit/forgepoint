@@ -289,15 +289,23 @@ spec:
             # Provisioned dashboards live under this path (matches the provider).
             - name: GF_PATHS_PROVISIONING
               value: /etc/grafana/provisioning
+            # Log to stdout only. The image default also writes
+            # /var/log/grafana/grafana.log, which a read-only root FS forbids, and
+            # the kubelet already captures stdout.
+            - name: GF_LOG_MODE
+              value: console
           ports:
             - name: http
               containerPort: 3000
           securityContext:
             allowPrivilegeEscalation: false
-            # NOT read-only: Grafana writes its internal SQLite + plugin cache to
-            # /var/lib/grafana even in provisioned mode. We give it a writable
-            # emptyDir there (below) rather than a fully read-only root FS, which
-            # the image does not cleanly support.
+            # Read-only root FS (Trivy KSV-0014). Grafana's writes all have a
+            # writable mount: SQLite + plugins in /var/lib/grafana (emptyDir),
+            # scratch in /tmp (emptyDir), and logs go to stdout (GF_LOG_MODE
+            # above). The earlier note said the image does not cleanly support
+            # this; with those three paths covered it should. VERIFY after apply:
+            # /api/health returns 200 and the provisioned dashboards load.
+            readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
           resources:
@@ -340,6 +348,9 @@ spec:
             # Writable scratch for Grafana's runtime state (SQLite, plugins).
             - name: grafana-data
               mountPath: /var/lib/grafana
+            # Writable scratch (session/render temp files) for the read-only root.
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: datasources
           configMap:
@@ -352,3 +363,6 @@ spec:
             name: grafana-dashboards
         - name: grafana-data
           emptyDir: {}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 128Mi
