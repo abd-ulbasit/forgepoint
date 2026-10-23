@@ -10,7 +10,7 @@
 `services/auth` mints access tokens with **HS256** (`services/auth/internal/domain/jwt.go`),
 and every other service verifies them locally with `pkg/auth/validator.go`, using the
 **same** symmetric key. That key, `FP_JWT_SECRET`, is rendered into the Secret of 11 Helm
-charts (12 `templates/secret.yaml` files reference it) and stored once in Secrets Manager
+charts (all 11 `templates/secret.yaml` files reference it) and stored once in Secrets Manager
 (`<prefix>/auth/jwt`, created by hand with the aws CLI).
 
 The verifier side is careful: it pins the algorithm (identity check on

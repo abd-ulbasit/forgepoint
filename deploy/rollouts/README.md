@@ -104,8 +104,8 @@ revisions pointed at `prometheus-operated`, the Service name the Prometheus
 *Operator* creates; this repo runs plain Prometheus, so that name never resolved
 and every analysis run would have failed.)
 
-This is the kube-prometheus-stack (or Prometheus Operator) address. Adjust if
-your Prometheus service has a different name or namespace.
+Adjust the address in both AnalysisTemplates if your Prometheus Service has a
+different name or namespace.
 
 ---
 
