@@ -183,7 +183,7 @@ func main() {
 		slog.Int("grpc_port", cfg.GRPCPort),
 		slog.Int("health_port", cfg.Port),
 		slog.String("log_level", cfg.LogLevel),
-		slog.String("nats_url", cfg.NATSUrl),
+		slog.String("nats_url", config.RedactURL(cfg.NATSUrl)),
 		slog.String("environment", cfg.Environment),
 	)
 

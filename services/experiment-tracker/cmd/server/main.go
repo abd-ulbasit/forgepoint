@@ -249,7 +249,7 @@ func main() {
 			logger.Error("nats drain error", slog.String("error", drainErr.Error()))
 		}
 	}()
-	logger.Info("NATS connected", slog.String("url", cfg.NATSUrl))
+	logger.Info("NATS connected", slog.String("url", config.RedactURL(cfg.NATSUrl)))
 
 	// --- ENSURE THE EXPERIMENTS STREAM EXISTS (producer owns its stream) ---
 	// experiment-tracker is the OWNER and sole producer of the fp.experiments.* tree

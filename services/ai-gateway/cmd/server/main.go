@@ -238,7 +238,7 @@ func main() {
 		os.Exit(1)
 	}
 	pingCancel()
-	logger.Info("redis connected", slog.String("url", cfg.RedisURL))
+	logger.Info("redis connected", slog.String("url", config.RedactURL(cfg.RedisURL)))
 
 	// 4b. NATS JetStream — events + warm signal.
 	natsConn, js, err := natsutil.Connect(cfg.NATSUrl)
@@ -251,7 +251,7 @@ func main() {
 			logger.Error("nats drain error", slog.String("error", drainErr.Error()))
 		}
 	}()
-	logger.Info("NATS connected", slog.String("url", cfg.NATSUrl))
+	logger.Info("NATS connected", slog.String("url", config.RedactURL(cfg.NATSUrl)))
 
 	// 5. ENSURE STREAMS (idempotent; fail fast — a gateway that can't guarantee its
 	// streams would silently drop cost events and never wake Ollama).

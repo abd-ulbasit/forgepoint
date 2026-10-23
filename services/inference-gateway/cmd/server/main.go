@@ -219,7 +219,7 @@ func main() {
 		os.Exit(1)
 	}
 	pingCancel()
-	logger.Info("redis connected", slog.String("url", cfg.RedisURL))
+	logger.Info("redis connected", slog.String("url", config.RedactURL(cfg.RedisURL)))
 
 	// ================================================================
 	// 4b. NATS JetStream — the async event bus (publish + subscribe)
@@ -241,7 +241,7 @@ func main() {
 			logger.Error("nats drain error", slog.String("error", drainErr.Error()))
 		}
 	}()
-	logger.Info("NATS connected", slog.String("url", cfg.NATSUrl))
+	logger.Info("NATS connected", slog.String("url", config.RedactURL(cfg.NATSUrl)))
 
 	// ================================================================
 	// 5. CONSTRUCT ADAPTERS → PUBLISHER → DOMAIN SERVICE → HANDLER

@@ -237,10 +237,10 @@ func main() {
 	// async-bus equivalent of the gRPC graceful drain.
 	natsConn, js, err := natsutil.Connect(cfg.NATSUrl)
 	if err != nil {
-		logger.Error("failed to connect to NATS", slog.String("url", cfg.NATSUrl), slog.String("error", err.Error()))
+		logger.Error("failed to connect to NATS", slog.String("url", config.RedactURL(cfg.NATSUrl)), slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	logger.Info("connected to NATS JetStream", slog.String("url", cfg.NATSUrl))
+	logger.Info("connected to NATS JetStream", slog.String("url", config.RedactURL(cfg.NATSUrl)))
 	// Deferred SECOND-from-last (runs after subscribers are stopped below, before
 	// OTel flush). Drain is graceful; if it errors we still proceed to exit.
 	defer func() {

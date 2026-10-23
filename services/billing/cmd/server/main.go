@@ -209,7 +209,7 @@ func main() {
 		slog.Int("grpc_port", cfg.GRPCPort),
 		slog.Int("health_port", cfg.Port),
 		slog.String("log_level", cfg.LogLevel),
-		slog.String("nats_url", cfg.NATSUrl),
+		slog.String("nats_url", config.RedactURL(cfg.NATSUrl)),
 		slog.String("default_currency", cfg.DefaultCurrency),
 		slog.Bool("otel_insecure", cfg.OTelInsecure),
 	)
@@ -287,7 +287,7 @@ func main() {
 		logger.Error("failed to connect NATS", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	logger.Info("nats connected", slog.String("url", natsConn.ConnectedUrl()))
+	logger.Info("nats connected", slog.String("url", natsConn.ConnectedUrlRedacted()))
 
 	// ENSURE THE STREAMS BILLING USES EXIST. JetStream silently DROPS a published
 	// message whose subject no stream captures, and a consumer cannot attach to a

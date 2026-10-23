@@ -246,7 +246,7 @@ func main() {
 		slog.Int("grpc_port", cfg.GRPCPort),
 		slog.Int("health_port", cfg.Port),
 		slog.String("log_level", cfg.LogLevel),
-		slog.String("nats_url", cfg.NATSUrl),
+		slog.String("nats_url", config.RedactURL(cfg.NATSUrl)),
 		slog.Bool("otel_insecure", cfg.OTelInsecure),
 		slog.Duration("compensation_timeout", cfg.CompensationTimeout),
 	)
@@ -307,7 +307,7 @@ func main() {
 		logger.Error("failed to connect to nats", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	logger.Info("nats connected", slog.String("url", natsConn.ConnectedUrl()))
+	logger.Info("nats connected", slog.String("url", natsConn.ConnectedUrlRedacted()))
 
 	// Provision the JetStream streams this service depends on, idempotently.
 	// WHY here (and why CreateOrUpdateStream): a PUBLISH only persists if some stream
