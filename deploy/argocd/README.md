@@ -231,4 +231,36 @@ chart's optional in-chart Secret holds **dev-only placeholders** (see its values
 SECURITY CONTRACT), so `secrets.create` defaults to `false` and the real Secret comes
 from **External Secrets Operator** or **Sealed Secrets** (ADR-0002 follow-up,
 Phase 17) — the encrypted/sealed material is safe to commit, the plaintext never is.
+
+### Every app needs its Secret before the first sync
+
+`secrets.create` is `false` in every chart, and nothing the root app syncs
+creates the Secrets. Each Deployment still mounts a Secret **named after its
+release** (`envFrom`), so an app whose Secret does not exist yet still syncs,
+but its pods sit in `CreateContainerConfigError` and the app goes Progressing,
+then Degraded. That is deliberate
+(fail closed instead of running on placeholder credentials), but plan for it:
+
+| App (Secret name) | Namespace | Keys the chart expects | Provided in this repo |
+|---|---|---|---|
+| `fp-auth` | fp-system | `FP_DATABASE_URL`, `FP_JWT_SECRET` (optional: `FP_BOOTSTRAP_ADMIN_PASSWORD`) | ExternalSecret `deploy/secrets/external-secrets/externalsecret-fp-auth.yaml` (applied by hand, not synced) |
+| `fp-billing` | fp-system | `FP_DATABASE_URL`, `FP_JWT_SECRET` | **nothing yet** |
+| `fp-experiment-tracker` | fp-system | `FP_DATABASE_URL`, `FP_JWT_SECRET` | **nothing yet** |
+| `fp-feature-store` | fp-system | `FP_DATABASE_URL`, `FP_JWT_SECRET`, `FP_REDIS_URL` | **nothing yet** |
+| `fp-inference-gateway` | fp-system | `FP_JWT_SECRET`, `FP_REDIS_URL` | **nothing yet** |
+| `fp-model-monitor` | fp-system | `FP_DATABASE_URL`, `FP_JWT_SECRET`, `FP_REDIS_URL` | **nothing yet** |
+| `fp-model-serving` | fp-models | `FP_JWT_SECRET` | **nothing yet** |
+| `fp-notification` | fp-system | `FP_DATABASE_URL`, `FP_JWT_SECRET` | **nothing yet** |
+| `fp-pipeline-orchestrator` | fp-system | `FP_DATABASE_URL`, `FP_JWT_SECRET` | **nothing yet** |
+| `fp-registry` | fp-system | `FP_DATABASE_URL`, `FP_JWT_SECRET` | **nothing yet** |
+
+The key lists come from each chart's `templates/secret.yaml` (the dev Secret it
+renders when `secrets.create=true`); that file is the reference if they drift.
+`FP_JWT_SECRET` must be the same value in all ten. For the nine without one,
+add an ExternalSecret (modelled on `externalsecret-fp-auth.yaml`, which also
+shows how to template a DSN) or a SealedSecret per app, and apply it before
+enabling the app. `fp-infra-creds` (`externalsecret-fp-infra-creds.yaml`)
+carries the shared Postgres and Redis URLs, but no chart reads it by default.
+For local Kind clusters, `make helm-install` passes `--set secrets.create=true`
+with the dev placeholders, so this only bites GitOps installs.
 ```

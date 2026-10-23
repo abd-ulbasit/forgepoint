@@ -61,7 +61,8 @@ spec:
       releaseName: fp-billing
       # valueFiles layered LEFT→RIGHT (later overrides earlier). The chart's
       # committed values.yaml carries DEV-safe defaults (per its SECURITY
-      # CONTRACT: in-chart Secret with placeholder creds, FP_ENV=local). For prod
+      # CONTRACT: secrets.create=false, so a Secret named after the release
+      # must already exist, see README "Secrets note"; FP_ENV=local). For prod
       # you ADD `- values-prod.yaml` here (External Secrets, real image tag,
       # higher replicas) — that file is the env override surface.
       valueFiles:
