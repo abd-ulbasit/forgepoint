@@ -201,8 +201,8 @@ The AppProject is least privilege for the delivery layer itself:
 ## Secrets note
 
 GitOps means manifests live in Git — so plaintext secrets must NOT. The fp-auth
-chart's in-chart Secret holds **dev-only placeholders** (see its values.yaml
-SECURITY CONTRACT). In prod, `secrets.create: false` and the real Secret comes
+chart's optional in-chart Secret holds **dev-only placeholders** (see its values.yaml
+SECURITY CONTRACT), so `secrets.create` defaults to `false` and the real Secret comes
 from **External Secrets Operator** or **Sealed Secrets** (ADR-0002 follow-up,
 Phase 17) — the encrypted/sealed material is safe to commit, the plaintext never is.
 ```

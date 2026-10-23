@@ -111,9 +111,9 @@ config:
 #                           below. Convenient for local Kind; NEVER commit real
 #                           values here.
 #   secrets.create: false → chart renders NO Secret. You must provide a Secret
-#                           named `secrets.existingSecret` out-of-band (External
-#                           Secrets / Sealed Secrets / kubectl). The Deployment
-#                           still envFrom's it.
+#                           named `secrets.existingSecret` (default: the chart
+#                           fullname) out-of-band (External Secrets / Sealed
+#                           Secrets / kubectl). The Deployment still envFrom's it.
 #
 # WHY a jwtSecret here even though notification does NOT mint tokens: the gRPC auth
 # interceptor VERIFIES every caller's JWT locally (design D2 — no per-request hop to
@@ -124,7 +124,12 @@ config:
 # (NOT the ConfigMap) because it is sensitive symmetric key material.
 # ----------------------------------------------------------------------------
 secrets:
-  create: true
+  # DEFAULT false (fail-closed). The chart renders NO Secret and the Deployment
+  # envFrom's an externally-managed one (External Secrets Operator / Sealed
+  # Secrets). If that Secret is missing the pod fails to start, instead of
+  # silently running with the committed dev placeholders below. Local Kind:
+  # `make helm-install` passes --set secrets.create=true.
+  create: false
   # When create=false, the Deployment envFrom's this externally-managed Secret.
   # Defaults to the chart's fullname when empty (see _helpers "secretName").
   existingSecret: ""

@@ -104,7 +104,7 @@ secrets.existingSecret. Either way the Deployment references ONE stable name.
 {{- if .Values.secrets.create -}}
 {{- include "fp-billing.fullname" . -}}
 {{- else -}}
-{{- required "secrets.create=false requires secrets.existingSecret to name the externally-managed Secret" .Values.secrets.existingSecret -}}
+{{- default (include "fp-billing.fullname" .) .Values.secrets.existingSecret -}}
 {{- end -}}
 {{- end -}}
 

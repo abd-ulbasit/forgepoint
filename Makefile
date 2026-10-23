@@ -346,6 +346,9 @@ kind-load: ## Load Docker image into Kind: make kind-load SVC=auth
 # Helm
 # ============================================================================
 
+# Local Kind installs render the chart's own dev Secret (secrets.create=true).
+# The chart default is false so that a real install fails closed on a missing
+# Secret instead of shipping the committed dev placeholders.
 .PHONY: helm-install
 helm-install: ## Install service via Helm: make helm-install SVC=auth
 	@if [ -z "$(SVC)" ]; then echo "ERROR: specify SVC=<service>"; exit 1; fi
@@ -353,6 +356,7 @@ helm-install: ## Install service via Helm: make helm-install SVC=auth
 	helm install fp-$(SVC) deploy/helm/fp-$(SVC)/ \
 		--namespace $(NAMESPACE) \
 		--create-namespace \
+		--set secrets.create=true \
 		--set image.repository=$(REGISTRY)-$(SVC) \
 		--set image.tag=$(IMAGE_TAG)
 
@@ -362,6 +366,7 @@ helm-upgrade: ## Upgrade service via Helm: make helm-upgrade SVC=auth
 	@echo "==> Upgrading $(SVC) via Helm in namespace $(NAMESPACE)..."
 	helm upgrade fp-$(SVC) deploy/helm/fp-$(SVC)/ \
 		--namespace $(NAMESPACE) \
+		--set secrets.create=true \
 		--set image.repository=$(REGISTRY)-$(SVC) \
 		--set image.tag=$(IMAGE_TAG)
 

@@ -109,7 +109,7 @@ DSN or JWT key (this service has neither).
 {{- if .Values.secrets.create -}}
 {{- include "fp-model-serving.fullname" . -}}
 {{- else -}}
-{{- required "secrets.create=false requires secrets.existingSecret to name the externally-managed Secret" .Values.secrets.existingSecret -}}
+{{- default (include "fp-model-serving.fullname" .) .Values.secrets.existingSecret -}}
 {{- end -}}
 {{- end -}}
 

@@ -105,7 +105,7 @@ spec:
         A re-deploy with no new files prints "no change" and exits 0 -- safe to run
         on every rollout and every replica (it serializes on the DB).
       */}}
-      {{- if and .Values.migrations.enabled (or (and .Values.secrets.create .Values.secrets.databaseUrl) (and (not .Values.secrets.create) .Values.secrets.existingSecret)) }}
+      {{- if and .Values.migrations.enabled (or (and .Values.secrets.create .Values.secrets.databaseUrl) (not .Values.secrets.create)) }}
       initContainers:
         - name: migrate
           image: "{{ .Values.migrations.image.repository }}:{{ .Values.migrations.image.tag }}"
@@ -220,7 +220,7 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
-        {{- if and .Values.migrations.enabled (or (and .Values.secrets.create .Values.secrets.databaseUrl) (and (not .Values.secrets.create) .Values.secrets.existingSecret)) }}
+        {{- if and .Values.migrations.enabled (or (and .Values.secrets.create .Values.secrets.databaseUrl) (not .Values.secrets.create)) }}
         # The migrations ConfigMap (the chart's migrations/*.sql) mounted into the
         # migrate initContainer at /migrations. defaultMode 0444 = world-readable,
         # read-only -- the nonroot migrate process can read it without owning it.
