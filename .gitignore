@@ -39,7 +39,8 @@ Thumbs.db
 *.tfstate
 *.tfstate.backup
 .terraform/
-.terraform.lock.hcl
+# NOTE: .terraform.lock.hcl is deliberately NOT ignored. It pins the exact
+# provider versions and their checksums; see deploy/terraform/.gitignore.
 
 # Helm packaging artifacts
 deploy/helm/*/charts/
