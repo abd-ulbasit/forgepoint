@@ -1,0 +1,29 @@
+# =============================================================================
+# gitleaks configuration — used by the Security workflow (full git history) and
+# the pre-commit hook (staged changes).
+# =============================================================================
+# Start from gitleaks' built-in rules and add a NARROW allowlist of published
+# development placeholders. Every value below is deliberately public, appears
+# in docs or committed dev values, and is never a working credential anywhere.
+# Do not add a real secret here "temporarily": rotate it instead.
+# =============================================================================
+
+title = "forgepoint"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Published dev/test placeholders, never valid credentials"
+# Matched against the extracted SECRET (gitleaks' default regexTarget).
+regexes = [
+  # The old dev JWT placeholder. It is public (in git history and in the
+  # fp-*/_helpers.tpl denylist), so the charts refuse to render with it. Any
+  # environment that ever used it as its signing key must rotate (SECURITY.md).
+  '''^dev-only-change-me-in-prod-min-32-bytes-of-entropy$''',
+  # Other dev-only placeholders in chart values and placeholder Secrets.
+  '''^dev-only-change-me(-[a-z0-9-]+)?$''',
+  '''^changeme-[a-z0-9-]+$''',
+  # The fixed HMAC key used by pkg/auth unit tests.
+  '''^unit-test-jwt-secret-32bytes-ok!$''',
+]

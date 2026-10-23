@@ -17,12 +17,13 @@ contracts, the Helm values, and the CLI flags alike as unstable until there is a
 ## What CI enforces
 
 The [`Security`](.github/workflows/security.yml) workflow runs on every push to
-`main`, every pull request, every `v*` tag, and on demand. Four gates, in order:
+`main`, every pull request, every `v*` tag, and on demand. The gates:
 
 | Gate | Tool | Fails on |
 |---|---|---|
 | Go dependencies | [`govulncheck`](https://pkg.go.dev/golang.org/x/vuln/cmd/govulncheck) v1.1.4, one leg per module in `go.work` | any **reachable** vulnerability |
 | Working tree | Trivy `fs` — `vuln,secret,misconfig` | HIGH / CRITICAL |
+| Git history | [`gitleaks`](https://github.com/gitleaks/gitleaks) v8.30.1 over **every commit** (`.gitleaks.toml`) | any secret not in the allowlist |
 | Built image | Trivy `image` — `os,library` | HIGH / CRITICAL |
 | Shipped web deps | `npm audit --omit=dev` (in [`CI`](.github/workflows/ci.yml)) | HIGH / CRITICAL |
 
@@ -45,6 +46,24 @@ Known and deliberately out of scope of the gates above: the build toolchain in
 carries two MODERATE advisories whose only fix is the 7.x major. Neither ships in
 the production bundle; the `npm audit` gate is scoped to production dependencies
 for that reason, and Dependabot proposes the majors as reviewable PRs.
+
+### Secrets in history
+
+Trivy's secret scanner only sees the current checkout, so a credential that was
+committed and later deleted passed every gate while remaining in every clone.
+The `gitleaks` job scans the full history, and the same rules run locally as a
+pre-commit hook (`.pre-commit-config.yaml`; `pre-commit install`). The first
+history run may surface old findings. Triage each one: rotate a real
+credential (deleting it from history does not un-leak it), and allowlist a
+published placeholder in `.gitleaks.toml` with a comment.
+
+One such placeholder is already known: the old dev JWT key
+`dev-o****` (the full value is in the `fp-*/_helpers.tpl` denylist). It was
+committed as a chart default, so it is public. The charts refuse to render
+with it, but **any environment that ever used it as its HS256 signing key must
+rotate that key**, because anyone can mint tokens with it. Purging it from
+history would need a force-push and does not help anyone who has already
+cloned the repo, so it is allowlisted rather than purged.
 
 ## Triage of the IaC findings (opened 2026-07-27, decided 2026-10-24)
 

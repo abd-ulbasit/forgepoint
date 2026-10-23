@@ -186,6 +186,18 @@ updates:
         update-types: ["version-update:semver-major"]
 
   # ---------------------------------------------------------------------------
+  # pre-commit — the pinned gitleaks hook in .pre-commit-config.yaml.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: pre-commit
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: deps(pre-commit)
+
+  # ---------------------------------------------------------------------------
   # Terraform — provider constraints AND the committed .terraform.lock.hcl,
   # one entry per root module.
   # ---------------------------------------------------------------------------
