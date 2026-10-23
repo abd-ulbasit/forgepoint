@@ -18,7 +18,7 @@ az_count           = 3
 single_nat_gateway = true # PROD: false (one NAT per AZ for egress resilience)
 
 # ---- EKS -------------------------------------------------------------------
-cluster_version = "1.30"
+cluster_version = "1.36"
 # Kubernetes API endpoint. Same secure default as variables.tf: private only,
 # reached from inside the VPC (bastion / VPN / SSM port-forward).
 eks_public_access       = false

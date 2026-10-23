@@ -46,9 +46,9 @@ variable "single_nat_gateway" {
 
 # ---- EKS -------------------------------------------------------------------
 variable "cluster_version" {
-  description = "EKS Kubernetes version."
+  description = "EKS Kubernetes version. Keep it in EKS standard support (1.36 until 2 Aug 2027); 1.30 left extended support in July 2026 and can no longer be created."
   type        = string
-  default     = "1.30"
+  default     = "1.36"
 }
 
 variable "eks_public_access" {
