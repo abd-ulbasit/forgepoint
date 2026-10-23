@@ -140,7 +140,7 @@ type NotificationConfig struct {
 	// AND the reactor's domain-level per-(event,recipient) dedup store. A redis://
 	// URL (host/port/db/credentials), parsed by go-redis ParseURL.
 	// K8s: a plain ConfigMap value pointing at the in-cluster Redis.
-	RedisURL string `env:"REDIS_URL" default:"redis://localhost:6379"`
+	RedisURL string `env:"REDIS_URL" default:"redis://:fp@localhost:6379"`
 
 	// SMTPAddr is the SMTP server for the EMAIL channel (host:port). Optional —
 	// consumed by the (not-yet-written) delivery adapter; unset is valid today.

@@ -67,6 +67,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -107,11 +108,12 @@ type RegistryConfig struct {
 
 	// RedisURL is the connection string for the CQRS READ projection (Redis). It is
 	// distinct from DatabaseURL (the Postgres WRITE store) precisely because the two
-	// stores are separate in CQRS. NewReadStore takes a host:port "addr" (not a URL),
-	// so the default is bare host:port and we pass it through directly. A full
-	// "redis://" URL with auth/db would need redis.ParseURL — a later concern when
-	// Redis grows credentials; bare addr is correct for the local/in-cluster stack.
-	RedisURL string `env:"REDIS_URL" default:"localhost:6379"`
+	// stores are separate in CQRS. Accepts either a full URL (redis:// or rediss://,
+	// parsed by redis.ParseURL, so credentials, db and TLS work, as ElastiCache with
+	// auth + in-transit encryption requires) or a bare host:port (the in-cluster
+	// Helm default). The default matches the local docker-compose stack, which
+	// requires a password (REDIS_PASSWORD, dev default "fp").
+	RedisURL string `env:"REDIS_URL" default:"redis://:fp@localhost:6379"`
 
 	// OTelInsecure controls whether the OTLP exporter uses plaintext (no TLS). It is
 	// true in local docker-compose (the collector has no cert) and false in
@@ -237,7 +239,13 @@ func main() {
 
 	// --- Redis: the CQRS READ projection (eventually-consistent query side) ---
 	// go-redis's Client is itself a pool; Ping fails fast on an unreachable server.
-	rdb := goredis.NewClient(&goredis.Options{Addr: cfg.RedisURL})
+	redisOpts, err := redisOptions(cfg.RedisURL)
+	if err != nil {
+		pgPool.Close()
+		logger.Error("invalid FP_REDIS_URL", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	rdb := goredis.NewClient(redisOpts)
 	if err := rdb.Ping(bootCtx).Err(); err != nil {
 		_ = rdb.Close()
 		pgPool.Close()
@@ -540,4 +548,15 @@ func main() {
 	// ================================================================
 	shutdown()
 	logger.Info("registry service stopped cleanly")
+}
+
+// redisOptions turns FP_REDIS_URL into client options. A value with a scheme
+// (redis:// or rediss://) goes through redis.ParseURL, which handles the
+// password, db number and TLS. A bare host:port, which the Helm chart sets for
+// the in-cluster Redis, is used as the address directly, as before.
+func redisOptions(raw string) (*goredis.Options, error) {
+	if strings.Contains(raw, "://") {
+		return goredis.ParseURL(raw)
+	}
+	return &goredis.Options{Addr: raw}, nil
 }

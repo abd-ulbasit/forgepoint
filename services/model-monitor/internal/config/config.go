@@ -45,7 +45,7 @@ type MonitorConfig struct {
 	// semantics far better than a relational table. Postgres holds the durable
 	// drift_reports; Redis holds the ephemeral in-flight windows. Optional at boot
 	// (the scaffold doesn't connect yet) — required once the Redis adapter lands.
-	RedisURL string `env:"REDIS_URL" default:"redis://localhost:6379"`
+	RedisURL string `env:"REDIS_URL" default:"redis://:fp@localhost:6379"`
 
 	// RetrainCooldown is the minimum gap between auto-retrains for one model — the
 	// ANTI-STORM interval of the closed loop. A sustained drift breaches CRITICAL on

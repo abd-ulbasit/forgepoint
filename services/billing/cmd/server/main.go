@@ -68,6 +68,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -139,13 +140,15 @@ type BillingConfig struct {
 	// applies. Validated to a 3-letter uppercase code by the domain on use.
 	DefaultCurrency string `env:"DEFAULT_CURRENCY" default:"USD"`
 
-	// RedisURL is the connection string (bare host:port) for the consumer-side
-	// idempotency ProcessedStore — the fast dedup layer over NATS at-least-once
-	// redelivery. NewClient takes an "addr", so the default is bare host:port; a
-	// full "redis://" URL with auth/db would need redis.ParseURL (a later concern
-	// when Redis grows credentials). Distinct from DatabaseURL: Redis holds only
-	// the short-lived dedup keys, Postgres holds the money-truth ledger + outbox.
-	RedisURL string `env:"REDIS_URL" default:"localhost:6379"`
+	// RedisURL is the connection string for the consumer-side idempotency
+	// ProcessedStore — the fast dedup layer over NATS at-least-once redelivery.
+	// Accepts either a full URL (redis:// or rediss://, parsed by redis.ParseURL,
+	// so credentials, db and TLS work, as ElastiCache with auth + in-transit
+	// encryption requires) or a bare host:port (the in-cluster Helm default). The
+	// default matches the local docker-compose stack, which requires a password
+	// (REDIS_PASSWORD, dev default "fp"). Distinct from DatabaseURL: Redis holds
+	// only the short-lived dedup keys, Postgres holds the ledger + outbox.
+	RedisURL string `env:"REDIS_URL" default:"redis://:fp@localhost:6379"`
 
 	// OTelInsecure controls whether the OTLP exporter uses plaintext (no TLS). It
 	// is true in local docker-compose (the collector has no cert) and false in
@@ -268,7 +271,13 @@ func main() {
 
 	// --- Redis: the consumer-side idempotency ProcessedStore (fast dedup) ---
 	// go-redis's Client is itself a pool; Ping fails fast on an unreachable server.
-	rdb := goredis.NewClient(&goredis.Options{Addr: cfg.RedisURL})
+	redisOpts, err := redisOptions(cfg.RedisURL)
+	if err != nil {
+		pgPool.Close()
+		logger.Error("invalid FP_REDIS_URL", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+	rdb := goredis.NewClient(redisOpts)
 	if err := rdb.Ping(bootCtx).Err(); err != nil {
 		_ = rdb.Close()
 		pgPool.Close()
@@ -879,4 +888,15 @@ func markUnwiredResolverActive(ctx context.Context, logger *slog.Logger, failClo
 	// One increment per active axis (inference + storage) so the series reflects how
 	// many money axes are degraded, and is unambiguously > 0 for the alert.
 	counter.Add(ctx, 2)
+}
+
+// redisOptions turns FP_REDIS_URL into client options. A value with a scheme
+// (redis:// or rediss://) goes through redis.ParseURL, which handles the
+// password, db number and TLS. A bare host:port, which the Helm chart sets for
+// the in-cluster Redis, is used as the address directly, as before.
+func redisOptions(raw string) (*goredis.Options, error) {
+	if strings.Contains(raw, "://") {
+		return goredis.ParseURL(raw)
+	}
+	return &goredis.Options{Addr: raw}, nil
 }

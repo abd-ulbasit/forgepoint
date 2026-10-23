@@ -137,7 +137,7 @@ type FeatureStoreConfig struct {
 	// RedisURL points at the Redis backing the online (latest-value) projection.
 	// Format: redis://host:port/db. Injected via env (K8s ConfigMap, or a Secret if
 	// it carries credentials).
-	RedisURL string `env:"REDIS_URL" default:"redis://localhost:6379"`
+	RedisURL string `env:"REDIS_URL" default:"redis://:fp@localhost:6379"`
 
 	// OTelInsecure controls whether the OTLP exporter uses plaintext (no TLS). It is
 	// true in local docker-compose (the collector has no cert) and false in

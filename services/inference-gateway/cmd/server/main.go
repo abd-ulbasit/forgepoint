@@ -114,7 +114,7 @@ type InferenceConfig struct {
 	// RedisURL is the connection string for the rate-limit buckets, the quota
 	// cache, and the routing-table mirror. In K8s this points at the fp-infra
 	// Redis Service. Defaulted for local docker-compose.
-	RedisURL string `env:"REDIS_URL" default:"redis://localhost:6379"`
+	RedisURL string `env:"REDIS_URL" default:"redis://:fp@localhost:6379"`
 
 	// Environment ("local"/"staging"/"production") tags telemetry and gates the
 	// in-memory idempotency-store fallback (production REFUSES it — see below).

@@ -92,7 +92,7 @@ type AIConfig struct {
 	JWTSecret string `env:"JWT_SECRET" required:"true"`
 
 	// RedisURL backs the per-team token budgets. Defaulted for local docker-compose.
-	RedisURL string `env:"REDIS_URL" default:"redis://localhost:6379"`
+	RedisURL string `env:"REDIS_URL" default:"redis://:fp@localhost:6379"`
 
 	// OllamaURL is the in-cluster Ollama serving endpoint. Defaulted to the fp-ml
 	// Service; local dev can point it at a laptop Ollama or leave it (the stub serves
