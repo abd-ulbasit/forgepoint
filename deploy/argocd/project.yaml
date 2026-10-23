@@ -28,6 +28,13 @@
 # the sourceRepos allow-list, the destinations allow-list, and the
 # namespaced/clusterResource allow-lists below. They are applied by hand
 # (kubectl), never synced by the root app, so a Git change cannot widen them.
+#
+# SPELLING MATTERS: the field is `namespaceResourceWhitelist` (no "d"). Argo CD
+# treats a MISSING namespaced whitelist as "every namespaced kind is allowed",
+# so a misspelled key is not just ignored, it silently removes the guardrail
+# (if it gets past kubectl's strict field validation at all). Validate with
+#   kubectl apply --dry-run=server -f deploy/argocd/project.yaml
+# against a cluster that has the Argo CD CRDs before relying on these limits.
 # ============================================================================
 apiVersion: argoproj.io/v1alpha1
 kind: AppProject
@@ -53,7 +60,7 @@ spec:
   # Exactly one kind. In particular NOT Secret (Argo CD reads cluster and repo
   # credentials from Secrets in this namespace) and NOT AppProject (a project
   # that could edit projects could lift its own limits).
-  namespacedResourceWhitelist:
+  namespaceResourceWhitelist:
     - group: argoproj.io
       kind: Application
 
@@ -116,7 +123,7 @@ spec:
       kind: Namespace
 
   # --------------------------------------------------------------------------
-  # namespacedResourceWhitelist — NAMESPACED kinds apps may create.
+  # namespaceResourceWhitelist — NAMESPACED kinds apps may create.
   # Deny-by-default. Exactly what the fp-* charts and deploy/k8s/infra render
   # today (checked with `helm template` / the infra manifests):
   #   workloads      Deployment, StatefulSet, Job (the MinIO bucket init),
@@ -131,7 +138,7 @@ spec:
   # fp-infra sync could not have succeeded. Secret stays (infra placeholders and
   # the charts' optional dev Secret), but only in fp-* namespaces now.
   # --------------------------------------------------------------------------
-  namespacedResourceWhitelist:
+  namespaceResourceWhitelist:
     - group: ""
       kind: ConfigMap
     - group: ""

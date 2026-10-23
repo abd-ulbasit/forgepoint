@@ -8,6 +8,13 @@
 # every guardrail in project.yaml. Emptying `default` closes that door: an
 # Application in it can deploy nothing.
 #
+# This is the lock-down the Argo CD docs recommend ("The Default Project"):
+# no repos, no destinations, and a `*/*` namespaced BLACKLIST. The blacklist is
+# what actually denies namespaced kinds. An empty namespaceResourceWhitelist
+# alone is fragile: the Go field is `omitempty`, so anything that round-trips
+# the object through Argo CD (UI, `argocd proj` CLI) drops the empty list, and
+# a missing namespaced whitelist means "allow every kind".
+#
 # Apply once, by hand, with the other projects (it is not under apps/, so the
 # root app never syncs it):
 #   kubectl apply -n argocd -f deploy/argocd/default-project.yaml
@@ -23,5 +30,9 @@ spec:
   description: Locked down. Use the forgepoint or forgepoint-bootstrap project.
   sourceRepos: []
   destinations: []
+  # Cluster-scoped kinds: an empty (or missing) whitelist already denies all.
   clusterResourceWhitelist: []
-  namespacedResourceWhitelist: []
+  # Namespaced kinds: deny every group and kind.
+  namespaceResourceBlacklist:
+    - group: "*"
+      kind: "*"

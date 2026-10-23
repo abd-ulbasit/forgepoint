@@ -207,14 +207,20 @@ The AppProjects are least privilege for the delivery layer itself:
   Nothing lands in `argocd` / `kube-system` / `default`.
 - **clusterResourceWhitelist** — only `Namespace`. No CRDs (a CRD write can
   redefine any API group) and **no ClusterRole/ClusterRoleBinding**.
-- **namespacedResourceWhitelist** — exactly the kinds the charts + infra
+- **namespaceResourceWhitelist** — exactly the kinds the charts + infra
   kustomize render (Deployment, StatefulSet, Job, Service, ConfigMap, Secret,
   ServiceAccount, PVC, HPA, PDB, NetworkPolicy, ServiceMonitor). No Role or
   RoleBinding: namespaced RBAC from Git is a privilege grant. Deny-by-default:
-  add a kind here the day a chart needs it.
+  add a kind here the day a chart needs it. Spell the key exactly
+  `namespaceResourceWhitelist`: Argo CD treats a missing namespaced whitelist
+  as "allow every kind", so a typo removes the guardrail instead of tightening it.
 - **`default` project emptied** — an Application chooses its own `spec.project`,
   so without this a child app could name `project: default` and bypass all of the
-  above.
+  above. It has no repos, no destinations and a `*/*` namespaced blacklist (the
+  lock-down the Argo CD docs recommend; an empty whitelist alone is fragile).
+- **Check before you trust it:** `kubectl apply --dry-run=server -f deploy/argocd/project.yaml -f deploy/argocd/default-project.yaml`
+  against a cluster with the Argo CD CRDs. kubectl's strict field validation
+  rejects a misspelled key.
 
 ---
 
