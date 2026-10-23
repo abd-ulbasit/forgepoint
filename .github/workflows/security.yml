@@ -53,6 +53,10 @@ on:
   # Allow on-demand runs (e.g. to re-scan after a base-image CVE disclosure)
   # without a code change.
   workflow_dispatch:
+  # Weekly re-scan with a fresh vulnerability DB, plus the third-party image
+  # scan below, which only runs on schedule/dispatch.
+  schedule:
+    - cron: "17 4 * * 1"
 
 # SECURITY: least privilege at the TOP. The default for every job is read-only.
 # Exactly one job elevates: `publish`, which runs only for pushes to main or a
@@ -239,6 +243,78 @@ jobs:
 
       - name: Scan every commit
         run: gitleaks git --config .gitleaks.toml --redact --verbose --exit-code 1 .
+
+  # ===========================================================================
+  # 2c. third-party images — the images we RUN but do not build.
+  # ===========================================================================
+  # The image job scans only first-party services. postgres, redis, nats,
+  # grafana, prometheus, tempo, loki, the OTel collector, ollama and the
+  # migrate initContainer also run in the cluster and were never scanned. The
+  # list is derived from the repo (every `image: ...@sha256:` in deploy/ and
+  # docker-compose.yaml, plus repository/tag@sha256 pairs in chart values), so
+  # a newly pinned image is covered automatically. The minio images are absent
+  # because they cannot be digest-pinned any more (see deploy/k8s/infra/minio).
+  #
+  # Runs on the weekly schedule and on demand, NOT on push/PR: these CVEs are
+  # fixed by bumping a pin (Dependabot's docker ecosystem proposes those), not
+  # by the change under review, so they must not block unrelated merges. A red
+  # scheduled run is the alert.
+  #
+  # Unlike the first-party gates this uses ignore-unfixed: an upstream CVE with
+  # no fixed release cannot be acted on by bumping, so reporting it weekly would
+  # only train people to ignore the run. Accept anything else via
+  # .trivyignore.yaml (statement + expiry) like every other finding.
+  third-party-matrix:
+    name: resolve third-party images
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.set.outputs.images }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve
+        id: set
+        run: |
+          set -euo pipefail
+          images=$( {
+            grep -rhoE '^[[:space:]]*image:[[:space:]]*"?[^"[:space:]]+@sha256:[0-9a-f]{64}' deploy docker-compose.yaml \
+              | sed -E 's/^[[:space:]]*image:[[:space:]]*"?//'
+            for f in deploy/helm/*/values.yaml; do
+              awk '/^[[:space:]]+repository:/{r=$2} /^[[:space:]]+tag:.*@sha256:/{print r":"$2}' "$f"
+            done
+          } | sort -u | jq -R . | jq -sc . )
+          [ "$(jq -r 'length' <<<"$images")" -gt 0 ] || { echo "no digest-pinned third-party images found" >&2; exit 1; }
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+          jq -r '.[]' <<<"$images"
+
+  third-party-images:
+    name: third-party (${{ matrix.image }})
+    needs: [third-party-matrix]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.third-party-matrix.outputs.images) }}
+    steps:
+      - name: Checkout (for .trivyignore.yaml)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ matrix.image }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          trivyignores: .trivyignore.yaml
 
   # ===========================================================================
   # 3. image — build → Trivy image scan → SBOM, per service. NEVER pushes.

@@ -65,6 +65,37 @@ rotate that key**, because anyone can mint tokens with it. Purging it from
 history would need a force-push and does not help anyone who has already
 cloned the repo, so it is allowlisted rather than purged.
 
+### Third-party images
+
+The images the cluster runs but this repo does not build (postgres, redis,
+nats, grafana, prometheus, tempo, loki, the OTel collector, ollama, migrate)
+are pinned by tag **and** digest, refreshed by Dependabot's docker/helm/compose
+ecosystems, and scanned weekly (and on demand) by the `third-party-images` job.
+That job runs on schedule only, so a new upstream CVE never blocks an unrelated
+PR, and it uses `ignore-unfixed`, because a CVE with no fixed release cannot be
+fixed by bumping a pin. A red scheduled run is the signal to bump.
+
+## What the gates do not see
+
+Each gate is narrower than its name suggests. Known blind spots, so nobody
+reads a green run as more than it is:
+
+| Gate | Catches | Misses |
+|---|---|---|
+| govulncheck | Go vulnerabilities your code **reaches** | Non-Go code; vulnerable code reached only via reflection or `unsafe`; anything not in the Go vuln DB yet |
+| Trivy `fs` (vuln) | CVEs in `go.mod`/`go.sum` and `package-lock.json` | npm **devDependencies** (Trivy skips them unless `--include-dev-deps`), so the vite/esbuild toolchain is not covered |
+| Trivy `fs` (misconfig) | Terraform, Kubernetes YAML, Helm charts **rendered with default values**, Dockerfiles | Values passed at deploy time (`--set`, Argo CD parameters, real `terraform.tfvars`); only the example tfvars is evaluated |
+| Trivy `fs` (secret) | Secrets in the **current checkout** | History (that is gitleaks' job) and formats without a rule |
+| gitleaks | Secrets in **every commit**, by rule and entropy | Formats no rule knows; anything allowlisted in `.gitleaks.toml` |
+| Trivy `image` | OS + library CVEs in the **first-party** images, before push | Third-party images (scanned weekly by `third-party-images`, not per PR); MinIO, which can no longer be pinned |
+| `npm audit` | HIGH/CRITICAL in **production** web deps | Dev deps (deliberately `--omit=dev`); MODERATE advisories |
+| Terraform workflow | Formatting, syntax, references, variable validation, lock-file drift | Anything a `plan` would show: there are no AWS credentials in CI and nothing has been applied |
+| Kyverno (cluster) | Pod settings, registries, tags, image signatures | Everything ships in **Audit**, so nothing is blocked until the enforce overlay is applied; `fp-ml` (ollama) is outside the matched namespaces |
+
+And one gap no workflow can close: **`main` has no branch protection or required
+checks**, so a red Security, CI or Terraform run blocks nothing. Making these
+gates real is a repository-settings change (protect `main`, require the checks).
+
 ## Triage of the IaC findings (opened 2026-07-27, decided 2026-10-24)
 
 The Trivy filesystem gate had never executed before 2026-07-27 — it referenced
