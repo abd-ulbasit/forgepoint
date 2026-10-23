@@ -28,6 +28,7 @@ deploy/terraform/
 │   ├── s3/                   ← model-artifacts bucket: versioned, SSE-KMS, public-access blocked
 │   ├── ecr/                  ← one repo per service, scan-on-push, immutable tags, lifecycle
 │   ├── iam/                  ← IRSA roles per workload, least-privilege, bound to K8s SAs via OIDC
+│   ├── github-oidc/          ← opt-in keyless GitHub Actions role that can push to ECR (main + v* tags only)
 │   └── state-backend/        ← S3 bucket (versioned, SSE-KMS CMK, TLS-only, prevent_destroy) FOR remote state
 ├── bootstrap/                ← the one root with LOCAL state: applies state-backend once per account
 └── environments/

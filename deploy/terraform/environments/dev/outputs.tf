@@ -71,6 +71,11 @@ output "ecr_repository_urls" {
   value       = module.ecr.repository_urls
 }
 
+output "github_ecr_push_role_arn" {
+  description = "ARN of the GitHub Actions ECR push role (null unless enable_github_ecr_push = true). Store it as the repository variable AWS_ROLE_ARN."
+  value       = var.enable_github_ecr_push ? module.github_oidc[0].role_arn : null
+}
+
 # ---- IRSA ------------------------------------------------------------------
 output "irsa_role_arns" {
   description = "Map of logical workload → IAM role ARN. Annotate each K8s ServiceAccount with eks.amazonaws.com/role-arn = <this> to grant the pod its scoped AWS access without static keys."

@@ -242,3 +242,24 @@ resource "aws_budgets_budget" "monthly" {
     subscriber_email_addresses = var.budget_alert_emails
   }
 }
+
+# ----------------------------------------------------------------------------
+# (9) CI IDENTITY — GitHub Actions → ECR push via OIDC (OPT-IN, off by default)
+# ----------------------------------------------------------------------------
+# The ECR repos above had no pusher: CI publishes to GHCR with GITHUB_TOKEN and
+# there was no AWS identity for it at all. This role is the keyless way to add
+# one: only workflow runs on main or a v* tag can assume it (never a PR run),
+# and it can push only to this env's ECR repos. Off by default because no
+# workflow pushes to ECR yet and an unused push role is surface for nothing.
+# Turn it on with enable_github_ecr_push = true, then store the role_arn output
+# as the repository variable AWS_ROLE_ARN.
+module "github_oidc" {
+  source = "../../modules/github-oidc"
+  count  = var.enable_github_ecr_push ? 1 : 0
+
+  name_prefix          = local.name_prefix
+  create_oidc_provider = var.create_github_oidc_provider
+  oidc_provider_arn    = var.github_oidc_provider_arn
+  allowed_subjects     = var.github_oidc_subjects
+  ecr_repository_arns  = values(module.ecr.repository_arns)
+}

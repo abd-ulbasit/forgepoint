@@ -130,6 +130,34 @@ variable "rds_backup_retention_days" {
   default     = 7
 }
 
+# ---- CI identity (GitHub Actions OIDC -> ECR push), opt-in --------------------
+variable "enable_github_ecr_push" {
+  description = "Create the GitHub OIDC provider + ECR push role (modules/github-oidc). Default false: no workflow pushes to ECR yet."
+  type        = bool
+  default     = false
+}
+
+variable "create_github_oidc_provider" {
+  description = "Create the account-wide token.actions.githubusercontent.com provider. Set false (and pass github_oidc_provider_arn) if the account already has one."
+  type        = bool
+  default     = true
+}
+
+variable "github_oidc_provider_arn" {
+  description = "Existing GitHub OIDC provider ARN, used when create_github_oidc_provider = false."
+  type        = string
+  default     = ""
+}
+
+variable "github_oidc_subjects" {
+  description = "OIDC sub patterns allowed to assume the ECR push role: the default branch and release tags of this repo only. This repo predates GitHub's 15 Jul 2026 switch to immutable sub claims for new/renamed/transferred repos; if it is ever renamed or transferred, the sub becomes repo:OWNER@OWNER_ID/REPO@REPO_ID:... and these must change."
+  type        = list(string)
+  default = [
+    "repo:abd-ulbasit/forgepoint:ref:refs/heads/main",
+    "repo:abd-ulbasit/forgepoint:ref:refs/tags/v*",
+  ]
+}
+
 # ---- Cost guardrail ---------------------------------------------------------
 variable "budget_monthly_limit_usd" {
   description = "Monthly cost budget in USD. This env idles at roughly $200-250/month (EKS control plane, NAT gateway, two t3.medium nodes, interface endpoints, RDS, ElastiCache, KMS keys), so the default leaves a little headroom; alerts fire at 50/80/100% of actual spend and at 100% of forecast."
