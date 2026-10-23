@@ -17,11 +17,10 @@ useDefault = true
 description = "Published dev/test placeholders, never valid credentials"
 # Matched against the extracted SECRET (gitleaks' default regexTarget).
 regexes = [
-  # The old dev JWT placeholder. It is public (in git history and in the
-  # fp-*/_helpers.tpl denylist), so the charts refuse to render with it. Any
+  # dev-only-change-me* placeholders in chart values and placeholder Secrets.
+  # This also covers the old dev JWT placeholder, which is public (git history
+  # and the fp-*/_helpers.tpl denylist, which makes the charts refuse it). Any
   # environment that ever used it as its signing key must rotate (SECURITY.md).
-  '''^dev-only-change-me-in-prod-min-32-bytes-of-entropy$''',
-  # Other dev-only placeholders in chart values and placeholder Secrets.
   '''^dev-only-change-me(-[a-z0-9-]+)?$''',
   '''^changeme-[a-z0-9-]+$''',
   # The fixed HMAC key used by pkg/auth unit tests.
