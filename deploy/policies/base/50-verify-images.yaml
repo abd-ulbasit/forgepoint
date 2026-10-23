@@ -1,0 +1,76 @@
+# =============================================================================
+# verify-image-signatures — admission-time check of the cosign signatures CI makes
+# =============================================================================
+#
+# The Security workflow's `publish` job signs every image it pushes (main and
+# v* tags) with cosign KEYLESS: the signature is bound to the workflow's GitHub
+# OIDC identity through a short-lived Fulcio certificate and logged in Rekor.
+# Until this policy existed nothing in the cluster checked that signature, so
+# signing stopped no attack at all: anyone able to push to the GHCR path, or to
+# point a manifest at a look-alike image, could run unsigned code.
+#
+# WHAT IS PINNED (both must match, or the image is rejected):
+#   issuer  : https://token.actions.githubusercontent.com   (GitHub Actions OIDC)
+#   subject : https://github.com/abd-ulbasit/forgepoint/.github/workflows/security.yml@refs/heads/main
+#             or ...@refs/tags/v<anything>
+# i.e. "signed by THIS repo's Security workflow, running on main or a release
+# tag". A fork, another repo, another workflow file, or a PR run cannot produce
+# a certificate with that subject.
+#
+# AUDIT FIRST, like every policy in base/ (the enforce overlay flips it).
+#   - mutateDigest: false. Kyverno would otherwise rewrite tags to digests, a
+#     mutation that is wrong to make while only auditing. Turn it on with
+#     Enforce, so the pod runs exactly the digest that was verified.
+#   - verifyDigest: false for the same reason: the charts still deploy by tag
+#     (Chart.appVersion). Flip both when CI pins digests in Git.
+#   - No forgepoint image had ever been published when this policy was added
+#     (the image job never ran on main), so the first signed images arrive
+#     with the next push to main or release tag. Until then every fp-* pod
+#     shows up as an audit failure, which is accurate.
+#
+# Kyverno needs network access to ghcr.io (signature) and rekor.sigstore.dev
+# (transparency log) from its admission controller.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-image-signatures
+  annotations:
+    policies.kyverno.io/title: Verify Image Signatures
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Pod
+    policies.kyverno.io/description: >-
+      Images from ghcr.io/abd-ulbasit/forgepoint must carry a cosign keyless
+      signature made by this repository's Security workflow on main or a v* tag.
+spec:
+  validationFailureAction: Audit
+  # Image verification runs at admission; background re-scans would re-fetch
+  # signatures for every existing pod on every cycle.
+  background: false
+  webhookTimeoutSeconds: 30
+  rules:
+    - name: verify-forgepoint-cosign-keyless
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - fp-system
+                - fp-models
+                - fp-jobs
+                - fp-infra
+      verifyImages:
+        - imageReferences:
+            - "ghcr.io/abd-ulbasit/forgepoint/*"
+          mutateDigest: false
+          verifyDigest: false
+          required: true
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    issuer: "https://token.actions.githubusercontent.com"
+                    subjectRegExp: '^https://github\.com/abd-ulbasit/forgepoint/\.github/workflows/security\.yml@refs/(heads/main|tags/v.*)$'
+                    rekor:
+                      url: https://rekor.sigstore.dev

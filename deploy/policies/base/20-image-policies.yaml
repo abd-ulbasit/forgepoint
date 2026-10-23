@@ -109,11 +109,17 @@ spec:
 # and the per-collection rules below reference it — no duplication, no drift.
 #
 # The allowlist below covers, intentionally:
-#   - <account>.dkr.ecr.<region>.amazonaws.com/*  → our prod ECR (M5 AWS plan).
-#     Wildcarded on account+region so we don't hard-code one account here.
-#   - ghcr.io/abd-ulbasit/forgepoint/*            → where fp-auth's chart points
-#     TODAY (values.yaml). Keeping it prevents the current platform from
-#     regressing the moment we flip to Enforce.
+#   - ghcr.io/abd-ulbasit/forgepoint/*            → where every chart, Rollout
+#     and (since 2026-10) the Security workflow's publish job point. Signatures
+#     on these are checked separately by 50-verify-images.yaml.
+#   - NO ECR entry in the base. It used to allow "*.dkr.ecr.*.amazonaws.com/*",
+#     and Kyverno's `*` also matches the account id, so that admitted images
+#     from ANY AWS account's registry, an attacker's included. Nothing deploys
+#     from ECR yet. The EKS overlay must add the ONE account and repo prefix it
+#     uses, e.g. "123456789012.dkr.ecr.us-east-1.amazonaws.com/forgepoint-dev/*".
+#   - migrate/migrate                              → the golang-migrate
+#     initContainer every Postgres-backed chart runs (pinned by digest). It was
+#     missing, so flipping to Enforce would have blocked every schema migration.
 #   - gcr.io/distroless/*                          → distroless runtime base
 #     (the hermetic-builds requirement).
 #   - the PINNED infra images: docker.io/library/{postgres,redis,nats} and
@@ -143,9 +149,10 @@ metadata:
     policies.kyverno.io/severity: high
     policies.kyverno.io/subject: Pod
     policies.kyverno.io/description: >-
-      Container images may only come from an allowlisted set of registries: the
-      platform ECR (prod), ghcr.io/abd-ulbasit/forgepoint (current), the
-      distroless base, and the specific pinned infra images.
+      Container images may only come from an allowlisted set of registries:
+      ghcr.io/abd-ulbasit/forgepoint, the distroless base, the golang-migrate
+      initContainer and the specific pinned infra images. ECR is added per
+      environment for one named account, never as a wildcard.
 spec:
   validationFailureAction: Audit
   background: true
@@ -177,8 +184,9 @@ spec:
           # `allowedRegistries`. Edit this list to add/remove a trusted registry.
           variable:
             value:
-              - "*.dkr.ecr.*.amazonaws.com/*"           # prod ECR (any account/region)
-              - "ghcr.io/abd-ulbasit/forgepoint/*"        # current GHCR images
+              # ECR: add "<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/forgepoint-<env>/*"
+              # in the EKS overlay. Never wildcard the account (see above).
+              - "ghcr.io/abd-ulbasit/forgepoint/*"        # platform images (CI-published)
               - "gcr.io/distroless/*"                     # distroless runtime base
               # Pinned infra images (full repo path, both spellings). We include
               # BOTH the docker.io-qualified form (what Kyverno normalizes to) AND
@@ -194,12 +202,16 @@ spec:
               - "docker.io/minio/minio:*"
               - "minio/mc:*"
               - "docker.io/minio/mc:*"
+              # golang-migrate initContainer in the fp-* charts.
+              - "migrate/migrate:*"
+              - "docker.io/migrate/migrate:*"
       validate:
         message: >-
-          Image registry is not allowlisted. Allowed: ECR
-          (*.dkr.ecr.*.amazonaws.com), ghcr.io/abd-ulbasit/forgepoint,
-          gcr.io/distroless, and the pinned infra images (postgres, redis, nats,
-          minio/minio, minio/mc). Edit restrict-image-registries to add one.
+          Image registry is not allowlisted. Allowed:
+          ghcr.io/abd-ulbasit/forgepoint, gcr.io/distroless, migrate/migrate,
+          and the pinned infra images (postgres, redis, nats, minio/minio,
+          minio/mc). ECR is allowed only for the single account added by the
+          EKS overlay. Edit restrict-image-registries to add one.
         # foreach + deny: for each container, count how many allowlist globs the
         # image matches; deny when ZERO match.
         #
