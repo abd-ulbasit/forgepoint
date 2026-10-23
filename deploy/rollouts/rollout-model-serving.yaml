@@ -6,8 +6,8 @@
 # MODEL SERVING CANARY — ADDITIONAL CONSIDERATIONS
 # --------------------------------------------------
 # model-serving is DIFFERENT from inference-gateway in one critical way:
-# it runs a sidecar-based ONNX serving pattern where the sidecar (the model
-# file downloader + ONNX runtime) and the main container are tightly coupled.
+# the binary fetches model artifacts itself (in-process ModelFetcher) and
+# serves them, so the code and the model it loads are tightly coupled.
 # A "new version" of model-serving may mean:
 #   (a) a new service binary (Go code change), OR
 #   (b) a new model version artifact (model weights change), OR
@@ -92,48 +92,21 @@ spec:
           type: RuntimeDefault
 
       # -----------------------------------------------------------------------
-      # Sidecar pattern: model-artifact-fetcher runs first (initContainer) to
-      # download model weights into a shared emptyDir; the ONNX runtime in the
-      # main container reads from that volume. This matches the Phase 3 design
-      # (Model Serving — Sidecar, HPA on custom metrics).
-      # The sidecar image tag is separately versioned from the main container;
-      # update them independently via `kubectl argo rollouts set image`.
+      # No init/sidecar fetcher. An earlier revision ran a
+      # "model-artifact-fetcher:latest" initContainer here; that image was never
+      # built (there is no such directory under services/), so every canary pod
+      # would have sat in ImagePullBackOff. model-serving fetches artifacts
+      # IN-PROCESS (ModelFetcher: file:// and http(s)://, see
+      # services/model-serving/cmd/server/main.go) into its scratch dir, which
+      # defaults to the OS temp dir: /tmp below, the same emptyDir the Helm
+      # chart mounts.
       # -----------------------------------------------------------------------
-      initContainers:
-        - name: model-artifact-fetcher
-          image: ghcr.io/abd-ulbasit/forgepoint/model-artifact-fetcher:latest
-          imagePullPolicy: IfNotPresent
-          command:
-            - /fetcher
-            - --artifact-path=$(MODEL_ARTIFACT_PATH)
-            - --output-dir=/models
-          envFrom:
-            - configMapRef:
-                name: fp-model-serving
-            - secretRef:
-                name: fp-model-serving
-          volumeMounts:
-            - name: model-weights
-              mountPath: /models
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 65532
-            capabilities:
-              drop:
-                - ALL
-          resources:
-            requests:
-              cpu: 50m
-              memory: 64Mi
-            limits:
-              cpu: 200m
-              memory: 256Mi
-
       containers:
         - name: model-serving
-          image: ghcr.io/abd-ulbasit/forgepoint/model-serving:latest
+          # Pinned tag (never :latest, which Kyverno disallow-latest-tag rejects and
+          # which makes rollback meaningless). The deployed tag is set in ONE
+          # place, the images: block of kustomization.yaml; 0.1.0 = Chart.appVersion.
+          image: ghcr.io/abd-ulbasit/forgepoint/model-serving:0.1.0
           imagePullPolicy: IfNotPresent
 
           ports:
@@ -151,9 +124,9 @@ spec:
                 name: fp-model-serving
 
           volumeMounts:
-            - name: model-weights
-              mountPath: /models
-              readOnly: true
+            # Writable scratch for the fetched artifact (read-only root FS).
+            - name: tmp
+              mountPath: /tmp
 
           securityContext:
             allowPrivilegeEscalation: false
@@ -201,8 +174,11 @@ spec:
             timeoutSeconds: 3
 
       volumes:
-        - name: model-weights
-          emptyDir: {}
+        - name: tmp
+          # Same as the chart: node-disk-backed, capped so an oversized artifact
+          # cannot fill the node.
+          emptyDir:
+            sizeLimit: 2Gi
 
   strategy:
     canary:

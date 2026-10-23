@@ -58,7 +58,7 @@ spec:
 
       provider:
         prometheus:
-          address: http://prometheus-operated.fp-infra.svc.cluster.local:9090
+          address: http://prometheus.fp-infra.svc.cluster.local:9090
 
           # PLACEHOLDER: replace with actual OTel-emitted metric name for
           # model-serving gRPC errors (e.g. grpc_server_handled_total with
@@ -98,7 +98,7 @@ spec:
 
       provider:
         prometheus:
-          address: http://prometheus-operated.fp-infra.svc.cluster.local:9090
+          address: http://prometheus.fp-infra.svc.cluster.local:9090
 
           # PLACEHOLDER: replace with the actual gRPC server duration histogram.
           # grpc_server_handling_seconds_bucket is the typical name from the
@@ -155,7 +155,7 @@ spec:
 
       provider:
         prometheus:
-          address: http://prometheus-operated.fp-infra.svc.cluster.local:9090
+          address: http://prometheus.fp-infra.svc.cluster.local:9090
 
           # PLACEHOLDER: replace with the actual Prometheus metric name that
           # model-monitor exposes for drift score. This is a gauge that

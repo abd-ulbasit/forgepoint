@@ -96,8 +96,13 @@ PDB, ServiceMonitor) remain managed by Helm. The Rollout owns only the pod templ
 
 The AnalysisTemplates query:
 ```
-http://prometheus-operated.fp-infra.svc.cluster.local:9090
+http://prometheus.fp-infra.svc.cluster.local:9090
 ```
+
+That is the `prometheus` Service in `deploy/k8s/observability/prometheus/`. (Earlier
+revisions pointed at `prometheus-operated`, the Service name the Prometheus
+*Operator* creates; this repo runs plain Prometheus, so that name never resolved
+and every analysis run would have failed.)
 
 This is the kube-prometheus-stack (or Prometheus Operator) address. Adjust if
 your Prometheus service has a different name or namespace.
@@ -164,7 +169,7 @@ instruments OpenTelemetry metrics:
 
 1. Find the actual metric names:
    ```bash
-   kubectl port-forward svc/prometheus-operated 9090:9090 -n fp-infra
+   kubectl port-forward svc/prometheus 9090:9090 -n fp-infra
    # Open http://localhost:9090 and search for "forgepoint_" or "grpc_server_"
    ```
 
