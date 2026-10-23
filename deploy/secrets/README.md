@@ -69,16 +69,17 @@ Files:
   `arn:aws:iam::<AWS_ACCOUNT_ID>:role/forgepoint-dev-irsa-external_secrets`.
 - [`externalsecret-fp-auth.yaml`](./external-secrets/externalsecret-fp-auth.yaml) —
   materializes Secret `fp-auth` with `FP_JWT_SECRET` (from `<prefix>/auth/jwt`) and
-  `FP_DATABASE_URL` (the `dsn` field of the RDS module's `<prefix>/rds/postgres`).
+  `FP_DATABASE_URL` (templated from the RDS-managed password secret plus the
+  RDS module's `<prefix>/rds/postgres` connection info).
 - [`externalsecret-fp-infra-creds.yaml`](./external-secrets/externalsecret-fp-infra-creds.yaml)
   — materializes Secret `fp-infra-creds` with the shared Postgres + Redis connection
-  info (RDS `dsn`/host/port + ElastiCache `url`/host/port/`auth_token`).
+  info (templated Postgres DSN + host/port, ElastiCache `url`/host/port/`auth_token`).
 
 ### Secret name ↔ Terraform source (no values, only names)
 
 | K8s Secret key | AWS SM secret (name) | JSON property | Terraform source |
 |---|---|---|---|
-| `FP_DATABASE_URL` | `<prefix>/rds/postgres` | `dsn` | `modules/rds` |
+| `FP_DATABASE_URL` (templated) | RDS-managed `rds!db-...` (by ARN) + `<prefix>/rds/postgres` | `username`/`password` + `host`/`port`/`dbname`/`sslmode` | `modules/rds` (`manage_master_user_password`) |
 | `POSTGRES_HOST`/`PORT` | `<prefix>/rds/postgres` | `host`/`port` | `modules/rds` |
 | `FP_REDIS_URL` | `<prefix>/elasticache/redis` | `url` | `modules/elasticache` |
 | `REDIS_*` | `<prefix>/elasticache/redis` | `host`/`port`/`auth_token` | `modules/elasticache` |
@@ -90,6 +91,13 @@ Files:
 > --name forgepoint-dev/auth/jwt --secret-string '{"jwt_secret":"<openssl rand>"}'`)
 > and adds its ARN to the `external_secrets` IRSA role's `secret_arns` in
 > `environments/dev/main.tf`. The generated key never touches Git.
+
+> **Note on the Postgres password:** RDS generates, stores and rotates it
+> (`manage_master_user_password`), so it never appears in Terraform state. The
+> secret's name is generated, so the ExternalSecrets reference it by ARN: replace
+> `<RDS_MASTER_USER_SECRET_ARN>` with the `rds_master_user_secret_arn` output. RDS
+> rotates it every 7 days by default; env vars only change on pod restart, so run a
+> reloader (or a scheduled rollout) or new connections will fail after a rotation.
 
 ## Local path: Sealed Secrets (`sealed-secrets/`)
 

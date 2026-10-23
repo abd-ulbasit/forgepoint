@@ -180,6 +180,8 @@ module "iam" {
       s3_artifact_access   = ""
       secret_arns = [
         module.rds.credentials_secret_arn,
+        # The RDS-managed master password (username + password JSON).
+        module.rds.master_user_secret_arn,
         module.elasticache.credentials_secret_arn,
       ]
       kms_key_arns = [
