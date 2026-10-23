@@ -68,15 +68,22 @@ resource "aws_internet_gateway" "this" {
 # ----------------------------------------------------------------------------
 # Subnets
 # ----------------------------------------------------------------------------
-# PUBLIC subnets. map_public_ip_on_launch = true so a NAT gateway / LB placed
-# here gets a public IP. The kubernetes.io/role/elb tag tells the AWS Load
-# Balancer Controller "put internet-facing LBs in these subnets".
+# PUBLIC subnets. The kubernetes.io/role/elb tag tells the AWS Load Balancer
+# Controller "put internet-facing LBs in these subnets".
+#
+# map_public_ip_on_launch = false (Trivy AWS-0164). Nothing here needs it: the
+# NAT gateway gets its public address from the Elastic IP passed as
+# allocation_id, and internet-facing ALB/NLB nodes get public addresses from AWS
+# regardless of this flag. What the flag WOULD do is give a public IP to any EC2
+# instance someone later launches into these subnets (a debug box, a mis-placed
+# node group), which is exactly the accident the private/public split exists to
+# prevent.
 resource "aws_subnet" "public" {
   count                   = var.az_count
   vpc_id                  = aws_vpc.this.id
   cidr_block              = local.public_subnet_cidrs[count.index]
   availability_zone       = local.azs[count.index]
-  map_public_ip_on_launch = true
+  map_public_ip_on_launch = false
 
   tags = merge(var.tags, {
     Name                     = "${var.name_prefix}-public-${local.azs[count.index]}"
