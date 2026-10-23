@@ -74,7 +74,8 @@ resource "aws_security_group_rule" "redis_ingress" {
 # ----------------------------------------------------------------------------
 # ElastiCache AUTH tokens have constraints: 16-128 chars, and only a limited
 # special-char set. We restrict override_special accordingly so the token is
-# always accepted by ElastiCache.
+# always accepted by ElastiCache. Several of these characters are not legal raw
+# in a URL, so the `url` field below percent-encodes the token.
 # KNOWN RESIDUAL RISK: this token is stored in Terraform STATE (random_password
 # results, the replication group's auth_token and the secret_string below are
 # all persisted). Unlike RDS there is no AWS-managed password for ElastiCache,
@@ -159,6 +160,11 @@ resource "aws_secretsmanager_secret_version" "redis" {
     auth_token = random_password.auth_token.result
     # rediss:// (note the double-s) = Redis over TLS, required because transit
     # encryption is on. The app uses this URL form instead of plain redis://.
-    url = "rediss://:${random_password.auth_token.result}@${aws_elasticache_replication_group.this.primary_endpoint_address}:${aws_elasticache_replication_group.this.port}"
+    # The token is percent-encoded: override_special includes # ^ < >, which
+    # Go's net/url (used by go-redis ParseURL) rejects in the userinfo part, so
+    # a raw token makes most generated URLs unparseable ("invalid FP_REDIS_URL"
+    # at boot). ParseURL decodes it back, so clients still send the real token.
+    # auth_token above stays raw for clients that build their own connection.
+    url = "rediss://:${urlencode(random_password.auth_token.result)}@${aws_elasticache_replication_group.this.primary_endpoint_address}:${aws_elasticache_replication_group.this.port}"
   })
 }

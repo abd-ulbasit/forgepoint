@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"net/url"
+	"testing"
+)
 
 func TestRedisOptions(t *testing.T) {
 	t.Run("bare host:port is used as the address", func(t *testing.T) {
@@ -28,6 +31,24 @@ func TestRedisOptions(t *testing.T) {
 		}
 		if opts.TLSConfig == nil {
 			t.Fatal("expected TLS config for rediss://")
+		}
+	})
+	// The ElastiCache module generates the token from [A-Za-z0-9] plus
+	// "!&#$^<>-". Go's net/url rejects #, ^, < and > raw in the userinfo, so
+	// Terraform writes the URL with urlencode(token). This pins both halves:
+	// the raw form fails, and the encoded form round-trips to the exact token.
+	t.Run("ElastiCache token must be percent-encoded in the URL", func(t *testing.T) {
+		const token = "Ab1!&#$^<>-z9Ab1!&#$^<>-z9"
+		const host = "master.example.cache.amazonaws.com:6379"
+		if _, err := redisOptions("rediss://:" + token + "@" + host); err == nil {
+			t.Fatal("expected the raw token to be rejected by net/url")
+		}
+		opts, err := redisOptions("rediss://:" + url.QueryEscape(token) + "@" + host)
+		if err != nil {
+			t.Fatalf("encoded token should parse: %v", err)
+		}
+		if opts.Password != token || opts.Addr != host || opts.TLSConfig == nil {
+			t.Fatalf("got Addr=%q password match=%t TLS=%t", opts.Addr, opts.Password == token, opts.TLSConfig != nil)
 		}
 	})
 	t.Run("bad scheme is an error", func(t *testing.T) {

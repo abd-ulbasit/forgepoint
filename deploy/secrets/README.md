@@ -81,7 +81,7 @@ Files:
 |---|---|---|---|
 | `FP_DATABASE_URL` (templated) | RDS-managed `rds!db-...` (by ARN) + `<prefix>/rds/postgres` | `username`/`password` + `host`/`port`/`dbname`/`sslmode` | `modules/rds` (`manage_master_user_password`) |
 | `POSTGRES_HOST`/`PORT` | `<prefix>/rds/postgres` | `host`/`port` | `modules/rds` |
-| `FP_REDIS_URL` | `<prefix>/elasticache/redis` | `url` | `modules/elasticache` |
+| `FP_REDIS_URL` | `<prefix>/elasticache/redis` | `url` (`rediss://`, token percent-encoded) | `modules/elasticache` |
 | `REDIS_*` | `<prefix>/elasticache/redis` | `host`/`port`/`auth_token` | `modules/elasticache` |
 | `FP_JWT_SECRET` | `<prefix>/auth/jwt` | `jwt_secret` | operator-created (see note) |
 
