@@ -17,8 +17,11 @@
 # impossible, and a poisoned upstream tag silently lands in prod. Pinned tags
 # (and ideally digests) make deployments reproducible and auditable — this is a
 # 12-Factor "build, release, run" separation and a "hermetic builds"
-# requirement. Our infra images are already pinned (postgres:17, redis:7,
-# nats:2.11, minio/...:RELEASE.<date>); fp-auth uses appVersion as the tag.
+# requirement. The infra images are pinned by tag AND digest (e.g.
+# postgres:17.11@sha256:...), because a Docker Hub tag, even a version tag, can be
+# re-pushed. (An earlier revision of this comment called postgres:17, redis:7 and
+# nats:2.11 "pinned"; those are floating tags.) The fp-* charts use
+# Chart.appVersion as the tag.
 #
 # We assert TWO things: (1) a tag is present at all, and (2) it isn't `latest`.
 apiVersion: kyverno.io/v1

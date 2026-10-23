@@ -260,7 +260,7 @@ spec:
           # VERIFY before first deploy: confirm this tag on Docker Hub
           # (hub.docker.com/r/grafana/grafana/tags) and check the release notes
           # for provisioning-format or datasource-API breaking changes.
-          image: grafana/grafana:11.5.1
+          image: grafana/grafana:11.5.1@sha256:5781759b3d27734d4d548fcbaf60b1180dbf4290e708f01f292faa6ae764c5e6
           env:
             # ---- SECURITY HARDENING (same as docker-compose) ----------------
             # Admin password injected from the Secret — NOT hardcoded, NOT the

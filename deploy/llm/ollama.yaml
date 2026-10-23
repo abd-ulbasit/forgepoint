@@ -69,7 +69,9 @@ spec:
           type: RuntimeDefault
       containers:
         - name: ollama
-          image: ollama/ollama:0.30.10
+          # Tag for humans, digest for the kubelet: Docker Hub tags (even version tags)
+          # can be re-pushed, so the digest is what pins the bytes. Bump both together.
+          image: ollama/ollama:0.30.10@sha256:bfc9c6d53cc6989aa5131a6fde6b162b2802d4d337657f3253b5f69579bddeee
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
