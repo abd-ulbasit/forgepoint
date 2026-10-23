@@ -67,11 +67,25 @@ None of the Kubernetes fixes has been run against a cluster yet. Verify postgres
 (synced by the `fp-infra` Argo CD app), grafana and ollama after rollout.
 
 **Still red after this triage (2026-10-24):** the same scan reports HIGH
-dependency CVEs in the Go modules (`golang.org/x/net`, `x/text`, `x/crypto`,
-`google.golang.org/grpc`, `klauspost/compress`, `moby/go-archive`) and in
-`web/package-lock.json` (`axios`, `follow-redirects`). Those are dependency
-bumps, which the open Dependabot group PRs carry; they are deliberately not
-duplicated here.
+dependency CVEs. They are dependency bumps, left to the open Dependabot PRs so
+the two do not conflict, but those PRs do **not** fully clear the gate as they
+stand:
+
+| Package | Fixed in | Open Dependabot PR brings it to |
+|---|---|---|
+| `golang.org/x/crypto` | 0.55.0 | 0.55.0 (#17) |
+| `golang.org/x/text` | 0.41.0 | 0.41.0 (#17) |
+| `google.golang.org/grpc` | 1.83.1 | 1.83.2 (#17) |
+| `golang.org/x/net` | **0.60.0** (one CVE; another is fixed in 0.56.0) | 0.58.0 (#17), still vulnerable |
+| `github.com/klauspost/compress` | **1.18.7** | 1.18.6 (#17), still vulnerable |
+| `github.com/moby/go-archive` | **0.3.0** | unchanged |
+| `axios` (web) | **1.20.0** | 1.19.0 (#10), still vulnerable |
+| `follow-redirects` (web) | **1.16.1** | unchanged |
+
+#17 also leaves out `cli/`, `gen/go` and `services/bff`, which carry the same
+`x/net`, `x/text` and `grpc` advisories. After merging #17 and #10, bump the
+remaining packages by hand (or let Dependabot's next run propose them), then
+re-run Security.
 
 **Known defect, not a scanner finding:** `postgres-backup-cronjob.yaml` cannot
 succeed as written. It runs as uid 999 but `apk add`s packages and writes `mc`
