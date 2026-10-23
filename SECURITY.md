@@ -65,6 +65,13 @@ rotate that key**, because anyone can mint tokens with it. Purging it from
 history would need a force-push and does not help anyone who has already
 cloned the repo, so it is allowlisted rather than purged.
 
+The first full-history run (gitleaks v8.30.1, 141 commits) found exactly one
+other hit, a false positive: `generic-api-key` matched the C4 diagram's
+technology label `Traefik/Kong` in `docs/diagrams/c4-architecture.md` (commit
+`d553f7fe`, line 112). It is allowlisted for that value in that one file only
+(`condition = "AND"`), so the same string elsewhere is still reported. With
+that entry, `gitleaks git --config .gitleaks.toml --exit-code 1 .` exits 0.
+
 ### Third-party images
 
 The images the cluster runs but this repo does not build (postgres, redis,

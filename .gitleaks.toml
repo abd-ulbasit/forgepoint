@@ -26,3 +26,13 @@ regexes = [
   # The fixed HMAC key used by pkg/auth unit tests.
   '''^unit-test-jwt-secret-32bytes-ok!$''',
 ]
+
+[[allowlists]]
+description = "False positive: the C4 diagram's technology label for the API gateway"
+# generic-api-key matches `Container(gateway_edge, "API Gateway", "Traefik/Kong", ...)`
+# in docs/diagrams/c4-architecture.md (commit d553f7fe, line 112) and captures
+# the label "Traefik/Kong" as a key. Both conditions must hold (AND): this exact
+# value AND this one file, so the same string anywhere else is still scanned.
+condition = "AND"
+paths = ['''^docs/diagrams/c4-architecture\.md$''']
+regexes = ['''^Traefik/Kong$''']
