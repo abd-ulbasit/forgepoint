@@ -84,6 +84,11 @@ import (
 	"github.com/abd-ulbasit/forgepoint/services/model-serving/internal/repository/artifactstore"
 )
 
+// version is set at build time with -ldflags "-X main.version=<ref>" (see the
+// Dockerfile's VERSION build arg) and reported as the OTel service.version.
+// Local `go run` builds report "dev".
+var version = "dev"
+
 // ServingConfig extends BaseConfig with model-serving-specific configuration.
 //
 // WHY embed BaseConfig: every Forgepoint service needs Port, GRPCPort, LogLevel,
@@ -206,7 +211,7 @@ func main() {
 	// ================================================================
 	otelShutdown, err := observability.Setup(ctx, observability.Config{
 		ServiceName:    "model-serving",
-		ServiceVersion: "dev",
+		ServiceVersion: version,
 		Environment:    "local",
 		OTLPEndpoint:   cfg.OTelEndpoint,
 		OTLPInsecure:   true, // plaintext to the local docker-compose collector (no TLS cert)

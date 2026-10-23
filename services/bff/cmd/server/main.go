@@ -51,6 +51,11 @@ import (
 	"github.com/abd-ulbasit/forgepoint/services/bff/internal/router"
 )
 
+// version is set at build time with -ldflags "-X main.version=<ref>" (see the
+// Dockerfile's VERSION build arg) and reported as the OTel service.version.
+// Local `go run` builds report "dev".
+var version = "dev"
+
 // BFFConfig is the BFF's env-driven configuration. It embeds BaseConfig (Port,
 // GRPCPort, LogLevel, OTelEndpoint, ...) and adds the per-service addresses and
 // CORS origins. Defaults target the in-cluster DNS so a vanilla deploy works;
@@ -125,7 +130,7 @@ func main() {
 
 	otelShutdown, err := observability.Setup(ctx, observability.Config{
 		ServiceName:    "bff",
-		ServiceVersion: "dev",
+		ServiceVersion: version,
 		Environment:    "local",
 		OTLPEndpoint:   cfg.OTelEndpoint,
 		OTLPInsecure:   true,

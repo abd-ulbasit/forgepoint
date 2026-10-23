@@ -74,6 +74,11 @@ import (
 	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/usage"
 )
 
+// version is set at build time with -ldflags "-X main.version=<ref>" (see the
+// Dockerfile's VERSION build arg) and reported as the OTel service.version.
+// Local `go run` builds report "dev".
+var version = "dev"
+
 // serviceName is the canonical identity for telemetry, the NATS event source, and
 // consumer-group naming. It MUST match events.Source.
 const serviceName = "ai-gateway"
@@ -204,7 +209,7 @@ func main() {
 
 	otelShutdown, err := observability.Setup(ctx, observability.Config{
 		ServiceName:    serviceName,
-		ServiceVersion: "dev",
+		ServiceVersion: version,
 		Environment:    cfg.Environment,
 		OTLPEndpoint:   cfg.OTelEndpoint,
 		OTLPInsecure:   true,

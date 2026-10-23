@@ -78,6 +78,11 @@ import (
 	redisrepo "github.com/abd-ulbasit/forgepoint/services/inference-gateway/internal/repository/redis"
 )
 
+// version is set at build time with -ldflags "-X main.version=<ref>" (see the
+// Dockerfile's VERSION build arg) and reported as the OTel service.version.
+// Local `go run` builds report "dev".
+var version = "dev"
+
 // serviceName is the canonical identity used for telemetry resource attributes,
 // the NATS event source, and the consumer-group/DLQ naming. It MUST match
 // events.Source (the value stamped into every published EventEnvelope.source) so
@@ -171,7 +176,7 @@ func main() {
 
 	otelShutdown, err := observability.Setup(ctx, observability.Config{
 		ServiceName:    serviceName,
-		ServiceVersion: "dev",
+		ServiceVersion: version,
 		Environment:    cfg.Environment,
 		OTLPEndpoint:   cfg.OTelEndpoint,
 		OTLPInsecure:   true, // plaintext to the local collector (no TLS cert in docker-compose)

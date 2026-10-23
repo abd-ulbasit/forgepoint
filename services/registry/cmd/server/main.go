@@ -87,6 +87,11 @@ import (
 	redisstore "github.com/abd-ulbasit/forgepoint/services/registry/internal/repository/redis"
 )
 
+// version is set at build time with -ldflags "-X main.version=<ref>" (see the
+// Dockerfile's VERSION build arg) and reported as the OTel service.version.
+// Local `go run` builds report "dev".
+var version = "dev"
+
 // depConnectTimeout bounds how long we wait, AT BOOT, for each datastore's
 // fail-fast ping. WHY a bound: a constructor that blocks forever on an
 // unreachable dependency would hang the pod in a not-ready state with no signal;
@@ -191,7 +196,7 @@ func main() {
 
 	otelShutdown, err := observability.Setup(ctx, observability.Config{
 		ServiceName:    "registry",
-		ServiceVersion: "dev",
+		ServiceVersion: version,
 		Environment:    "local",
 		OTLPEndpoint:   cfg.OTelEndpoint,
 		OTLPInsecure:   cfg.OTelInsecure, // ← from config, not hard-coded (see RegistryConfig)

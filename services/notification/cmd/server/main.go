@@ -113,6 +113,11 @@ import (
 	redisrepo "github.com/abd-ulbasit/forgepoint/services/notification/internal/repository/redis"
 )
 
+// version is set at build time with -ldflags "-X main.version=<ref>" (see the
+// Dockerfile's VERSION build arg) and reported as the OTel service.version.
+// Local `go run` builds report "dev".
+var version = "dev"
+
 // NotificationConfig extends BaseConfig with notification-specific configuration.
 //
 // WHY embed BaseConfig: every Forgepoint service needs Port, GRPCPort, LogLevel,
@@ -204,7 +209,7 @@ func main() {
 	// producer's trace context per message).
 	otelShutdown, err := observability.Setup(ctx, observability.Config{
 		ServiceName:    "notification",
-		ServiceVersion: "dev",
+		ServiceVersion: version,
 		Environment:    cfg.Environment,
 		OTLPEndpoint:   cfg.OTelEndpoint,
 		OTLPInsecure:   cfg.OTLPInsecure,

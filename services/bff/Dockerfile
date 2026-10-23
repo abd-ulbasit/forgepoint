@@ -79,10 +79,16 @@ COPY services/bff/ ./services/bff/
 # -buildvcs=false → don't stamp VCS (the .git dir isn't in the context).
 # -trimpath → strip absolute /workspace paths → reproducible.
 ### PER-SERVICE: the `./services/bff/cmd/server` build path is the only build arg to change.
+# VERSION: CI passes the git ref name (tag or branch) as --build-arg VERSION.
+# It is stamped into main.version, which the service reports as
+# service.version on its traces and metrics. Before this ARG existed the
+# build-arg was silently ignored and every image reported "dev". Declared
+# after the dependency layers so a new version only re-runs the compile step.
+ARG VERSION=dev
 ENV CGO_ENABLED=0 GOFLAGS=-mod=readonly
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    go build -ldflags="-s -w" -buildvcs=false -trimpath \
+    go build -ldflags="-s -w -X main.version=${VERSION}" -buildvcs=false -trimpath \
         -o /out/service ./services/bff/cmd/server
 
 
