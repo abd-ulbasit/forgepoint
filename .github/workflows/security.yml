@@ -168,9 +168,25 @@ jobs:
       # cannot break this gate the same way again.
       - name: Trivy filesystem scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          # Render the Helm charts against a Kubernetes version they accept.
+          # Trivy renders charts as Kubernetes v1.20.0 by default, below every
+          # chart's kubeVersion (>=1.23.0-0), so it logged "Failed to render
+          # Chart files" for all 12 charts and scanned NONE of them, and the job
+          # still passed on that part. Keep this in step with the EKS
+          # cluster_version in deploy/terraform.
+          TRIVY_HELM_KUBE_VERSION: "1.36.0"
         with:
           scan-type: fs
           scan-ref: .
+          # Evaluate the Terraform with the values people actually copy. Trivy
+          # does not read *.tfvars.example on its own, which is how an example
+          # opening the EKS API to 0.0.0.0/0 sat in the repo with the gate
+          # green (AWS-0040/AWS-0041 fire on it when this is set).
+          tf-vars: deploy/terraform/environments/dev/terraform.tfvars.example
+          # Accepted findings: every entry has a reason and an expiry date
+          # (see .trivyignore.yaml and SECURITY.md "Accepted findings").
+          trivyignores: .trivyignore.yaml
           # Gate the build on actionable severities only; INFO/LOW noise would
           # train people to ignore the gate.
           severity: HIGH,CRITICAL
@@ -179,9 +195,9 @@ jobs:
           # NOTE: ignore-unfixed has been intentionally removed. Keeping it would
           # silently pass HIGH/CRITICAL CVEs that have no upstream fix yet —
           # exactly the ones you most need visibility on. An unfixed CVE is a
-          # real risk; we want the gate to be honest. If a specific CVE must be
-          # accepted (e.g. no fix exists and a compensating control is in place),
-          # add it to a `.trivyignore` file with a documented expiry date.
+          # real risk; we want the gate to be honest. If a specific finding must
+          # be accepted, add it to .trivyignore.yaml with a statement and an
+          # expired_at date; after that date the gate goes red again.
           # Cover dependency CVEs, leaked secrets, and IaC misconfig in one pass.
           scanners: vuln,secret,misconfig
 

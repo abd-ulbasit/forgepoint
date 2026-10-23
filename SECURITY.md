@@ -31,10 +31,14 @@ build actually reaches the vulnerable symbol. That is the reason this gate is
 worth failing on — it is not "a line in `go.sum` matches an OSV record".
 
 Trivy runs **without** `ignore-unfixed`. An advisory with no upstream fix is
-still a real risk and deserves a decision, not a silent pass. There is currently
-no `.trivyignore` in this repo and no accepted-advisory allowlist; if one becomes
-necessary, each entry must carry a written justification and an expiry date, and
-this file is where it gets documented.
+still a real risk and deserves a decision, not a silent pass. Accepted findings
+live in [`.trivyignore.yaml`](.trivyignore.yaml), never in a bare `.trivyignore`
+(see "Accepted findings" below).
+
+The filesystem scan also renders the Helm charts (`TRIVY_HELM_KUBE_VERSION`;
+before that was set, Trivy failed to render all 12 charts and silently skipped
+them) and evaluates the Terraform with `terraform.tfvars.example` (`tf-vars`),
+because Trivy does not read `*.example` files on its own.
 
 Known and deliberately out of scope of the gates above: the build toolchain in
 `web/` (vite, esbuild) carries dev-server advisories, and `react-router` 6.x
@@ -42,30 +46,53 @@ carries two MODERATE advisories whose only fix is the 7.x major. Neither ships i
 the production bundle; the `npm audit` gate is scoped to production dependencies
 for that reason, and Dependabot proposes the majors as reviewable PRs.
 
-## Open findings
+## Triage of the IaC findings (opened 2026-07-27, decided 2026-10-24)
 
 The Trivy filesystem gate had never executed before 2026-07-27 — it referenced
 an action tag that upstream deleted, so the job died in setup. The first run
-that got past setup surfaced eight HIGH **IaC misconfigurations**, all
-pre-existing. They are listed here rather than suppressed, and the gate stays
-red until they are resolved:
+that got past setup surfaced HIGH **IaC misconfigurations**, all pre-existing,
+and the gate stayed red on them for three months. Each one now has a decision:
 
-| Rule | Where | Fix |
+| Rule | Where | Decision |
 |---|---|---|
-| KSV-0014 | `deploy/k8s/infra/postgres/postgres.yaml`, `deploy/backup/postgres-backup-cronjob.yaml`, `deploy/k8s/observability/grafana/grafana.yaml`, `deploy/llm/ollama.yaml` | `securityContext.readOnlyRootFilesystem: true` plus writable `emptyDir` mounts for each image's scratch paths |
-| KSV-0118 | `deploy/llm/ollama.yaml` | give the ollama pod/container a non-default `securityContext` |
-| AWS-0164 (x3) | `deploy/terraform/modules/network/main.tf:79` | `map_public_ip_on_launch = false` on the public subnets |
-| AWS-0132 | `deploy/terraform/modules/state-backend/main.tf:33-41` | SSE-KMS with a customer-managed key instead of SSE-S3 |
+| KSV-0014 | `deploy/k8s/infra/postgres/postgres.yaml` | **Fixed.** Read-only root plus emptyDirs for `/var/run/postgresql` and `/tmp`. The "image cannot run read-only" comment was wrong, and the Kyverno exception for postgres is gone. |
+| KSV-0014 | `deploy/k8s/observability/grafana/grafana.yaml` | **Fixed.** Read-only root, `/tmp` emptyDir, `GF_LOG_MODE=console`. |
+| KSV-0014, KSV-0118 (x2) | `deploy/llm/ollama.yaml` | **Fixed.** seccomp, drop ALL, no privilege escalation, read-only root. Still uid 0 until the PVC is chowned (see `deploy/llm/README.md`). |
+| KSV-0014 | `deploy/backup/postgres-backup-cronjob.yaml` | **Accepted until 2027-01-31** (`.trivyignore.yaml`). The job installs tools at runtime and is broken for other reasons (below); a rewrite fixes both. |
+| AWS-0164 (x3) | `deploy/terraform/modules/network/main.tf` | **Fixed.** `map_public_ip_on_launch = false`. NAT uses an EIP; load balancers do not need it. |
+| AWS-0132 | `deploy/terraform/modules/state-backend/main.tf` | **Fixed.** SSE-KMS with a dedicated CMK. |
+| KSV-0109 | `deploy/helm/fp-ai-gateway/templates/configmap.yaml` | **False positive, accepted until 2027-04-30.** Surfaced only once the charts rendered: the key `FP_TEAM_TOKEN_BUDGET` contains "TOKEN" but holds an integer budget. |
 
-Three of the KSV-0014 sites carry in-file comments saying `readOnlyRootFilesystem`
-was left unset on purpose because the upstream image does not cleanly support it,
-with non-root, `drop: ["ALL"]` and `allowPrivilegeEscalation: false` as
-compensating controls. Either those comments or this gate is wrong; resolving
-that needs a cluster to test against, so it is open rather than decided.
+None of the Kubernetes fixes has been run against a cluster yet. Verify postgres
+(synced by the `fp-infra` Argo CD app), grafana and ollama after rollout.
 
-The `image` job `needs` this one, so build → SBOM → cosign does not run while
-these stand. That is the honest state: the signing pipeline is wired and
-unblocked at the action level, but it has not yet produced a Rekor entry.
+**Still red after this triage (2026-10-24):** the same scan reports HIGH
+dependency CVEs in the Go modules (`golang.org/x/net`, `x/text`, `x/crypto`,
+`google.golang.org/grpc`, `klauspost/compress`, `moby/go-archive`) and in
+`web/package-lock.json` (`axios`, `follow-redirects`). Those are dependency
+bumps, which the open Dependabot group PRs carry; they are deliberately not
+duplicated here.
+
+**Known defect, not a scanner finding:** `postgres-backup-cronjob.yaml` cannot
+succeed as written. It runs as uid 999 but `apk add`s packages and writes `mc`
+to `/usr/local/bin`, downloads that binary at runtime without verification,
+calls `gpg --passphrase` without `--pinentry-mode loopback`, and dumps database
+names (`fp_features`, `fp_experiments`, `fp_notifications`) that
+`scripts/init-postgres.sh` does not create. It also depends on `minio/mc`,
+which is no longer on Docker Hub. It needs a rewrite (pinned image with the
+tools baked in, no runtime downloads, read-only root), not a patch.
+
+## Accepted findings
+
+`.trivyignore.yaml` is the only allowlist, and both the filesystem and the
+image scan read it. Each entry must have:
+
+- a `statement` that says why it is a false positive or an accepted risk, and
+  what would remove it;
+- an `expired_at` date. After that date Trivy stops honouring the entry and the
+  gate fails again, which forces a fresh decision rather than a permanent mute;
+- the narrowest scope possible (`paths`, or a specific package/CVE), never a
+  rule ID for the whole repo.
 
 ## Supply chain
 
