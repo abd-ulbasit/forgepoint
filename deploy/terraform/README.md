@@ -28,7 +28,8 @@ deploy/terraform/
 │   ├── s3/                   ← model-artifacts bucket: versioned, SSE-KMS, public-access blocked
 │   ├── ecr/                  ← one repo per service, scan-on-push, immutable tags, lifecycle
 │   ├── iam/                  ← IRSA roles per workload, least-privilege, bound to K8s SAs via OIDC
-│   └── state-backend/        ← S3 (versioned/SSE/locked) + DynamoDB lock table FOR the remote state
+│   └── state-backend/        ← S3 bucket (versioned, SSE-KMS CMK, TLS-only, prevent_destroy) FOR remote state
+├── bootstrap/                ← the one root with LOCAL state: applies state-backend once per account
 └── environments/
     └── dev/                  ← composes the modules with small/cheap defaults
         ├── versions.tf       (symlink-style copy of root pins — kept per-env so each env is hermetic)
@@ -49,18 +50,27 @@ between environments — that's the whole point of the split.
 
 ## Bootstrapping order (chicken-and-egg with remote state)
 
-The `state-backend` module creates the S3 bucket + DynamoDB table that the *other* stacks
-store their state in — but Terraform needs a backend before it can store state. Resolve it
-the standard way:
+The `state-backend` module creates the S3 bucket + KMS key that the *other* stacks store
+their state in — but Terraform needs a backend before it can store state. Resolve it the
+standard way:
 
-1. **First run, local state:** apply `state-backend` (from a tiny bootstrap stack or by
-   targeting it) with the default *local* backend. This creates the bucket + lock table.
-2. **Migrate:** fill in `backend.tf` with that bucket/table and run
-   `terraform init -migrate-state` to push local state into S3.
+1. **First run, local state:** `terraform -chdir=deploy/terraform/bootstrap init && … apply`.
+   The bootstrap root calls `state-backend` with the default *local* backend and creates
+   the bucket (versioned, SSE-KMS with its own CMK, TLS-only policy, public access blocked,
+   `prevent_destroy`) and the key (rotated, `prevent_destroy`, 30-day deletion window).
+   Set `state_access_principal_arns` to restrict state reads/writes to the roles that run
+   Terraform.
+2. **Migrate:** copy the bootstrap `backend_config` output into `environments/<env>/backend.tf`
+   (or a gitignored `*.backend.hcl`) and run `terraform init -migrate-state`.
 3. Everything afterwards (network/eks/rds/…) uses the S3 backend from the start.
 
+Locking uses the S3-native lock file (`use_lockfile = true`, Terraform ≥ 1.11). There is no
+DynamoDB lock table: DynamoDB locking is deprecated in the S3 backend.
+
 `dev/backend.tf` ships **commented out** so `terraform init -backend=false` works offline
-(no AWS creds, no real bucket) for `validate`/`plan` in CI and for graders.
+(no AWS creds, no real bucket). CI (`.github/workflows/terraform.yml`) runs `fmt -check`,
+`init -backend=false` and `validate` on every root; it does **not** plan, because CI has
+no AWS credentials and nothing has been applied.
 
 ## Conventions enforced everywhere
 

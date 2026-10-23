@@ -1,17 +1,61 @@
 # ============================================================================
-# state-backend — the S3 bucket + DynamoDB lock table that back REMOTE STATE
+# state-backend — the S3 bucket (and its KMS key) that back REMOTE STATE
 # ============================================================================
-# Every other stack stores its state in THIS bucket and locks against THIS table.
-# The bucket therefore gets the full hardening treatment: versioned (roll back a
-# bad apply), encrypted (state can hold secrets), and public access fully blocked.
+# Every other stack stores its state in THIS bucket. State is the most sensitive
+# artifact in the repo: it holds every resource attribute, including the Redis
+# AUTH token (see modules/elasticache) and anything else a provider persists. So
+# the bucket gets the full treatment: versioned, encrypted with a customer-managed
+# KMS key, TLS-only, public access blocked, ACLs disabled, and protected from
+# `terraform destroy`.
+#
+# LOCKING: S3-native lock files (`use_lockfile = true` in the backend block,
+# GA since Terraform 1.11). Terraform writes <key>.tflock next to the state
+# object with a conditional PUT, so there is no DynamoDB table any more; the
+# DynamoDB lock is deprecated in the S3 backend.
+#
+# Created ONCE, by the bootstrap root (deploy/terraform/bootstrap), which starts
+# with local state. See README.md "Bootstrapping order".
 # ----------------------------------------------------------------------------
 
-# The state bucket itself. Note: no `acl` argument — public-block (below) +
-# bucket-owner-enforced object ownership is the modern, ACL-free way to keep a
-# bucket private.
+# ----------------------------------------------------------------------------
+# KMS key for the state objects (Trivy AWS-0132: S3 encryption should use a CMK).
+# ----------------------------------------------------------------------------
+# WHY a CMK rather than SSE-S3: reading state then needs kms:Decrypt on THIS key
+# as well as s3:GetObject, so a broad S3 read grant elsewhere in the account no
+# longer exposes state, and every decrypt is a CloudTrail event.
+#
+# The old "no CMK, to avoid a bootstrap circular dependency" argument does not
+# hold: the key and the bucket are created together by the bootstrap root (local
+# state), before any stack stores state in the bucket. The real hazard is
+# losing the key, which would make every state object unreadable, hence
+# prevent_destroy and the maximum 30-day deletion window.
+resource "aws_kms_key" "state" {
+  description             = "Terraform remote state encryption key (${var.bucket_name})"
+  enable_key_rotation     = true
+  deletion_window_in_days = 30
+  tags                    = var.tags
+
+  lifecycle {
+    prevent_destroy = true
+  }
+}
+
+resource "aws_kms_alias" "state" {
+  name          = "alias/${var.bucket_name}"
+  target_key_id = aws_kms_key.state.key_id
+}
+
+# The state bucket itself. No `acl` argument: public-block (below) +
+# BucketOwnerEnforced ownership is the modern, ACL-free way to keep it private.
 resource "aws_s3_bucket" "state" {
   bucket = var.bucket_name
   tags   = var.tags
+
+  # A `terraform destroy` (or a refactor that drops this resource) must not be
+  # able to delete the bucket holding every environment's state.
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 # VERSIONING: keep every prior version of the state object. If an apply corrupts
@@ -25,24 +69,23 @@ resource "aws_s3_bucket_versioning" "state" {
   }
 }
 
-# ENCRYPTION AT REST: SSE with the S3-managed key (SSE-S3 / AES256). We use the
-# AWS-managed key here rather than a customer KMS key on purpose — the state
-# bucket must be usable during bootstrap BEFORE any KMS key exists, and a KMS
-# key whose own state lives in this bucket would be circular. SSE-S3 still
-# encrypts everything at rest with zero key management.
+# ENCRYPTION AT REST: SSE-KMS with the CMK above. bucket_key_enabled caches a
+# bucket-level data key, which cuts KMS request cost. The backend block should
+# also set kms_key_id to this key (see environments/dev/backend.tf); without it
+# the S3 backend asks for SSE-S3 explicitly on each write.
 resource "aws_s3_bucket_server_side_encryption_configuration" "state" {
   bucket = aws_s3_bucket.state.id
   rule {
     apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_key.state.arn
     }
-    # bucket_key_enabled has no effect for AES256; omitted deliberately.
+    bucket_key_enabled = true
   }
 }
 
-# PUBLIC ACCESS BLOCK: all four switches on. State is the most sensitive thing in
-# the repo — it must NEVER be reachable from the internet, even by accident via a
-# stray ACL or bucket policy. This object is the belt-and-suspenders guard.
+# PUBLIC ACCESS BLOCK: all four switches on. State must NEVER be reachable from
+# the internet, even by accident via a stray ACL or bucket policy.
 resource "aws_s3_bucket_public_access_block" "state" {
   bucket                  = aws_s3_bucket.state.id
   block_public_acls       = true
@@ -51,37 +94,76 @@ resource "aws_s3_bucket_public_access_block" "state" {
   restrict_public_buckets = true
 }
 
-# DynamoDB LOCK TABLE. The S3 backend uses this for advisory locking: before an
-# apply mutates state it writes a lock item keyed by `LockID`; concurrent applies
-# see the lock and refuse, preventing two writers from racing on one state file.
-#   - PAY_PER_REQUEST (on-demand): locking traffic is tiny + bursty; on-demand
-#     costs cents and needs no capacity planning vs provisioned throughput.
-#   - hash key MUST be named exactly "LockID" (string) — that's the contract the
-#     S3 backend expects; renaming it breaks locking.
-resource "aws_dynamodb_table" "lock" {
-  name         = var.lock_table_name
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "LockID"
+# OWNERSHIP: BucketOwnerEnforced disables ACLs entirely, so access is decided by
+# IAM + the bucket policy alone.
+resource "aws_s3_bucket_ownership_controls" "state" {
+  bucket = aws_s3_bucket.state.id
+  rule {
+    object_ownership = "BucketOwnerEnforced"
+  }
+}
 
-  attribute {
-    name = "LockID"
-    type = "S"
+# ----------------------------------------------------------------------------
+# BUCKET POLICY
+# ----------------------------------------------------------------------------
+#   1. DenyInsecureTransport: any request over plain HTTP is refused, for every
+#      principal (state must never cross the wire unencrypted).
+#   2. DenyStateAccessToOthers (only when state_access_principal_arns is set):
+#      object reads/writes/deletes are refused to every principal NOT in the
+#      list. Bucket-level actions (e.g. PutBucketPolicy) are deliberately left
+#      out of the deny so an account admin can never be locked out of fixing
+#      this policy.
+data "aws_iam_policy_document" "state" {
+  statement {
+    sid    = "DenyInsecureTransport"
+    effect = "Deny"
+    principals {
+      type        = "*"
+      identifiers = ["*"]
+    }
+    actions = ["s3:*"]
+    resources = [
+      aws_s3_bucket.state.arn,
+      "${aws_s3_bucket.state.arn}/*",
+    ]
+    condition {
+      test     = "Bool"
+      variable = "aws:SecureTransport"
+      values   = ["false"]
+    }
   }
 
-  # Recover the table to any point in the last 35 days if it's corrupted/deleted.
-  # Cheap insurance for the component that guards every other apply.
-  point_in_time_recovery {
-    enabled = true
+  dynamic "statement" {
+    for_each = length(var.state_access_principal_arns) > 0 ? [1] : []
+    content {
+      sid    = "DenyStateAccessToOthers"
+      effect = "Deny"
+      principals {
+        type        = "*"
+        identifiers = ["*"]
+      }
+      actions = [
+        "s3:GetObject",
+        "s3:GetObjectVersion",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:DeleteObjectVersion",
+      ]
+      resources = ["${aws_s3_bucket.state.arn}/*"]
+      condition {
+        test     = "ArnNotLike"
+        variable = "aws:PrincipalArn"
+        values   = var.state_access_principal_arns
+      }
+    }
   }
+}
 
-  # ENCRYPTION AT REST — SSE with the AWS-owned KMS key (SSE_OWNED_KEY). Like the
-  # S3 state bucket we deliberately avoid a customer CMK here because this table
-  # must be usable BEFORE any application CMK exists (bootstrap circular-dependency
-  # problem). AWS-owned encryption still satisfies CIS DynamoDB controls (encrypted
-  # at rest); it simply uses an AWS-managed root key rather than a customer one.
-  server_side_encryption {
-    enabled = true
-  }
+resource "aws_s3_bucket_policy" "state" {
+  bucket = aws_s3_bucket.state.id
+  policy = data.aws_iam_policy_document.state.json
 
-  tags = var.tags
+  # The public-access block must be in place first, or attaching a policy that
+  # references a "*" principal can transiently trip the block-public-policy guard.
+  depends_on = [aws_s3_bucket_public_access_block.state]
 }
