@@ -51,6 +51,10 @@ redis_engine_version     = "7.1"
 redis_num_nodes          = 1     # PROD: >= 2
 redis_automatic_failover = false # PROD: true (needs redis_num_nodes >= 2)
 
+# ---- Cost guardrail (budget_alert_emails is REQUIRED) -----------------------
+budget_monthly_limit_usd = 250
+budget_alert_emails      = ["you@example.com"]
+
 # ---- Throwaway-env teardown switches ----------------------------------------
 # These make `terraform destroy` fast and complete for a disposable dev env. The
 # variable defaults are the SAFE values; delete these lines for anything that

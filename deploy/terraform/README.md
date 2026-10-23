@@ -92,6 +92,9 @@ no AWS credentials and nothing has been applied.
     they never were.)
 - **Encryption everywhere:** KMS for EKS secrets, RDS storage, S3 (SSE-KMS), ElastiCache
   at-rest + in-transit; S3 + RDS + ElastiCache are all private-subnet only.
+- **Cost guardrail:** each environment has a monthly `aws_budgets_budget` (default $250) that
+  emails `budget_alert_emails` at 50/80/100% of actual spend and 100% of forecast. The
+  variable has no default, so an environment cannot be applied without a recipient.
 - **Private-by-default networking:** workloads live in private subnets; only the NAT gateway
   and (optionally) the EKS public API endpoint touch the internet. S3/ECR reach via VPC
   endpoints to cut NAT data-processing cost.

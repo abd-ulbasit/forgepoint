@@ -17,6 +17,8 @@
 #                                                                     │  │
 #      iam ◄── consumes EKS OIDC + S3 bucket ARN + secret ARNs ───────┘  │
 #          └── builds IRSA roles bound to per-service ServiceAccounts ◄───┘
+#
+#   budget ── monthly cost budget with email alerts (account-wide)
 # ----------------------------------------------------------------------------
 
 locals {
@@ -197,5 +199,46 @@ module "iam" {
         module.elasticache.kms_key_arn,
       ]
     }
+  }
+}
+
+# ----------------------------------------------------------------------------
+# (8) BUDGET — a cost guardrail with email alerts
+# ----------------------------------------------------------------------------
+# This env runs an EKS control plane, a NAT gateway, interface endpoints, RDS
+# and ElastiCache around the clock, so a forgotten `terraform apply` costs
+# money every hour. Nothing else in this stack would ever tell you.
+#
+# Scope: the WHOLE ACCOUNT's monthly cost (no cost filter). Filtering on the
+# Project tag would read $0 until that tag is activated as a cost allocation
+# tag in the Billing console, which is exactly the silent failure a budget
+# exists to prevent. If dev and prod share an account, give prod its own
+# budget and raise this one, or switch to a tag filter after activating it.
+resource "aws_budgets_budget" "monthly" {
+  name         = "${local.name_prefix}-monthly"
+  budget_type  = "COST"
+  limit_amount = tostring(var.budget_monthly_limit_usd)
+  limit_unit   = "USD"
+  time_unit    = "MONTHLY"
+
+  dynamic "notification" {
+    for_each = [50, 80, 100]
+    content {
+      comparison_operator        = "GREATER_THAN"
+      threshold                  = notification.value
+      threshold_type             = "PERCENTAGE"
+      notification_type          = "ACTUAL"
+      subscriber_email_addresses = var.budget_alert_emails
+    }
+  }
+
+  # Forecast alert: fires early in the month when the run rate says you will
+  # blow the budget, before the money is actually spent.
+  notification {
+    comparison_operator        = "GREATER_THAN"
+    threshold                  = 100
+    threshold_type             = "PERCENTAGE"
+    notification_type          = "FORECASTED"
+    subscriber_email_addresses = var.budget_alert_emails
   }
 }

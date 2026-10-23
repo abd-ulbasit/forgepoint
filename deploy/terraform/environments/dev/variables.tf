@@ -130,6 +130,23 @@ variable "rds_backup_retention_days" {
   default     = 7
 }
 
+# ---- Cost guardrail ---------------------------------------------------------
+variable "budget_monthly_limit_usd" {
+  description = "Monthly cost budget in USD. This env idles at roughly $200-250/month (EKS control plane, NAT gateway, two t3.medium nodes, interface endpoints, RDS, ElastiCache, KMS keys), so the default leaves a little headroom; alerts fire at 50/80/100% of actual spend and at 100% of forecast."
+  type        = number
+  default     = 250
+}
+
+variable "budget_alert_emails" {
+  description = "Email addresses that receive the budget alerts. REQUIRED, with no default: an environment that runs a NAT gateway and an EKS control plane must not be applyable without someone being told what it costs. AWS sends a confirmation email to each address once."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.budget_alert_emails) > 0
+    error_message = "budget_alert_emails must list at least one address."
+  }
+}
+
 # ---- Destructive teardown switches (safe defaults; dev opts in via tfvars) --
 variable "secret_recovery_window_days" {
   description = "Recovery window for the Secrets Manager secrets Terraform creates (RDS connection info, Redis credentials): 7-30 days, or 0 to delete immediately. SAFE DEFAULT 30. The dev tfvars sets 0 so destroy + re-apply does not collide with a secret pending deletion."
