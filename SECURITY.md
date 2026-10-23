@@ -150,8 +150,11 @@ Use `@refs/tags/v.*$` instead to accept release builds only.
 
 Dependency drift is what put ten reachable CVEs in this repo in the first place,
 so the gates above are paired with [Dependabot](.github/dependabot.yml): weekly
-updates for all 15 Go modules, the `web/` npm tree, and every pinned GitHub
-Action. Actions are pinned by commit SHA with the version in a trailing comment —
+updates for all 15 Go modules, the `web/` npm tree, every pinned GitHub Action,
+the digest-pinned Docker base images and deploy images (`docker`, `helm`,
+`docker-compose`), and the Terraform providers with their lock files. Database
+majors (postgres, redis) are excluded: those are migrations, not bumps.
+Actions are pinned by commit SHA with the version in a trailing comment —
 a moved tag cannot swap an action out from under a run, and Dependabot rewrites
 the SHA and the comment together so the pin stays a pin.
 
