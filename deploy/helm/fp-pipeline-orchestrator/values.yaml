@@ -156,10 +156,12 @@ migrations:
   image:
     # golang-migrate official image. Alpine-based, so it has /bin/sh (needed to
     # expand the DSN from env without baking it into the pod spec) and the
-    # `migrate` binary on PATH. Pinned to an immutable tag for reproducible
-    # rollouts — bump deliberately, never track a moving tag.
+    # `migrate` binary on PATH. Pinned BY DIGEST: Docker Hub tags are
+    # mutable (a re-pushed v4.18.3 would change what the kubelet pulls), so the
+    # tag is for humans and the digest is what actually gets pulled. Bump both
+    # together, deliberately.
     repository: migrate/migrate
-    tag: v4.18.3
+    tag: v4.18.3@sha256:39b59b389634e43bb3f2d4e94bc1edef0775ec2a9a3540ce6a2cf330e5daae55
     pullPolicy: IfNotPresent
   # Modest resources: the migrate step is short-lived and IO-light. Requests are
   # tiny so it never blocks scheduling; limits cap a pathological migration.
