@@ -1,6 +1,6 @@
 module github.com/abd-ulbasit/forgepoint/cli
 
-go 1.25.0
+go 1.26.10
 
 require (
 	google.golang.org/grpc v1.82.1

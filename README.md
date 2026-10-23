@@ -93,7 +93,7 @@ Reusable building blocks every service imports:
 
 ## Getting started
 
-Prerequisites: Go 1.26+, Docker, `make`.
+Prerequisites: Go 1.26.10+ (the `go` directive in `go.work`; an older Go downloads 1.26.10 unless `GOTOOLCHAIN=local`), Docker, `make`.
 
 ```bash
 # Start local infrastructure (NATS, Postgres, Redis, MinIO, monitoring)

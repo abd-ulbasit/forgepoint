@@ -50,11 +50,15 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
-# Pin the toolchain to the go.work `go 1.26.0` directive. The Go toolchain
-# refuses to build a workspace whose go directive is newer than the toolchain,
-# so this MUST track go.work (bump both together on a Go upgrade).
+# Pin the toolchain to the exact patch release in go.work's `go 1.26.10`
+# directive. setup-go sets GOTOOLCHAIN=local, so a toolchain older than that
+# directive refuses to build the workspace; this MUST track go.work, every
+# go.mod and the golang builder image in services/*/Dockerfile (bump all of
+# them together on a Go upgrade). A bare "1.26" let setup-go pick whatever
+# 1.26.x the runner had cached (1.26.9, which govulncheck flags for
+# GO-2026-6809 in crypto/x509).
 env:
-  GO_VERSION: "1.26"
+  GO_VERSION: "1.26.10"
 
 jobs:
   # ---------------------------------------------------------------------------

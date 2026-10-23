@@ -1,6 +1,6 @@
 module github.com/abd-ulbasit/forgepoint/services/auth
 
-go 1.25.0
+go 1.26.10
 
 require (
 	github.com/golang-jwt/jwt/v5 v5.3.1

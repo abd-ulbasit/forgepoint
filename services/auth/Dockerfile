@@ -69,13 +69,16 @@
 #      isolation is enforced at build time, not just by convention).
 #
 # -----------------------------------------------------------------------------
-# WHY golang:1.26-alpine (NOT 1.25)
+# WHY golang:1.26.10-alpine (AN EXACT PATCH RELEASE)
 # -----------------------------------------------------------------------------
-# `go.work` declares `go 1.26.0`. The Go toolchain refuses to build a workspace
-# whose go directive is NEWER than the toolchain, so a 1.25 image cannot build
-# this repo (it would either error or trigger a slow toolchain auto-download).
-# We pin the builder to 1.26 to match the workspace. Bump this line in lockstep
-# with the `go` directive in go.work when the platform upgrades Go.
+# go.work and every go.mod declare `go 1.26.10`. The image sets
+# GOTOOLCHAIN=local, so the Go toolchain refuses to build modules whose go
+# directive is NEWER than the toolchain: an older image errors out instead of
+# compiling a binary on an unpatched standard library. The patch level matters
+# because the binary's standard library IS this image's Go (1.26.9 carried
+# GO-2026-6809 in crypto/x509). Bump this line (tag AND digest) in lockstep
+# with the `go` directive in go.work and every go.mod, and GO_VERSION in
+# .github/workflows/{ci,security}.yml.
 #
 # -----------------------------------------------------------------------------
 # WHY distroless/static + nonroot for the final image
@@ -106,8 +109,8 @@
 # reproducible builds: the same Dockerfile resolves to the identical bytes today
 # and a year from now. These are multi-arch index digests, so the build works on
 # amd64 and arm64 hosts alike. Refresh with:
-#   docker buildx imagetools inspect golang:1.26-alpine
-FROM golang:1.26-alpine@sha256:f1ddd9fe14fffc091dd98cb4bfa999f32c5fc77d2f2305ea9f0e2595c5437c14 AS builder
+#   docker buildx imagetools inspect golang:1.26.10-alpine
+FROM golang:1.26.10-alpine@sha256:27f2d3b83cfc5803c8078f8e730af0f7c431bf067afaec8f60a36fb763187cba AS builder
 
 # git: some Go tooling/VCS stamping needs it. ca-certificates: for module fetches
 # over HTTPS. We disable VCS stamping at build time anyway (-buildvcs=false) so
