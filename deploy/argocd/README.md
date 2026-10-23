@@ -6,8 +6,10 @@ cluster to match Git and **self-heals** drift. This is the realization of
 [ADR-0002](../../docs/adr/0002-gitops-with-argocd.md) and Milestone **M6 (GitOps)**.
 
 > **This REPLACES the CI `helm upgrade` push step.** CI no longer deploys.
-> CI's job ends at *build → scan → sign → push image → bump the image tag in Git*.
-> ArgoCD does the deploying. No cluster credentials live in CI anymore.
+> CI's job ends at *build → scan → sign → push image*. The planned last step,
+> *bump the image tag in Git*, is **not implemented yet**: `image.tag` in every
+> `apps/fp-*.yaml` is `""` (Chart.appVersion) and is changed by hand in a
+> reviewed PR. ArgoCD does the deploying. No cluster credentials live in CI.
 
 `REPO_URL` placeholder used throughout: `https://github.com/abd-ulbasit/forgepoint.git`
 (swap for your fork in `project.yaml`, `root.yaml`, and each `apps/*.yaml`).
@@ -18,9 +20,13 @@ cluster to match Git and **self-heals** drift. This is the realization of
 
 ```
 deploy/argocd/
-├── project.yaml        AppProject "forgepoint" — the guardrail (least privilege):
-│                         allowed source repos, destination namespaces (fp-*),
-│                         and allowed resource kinds. Denies cluster RBAC.
+├── project.yaml        Two AppProjects (the guardrails, least privilege):
+│                         forgepoint-bootstrap — root only: Application objects
+│                           in `argocd`, nothing else;
+│                         forgepoint — child apps: fp-* namespaces only, never
+│                           `argocd`, no RBAC kinds, no CRDs.
+├── default-project.yaml  The built-in `default` project emptied, so an app
+│                         naming `project: default` can deploy nothing.
 ├── root.yaml           ROOT Application (app-of-apps). The ONE thing you apply by
 │                         hand. Watches apps/ and manages the child Applications.
 ├── apps/               Child Applications (root reconciles this directory):
@@ -34,7 +40,8 @@ deploy/argocd/
 ```
    operator (once)                 ArgoCD controller (forever)
    ──────────────                  ───────────────────────────
-   kubectl apply project.yaml  ─►  AppProject enforces guardrails on every app
+   kubectl apply project.yaml  ─►  AppProjects enforce guardrails on every app
+   kubectl apply default-project.yaml ─► `default` project can deploy nothing
    kubectl apply root.yaml     ─►  root watches apps/ ──► creates child Apps
                                         │
                                         ├─ fp-infra (wave -1) ─► fp-infra ns
@@ -60,6 +67,7 @@ reverted state. No imperative `helm rollback`.
 # 1. Install ArgoCD into the argocd namespace (Helm or upstream manifests).
 # 2. Apply the guardrail, then the root. That's the entire bootstrap.
 kubectl apply -n argocd -f deploy/argocd/project.yaml
+kubectl apply -n argocd -f deploy/argocd/default-project.yaml
 kubectl apply -n argocd -f deploy/argocd/root.yaml
 # Everything else (infra + every service) appears via the app-of-apps.
 ```
@@ -101,8 +109,10 @@ the diff per service is ~3 lines. (Once all 10 are truly uniform, an ArgoCD
 Two supported paths. **Git is always the trigger** — ArgoCD only ever reacts to
 a commit.
 
-**1. CI bumps the tag in Git (default, used here).**
-After build → scan → sign → push, CI rewrites the image tag in Git and pushes:
+**1. CI bumps the tag in Git (the plan; NOT implemented yet).**
+After build → scan → sign → push, CI would rewrite the image tag in Git and push.
+Today the Security workflow stops at push + sign, and the tag is edited by hand
+in a reviewed PR. The intended flow:
 
 ```
 service code change
@@ -182,19 +192,29 @@ and whose own `syncPolicy` is also manual, so even adding a prod app is reviewed
 
 ---
 
-## Guardrails recap (`project.yaml`)
+## Guardrails recap (`project.yaml`, `default-project.yaml`)
 
-The AppProject is least privilege for the delivery layer itself:
+The AppProjects are least privilege for the delivery layer itself:
 
+- **Two projects.** `forgepoint-bootstrap` (root only) may create
+  `argoproj.io/Application` in `argocd` and nothing else. `forgepoint` (every
+  child app) may never write to `argocd`. Before the split, one project allowed
+  `argocd` as a destination *and* Secret/Role/RoleBinding, so any merged chart
+  could drop a cluster/repo credential Secret or a RoleBinding into Argo CD's
+  own namespace.
 - **sourceRepos** — only the forgepoint repo may be a source (supply-chain guard).
-- **destinations** — only `fp-system / fp-infra / fp-models / fp-jobs` (+ `argocd`
-  for the child Application CRs). Nothing lands in `kube-system` / `default`.
-- **clusterResourceWhitelist** — only `Namespace` and `CustomResourceDefinition`.
-  **No ClusterRole/ClusterRoleBinding** — a child app can't mint cluster-wide RBAC.
-- **namespacedResourceWhitelist** — exactly the kinds the fp-auth chart + infra
-  kustomize render (Deployment, Service, ConfigMap, Secret, HPA, PDB,
-  NetworkPolicy, namespaced Role/RoleBinding, ServiceMonitor, ...). Deny-by-default:
+- **destinations** — `forgepoint`: only `fp-system / fp-infra / fp-models / fp-jobs`.
+  Nothing lands in `argocd` / `kube-system` / `default`.
+- **clusterResourceWhitelist** — only `Namespace`. No CRDs (a CRD write can
+  redefine any API group) and **no ClusterRole/ClusterRoleBinding**.
+- **namespacedResourceWhitelist** — exactly the kinds the charts + infra
+  kustomize render (Deployment, StatefulSet, Job, Service, ConfigMap, Secret,
+  ServiceAccount, PVC, HPA, PDB, NetworkPolicy, ServiceMonitor). No Role or
+  RoleBinding: namespaced RBAC from Git is a privilege grant. Deny-by-default:
   add a kind here the day a chart needs it.
+- **`default` project emptied** — an Application chooses its own `spec.project`,
+  so without this a child app could name `project: default` and bypass all of the
+  above.
 
 ---
 
