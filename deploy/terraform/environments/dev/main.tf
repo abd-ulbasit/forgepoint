@@ -81,8 +81,11 @@ module "rds" {
   multi_az              = var.rds_multi_az
   deletion_protection   = var.rds_deletion_protection
   backup_retention_days = var.rds_backup_retention_days
-  # Dev throwaway: skip the final snapshot so teardown is instant + free.
-  skip_final_snapshot = true
+  # Destructive settings come from variables with SAFE defaults; the dev
+  # teardown values live in terraform.tfvars.example. (They used to be
+  # hard-coded here, so a copy of this directory for prod inherited them.)
+  skip_final_snapshot         = var.rds_skip_final_snapshot
+  secret_recovery_window_days = var.secret_recovery_window_days
 }
 
 # ----------------------------------------------------------------------------
@@ -100,6 +103,8 @@ module "elasticache" {
   node_type          = var.redis_node_type
   num_cache_nodes    = var.redis_num_nodes
   automatic_failover = var.redis_automatic_failover
+
+  secret_recovery_window_days = var.secret_recovery_window_days
 }
 
 # ----------------------------------------------------------------------------
@@ -123,8 +128,9 @@ module "ecr" {
   source = "../../modules/ecr"
 
   name_prefix = local.name_prefix
-  # Dev: allow destroy to remove repos with images, mutable-tag off (immutable).
-  force_delete = true
+  # Images stay immutable (module default). force_delete comes from a variable
+  # with a safe default; dev opts in via tfvars so destroy can remove repos.
+  force_delete = var.ecr_force_delete
 }
 
 # ----------------------------------------------------------------------------

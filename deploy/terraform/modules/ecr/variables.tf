@@ -59,9 +59,9 @@ variable "max_tagged_images" {
 }
 
 variable "force_delete" {
-  description = "Allow `terraform destroy` to delete a repo that still contains images. TRUE in dev (tear it all down). FALSE in prod so you can't wipe release images by accident."
+  description = "Allow `terraform destroy` to delete a repo that still contains images. SAFE DEFAULT false, so release images cannot be wiped by accident. A throwaway dev env sets true in its tfvars."
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "tags" {

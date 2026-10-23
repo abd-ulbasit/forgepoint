@@ -147,7 +147,7 @@ resource "aws_secretsmanager_secret" "redis" {
   name                    = "${var.name_prefix}/elasticache/redis"
   description             = "Forgepoint Redis auth token + connection info"
   kms_key_id              = aws_kms_key.redis.arn
-  recovery_window_in_days = 0
+  recovery_window_in_days = var.secret_recovery_window_days
   tags                    = var.tags
 }
 

@@ -113,7 +113,8 @@ resource "aws_db_instance" "this" {
   maintenance_window      = "sun:04:30-sun:05:30"
   copy_tags_to_snapshot   = true
 
-  # Safety rails (prod tightens both via tfvars).
+  # Safety rails. Module defaults are the SAFE values (protected, final
+  # snapshot taken); a throwaway env opts out explicitly in its tfvars.
   deletion_protection       = var.deletion_protection
   skip_final_snapshot       = var.skip_final_snapshot
   final_snapshot_identifier = var.skip_final_snapshot ? null : "${var.name_prefix}-postgres-final"
@@ -125,7 +126,6 @@ resource "aws_db_instance" "this" {
   enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
 
   tags = merge(var.tags, { Name = "${var.name_prefix}-postgres" })
-
 }
 
 # ----------------------------------------------------------------------------
@@ -140,14 +140,14 @@ resource "aws_db_instance" "this" {
 # so an out-of-band rotation set up a later apply that would overwrite the
 # secret with a password the database no longer accepted.
 #
-# recovery_window: 0 in dev lets us delete+recreate the secret immediately on
-# teardown (no 7-30 day "scheduled deletion" blocking a re-apply). Prod should
-# RAISE this (e.g. 7) so an accidental delete is recoverable.
+# recovery_window: var.secret_recovery_window_days (safe default 30). A dev
+# teardown can set 0 in tfvars so a re-apply is not blocked by a secret pending
+# deletion. It used to be hard-coded to 0, which every copy of the env inherited.
 resource "aws_secretsmanager_secret" "db" {
   name                    = "${var.name_prefix}/rds/postgres"
   description             = "Forgepoint Postgres connection info (no password; see master_user_secret_arn)"
   kms_key_id              = aws_kms_key.rds.arn
-  recovery_window_in_days = 0
+  recovery_window_in_days = var.secret_recovery_window_days
   tags                    = var.tags
 }
 

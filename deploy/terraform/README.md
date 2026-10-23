@@ -41,8 +41,11 @@ deploy/terraform/
 ```
 
 `staging/` and `prod/` are produced by **copying `dev/` and tuning the variables** (bigger
-instances, `multi_az = true`, `deletion_protection = true`, restricted API CIDRs). The
-modules themselves do not change between environments — that's the whole point of the split.
+instances, `multi_az = true`, restricted API CIDRs). Destructive settings (deletion
+protection off, no final snapshot, ECR force-delete, immediate secret deletion) are
+variables whose **defaults are the safe values**; only the dev `terraform.tfvars.example`
+turns them on, so a copied directory starts safe. The modules themselves do not change
+between environments — that's the whole point of the split.
 
 ## Bootstrapping order (chicken-and-egg with remote state)
 

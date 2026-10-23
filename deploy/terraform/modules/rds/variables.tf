@@ -85,15 +85,26 @@ variable "backup_retention_days" {
 }
 
 variable "deletion_protection" {
-  description = "Block `terraform destroy`/console delete of the instance. FALSE in dev so the throwaway env can be torn down to save money; TRUE in prod so nobody nukes the production DB by accident."
+  description = "Block `terraform destroy`/console delete of the instance. SAFE DEFAULT true. A throwaway dev env sets false in its tfvars so it can be torn down."
+  type        = bool
+  default     = true
+}
+
+variable "skip_final_snapshot" {
+  description = "Skip the final snapshot on delete. SAFE DEFAULT false, so a delete always leaves a recoverable snapshot. A throwaway dev env sets true in its tfvars."
   type        = bool
   default     = false
 }
 
-variable "skip_final_snapshot" {
-  description = "Skip the final snapshot on delete. TRUE in dev (we don't care about a throwaway DB's data). FALSE in prod so a delete always leaves a recoverable snapshot."
-  type        = bool
-  default     = true
+variable "secret_recovery_window_days" {
+  description = "Days Secrets Manager keeps the deleted connection-info secret recoverable (7-30), or 0 to delete immediately. SAFE DEFAULT 30 (the AWS default). A throwaway dev env may set 0 so destroy + re-apply does not collide with a secret pending deletion."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.secret_recovery_window_days == 0 || (var.secret_recovery_window_days >= 7 && var.secret_recovery_window_days <= 30)
+    error_message = "secret_recovery_window_days must be 0 or between 7 and 30."
+  }
 }
 
 variable "tags" {
