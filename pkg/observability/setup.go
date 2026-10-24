@@ -85,15 +85,15 @@ import (
 	// resource.Default() for this otel release. resource.Merge() rejects two
 	// resources whose Schema URLs differ, so a mismatch makes Setup() return
 	// "conflicting Schema URL" — a RUNTIME failure in every service's
-	// composition root, invisible to the compiler. otel 1.44's
-	// resource.Default() carries schema 1.41.0.
+	// composition root, invisible to the compiler. otel 1.45's
+	// resource.Default() carries schema 1.43.0.
 	//
 	// Bump this together with the otel modules. TestSetup_* in this package is
-	// what catches it if you don't: it has now caught it on two consecutive
-	// otel upgrades (1.40 -> 1.42 -> 1.44), which is the argument for keeping
-	// the version pinned here rather than reaching for resource.NewSchemaless
-	// to make the mismatch impossible-and-silent.
-	semconv "go.opentelemetry.io/otel/semconv/v1.41.0"
+	// what catches it if you don't: it has now caught it on three consecutive
+	// otel upgrades (1.40 -> 1.42 -> 1.44 -> 1.45), which is the argument for
+	// keeping the version pinned here rather than reaching for
+	// resource.NewSchemaless to make the mismatch impossible-and-silent.
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 )
 
 // setupCalled (guarded by setupMu) ensures Setup() runs at most once per process.

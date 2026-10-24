@@ -123,28 +123,29 @@ and the gate stayed red on them for three months. Each one now has a decision:
 None of the Kubernetes fixes has been run against a cluster yet. Verify postgres
 (synced by the `fp-infra` Argo CD app), grafana and ollama after rollout.
 
-**Still red after this triage (2026-10-24):** the same scan reports HIGH
-dependency CVEs in the Go modules, and govulncheck fails every module on the
-reachable subset of them. They are dependency bumps, left to the open
-Dependabot PR so the two do not conflict, but #17 does **not** fully clear
-either gate as it stands:
+**Go dependency advisories (2026-10-24):** after this triage the same scan
+still reported HIGH dependency CVEs in every Go module, and govulncheck failed
+all 15 modules on the reachable subset. These were first left to Dependabot PR
+#17, but #17 cleared neither gate. It stopped short on `x/net`, `x/crypto`,
+`klauspost/compress` and `moby/go-archive`, and it did not touch `cli/`,
+`gen/go` or `services/bff`. This branch bumps them instead, to the lowest
+release that clears every advisory, so #17 is superseded:
 
-| Package | Fixed in | Open Dependabot PR brings it to |
-|---|---|---|
-| `golang.org/x/crypto` | 0.55.0 (Trivy); **0.56.0** for govulncheck (GO-2026-6354, GO-2026-6355, reachable from `pkg`) | 0.55.0 (#17), still red in govulncheck |
-| `golang.org/x/text` | 0.41.0 | 0.41.0 (#17) |
-| `google.golang.org/grpc` | 1.83.1 | 1.83.2 (#17) |
-| `golang.org/x/net` | **0.60.0** (one CVE; another is fixed in 0.56.0) | 0.58.0 (#17), still vulnerable |
-| `go.opentelemetry.io/otel/sdk`, `.../exporters/otlp/otlptrace` | 1.45.0 (govulncheck only, GO-2026-6505) | 1.46.0 (#17) |
-| `github.com/klauspost/compress` | **1.18.7** | 1.18.6 (#17), still vulnerable |
-| `github.com/moby/go-archive` | **0.3.0** | unchanged |
+| Package | Advisories | Fixed in | Now |
+|---|---|---|---|
+| `golang.org/x/net` | GO-2026-6603, -6611, -6612, -6617; CVE-2026-46600, CVE-2026-78669 | 0.60.0 | 0.60.0 |
+| `google.golang.org/grpc` | GO-2026-6348 (1.83.1), GO-2026-6443 (1.83.2 on the 1.83 line) | 1.83.2 | 1.83.2 |
+| `golang.org/x/text` | GO-2026-6629, CVE-2026-56851 | 0.41.0 | 0.42.0, the floor `x/net` 0.60.0 requires |
+| `golang.org/x/crypto` | GO-2026-6354, GO-2026-6355 (reachable from `pkg`), CVE-2026-56854 | 0.56.0 | 0.57.0, the floor `x/net` 0.60.0 requires |
+| `go.opentelemetry.io/otel/sdk`, `.../exporters/otlp/otlptrace` | GO-2026-6505 | 1.45.0 | 1.45.0, with the rest of the otel v1 set |
+| `github.com/klauspost/compress` | CVE-2026-63209 | 1.18.7 | 1.18.7 |
+| `github.com/moby/go-archive` | GO-2026-6253, CVE-2026-17106 | 0.3.0 | 0.3.0 |
 
-#17 also leaves out `cli/`, `gen/go` and `services/bff`, which carry the same
-`x/net`, `x/text` and `grpc` advisories (and, in `bff`, the `otel` one). After
-merging #17, bump the remaining packages by hand (or let Dependabot's next run
-propose them), then re-run Security.
+The otel bump also moves the semconv import in `pkg/observability` to v1.43.0.
+That is the schema otel 1.45's `resource.Default()` carries; the comment there
+explains why the two must match.
 
-Fixed on this branch rather than left to Dependabot:
+Also fixed on this branch rather than left to Dependabot:
 
 - the web findings: `axios` 1.20.0 and `follow-redirects` 1.16.1 (#10 only
   reached axios 1.19.0, still vulnerable);
