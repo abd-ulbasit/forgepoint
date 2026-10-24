@@ -1,0 +1,102 @@
+# =============================================================================
+# TERRAFORM — offline checks for every root module in deploy/terraform
+# =============================================================================
+#
+# Until this workflow existed nothing ran `terraform fmt` or `validate` in CI,
+# although environments/dev/backend.tf said CI did; the only thing that read
+# the .tf files was Trivy's misconfiguration scanner.
+#
+# WHAT IT CHECKS (no cloud credentials, nothing is planned or applied):
+#   - fmt -check: formatting drift fails the build.
+#   - init -backend=false -lockfile=readonly: providers are installed from the
+#     COMMITTED .terraform.lock.hcl and must match its checksums. A constraint
+#     change without a regenerated lock file fails here instead of silently
+#     resolving a different provider build.
+#   - validate: syntax, references, types and variable validation rules.
+#
+# WHAT IT DOES NOT DO: `plan`. There are no AWS credentials in this repo's CI
+# and nothing has been applied, so a plan would have no state to compare to.
+# When an environment goes live, add a plan job that assumes a read-only role
+# through GitHub OIDC (see modules/github-oidc for the trust pattern).
+#
+# No path filter on purpose: if this check is ever made required in branch
+# protection, a path-filtered workflow never reports on unrelated PRs and
+# blocks them forever.
+# =============================================================================
+
+name: Terraform
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Nothing by default; the jobs ask for read access to the repo and no more.
+permissions: {}
+
+concurrency:
+  group: terraform-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  # The version the lock files and README are validated against.
+  TERRAFORM_VERSION: "1.14.8"
+
+jobs:
+  fmt:
+    name: terraform fmt
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt -check
+        run: terraform fmt -check -recursive -diff deploy/terraform
+
+  validate:
+    name: validate (${{ matrix.root }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every ROOT module (a directory you run terraform in). Modules under
+        # deploy/terraform/modules are validated through the roots that call
+        # them. Add staging/prod here when they exist.
+        root:
+          - deploy/terraform/bootstrap
+          - deploy/terraform/environments/dev
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init (no backend, lock file read-only)
+        env:
+          ROOT: ${{ matrix.root }}
+        run: terraform -chdir="${ROOT}" init -backend=false -input=false -lockfile=readonly
+
+      - name: terraform validate
+        env:
+          ROOT: ${{ matrix.root }}
+        run: terraform -chdir="${ROOT}" validate -no-color

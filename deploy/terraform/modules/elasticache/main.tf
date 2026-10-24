@@ -74,7 +74,22 @@ resource "aws_security_group_rule" "redis_ingress" {
 # ----------------------------------------------------------------------------
 # ElastiCache AUTH tokens have constraints: 16-128 chars, and only a limited
 # special-char set. We restrict override_special accordingly so the token is
-# always accepted by ElastiCache.
+# always accepted by ElastiCache. Several of these characters are not legal raw
+# in a URL, so the `url` field below percent-encodes the token.
+# KNOWN RESIDUAL RISK: this token is stored in Terraform STATE (random_password
+# results, the replication group's auth_token and the secret_string below are
+# all persisted). Unlike RDS there is no AWS-managed password for ElastiCache,
+# and AWS provider 5.x has no write-only auth_token. Mitigations: the state
+# bucket is SSE-KMS with a CMK, and restricted to the roles listed in
+# state_access_principal_arns once that is set (it defaults to [], which adds
+# no restriction; modules/state-backend). The longer-term fix is ElastiCache
+# RBAC users with IAM authentication, which needs a client change (short-lived
+# IAM auth tokens).
+#
+# DRIFT HAZARD: the replication group ignores auth_token changes (below) but the
+# secret version does not. If the token is ever rotated outside Terraform, the
+# next apply rewrites the secret with the OLD token and clients break. Rotate
+# by changing it here (and applying), never out of band.
 resource "random_password" "auth_token" {
   length           = 48
   special          = true
@@ -135,7 +150,7 @@ resource "aws_secretsmanager_secret" "redis" {
   name                    = "${var.name_prefix}/elasticache/redis"
   description             = "Forgepoint Redis auth token + connection info"
   kms_key_id              = aws_kms_key.redis.arn
-  recovery_window_in_days = 0
+  recovery_window_in_days = var.secret_recovery_window_days
   tags                    = var.tags
 }
 
@@ -147,6 +162,11 @@ resource "aws_secretsmanager_secret_version" "redis" {
     auth_token = random_password.auth_token.result
     # rediss:// (note the double-s) = Redis over TLS, required because transit
     # encryption is on. The app uses this URL form instead of plain redis://.
-    url = "rediss://:${random_password.auth_token.result}@${aws_elasticache_replication_group.this.primary_endpoint_address}:${aws_elasticache_replication_group.this.port}"
+    # The token is percent-encoded: override_special includes # ^ < >, which
+    # Go's net/url (used by go-redis ParseURL) rejects in the userinfo part, so
+    # a raw token makes most generated URLs unparseable ("invalid FP_REDIS_URL"
+    # at boot). ParseURL decodes it back, so clients still send the real token.
+    # auth_token above stays raw for clients that build their own connection.
+    url = "rediss://:${urlencode(random_password.auth_token.result)}@${aws_elasticache_replication_group.this.primary_endpoint_address}:${aws_elasticache_replication_group.this.port}"
   })
 }

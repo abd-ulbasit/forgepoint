@@ -6,8 +6,10 @@ cluster to match Git and **self-heals** drift. This is the realization of
 [ADR-0002](../../docs/adr/0002-gitops-with-argocd.md) and Milestone **M6 (GitOps)**.
 
 > **This REPLACES the CI `helm upgrade` push step.** CI no longer deploys.
-> CI's job ends at *build → scan → sign → push image → bump the image tag in Git*.
-> ArgoCD does the deploying. No cluster credentials live in CI anymore.
+> CI's job ends at *build → scan → sign → push image*. The planned last step,
+> *bump the image tag in Git*, is **not implemented yet**: `image.tag` in every
+> `apps/fp-*.yaml` is `""` (Chart.appVersion) and is changed by hand in a
+> reviewed PR. ArgoCD does the deploying. No cluster credentials live in CI.
 
 `REPO_URL` placeholder used throughout: `https://github.com/abd-ulbasit/forgepoint.git`
 (swap for your fork in `project.yaml`, `root.yaml`, and each `apps/*.yaml`).
@@ -18,9 +20,13 @@ cluster to match Git and **self-heals** drift. This is the realization of
 
 ```
 deploy/argocd/
-├── project.yaml        AppProject "forgepoint" — the guardrail (least privilege):
-│                         allowed source repos, destination namespaces (fp-*),
-│                         and allowed resource kinds. Denies cluster RBAC.
+├── project.yaml        Two AppProjects (the guardrails, least privilege):
+│                         forgepoint-bootstrap — root only: Application objects
+│                           in `argocd`, nothing else;
+│                         forgepoint — child apps: fp-* namespaces only, never
+│                           `argocd`, no RBAC kinds, no CRDs.
+├── default-project.yaml  The built-in `default` project emptied, so an app
+│                         naming `project: default` can deploy nothing.
 ├── root.yaml           ROOT Application (app-of-apps). The ONE thing you apply by
 │                         hand. Watches apps/ and manages the child Applications.
 ├── apps/               Child Applications (root reconciles this directory):
@@ -34,7 +40,8 @@ deploy/argocd/
 ```
    operator (once)                 ArgoCD controller (forever)
    ──────────────                  ───────────────────────────
-   kubectl apply project.yaml  ─►  AppProject enforces guardrails on every app
+   kubectl apply project.yaml  ─►  AppProjects enforce guardrails on every app
+   kubectl apply default-project.yaml ─► `default` project can deploy nothing
    kubectl apply root.yaml     ─►  root watches apps/ ──► creates child Apps
                                         │
                                         ├─ fp-infra (wave -1) ─► fp-infra ns
@@ -60,6 +67,7 @@ reverted state. No imperative `helm rollback`.
 # 1. Install ArgoCD into the argocd namespace (Helm or upstream manifests).
 # 2. Apply the guardrail, then the root. That's the entire bootstrap.
 kubectl apply -n argocd -f deploy/argocd/project.yaml
+kubectl apply -n argocd -f deploy/argocd/default-project.yaml
 kubectl apply -n argocd -f deploy/argocd/root.yaml
 # Everything else (infra + every service) appears via the app-of-apps.
 ```
@@ -101,8 +109,10 @@ the diff per service is ~3 lines. (Once all 10 are truly uniform, an ArgoCD
 Two supported paths. **Git is always the trigger** — ArgoCD only ever reacts to
 a commit.
 
-**1. CI bumps the tag in Git (default, used here).**
-After build → scan → sign → push, CI rewrites the image tag in Git and pushes:
+**1. CI bumps the tag in Git (the plan; NOT implemented yet).**
+After build → scan → sign → push, CI would rewrite the image tag in Git and push.
+Today the Security workflow stops at push + sign, and the tag is edited by hand
+in a reviewed PR. The intended flow:
 
 ```
 service code change
@@ -182,27 +192,75 @@ and whose own `syncPolicy` is also manual, so even adding a prod app is reviewed
 
 ---
 
-## Guardrails recap (`project.yaml`)
+## Guardrails recap (`project.yaml`, `default-project.yaml`)
 
-The AppProject is least privilege for the delivery layer itself:
+The AppProjects are least privilege for the delivery layer itself:
 
+- **Two projects.** `forgepoint-bootstrap` (root only) may create
+  `argoproj.io/Application` in `argocd` and nothing else. `forgepoint` (every
+  child app) may never write to `argocd`. Before the split, one project allowed
+  `argocd` as a destination *and* Secret/Role/RoleBinding, so any merged chart
+  could drop a cluster/repo credential Secret or a RoleBinding into Argo CD's
+  own namespace.
 - **sourceRepos** — only the forgepoint repo may be a source (supply-chain guard).
-- **destinations** — only `fp-system / fp-infra / fp-models / fp-jobs` (+ `argocd`
-  for the child Application CRs). Nothing lands in `kube-system` / `default`.
-- **clusterResourceWhitelist** — only `Namespace` and `CustomResourceDefinition`.
-  **No ClusterRole/ClusterRoleBinding** — a child app can't mint cluster-wide RBAC.
-- **namespacedResourceWhitelist** — exactly the kinds the fp-auth chart + infra
-  kustomize render (Deployment, Service, ConfigMap, Secret, HPA, PDB,
-  NetworkPolicy, namespaced Role/RoleBinding, ServiceMonitor, ...). Deny-by-default:
-  add a kind here the day a chart needs it.
+- **destinations** — `forgepoint`: only `fp-system / fp-infra / fp-models / fp-jobs`.
+  Nothing lands in `argocd` / `kube-system` / `default`.
+- **clusterResourceWhitelist** — only `Namespace`. No CRDs (a CRD write can
+  redefine any API group) and **no ClusterRole/ClusterRoleBinding**.
+- **namespaceResourceWhitelist** — exactly the kinds the charts + infra
+  kustomize render (Deployment, StatefulSet, Job, Service, ConfigMap, Secret,
+  ServiceAccount, PVC, HPA, PDB, NetworkPolicy, ServiceMonitor). No Role or
+  RoleBinding: namespaced RBAC from Git is a privilege grant. Deny-by-default:
+  add a kind here the day a chart needs it. Spell the key exactly
+  `namespaceResourceWhitelist`: Argo CD treats a missing namespaced whitelist
+  as "allow every kind", so a typo removes the guardrail instead of tightening it.
+- **`default` project emptied** — an Application chooses its own `spec.project`,
+  so without this a child app could name `project: default` and bypass all of the
+  above. It has no repos, no destinations and a `*/*` namespaced blacklist (the
+  lock-down the Argo CD docs recommend; an empty whitelist alone is fragile).
+- **Check before you trust it:** `kubectl apply --dry-run=server -f deploy/argocd/project.yaml -f deploy/argocd/default-project.yaml`
+  against a cluster with the Argo CD CRDs. kubectl's strict field validation
+  rejects a misspelled key.
 
 ---
 
 ## Secrets note
 
 GitOps means manifests live in Git — so plaintext secrets must NOT. The fp-auth
-chart's in-chart Secret holds **dev-only placeholders** (see its values.yaml
-SECURITY CONTRACT). In prod, `secrets.create: false` and the real Secret comes
+chart's optional in-chart Secret holds **dev-only placeholders** (see its values.yaml
+SECURITY CONTRACT), so `secrets.create` defaults to `false` and the real Secret comes
 from **External Secrets Operator** or **Sealed Secrets** (ADR-0002 follow-up,
 Phase 17) — the encrypted/sealed material is safe to commit, the plaintext never is.
+
+### Every app needs its Secret before the first sync
+
+`secrets.create` is `false` in every chart, and nothing the root app syncs
+creates the Secrets. Each Deployment still mounts a Secret **named after its
+release** (`envFrom`), so an app whose Secret does not exist yet still syncs,
+but its pods sit in `CreateContainerConfigError` and the app goes Progressing,
+then Degraded. That is deliberate
+(fail closed instead of running on placeholder credentials), but plan for it:
+
+| App (Secret name) | Namespace | Keys the chart expects | Provided in this repo |
+|---|---|---|---|
+| `fp-auth` | fp-system | `FP_DATABASE_URL`, `FP_JWT_SECRET` (optional: `FP_BOOTSTRAP_ADMIN_PASSWORD`) | ExternalSecret `deploy/secrets/external-secrets/externalsecret-fp-auth.yaml` (applied by hand, not synced) |
+| `fp-billing` | fp-system | `FP_DATABASE_URL`, `FP_JWT_SECRET` | **nothing yet** |
+| `fp-experiment-tracker` | fp-system | `FP_DATABASE_URL`, `FP_JWT_SECRET` | **nothing yet** |
+| `fp-feature-store` | fp-system | `FP_DATABASE_URL`, `FP_JWT_SECRET`, `FP_REDIS_URL` | **nothing yet** |
+| `fp-inference-gateway` | fp-system | `FP_JWT_SECRET`, `FP_REDIS_URL` | **nothing yet** |
+| `fp-model-monitor` | fp-system | `FP_DATABASE_URL`, `FP_JWT_SECRET`, `FP_REDIS_URL` | **nothing yet** |
+| `fp-model-serving` | fp-models | `FP_JWT_SECRET` | **nothing yet** |
+| `fp-notification` | fp-system | `FP_DATABASE_URL`, `FP_JWT_SECRET` | **nothing yet** |
+| `fp-pipeline-orchestrator` | fp-system | `FP_DATABASE_URL`, `FP_JWT_SECRET` | **nothing yet** |
+| `fp-registry` | fp-system | `FP_DATABASE_URL`, `FP_JWT_SECRET` | **nothing yet** |
+
+The key lists come from each chart's `templates/secret.yaml` (the dev Secret it
+renders when `secrets.create=true`); that file is the reference if they drift.
+`FP_JWT_SECRET` must be the same value in all ten. For the nine without one,
+add an ExternalSecret (modelled on `externalsecret-fp-auth.yaml`, which also
+shows how to template a DSN) or a SealedSecret per app, and apply it before
+enabling the app. `fp-infra-creds` (`externalsecret-fp-infra-creds.yaml`)
+carries the shared Postgres and Redis URLs, but no chart reads it by default.
+For local Kind clusters, `make helm-install` passes `--set secrets.create=true`
+with the dev placeholders, so this only bites GitOps installs.
 ```

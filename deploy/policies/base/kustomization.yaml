@@ -18,3 +18,4 @@ resources:
   - 20-image-policies.yaml
   - 30-workload-policies.yaml
   - 40-ai-gateway-policies.yaml
+  - 50-verify-images.yaml

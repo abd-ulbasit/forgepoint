@@ -11,7 +11,8 @@
 # ============================================================================
 
 terraform {
-  required_version = ">= 1.9.0, < 2.0.0"
+  # >= 1.11: the S3 backend's use_lockfile (backend.tf) is GA from 1.11.
+  required_version = ">= 1.11.0, < 2.0.0"
 
   required_providers {
     aws = {

@@ -59,6 +59,17 @@ variable "snapshot_retention_days" {
   default     = 1
 }
 
+variable "secret_recovery_window_days" {
+  description = "Days Secrets Manager keeps the deleted Redis credentials secret recoverable (7-30), or 0 to delete immediately. SAFE DEFAULT 30 (the AWS default). A throwaway dev env may set 0 so destroy + re-apply does not collide with a secret pending deletion."
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.secret_recovery_window_days == 0 || (var.secret_recovery_window_days >= 7 && var.secret_recovery_window_days <= 30)
+    error_message = "secret_recovery_window_days must be 0 or between 7 and 30."
+  }
+}
+
 variable "tags" {
   description = "Additional tags (Project/Environment/ManagedBy via provider default_tags)."
   type        = map(string)

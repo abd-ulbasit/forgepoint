@@ -130,6 +130,11 @@ import (
 	redisrepo "github.com/abd-ulbasit/forgepoint/services/model-monitor/internal/repository/redis"
 )
 
+// version is set at build time with -ldflags "-X main.version=<ref>" (see the
+// Dockerfile's VERSION build arg) and reported as the OTel service.version.
+// Local `go run` builds report "dev".
+var version = "dev"
+
 func main() {
 	// ================================================================
 	// 1. STRUCTURED LOGGER
@@ -170,7 +175,7 @@ func main() {
 
 	otelShutdown, err := observability.Setup(ctx, observability.Config{
 		ServiceName:    "model-monitor",
-		ServiceVersion: "dev",
+		ServiceVersion: version,
 		Environment:    "local",
 		OTLPEndpoint:   cfg.OTelEndpoint,
 		OTLPInsecure:   true, // plaintext to the local collector (no TLS cert there)

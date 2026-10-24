@@ -51,9 +51,12 @@ metadata:
   labels:
     app.kubernetes.io/part-of: forgepoint
 spec:
-  # Bind to the guardrail project from project.yaml. The root only manages
-  # Application CRs in the `argocd` namespace, which the project permits.
-  project: forgepoint
+  # Bind to the bootstrap project from project.yaml. It permits exactly one
+  # thing: Application objects in the `argocd` namespace. The child apps it
+  # creates run under the separate `forgepoint` project, which cannot touch
+  # `argocd` at all. (The root used to share that project, which is why the
+  # workload project had to allow writes into `argocd`.)
+  project: forgepoint-bootstrap
 
   source:
     # REPO_URL — the one forgepoint mono-repo (must match an entry in the

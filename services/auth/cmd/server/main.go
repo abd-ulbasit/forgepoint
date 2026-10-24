@@ -101,6 +101,11 @@ import (
 	"github.com/abd-ulbasit/forgepoint/services/auth/internal/repository/postgres"
 )
 
+// version is set at build time with -ldflags "-X main.version=<ref>" (see the
+// Dockerfile's VERSION build arg) and reported as the OTel service.version.
+// Local `go run` builds report "dev".
+var version = "dev"
+
 // AuthConfig extends BaseConfig with auth-specific configuration.
 //
 // WHY embed BaseConfig:
@@ -199,7 +204,7 @@ func main() {
 	// config and TLS is on.
 	otelShutdown, err := observability.Setup(ctx, observability.Config{
 		ServiceName:    "auth",
-		ServiceVersion: "dev",
+		ServiceVersion: version,
 		Environment:    "local",
 		OTLPEndpoint:   cfg.OTelEndpoint,
 		OTLPInsecure:   true,

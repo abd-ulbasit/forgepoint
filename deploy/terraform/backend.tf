@@ -9,17 +9,19 @@
 # WHY remote state at all:
 #   - SHARED + LOCKED: a team (or CI) runs Terraform from many machines. Local
 #     state on one laptop is a single point of truth/failure and invites two
-#     people applying at once and corrupting state. S3 stores it centrally;
-#     DynamoDB provides a LOCK so only one apply mutates state at a time.
+#     people applying at once and corrupting state. S3 stores it centrally, and
+#     an S3-native lock file (use_lockfile, Terraform >= 1.11) makes sure only
+#     one apply mutates state at a time. (DynamoDB locking is deprecated.)
 #   - DURABLE + VERSIONED: the S3 bucket has versioning on (see the state-backend
 #     module), so a botched apply can be rolled back to a prior state object.
-#   - ENCRYPTED: state contains sensitive material (resource IDs, sometimes
-#     secret values), so the bucket is SSE-encrypted and the backend sets
-#     `encrypt = true`.
+#   - ENCRYPTED: state contains sensitive material (resource IDs and, here, the
+#     Redis AUTH token), so the bucket is SSE-KMS with a customer-managed key and
+#     the backend sets `encrypt = true` + `kms_key_id`.
 #
-# CHICKEN-AND-EGG: the S3 bucket + DynamoDB table that back this state are
-# themselves created by modules/state-backend. Bootstrap once with LOCAL state,
-# then `terraform init -migrate-state` into S3. See README.md "Bootstrapping".
+# CHICKEN-AND-EGG: the S3 bucket + KMS key that back this state are themselves
+# created by the bootstrap root (deploy/terraform/bootstrap, which calls
+# modules/state-backend) with LOCAL state; then `terraform init -migrate-state`
+# moves each environment into S3. See README.md "Bootstrapping order".
 #
 # This block is intentionally COMMENTED OUT here. The root dir is not a rootmodule
 # you `apply` — it just holds shared versions.tf + this reference. The real,
@@ -28,10 +30,11 @@
 #
 # terraform {
 #   backend "s3" {
-#     bucket         = "forgepoint-tfstate-<account_id>"   # from state-backend module output
-#     key            = "<env>/terraform.tfstate"           # per-env key (dev/, staging/, prod/)
-#     region         = "us-east-1"                         # bucket region (not necessarily infra region)
-#     dynamodb_table = "forgepoint-tflock"                 # lock table from state-backend module
-#     encrypt        = true                                # encrypt the state object at rest
+#     bucket       = "forgepoint-tfstate-<account_id>"   # bootstrap output state_bucket_name
+#     key          = "<env>/terraform.tfstate"           # per-env key (dev/, staging/, prod/)
+#     region       = "us-east-1"                         # bucket region (not necessarily infra region)
+#     encrypt      = true                                # encrypt the state object at rest...
+#     kms_key_id   = "<bootstrap output kms_key_arn>"    # ...with the state CMK
+#     use_lockfile = true                                # S3-native lock (Terraform >= 1.11)
 #   }
 # }

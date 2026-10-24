@@ -28,16 +28,21 @@ output "security_group_id" {
 }
 
 output "credentials_secret_arn" {
-  description = "ARN of the Secrets Manager secret holding the DB DSN/credentials. The iam module grants specific IRSA roles secretsmanager:GetSecretValue on THIS arn so only the right pods can read it. NOT sensitive (an ARN is not a secret), but the secret it points to is."
+  description = "ARN of the Secrets Manager secret holding the DB CONNECTION INFO (host, port, dbname, username, master_user_secret_arn). It contains no password. An ARN is not a secret."
   value       = aws_secretsmanager_secret.db.arn
 }
 
 output "credentials_secret_name" {
-  description = "Name of the Secrets Manager secret (handy for External Secrets Operator ExternalSecret refs)."
+  description = "Name of the connection-info secret (for External Secrets Operator ExternalSecret refs)."
   value       = aws_secretsmanager_secret.db.name
 }
 
 output "kms_key_arn" {
-  description = "ARN of the KMS key encrypting RDS storage + the credentials secret."
+  description = "ARN of the KMS key encrypting RDS storage, the RDS-managed master password secret and the connection-info secret."
   value       = aws_kms_key.rds.arn
+}
+
+output "master_user_secret_arn" {
+  description = "ARN of the Secrets Manager secret RDS creates and rotates for the master user (JSON: username, password). Grant External Secrets Operator read on THIS arn plus kms:Decrypt on kms_key_arn; no application pod should read it directly."
+  value       = aws_db_instance.this.master_user_secret[0].secret_arn
 }

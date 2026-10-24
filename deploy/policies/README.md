@@ -21,11 +21,12 @@ This is part of milestone **M6 — Platform security, GitOps & autoscaling**
 | `require-run-as-nonroot` | `runAsNonRoot=true` (pod or every container) | fp-auth podSecurityContext; infra `runAsUser` 999/1000 |
 | `disallow-privilege-escalation` | `allowPrivilegeEscalation=false` on all containers | every container securityContext |
 | `drop-all-capabilities` | `capabilities.drop` contains `ALL` | every container securityContext |
-| `require-readonly-rootfs` | `readOnlyRootFilesystem=true` (**exception:** `app.kubernetes.io/name=postgres`) | fp-auth, redis, nats, minio |
+| `require-readonly-rootfs` | `readOnlyRootFilesystem=true` (no exceptions) | fp-auth, redis, nats, minio, postgres |
 | `require-seccomp-runtimedefault` | `seccompProfile.type` is `RuntimeDefault`/`Localhost` | all pods' podSecurityContext |
 | `require-resource-requests-and-limits` | cpu+memory **requests AND limits** on every container | fp-auth `resources`; all infra pods |
 | `disallow-latest-tag` | image is tagged and not `:latest` | pinned infra tags; appVersion tag |
-| `restrict-image-registries` | image from the **allowlist** (parameterized) | ghcr today, ECR in prod, distroless, pinned infra |
+| `restrict-image-registries` | image from the **allowlist** (parameterized) | ghcr, distroless, migrate, pinned infra and observability images; ECR only per-account in the EKS overlay |
+| `verify-image-signatures` | `ghcr.io/abd-ulbasit/forgepoint/*` carries a cosign **keyless** signature from this repo's `security.yml` on `main` or a `v*` tag | the Security workflow's `publish` job |
 | `require-part-of-label` | `app.kubernetes.io/part-of=forgepoint` on pod templates | recommended labels everywhere |
 | `disallow-host-namespaces` | no `hostPID`/`hostIPC`/`hostNetwork` | (none of ours use them) |
 | `disallow-host-path` | no `hostPath` volumes | we use PVCs/emptyDir only |
@@ -51,16 +52,14 @@ audit** trail):
   it's disallowed in non-dev. `fp-dev` is excluded so the permissive dev default stays
   frictionless locally.
 
-### The documented `readOnlyRootFilesystem` exception
+### No `readOnlyRootFilesystem` exception
 
-`require-readonly-rootfs` **excludes** pods labeled
-`app.kubernetes.io/name=postgres`. The official `postgres` image's entrypoint
-writes to transient paths and does not cleanly support a fully read-only root FS
-(see the comments in `deploy/k8s/infra/postgres/postgres.yaml`), so postgres
-confines writes to its PVC + an emptyDir socket dir instead. The carve-out is a
-**narrow, named, label-selected** exclusion — not a blanket hole. Adding another
-genuinely-incompatible image means extending that exclusion explicitly and
-documenting why.
+`require-readonly-rootfs` used to exclude pods labeled
+`app.kubernetes.io/name=postgres`, on the belief that the official image could not
+run with a read-only root FS. It can: PGDATA lives on the PVC and the socket dir
+and `/tmp` are emptyDirs (see `deploy/k8s/infra/postgres/postgres.yaml`), so the
+exception was removed. If an image genuinely cannot run read-only, add a
+**narrow, named, label-selected** exclusion and document why next to it.
 
 ### The parameterized registry allowlist
 
@@ -69,11 +68,36 @@ documenting why.
 `base/20-image-policies.yaml`. Add or remove a trusted registry by editing that
 single list. It currently allows:
 
-- `*.dkr.ecr.*.amazonaws.com/*` — prod ECR (any account/region; M5 AWS plan)
-- `ghcr.io/abd-ulbasit/forgepoint/*` — where the chart points **today**
+- `ghcr.io/abd-ulbasit/forgepoint/*` — where every chart and Rollout points and
+  where CI publishes
 - `gcr.io/distroless/*` — the distroless runtime base (hermetic builds)
+- `migrate/migrate` — the golang-migrate initContainer in the Postgres-backed
+  charts (previously missing: Enforce would have blocked every migration)
 - the **specific pinned infra images**: `postgres`, `redis`, `nats`,
   `minio/minio`, `minio/mc` (both short and `docker.io/...` spellings)
+- the **specific pinned observability images** in `fp-infra`:
+  `grafana/grafana`, `grafana/loki`, `grafana/tempo`, `prom/prometheus`,
+  `otel/opentelemetry-collector-contrib` (both spellings; previously missing, so
+  Enforce would have blocked the whole observability plane)
+
+`ollama/ollama` (`deploy/llm`) runs in `fp-ml`, which these policies do not
+match, so it needs no entry unless the scope grows.
+
+There is deliberately **no ECR entry** in the base. The old
+`*.dkr.ecr.*.amazonaws.com/*` glob matched any AWS account's registry, an
+attacker's included. The EKS overlay adds exactly one, e.g.
+`123456789012.dkr.ecr.us-east-1.amazonaws.com/forgepoint-dev/*`.
+
+### Signature verification
+
+The allowlist says *where* an image may come from; `verify-image-signatures`
+(`base/50-verify-images.yaml`) checks *who built it*. Every image the Security
+workflow publishes is signed with cosign keyless. The policy requires, for
+`ghcr.io/abd-ulbasit/forgepoint/*`, a Fulcio certificate with issuer
+`https://token.actions.githubusercontent.com` and a subject matching
+`https://github.com/abd-ulbasit/forgepoint/.github/workflows/security.yml@refs/(heads/main|tags/v.*)`.
+It ships in Audit with `mutateDigest`/`verifyDigest` off. When it moves to
+Enforce, turn both on so the pod runs the exact digest that was verified.
 
 ---
 
@@ -162,7 +186,7 @@ These Kyverno policies **complement** — they don't replace — PodSecurity:
 | | Pod Security admission | Kyverno (these policies) |
 |---|---|---|
 | Granularity | 3 fixed profiles, all-or-nothing per namespace | per-rule, fine-grained, individually toggled |
-| Exceptions | none built in (exempt = whole namespace) | **narrow, labeled** (e.g. postgres readonly-rootfs) |
+| Exceptions | none built in (exempt = whole namespace) | **narrow, labeled** (selector-based `exclude`) |
 | Coverage | pod securityContext only | + **registries, image tags, resource limits, labels, hostPort** |
 | Reporting | deny only (no "audit-but-allow" inventory of *all* violations) | rich PolicyReports, background scan of existing objects |
 | Custom rules | not possible | yes (any field, JMESPath conditions) |
@@ -189,7 +213,7 @@ deploy/policies/
 ├── base/                          ← all policies, validationFailureAction: Audit
 │   ├── kustomization.yaml
 │   ├── 00-pod-security.yaml        ← nonroot, no-priv-esc, drop-all-caps,
-│   │                                  readonly-rootfs (+postgres exception),
+│   │                                  readonly-rootfs,                  
 │   │                                  seccomp RuntimeDefault
 │   ├── 10-require-resources.yaml   ← requests + limits (cpu & memory)
 │   ├── 20-image-policies.yaml      ← disallow-latest-tag, restrict-registries

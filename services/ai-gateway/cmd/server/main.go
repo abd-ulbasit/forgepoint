@@ -74,6 +74,11 @@ import (
 	"github.com/abd-ulbasit/forgepoint/services/ai-gateway/internal/usage"
 )
 
+// version is set at build time with -ldflags "-X main.version=<ref>" (see the
+// Dockerfile's VERSION build arg) and reported as the OTel service.version.
+// Local `go run` builds report "dev".
+var version = "dev"
+
 // serviceName is the canonical identity for telemetry, the NATS event source, and
 // consumer-group naming. It MUST match events.Source.
 const serviceName = "ai-gateway"
@@ -92,7 +97,7 @@ type AIConfig struct {
 	JWTSecret string `env:"JWT_SECRET" required:"true"`
 
 	// RedisURL backs the per-team token budgets. Defaulted for local docker-compose.
-	RedisURL string `env:"REDIS_URL" default:"redis://localhost:6379"`
+	RedisURL string `env:"REDIS_URL" default:"redis://:fp@localhost:6379"`
 
 	// OllamaURL is the in-cluster Ollama serving endpoint. Defaulted to the fp-ml
 	// Service; local dev can point it at a laptop Ollama or leave it (the stub serves
@@ -204,7 +209,7 @@ func main() {
 
 	otelShutdown, err := observability.Setup(ctx, observability.Config{
 		ServiceName:    serviceName,
-		ServiceVersion: "dev",
+		ServiceVersion: version,
 		Environment:    cfg.Environment,
 		OTLPEndpoint:   cfg.OTelEndpoint,
 		OTLPInsecure:   true,
@@ -238,7 +243,7 @@ func main() {
 		os.Exit(1)
 	}
 	pingCancel()
-	logger.Info("redis connected", slog.String("url", cfg.RedisURL))
+	logger.Info("redis connected", slog.String("url", config.RedactURL(cfg.RedisURL)))
 
 	// 4b. NATS JetStream — events + warm signal.
 	natsConn, js, err := natsutil.Connect(cfg.NATSUrl)
@@ -251,7 +256,7 @@ func main() {
 			logger.Error("nats drain error", slog.String("error", drainErr.Error()))
 		}
 	}()
-	logger.Info("NATS connected", slog.String("url", cfg.NATSUrl))
+	logger.Info("NATS connected", slog.String("url", config.RedactURL(cfg.NATSUrl)))
 
 	// 5. ENSURE STREAMS (idempotent; fail fast — a gateway that can't guarantee its
 	// streams would silently drop cost events and never wake Ollama).

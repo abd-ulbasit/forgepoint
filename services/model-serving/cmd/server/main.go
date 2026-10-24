@@ -84,6 +84,11 @@ import (
 	"github.com/abd-ulbasit/forgepoint/services/model-serving/internal/repository/artifactstore"
 )
 
+// version is set at build time with -ldflags "-X main.version=<ref>" (see the
+// Dockerfile's VERSION build arg) and reported as the OTel service.version.
+// Local `go run` builds report "dev".
+var version = "dev"
+
 // ServingConfig extends BaseConfig with model-serving-specific configuration.
 //
 // WHY embed BaseConfig: every Forgepoint service needs Port, GRPCPort, LogLevel,
@@ -206,7 +211,7 @@ func main() {
 	// ================================================================
 	otelShutdown, err := observability.Setup(ctx, observability.Config{
 		ServiceName:    "model-serving",
-		ServiceVersion: "dev",
+		ServiceVersion: version,
 		Environment:    "local",
 		OTLPEndpoint:   cfg.OTelEndpoint,
 		OTLPInsecure:   true, // plaintext to the local docker-compose collector (no TLS cert)
@@ -237,10 +242,10 @@ func main() {
 	// async-bus equivalent of the gRPC graceful drain.
 	natsConn, js, err := natsutil.Connect(cfg.NATSUrl)
 	if err != nil {
-		logger.Error("failed to connect to NATS", slog.String("url", cfg.NATSUrl), slog.String("error", err.Error()))
+		logger.Error("failed to connect to NATS", slog.String("url", config.RedactURL(cfg.NATSUrl)), slog.String("error", err.Error()))
 		os.Exit(1)
 	}
-	logger.Info("connected to NATS JetStream", slog.String("url", cfg.NATSUrl))
+	logger.Info("connected to NATS JetStream", slog.String("url", config.RedactURL(cfg.NATSUrl)))
 	// Deferred SECOND-from-last (runs after subscribers are stopped below, before
 	// OTel flush). Drain is graceful; if it errors we still proceed to exit.
 	defer func() {

@@ -1,9 +1,9 @@
 # ============================================================================
 # Terraform-specific ignores (scoped to deploy/terraform)
 # ============================================================================
-# The repo root .gitignore already excludes *.tfstate, *.tfstate.backup,
-# .terraform/, and .terraform.lock.hcl. This file adds the bits specific to this
-# tree and documents WHY each is ignored.
+# The repo root .gitignore already excludes *.tfstate, *.tfstate.backup and
+# .terraform/. This file adds the bits specific to this tree and documents WHY
+# each is ignored.
 
 # Real per-env variable files. terraform.tfvars.example IS committed (the
 # template); the filled-in terraform.tfvars may contain environment-specific
@@ -18,7 +18,12 @@ terraform.tfvars
 crash.log
 *.tfplan
 
-# NOTE on lock files: .terraform.lock.hcl is ignored by the ROOT .gitignore in
-# this repo. In a production setup you would normally COMMIT the lock file so
-# every machine/CI run resolves identical provider checksums. If you adopt that,
-# add `!**/.terraform.lock.hcl` here to un-ignore it.
+# NOTE on lock files: .terraform.lock.hcl IS committed, one per root module
+# (environments/<env>/, bootstrap/). It records the exact provider version
+# `terraform init` selected inside the ~> constraints AND the checksums of that
+# build for every platform we run on, so a provider binary that does not match
+# the recorded hash fails `init` instead of running. After changing a
+# constraint, regenerate it with:
+#   terraform providers lock -platform=linux_amd64 -platform=darwin_arm64
+# (linux_amd64 = CI runners, darwin_arm64 = maintainer laptops.) Dependabot's
+# terraform ecosystem updates the lock file together with the constraint.

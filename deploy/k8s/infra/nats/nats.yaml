@@ -109,7 +109,9 @@ spec:
           type: RuntimeDefault   # use the kernel's default seccomp filter
       containers:
         - name: nats
-          image: nats:2.11
+          # Tag for humans, digest for the kubelet: Docker Hub tags (even version tags)
+          # can be re-pushed, so the digest is what pins the bytes. Bump both together.
+          image: nats:2.11.17@sha256:c991221cdddd53a24893cd18a90faf7a42396108496aed076bb982a349e76484
           args: ["-c", "/etc/nats/nats.conf"]
           ports:
             - name: client

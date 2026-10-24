@@ -237,7 +237,7 @@ spec:
           # VERIFY before first deploy: confirm this tag exists on Docker Hub
           # (hub.docker.com/r/otel/opentelemetry-collector-contrib/tags) and
           # check the release notes for breaking pipeline config changes.
-          image: otel/opentelemetry-collector-contrib:0.119.0
+          image: otel/opentelemetry-collector-contrib:0.119.0@sha256:36c35cc213c0f3b64d6e8a3e844dc90822f00725e0e518eaed5b08bcc2231e72
           args: ["--config=/etc/otel/config.yaml"]
           ports:
             - name: otlp-grpc

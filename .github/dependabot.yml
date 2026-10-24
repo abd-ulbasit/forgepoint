@@ -19,6 +19,10 @@
 #     that would have caught the failure that kept Security red for a month:
 #     the pinned trivy-action v0.29.0 referenced aquasecurity/setup-trivy@v0.2.2,
 #     a tag upstream deleted, so the job died in "Set up job" in four seconds.
+#   - docker / helm / docker-compose: the digest-pinned base images, the infra
+#     images in deploy/, the migrate image in the charts, and the compose
+#     stack. (Added 2026-10: before that nothing refreshed a single digest pin.)
+#   - terraform: provider constraints + .terraform.lock.hcl per root module.
 #
 # WHY GROUPED UPDATES:
 #   15 modules x N dependencies of individual PRs is noise nobody reads, and
@@ -99,6 +103,118 @@ updates:
       prefix: ci
     groups:
       actions-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # ---------------------------------------------------------------------------
+  # Docker images — base images in the Dockerfiles and the images the raw
+  # Kubernetes manifests run.
+  # ---------------------------------------------------------------------------
+  # WHY: every Dockerfile pins golang:<ver>-alpine and distroless by DIGEST, and
+  # the infra manifests pin postgres/redis/nats/ollama/... by tag AND digest. A
+  # digest pin is only safe while something refreshes it: without this entry
+  # the pins silently go stale and the images keep their CVEs forever.
+  # Dependabot's docker ecosystem reads Dockerfiles and, per GitHub's docs,
+  # Kubernetes manifests; it rewrites tag and digest together.
+  - package-ecosystem: docker
+    directories:
+      - /services/*
+      - /deploy/k8s/infra/*
+      - /deploy/k8s/observability/*
+      - /deploy/llm
+      - /deploy/backup
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: deps(docker)
+    groups:
+      docker-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # A database major is a data migration (pg_upgrade / dump-restore for
+      # Postgres, a licence and persistence-format change for Redis 8), not a
+      # dependency bump. Plan those by hand.
+      - dependency-name: postgres
+        update-types: ["version-update:semver-major"]
+      - dependency-name: redis
+        update-types: ["version-update:semver-major"]
+
+  # ---------------------------------------------------------------------------
+  # Helm charts — images referenced in deploy/helm/*/values.yaml (the
+  # migrate/migrate initContainer, pinned by digest).
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: helm
+    directories:
+      - /deploy/helm/*
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps(helm)
+    groups:
+      helm-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # ---------------------------------------------------------------------------
+  # docker-compose — the local dev stack (docker-compose.yaml).
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps(compose)
+    groups:
+      compose-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    ignore:
+      - dependency-name: postgres
+        update-types: ["version-update:semver-major"]
+      - dependency-name: redis
+        update-types: ["version-update:semver-major"]
+
+  # ---------------------------------------------------------------------------
+  # pre-commit — the pinned gitleaks hook in .pre-commit-config.yaml.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: pre-commit
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 2
+    commit-message:
+      prefix: deps(pre-commit)
+
+  # ---------------------------------------------------------------------------
+  # Terraform — provider constraints AND the committed .terraform.lock.hcl,
+  # one entry per root module.
+  # ---------------------------------------------------------------------------
+  # Majors stay separate (an AWS provider major, e.g. 5 -> 6, renames and
+  # removes arguments and needs a reviewed migration).
+  - package-ecosystem: terraform
+    directories:
+      - /deploy/terraform/bootstrap
+      - /deploy/terraform/environments/dev
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps(terraform)
+    groups:
+      terraform-minor-and-patch:
         update-types:
           - minor
           - patch

@@ -78,6 +78,11 @@ import (
 	redisrepo "github.com/abd-ulbasit/forgepoint/services/inference-gateway/internal/repository/redis"
 )
 
+// version is set at build time with -ldflags "-X main.version=<ref>" (see the
+// Dockerfile's VERSION build arg) and reported as the OTel service.version.
+// Local `go run` builds report "dev".
+var version = "dev"
+
 // serviceName is the canonical identity used for telemetry resource attributes,
 // the NATS event source, and the consumer-group/DLQ naming. It MUST match
 // events.Source (the value stamped into every published EventEnvelope.source) so
@@ -114,7 +119,7 @@ type InferenceConfig struct {
 	// RedisURL is the connection string for the rate-limit buckets, the quota
 	// cache, and the routing-table mirror. In K8s this points at the fp-infra
 	// Redis Service. Defaulted for local docker-compose.
-	RedisURL string `env:"REDIS_URL" default:"redis://localhost:6379"`
+	RedisURL string `env:"REDIS_URL" default:"redis://:fp@localhost:6379"`
 
 	// Environment ("local"/"staging"/"production") tags telemetry and gates the
 	// in-memory idempotency-store fallback (production REFUSES it — see below).
@@ -171,7 +176,7 @@ func main() {
 
 	otelShutdown, err := observability.Setup(ctx, observability.Config{
 		ServiceName:    serviceName,
-		ServiceVersion: "dev",
+		ServiceVersion: version,
 		Environment:    cfg.Environment,
 		OTLPEndpoint:   cfg.OTelEndpoint,
 		OTLPInsecure:   true, // plaintext to the local collector (no TLS cert in docker-compose)
@@ -219,7 +224,7 @@ func main() {
 		os.Exit(1)
 	}
 	pingCancel()
-	logger.Info("redis connected", slog.String("url", cfg.RedisURL))
+	logger.Info("redis connected", slog.String("url", config.RedactURL(cfg.RedisURL)))
 
 	// ================================================================
 	// 4b. NATS JetStream — the async event bus (publish + subscribe)
@@ -241,7 +246,7 @@ func main() {
 			logger.Error("nats drain error", slog.String("error", drainErr.Error()))
 		}
 	}()
-	logger.Info("NATS connected", slog.String("url", cfg.NATSUrl))
+	logger.Info("NATS connected", slog.String("url", config.RedactURL(cfg.NATSUrl)))
 
 	// ================================================================
 	// 5. CONSTRUCT ADAPTERS → PUBLISHER → DOMAIN SERVICE → HANDLER

@@ -97,6 +97,11 @@ import (
 	redisrepo "github.com/abd-ulbasit/forgepoint/services/feature-store/internal/repository/redis"
 )
 
+// version is set at build time with -ldflags "-X main.version=<ref>" (see the
+// Dockerfile's VERSION build arg) and reported as the OTel service.version.
+// Local `go run` builds report "dev".
+var version = "dev"
+
 // FeatureStoreConfig extends BaseConfig with feature-store-specific configuration.
 //
 // WHY embed BaseConfig: every Forgepoint service needs Port, GRPCPort, LogLevel,
@@ -137,7 +142,7 @@ type FeatureStoreConfig struct {
 	// RedisURL points at the Redis backing the online (latest-value) projection.
 	// Format: redis://host:port/db. Injected via env (K8s ConfigMap, or a Secret if
 	// it carries credentials).
-	RedisURL string `env:"REDIS_URL" default:"redis://localhost:6379"`
+	RedisURL string `env:"REDIS_URL" default:"redis://:fp@localhost:6379"`
 
 	// OTelInsecure controls whether the OTLP exporter uses plaintext (no TLS). It is
 	// true in local docker-compose (the collector has no cert) and false in
@@ -188,7 +193,7 @@ func main() {
 
 	otelShutdown, err := observability.Setup(ctx, observability.Config{
 		ServiceName:    "feature-store",
-		ServiceVersion: "dev",
+		ServiceVersion: version,
 		Environment:    "local",
 		OTLPEndpoint:   cfg.OTelEndpoint,
 		OTLPInsecure:   cfg.OTelInsecure, // ← from config, not hard-coded

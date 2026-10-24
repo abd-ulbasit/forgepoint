@@ -13,9 +13,9 @@ variable "name_prefix" {
 }
 
 variable "cluster_version" {
-  description = "Kubernetes minor version for the control plane (e.g. \"1.30\"). Pin it: EKS won't auto-upgrade the control plane, and node AMIs are chosen to match. Bump deliberately, one minor at a time."
+  description = "Kubernetes minor version for the control plane. Pin it and bump deliberately, one minor at a time. Stay inside EKS STANDARD support: past it, EKS bills extended support per cluster-hour, and at the end of extended support it upgrades the control plane for you. 1.36 is in standard support until 2 Aug 2027 (EKS calendar, checked Oct 2026). Managed node groups on 1.30+ default to AL2023 AMIs."
   type        = string
-  default     = "1.30"
+  default     = "1.36"
 }
 
 variable "vpc_id" {

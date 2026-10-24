@@ -90,14 +90,16 @@ import (
 //     because gRPC uses HTTP/2 and health checks use HTTP/1.1)
 //   - LogLevel: Controls slog verbosity (debug/info/warn/error)
 //   - OTelEndpoint: OpenTelemetry collector for traces/metrics
-//   - NATSUrl: Async event bus connection
+//   - NATSUrl: Async event bus connection. The default carries the local
+//     docker-compose dev credentials (NATS_PASSWORD, default "fp"); every real
+//     deployment sets FP_NATS_URL explicitly.
 //   - DatabaseURL: Per-service PostgreSQL database
 type BaseConfig struct {
 	Port         int    `env:"PORT" default:"8080"`
 	GRPCPort     int    `env:"GRPC_PORT" default:"9090"`
 	LogLevel     string `env:"LOG_LEVEL" default:"info"`
 	OTelEndpoint string `env:"OTEL_ENDPOINT" default:"localhost:4317"`
-	NATSUrl      string `env:"NATS_URL" default:"nats://localhost:4222"`
+	NATSUrl      string `env:"NATS_URL" default:"nats://fp:fp@localhost:4222"`
 	DatabaseURL  string `env:"DATABASE_URL"`
 }
 

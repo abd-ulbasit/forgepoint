@@ -71,7 +71,7 @@ its own `go.mod`; `pkg/` and `gen/go/` are sibling modules the workspace resolve
 
 Adopt **Option D**: a **Go workspace monorepo** — `go.work` + a module per service +
 `gen/go` + `pkg`. The `go.work` `use(...)` block lists `./gen/go`, `./pkg`, `./cli` and every
-`./services/*` module (15 entries today); the workspace declares `go 1.26.0`.
+`./services/*` module (15 entries today); the workspace declares `go 1.26.10`.
 
 Three gotchas are part of the decision (each cost real debugging; all are now encoded in
 `docs/design/service-architecture.md` and `services/auth/Dockerfile`):
@@ -108,8 +108,8 @@ RUN go work init ./pkg ./gen/go ./services/auth && go mod download -x all
 This is **self-contained** (adding another service never breaks an existing image), **correct**
 (`./pkg`/`./gen/go` resolve to local source exactly as on a laptop), and keeps **module
 isolation honest** — a service image can only build against `pkg`, `gen/go`, and its own
-source, never another service's. The builder image is pinned to `golang:1.26-alpine` to match
-the workspace's `go 1.26.0` directive (an older toolchain refuses to build a newer workspace).
+source, never another service's. The builder image is pinned to `golang:1.26.10-alpine` to match
+the `go 1.26.10` directive in the workspace and every module (an older toolchain refuses to build a newer workspace).
 
 Deciding factor: Option D is the only one that delivers share-without-publish **and**
 per-service dependency/build isolation; the gotchas are one-time costs already paid and

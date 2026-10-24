@@ -13,10 +13,24 @@
 # VERIFICATION:
 #   curl http://localhost:8222/healthz        # NATS
 #   psql -h localhost -U fp -c "SELECT 1"   # Postgres (password: fp)
-#   redis-cli -h localhost ping               # Redis
+#   redis-cli -h localhost -a fp ping         # Redis (password: fp)
 #   curl http://localhost:9000/minio/health/live  # MinIO
 #   curl http://localhost:9090/-/healthy      # Prometheus
 #   curl http://localhost:3000/api/health     # Grafana (admin/admin)
+#
+# NETWORK EXPOSURE: every published port binds to ${FP_BIND_ADDR:-127.0.0.1}.
+# Docker's default for "5432:5432" is 0.0.0.0, i.e. every interface of the
+# machine running the ENGINE. With a remote engine (docker context over ssh)
+# that is the remote box's LAN and VPN interfaces, not your laptop. To reach
+# the stack from another machine, prefer an ssh tunnel
+# (ssh -L 5432:127.0.0.1:5432 <engine-host>). Only set FP_BIND_ADDR to a
+# non-loopback address after replacing every *_PASSWORD default in .env.
+#
+# AUTH: Redis (requirepass) and NATS (user/password) require credentials,
+# defaulting to the same dev value as Postgres ("fp"). The defaults are
+# published, so they are not the control; the loopback bind is. They exist so
+# that setting real values in .env takes effect end to end. The Go services'
+# local defaults (FP_REDIS_URL / FP_NATS_URL) carry the same dev credentials.
 #
 # ARCHITECTURE:
 #   ┌─────────────────────────────────────────────────────┐
@@ -42,11 +56,12 @@ services:
   # NATS — Async event bus (JetStream for persistence)
   # ==========================================================================
   nats:
-    image: nats:2.11
-    command: ["--jetstream", "--http_port", "8222", "-DV"]
+    image: nats:2.11.17@sha256:c991221cdddd53a24893cd18a90faf7a42396108496aed076bb982a349e76484
+    # --user/--pass: clients must authenticate (nats://fp:<NATS_PASSWORD>@host).
+    command: ["--jetstream", "--http_port", "8222", "--user", "fp", "--pass", "${NATS_PASSWORD:-fp}", "-DV"]
     ports:
-      - "4222:4222"            # Client connections (accessible by services)
-      - "127.0.0.1:8222:8222" # HTTP monitoring — localhost only (not LAN-exposed)
+      - "${FP_BIND_ADDR:-127.0.0.1}:4222:4222" # Client connections
+      - "127.0.0.1:8222:8222"                 # HTTP monitoring — always localhost only
     volumes:
       - nats-data:/data
     restart: unless-stopped
@@ -61,13 +76,13 @@ services:
   #   REGISTRY_DATABASE_URL=postgres://fp:fp@localhost:5432/fp_registry
   # ==========================================================================
   postgres:
-    image: postgres:17
+    image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
     environment:
       POSTGRES_USER: fp
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fp}
       POSTGRES_DB: fp
     ports:
-      - "5432:5432"
+      - "${FP_BIND_ADDR:-127.0.0.1}:5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./scripts/init-postgres.sh:/docker-entrypoint-initdb.d/init-postgres.sh:ro
@@ -77,9 +92,11 @@ services:
   # REDIS — Caching (registry read model, rate limiting, sessions)
   # ==========================================================================
   redis:
-    image: redis:7
+    image: redis:7.4.11@sha256:44960b3100c48159a66d28c18b0588c193492e25f7551d60e51dd464fc3eca5b
+    # requirepass: every command needs AUTH (redis://:<REDIS_PASSWORD>@host:6379).
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-fp}"]
     ports:
-      - "6379:6379"
+      - "${FP_BIND_ADDR:-127.0.0.1}:6379:6379"
     volumes:
       - redis-data:/data
     restart: unless-stopped
@@ -101,15 +118,18 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
     ports:
-      - "9000:9000"            # S3 API (used by services — keep accessible)
-      - "127.0.0.1:9001:9001" # Web console — localhost only
+      - "${FP_BIND_ADDR:-127.0.0.1}:9000:9000" # S3 API (used by services)
+      - "127.0.0.1:9001:9001"                 # Web console — always localhost only
     volumes:
       - minio-data:/data
     restart: unless-stopped
 
   # Create default bucket on startup
   minio-init:
-    image: minio/mc:latest
+    # NOTE: minio/minio and minio/mc no longer exist on Docker Hub (the
+    # repositories return 404), so neither image can be pinned by digest here.
+    # Pulls only work from a local cache. Replacing MinIO is tracked separately.
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
     depends_on:
       minio:
         condition: service_started
@@ -128,9 +148,9 @@ services:
   # PROMETHEUS — Metrics collection (pull-based scraping)
   # ==========================================================================
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.1.0@sha256:6559acbd5d770b15bb3c954629ce190ac3cbbdb2b7f1c30f0385c4e05104e218
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     volumes:
       - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
@@ -148,7 +168,7 @@ services:
   # Default login: admin / admin
   # ==========================================================================
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:11.5.1@sha256:5781759b3d27734d4d548fcbaf60b1180dbf4290e708f01f292faa6ae764c5e6
     ports:
       - "127.0.0.1:3000:3000" # UI — localhost only; not exposed to LAN
     environment:
@@ -176,11 +196,11 @@ services:
   # Grafana queries Tempo to display trace waterfalls.
   # ==========================================================================
   tempo:
-    image: grafana/tempo:latest
+    image: grafana/tempo:2.7.1@sha256:4443be217c396b065ee34845534199c36fdba4dc619cb96550e228d73fba6e69
     command: ["-config.file=/etc/tempo.yaml"]
     ports:
-      - "4317:4317"   # OTLP gRPC (OpenTelemetry traces)
-      - "3200:3200"   # Tempo HTTP API (Grafana queries this)
+      - "${FP_BIND_ADDR:-127.0.0.1}:4317:4317" # OTLP gRPC (OpenTelemetry traces)
+      - "127.0.0.1:3200:3200"                 # Tempo HTTP API (Grafana queries this)
     volumes:
       - ./deploy/tempo/tempo.yaml:/etc/tempo.yaml:ro
       - tempo-data:/tmp/tempo
@@ -194,9 +214,9 @@ services:
   # Locally, services can push directly to Loki or we can add promtail later.
   # ==========================================================================
   loki:
-    image: grafana/loki:latest
+    image: grafana/loki:3.4.2@sha256:58a6c186ce78ba04d58bfe2a927eff296ba733a430df09645d56cdc158f3ba08
     ports:
-      - "3100:3100"
+      - "127.0.0.1:3100:3100"
     volumes:
       - loki-data:/loki
     restart: unless-stopped

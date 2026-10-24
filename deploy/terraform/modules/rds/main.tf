@@ -2,12 +2,22 @@
 # rds — PostgreSQL: private, KMS-encrypted, SG-restricted, creds in Secrets Manager
 # ============================================================================
 # The credential flow is the centerpiece:
-#   random_password → aws_db_instance.master_password → aws_secretsmanager_secret
-# The plaintext password exists only inside Terraform's run and the encrypted
-# Secrets Manager entry. It is NEVER an input var, NEVER an output, and the random
-# resource is marked sensitive so it doesn't print in plan/apply logs. The app
-# reads the DSN from Secrets Manager at runtime (via External Secrets Operator in
-# K8s, which maps the secret into a K8s Secret the pod envFrom's).
+#   manage_master_user_password = true
+#     → RDS generates the master password itself, stores it in a Secrets Manager
+#       secret it owns (rds!db-...), encrypted with our CMK, and rotates it.
+# Terraform never sees the password, so it is not in state, not in plan output
+# and not in any secret_string Terraform writes. (The previous design generated
+# it with random_password and wrote a full DSN into a secret version, which put
+# the plaintext into state, and the state bucket was only SSE-S3.)
+#
+# The app still gets a ready DSN: External Secrets Operator reads username +
+# password from the RDS-managed secret and host/port/dbname from the
+# connection-info secret below, and renders FP_DATABASE_URL with a template
+# (deploy/secrets/external-secrets/). Rotation: RDS rotates the managed secret
+# (every 7 days by default); ESO picks the new value up on its refresh, but env
+# vars only change when a pod restarts, so pair it with a reloader or a
+# scheduled rollout. Existing connections survive a rotation; new ones need
+# the new password.
 # ----------------------------------------------------------------------------
 
 # ----------------------------------------------------------------------------
@@ -66,17 +76,6 @@ resource "aws_security_group_rule" "rds_ingress" {
 }
 
 # ----------------------------------------------------------------------------
-# Generated master password — never typed by a human, never committed.
-# ----------------------------------------------------------------------------
-# override_special avoids characters that break DSN parsing / shell quoting in
-# connection strings ('@', '/', '"', spaces). 32 chars of entropy.
-resource "random_password" "master" {
-  length           = 32
-  special          = true
-  override_special = "!#$%*-_=+[]{}<>:?"
-}
-
-# ----------------------------------------------------------------------------
 # The instance.
 # ----------------------------------------------------------------------------
 resource "aws_db_instance" "this" {
@@ -94,7 +93,11 @@ resource "aws_db_instance" "this" {
 
   db_name  = var.database_name
   username = var.master_username
-  password = random_password.master.result
+  # RDS owns the password: generated, stored in a Secrets Manager secret it
+  # manages (encrypted with our CMK, not the AWS-managed key) and rotated. It
+  # never passes through Terraform, so it never lands in state.
+  manage_master_user_password   = true
+  master_user_secret_kms_key_id = aws_kms_key.rds.arn
 
   # PRIVATE: in our subnet group, attached to the restricted SG, and explicitly
   # NOT publicly accessible — three independent guarantees of no internet exposure.
@@ -110,7 +113,8 @@ resource "aws_db_instance" "this" {
   maintenance_window      = "sun:04:30-sun:05:30"
   copy_tags_to_snapshot   = true
 
-  # Safety rails (prod tightens both via tfvars).
+  # Safety rails. Module defaults are the SAFE values (protected, final
+  # snapshot taken); a throwaway env opts out explicitly in its tfvars.
   deletion_protection       = var.deletion_protection
   skip_final_snapshot       = var.skip_final_snapshot
   final_snapshot_identifier = var.skip_final_snapshot ? null : "${var.name_prefix}-postgres-final"
@@ -122,30 +126,28 @@ resource "aws_db_instance" "this" {
   enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
 
   tags = merge(var.tags, { Name = "${var.name_prefix}-postgres" })
-
-  # The generated password churns plan output; don't let a password rotation
-  # outside TF (e.g. via Secrets Manager rotation) force a needless modify.
-  lifecycle {
-    ignore_changes = [password]
-  }
 }
 
 # ----------------------------------------------------------------------------
-# Secrets Manager — store the FULL connection material so apps consume it.
+# Secrets Manager — connection INFO only (no password).
 # ----------------------------------------------------------------------------
-# We store a JSON blob (not just the password) so consumers get everything needed
-# to build a DSN: host, port, user, password, the bootstrap dbname. External
-# Secrets Operator in K8s reads this and projects it into a K8s Secret that the
-# service pods envFrom — closing the loop from cloud secret → running container.
+# host, port, dbname, username and the ARN of the RDS-managed password secret.
+# None of it is a credential; it lives in Secrets Manager (rather than only in
+# outputs) so External Secrets Operator can read it next to the password and
+# render the DSN in-cluster. Keeping the password OUT of this secret is the
+# point: the old design wrote the plaintext into secret_string, i.e. into state,
+# and its aws_db_instance ignored password changes while this resource did not,
+# so an out-of-band rotation set up a later apply that would overwrite the
+# secret with a password the database no longer accepted.
 #
-# recovery_window: 0 in dev lets us delete+recreate the secret immediately on
-# teardown (no 7-30 day "scheduled deletion" blocking a re-apply). Prod should
-# RAISE this (e.g. 7) so an accidental delete is recoverable.
+# recovery_window: var.secret_recovery_window_days (safe default 30). A dev
+# teardown can set 0 in tfvars so a re-apply is not blocked by a secret pending
+# deletion. It used to be hard-coded to 0, which every copy of the env inherited.
 resource "aws_secretsmanager_secret" "db" {
   name                    = "${var.name_prefix}/rds/postgres"
-  description             = "Forgepoint Postgres master credentials + connection info"
+  description             = "Forgepoint Postgres connection info (no password; see master_user_secret_arn)"
   kms_key_id              = aws_kms_key.rds.arn
-  recovery_window_in_days = 0
+  recovery_window_in_days = var.secret_recovery_window_days
   tags                    = var.tags
 }
 
@@ -156,10 +158,10 @@ resource "aws_secretsmanager_secret_version" "db" {
     host     = aws_db_instance.this.address
     port     = aws_db_instance.this.port
     username = var.master_username
-    password = random_password.master.result
     dbname   = var.database_name
-    # A ready-to-use DSN with TLS required (RDS terminates TLS; sslmode=require
-    # ensures the client refuses an unencrypted connection).
-    dsn = "postgres://${var.master_username}:${random_password.master.result}@${aws_db_instance.this.address}:${aws_db_instance.this.port}/${var.database_name}?sslmode=require"
+    # Clients must use TLS (sslmode=require); ESO's DSN template adds it.
+    sslmode = "require"
+    # Where the password lives (RDS-managed, rotated). ESO reads it from there.
+    master_user_secret_arn = aws_db_instance.this.master_user_secret[0].secret_arn
   })
 }

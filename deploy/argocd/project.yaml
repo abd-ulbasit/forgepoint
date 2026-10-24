@@ -1,23 +1,72 @@
 # ============================================================================
-# ARGOCD APPPROJECT — forgepoint
+# ARGOCD APPPROJECTS — forgepoint-bootstrap (root app) + forgepoint (workloads)
 # ============================================================================
 # An AppProject is ArgoCD's TENANCY + GUARDRAIL boundary. Every Application
 # belongs to exactly one project, and the project caps what those Applications
 # are ALLOWED to do, regardless of what their manifests ask for. Think of it as
 # an RBAC + admission-policy envelope around a set of apps.
 #
-# WHY a dedicated project (not the built-in "default")?
-#   The "default" project is wide open: any repo, any cluster, any namespace,
-#   any resource kind. That is fine for a toy, dangerous for a platform. A
-#   compromised or fat-fingered Application in `default` could deploy a
-#   cluster-admin ClusterRoleBinding into kube-system. Scoping a project to
-#   "only this repo, only fp-* namespaces, only these kinds" is LEAST PRIVILEGE
-#   applied to the delivery layer itself.
+# WHY TWO PROJECTS (this used to be one):
+#   The single "forgepoint" project allowed the `argocd` namespace as a
+#   destination (so the root app could create child Applications) AND
+#   whitelisted Secret, Role and RoleBinding. Together that meant ANY chart or
+#   manifest merged to main could write a Secret into `argocd` (e.g. a cluster
+#   or repository credential Secret with argocd.argoproj.io/secret-type) or a
+#   RoleBinding granting itself read on Argo CD's own secrets: privilege
+#   escalation through Git, auto-synced. It also never whitelisted the
+#   Application kind, which the root app-of-apps exists to create.
 #
-# HOW GitOps IS STOPPED FROM BECOMING A CLUSTER-ADMIN BACKDOOR: this object —
+#   Now:
+#   - forgepoint-bootstrap (root.yaml only): may create ONE kind,
+#     argoproj.io/Application, and only in `argocd`. Nothing else.
+#   - forgepoint (every child app): fp-* namespaces only, never `argocd`, no
+#     RBAC kinds, no CRDs.
+#   - default: locked to nothing (default-project.yaml), so a child Application
+#     that names `project: default` cannot escape both of the above.
+#
+# HOW GitOps IS STOPPED FROM BECOMING A CLUSTER-ADMIN BACKDOOR: these objects —
 # the sourceRepos allow-list, the destinations allow-list, and the
-# namespaced/clusterResource allow-lists below.
+# namespaced/clusterResource allow-lists below. They are applied by hand
+# (kubectl), never synced by the root app, so a Git change cannot widen them.
+#
+# SPELLING MATTERS: the field is `namespaceResourceWhitelist` (no "d"). Argo CD
+# treats a MISSING namespaced whitelist as "every namespaced kind is allowed",
+# so a misspelled key is not just ignored, it silently removes the guardrail
+# (if it gets past kubectl's strict field validation at all). Validate with
+#   kubectl apply --dry-run=server -f deploy/argocd/project.yaml
+# against a cluster that has the Argo CD CRDs before relying on these limits.
 # ============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: forgepoint-bootstrap
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: forgepoint
+spec:
+  description: Root app-of-apps only — may create Application objects in argocd, nothing else.
+
+  sourceRepos:
+    - https://github.com/abd-ulbasit/forgepoint.git
+
+  # The child Application CRs live in the namespace Argo CD runs in.
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: argocd
+
+  # No cluster-scoped kinds at all.
+  clusterResourceWhitelist: []
+
+  # Exactly one kind. In particular NOT Secret (Argo CD reads cluster and repo
+  # credentials from Secrets in this namespace) and NOT AppProject (a project
+  # that could edit projects could lift its own limits).
+  namespaceResourceWhitelist:
+    - group: argoproj.io
+      kind: Application
+
+  orphanedResources:
+    warn: true
+---
 apiVersion: argoproj.io/v1alpha1
 kind: AppProject
 metadata:
@@ -37,26 +86,19 @@ spec:
   # --------------------------------------------------------------------------
   # sourceRepos — WHICH Git repos Applications in this project may pull from.
   # A wildcard "*" would let anyone point an app at an arbitrary repo (supply-
-  # chain risk). We pin to this one mono-repo. Add more entries only when a
-  # second trusted repo genuinely exists (e.g. a separate Helm chart registry).
-  #
-  # REPO_URL placeholder: this is THE forgepoint repo. Keep it generic; no creds
-  # belong here. For a private repo, ArgoCD reads credentials from a separately
-  # managed `repo-creds` Secret (label argocd.argoproj.io/secret-type=repository)
-  # — never inline a token in this manifest.
+  # chain risk). We pin to this one mono-repo. For a private repo, ArgoCD reads
+  # credentials from a separately managed `repo-creds` Secret (label
+  # argocd.argoproj.io/secret-type=repository) — never inline a token here.
   # --------------------------------------------------------------------------
   sourceRepos:
     - https://github.com/abd-ulbasit/forgepoint.git
 
   # --------------------------------------------------------------------------
   # destinations — WHICH (cluster, namespace) pairs apps may deploy into.
-  # We allow only the four Forgepoint namespaces, all on the in-cluster server
-  # (https://kubernetes.default.svc = the cluster ArgoCD runs in). Anything
-  # outside fp-* (kube-system, argocd, default) is denied even if a child app
-  # asks for it. This is the namespace half of least privilege.
-  #
-  # Multi-cluster later: to deploy prod to a remote cluster, add a destination
-  # with that cluster's API server URL (registered as an ArgoCD cluster Secret).
+  # Only the four Forgepoint namespaces on the in-cluster server. `argocd`,
+  # kube-system and default are denied even if a child app asks for them.
+  # (`argocd` used to be listed here for the root app; it now has its own
+  # project, forgepoint-bootstrap.)
   # --------------------------------------------------------------------------
   destinations:
     - server: https://kubernetes.default.svc
@@ -67,45 +109,36 @@ spec:
       namespace: fp-models
     - server: https://kubernetes.default.svc
       namespace: fp-jobs
-    # The root app-of-apps creates CHILD Applications, which are themselves
-    # objects living in the `argocd` namespace. Allow that one namespace so the
-    # project can manage its own Application CRs (app-of-apps needs this).
-    - server: https://kubernetes.default.svc
-      namespace: argocd
 
   # --------------------------------------------------------------------------
   # clusterResourceWhitelist — CLUSTER-SCOPED kinds apps may create.
-  # Cluster-scoped resources have no namespace, so destinations can't gate them;
-  # this list is the only guard. We allow exactly two:
-  #   Namespace            — infra creates fp-infra/fp-system/fp-models/fp-jobs.
-  #   CustomResourceDefinition — reserved for future operators we install via
-  #                              GitOps (e.g. Prometheus Operator, Argo Rollouts).
-  # NOTE the conspicuous ABSENCE of ClusterRole / ClusterRoleBinding here: no
-  # child app may mint cluster-wide RBAC. That is the single most important
-  # privilege to withhold from a delivery controller.
+  # Only Namespace (infra creates fp-infra/fp-system/fp-models/fp-jobs).
+  # CustomResourceDefinition was listed "for future operators"; nothing creates
+  # one, and a CRD write can replace the schema of ANY API group in the
+  # cluster, so it is removed until an operator genuinely needs it (and then
+  # belongs in its own project). No ClusterRole / ClusterRoleBinding, ever.
   # --------------------------------------------------------------------------
   clusterResourceWhitelist:
     - group: ""
       kind: Namespace
-    - group: apiextensions.k8s.io
-      kind: CustomResourceDefinition
 
   # --------------------------------------------------------------------------
-  # namespacedResourceWhitelist — NAMESPACED kinds apps may create.
-  # This is an ALLOW-list (deny-by-default): if a kind isn't named here, a child
-  # app cannot create it. It covers exactly what the fp-auth reference chart and
-  # the infra kustomize render today:
-  #   workloads      Deployment, StatefulSet, Pod, Service, ConfigMap, Secret,
-  #                  ServiceAccount, PersistentVolumeClaim
+  # namespaceResourceWhitelist — NAMESPACED kinds apps may create.
+  # Deny-by-default. Exactly what the fp-* charts and deploy/k8s/infra render
+  # today (checked with `helm template` / the infra manifests):
+  #   workloads      Deployment, StatefulSet, Job (the MinIO bucket init),
+  #                  Service, ConfigMap, Secret, ServiceAccount,
+  #                  PersistentVolumeClaim
   #   scaling/avail  HorizontalPodAutoscaler, PodDisruptionBudget
-  #   security       NetworkPolicy, Role, RoleBinding (namespaced RBAC is OK;
-  #                  cluster RBAC is not — see whitelist above)
+  #   network        NetworkPolicy
   #   operator CRs   ServiceMonitor (Prometheus Operator)
-  # Add a kind here the day a chart needs it (e.g. Rollout, Ingress, KEDA
-  # ScaledObject) — a missing entry yields a clear "resource not permitted in
-  # project" sync error rather than a silent deploy of something unexpected.
+  # Role/RoleBinding were whitelisted but nothing renders them; namespaced RBAC
+  # written from Git is a privilege grant, so add it back only with a reason.
+  # batch/Job was MISSING although the infra kustomization renders one, so the
+  # fp-infra sync could not have succeeded. Secret stays (infra placeholders and
+  # the charts' optional dev Secret), but only in fp-* namespaces now.
   # --------------------------------------------------------------------------
-  namespacedResourceWhitelist:
+  namespaceResourceWhitelist:
     - group: ""
       kind: ConfigMap
     - group: ""
@@ -120,24 +153,20 @@ spec:
       kind: Deployment
     - group: apps
       kind: StatefulSet
+    - group: batch
+      kind: Job
     - group: autoscaling
       kind: HorizontalPodAutoscaler
     - group: policy
       kind: PodDisruptionBudget
     - group: networking.k8s.io
       kind: NetworkPolicy
-    - group: rbac.authorization.k8s.io
-      kind: Role
-    - group: rbac.authorization.k8s.io
-      kind: RoleBinding
     - group: monitoring.coreos.com
       kind: ServiceMonitor
 
   # --------------------------------------------------------------------------
   # orphanedResources — surface (don't auto-delete) resources that exist in a
-  # project namespace but aren't tracked by any Application. warn:true flags them
-  # in the UI as a hygiene signal without taking destructive action. We keep this
-  # informational; prune (below, per-app) handles deletion of MANAGED resources.
+  # project namespace but aren't tracked by any Application.
   # --------------------------------------------------------------------------
   orphanedResources:
     warn: true

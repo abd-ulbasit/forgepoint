@@ -94,6 +94,26 @@ data "aws_iam_policy_document" "permissions" {
     }
   }
 
+  # --- KMS for the artifacts bucket (SSE-KMS) -------------------------------
+  # Reading an SSE-KMS object needs kms:Decrypt; writing one needs
+  # kms:GenerateDataKey. Scoped to the artifacts key only.
+  dynamic "statement" {
+    for_each = (each.value.s3_artifact_access != "" && var.artifacts_bucket_arn != "" && var.artifacts_kms_key_arn != "") ? [each.value.s3_artifact_access] : []
+    content {
+      sid    = "ArtifactsKMS"
+      effect = "Allow"
+      actions = statement.value == "readwrite" ? [
+        "kms:Decrypt",
+        "kms:GenerateDataKey",
+        "kms:DescribeKey",
+        ] : [
+        "kms:Decrypt",
+        "kms:DescribeKey",
+      ]
+      resources = [var.artifacts_kms_key_arn]
+    }
+  }
+
   # --- Secrets Manager: GetSecretValue on the EXACT secret ARNs listed -----
   # This is how a service reads its DB/Redis credentials at runtime (directly, or
   # via External Secrets Operator running under its own IRSA role). Scoped to the

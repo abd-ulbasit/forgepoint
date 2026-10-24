@@ -41,8 +41,13 @@ output "rds_endpoint" {
 }
 
 output "rds_credentials_secret_arn" {
-  description = "Secrets Manager ARN holding the Postgres DSN/credentials. External Secrets Operator (under the external_secrets IRSA role) syncs this into K8s."
+  description = "Secrets Manager ARN holding the Postgres connection info (host, port, dbname, username; no password). External Secrets Operator reads it to build the DSN."
   value       = module.rds.credentials_secret_arn
+}
+
+output "rds_master_user_secret_arn" {
+  description = "Secrets Manager ARN of the RDS-managed (and rotated) master password. Put this ARN in the ExternalSecret manifests under deploy/secrets/external-secrets (placeholder <RDS_MASTER_USER_SECRET_ARN>)."
+  value       = module.rds.master_user_secret_arn
 }
 
 output "redis_endpoint" {
@@ -64,6 +69,11 @@ output "model_artifacts_bucket" {
 output "ecr_repository_urls" {
   description = "Map service → ECR repository URL. CI pushes here; Helm image.repository points here."
   value       = module.ecr.repository_urls
+}
+
+output "github_ecr_push_role_arn" {
+  description = "ARN of the GitHub Actions ECR push role (null unless enable_github_ecr_push = true). Store it as the repository variable AWS_ROLE_ARN."
+  value       = var.enable_github_ecr_push ? module.github_oidc[0].role_arn : null
 }
 
 # ---- IRSA ------------------------------------------------------------------

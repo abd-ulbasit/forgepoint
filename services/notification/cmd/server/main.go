@@ -113,6 +113,11 @@ import (
 	redisrepo "github.com/abd-ulbasit/forgepoint/services/notification/internal/repository/redis"
 )
 
+// version is set at build time with -ldflags "-X main.version=<ref>" (see the
+// Dockerfile's VERSION build arg) and reported as the OTel service.version.
+// Local `go run` builds report "dev".
+var version = "dev"
+
 // NotificationConfig extends BaseConfig with notification-specific configuration.
 //
 // WHY embed BaseConfig: every Forgepoint service needs Port, GRPCPort, LogLevel,
@@ -140,7 +145,7 @@ type NotificationConfig struct {
 	// AND the reactor's domain-level per-(event,recipient) dedup store. A redis://
 	// URL (host/port/db/credentials), parsed by go-redis ParseURL.
 	// K8s: a plain ConfigMap value pointing at the in-cluster Redis.
-	RedisURL string `env:"REDIS_URL" default:"redis://localhost:6379"`
+	RedisURL string `env:"REDIS_URL" default:"redis://:fp@localhost:6379"`
 
 	// SMTPAddr is the SMTP server for the EMAIL channel (host:port). Optional —
 	// consumed by the (not-yet-written) delivery adapter; unset is valid today.
@@ -183,7 +188,7 @@ func main() {
 		slog.Int("grpc_port", cfg.GRPCPort),
 		slog.Int("health_port", cfg.Port),
 		slog.String("log_level", cfg.LogLevel),
-		slog.String("nats_url", cfg.NATSUrl),
+		slog.String("nats_url", config.RedactURL(cfg.NATSUrl)),
 		slog.String("environment", cfg.Environment),
 	)
 
@@ -204,7 +209,7 @@ func main() {
 	// producer's trace context per message).
 	otelShutdown, err := observability.Setup(ctx, observability.Config{
 		ServiceName:    "notification",
-		ServiceVersion: "dev",
+		ServiceVersion: version,
 		Environment:    cfg.Environment,
 		OTLPEndpoint:   cfg.OTelEndpoint,
 		OTLPInsecure:   cfg.OTLPInsecure,

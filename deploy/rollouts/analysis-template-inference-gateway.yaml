@@ -92,7 +92,7 @@ spec:
           # Prometheus endpoint — the in-cluster address of the Prometheus
           # server deployed in Phase 10 (or the OTel Collector's Prometheus
           # remote-write receiver).
-          address: http://prometheus-operated.fp-infra.svc.cluster.local:9090
+          address: http://prometheus.fp-infra.svc.cluster.local:9090
 
           # Query: 1 - (error_rate). Uses the `service` arg from the Rollout.
           # PLACEHOLDER: replace metric names with actual OTel-emitted names.
@@ -120,7 +120,7 @@ spec:
 
       provider:
         prometheus:
-          address: http://prometheus-operated.fp-infra.svc.cluster.local:9090
+          address: http://prometheus.fp-infra.svc.cluster.local:9090
 
           # histogram_quantile over the grpc/http duration histogram.
           # PLACEHOLDER: replace with the actual OTel duration histogram metric name.

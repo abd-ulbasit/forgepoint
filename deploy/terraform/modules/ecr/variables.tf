@@ -12,7 +12,7 @@ variable "name_prefix" {
 }
 
 variable "service_names" {
-  description = "The services to create repositories for. Defaults to the full 10-service set from the design doc plus the BFF. Override to add/remove."
+  description = "The services to create repositories for. Defaults to every directory under services/ that has a Dockerfile (the same list the Security workflow builds). Keep the two in step when a service is added."
   type        = list(string)
   default = [
     "auth",
@@ -26,6 +26,7 @@ variable "service_names" {
     "model-serving",
     "model-monitor",
     "bff",
+    "ai-gateway",
   ]
 }
 
@@ -59,9 +60,9 @@ variable "max_tagged_images" {
 }
 
 variable "force_delete" {
-  description = "Allow `terraform destroy` to delete a repo that still contains images. TRUE in dev (tear it all down). FALSE in prod so you can't wipe release images by accident."
+  description = "Allow `terraform destroy` to delete a repo that still contains images. SAFE DEFAULT false, so release images cannot be wiped by accident. A throwaway dev env sets true in its tfvars."
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "tags" {

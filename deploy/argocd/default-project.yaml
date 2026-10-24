@@ -1,0 +1,38 @@
+# ============================================================================
+# The built-in `default` AppProject, locked to nothing
+# ============================================================================
+# Argo CD creates a `default` project that allows any repo, any cluster, any
+# namespace and any kind. The root app (project forgepoint-bootstrap) may create
+# Application objects, and an Application chooses its own `spec.project`, so a
+# child Application merged to main that says `project: default` would escape
+# every guardrail in project.yaml. Emptying `default` closes that door: an
+# Application in it can deploy nothing.
+#
+# This is the lock-down the Argo CD docs recommend ("The Default Project"):
+# no repos, no destinations, and a `*/*` namespaced BLACKLIST. The blacklist is
+# what actually denies namespaced kinds. An empty namespaceResourceWhitelist
+# alone is fragile: the Go field is `omitempty`, so anything that round-trips
+# the object through Argo CD (UI, `argocd proj` CLI) drops the empty list, and
+# a missing namespaced whitelist means "allow every kind".
+#
+# Apply once, by hand, with the other projects (it is not under apps/, so the
+# root app never syncs it):
+#   kubectl apply -n argocd -f deploy/argocd/default-project.yaml
+# Check first that nothing else in the cluster relies on `default`:
+#   kubectl -n argocd get applications -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.project}{"\n"}{end}'
+# ============================================================================
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: default
+  namespace: argocd
+spec:
+  description: Locked down. Use the forgepoint or forgepoint-bootstrap project.
+  sourceRepos: []
+  destinations: []
+  # Cluster-scoped kinds: an empty (or missing) whitelist already denies all.
+  clusterResourceWhitelist: []
+  # Namespaced kinds: deny every group and kind.
+  namespaceResourceBlacklist:
+    - group: "*"
+      kind: "*"

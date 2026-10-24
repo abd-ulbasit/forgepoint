@@ -123,11 +123,12 @@ spec:
 
       containers:
         - name: inference-gateway
-          # Image tag is overridden per deploy via:
+          # Pinned tag (never :latest, which Kyverno disallow-latest-tag rejects and
+          # which makes rollback meaningless). Set the deployed tag in ONE place,
+          # the images: block of kustomization.yaml (or for a one-off canary:
           #   kubectl argo rollouts set image fp-inference-gateway \
-          #     inference-gateway=ghcr.io/abd-ulbasit/forgepoint/inference-gateway:<sha>
-          # or via ArgoCD image updater.
-          image: ghcr.io/abd-ulbasit/forgepoint/inference-gateway:latest
+          #     inference-gateway=ghcr.io/abd-ulbasit/forgepoint/inference-gateway:<tag>).
+          image: ghcr.io/abd-ulbasit/forgepoint/inference-gateway:0.1.0
           imagePullPolicy: IfNotPresent
 
           ports:

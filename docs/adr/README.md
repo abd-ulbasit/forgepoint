@@ -18,3 +18,5 @@ zero-padded (`0001`, `0002`, …). Use `docs/adr/template.md` as the starting po
 | [0007](0007-one-pattern-per-service.md) | One distributed-systems pattern per service | Accepted | 2026-06-17 |
 | [0008](0008-istio-service-mesh.md) | Istio service mesh — STRICT mTLS, deny-by-default authz, mesh resilience | Accepted | 2026-06-18 |
 | [0009](0009-tamper-evident-audit-log.md) | Tamper-evident, hash-chained audit log (interceptor capture + append-only sink) | Accepted | 2026-06-18 |
+| [0010](0010-asymmetric-jwt-signing.md) | Asymmetric JWT signing with a published key set (replace the shared HS256 key) | Proposed | 2026-10-24 |
+| [0011](0011-per-service-database-users.md) | Per-service database users instead of the shared master DSN | Proposed | 2026-10-24 |

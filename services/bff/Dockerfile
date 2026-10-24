@@ -34,10 +34,11 @@
 # Stage 1: builder — full Go toolchain, compiles the static binary.
 # ----------------------------------------------------------------------------
 # Pinned by multi-arch index DIGEST (not a floating tag) for hermetic, reproducible
-# builds across amd64/arm64. The builder is 1.26 to match go.work's `go 1.26.0`
-# directive (a 1.25 toolchain refuses to build a workspace declaring a newer Go).
-# Refresh with: docker buildx imagetools inspect golang:1.26-alpine
-FROM golang:1.26-alpine@sha256:f1ddd9fe14fffc091dd98cb4bfa999f32c5fc77d2f2305ea9f0e2595c5437c14 AS builder
+# builds across amd64/arm64. The builder is 1.26.10 to match the `go 1.26.10`
+# directive in go.work and every go.mod (with GOTOOLCHAIN=local an older
+# toolchain refuses to build them; 1.26.9 carried GO-2026-6809 in crypto/x509).
+# Refresh with: docker buildx imagetools inspect golang:1.26.10-alpine
+FROM golang:1.26.10-alpine@sha256:27f2d3b83cfc5803c8078f8e730af0f7c431bf067afaec8f60a36fb763187cba AS builder
 
 # git: VCS stamping/tooling. ca-certificates: HTTPS module fetches. We pass
 # -buildvcs=false below so the .git dir need not be in the context.
@@ -79,10 +80,16 @@ COPY services/bff/ ./services/bff/
 # -buildvcs=false → don't stamp VCS (the .git dir isn't in the context).
 # -trimpath → strip absolute /workspace paths → reproducible.
 ### PER-SERVICE: the `./services/bff/cmd/server` build path is the only build arg to change.
+# VERSION: CI passes the git ref name (tag or branch) as --build-arg VERSION.
+# It is stamped into main.version, which the service reports as
+# service.version on its traces and metrics. Before this ARG existed the
+# build-arg was silently ignored and every image reported "dev". Declared
+# after the dependency layers so a new version only re-runs the compile step.
+ARG VERSION=dev
 ENV CGO_ENABLED=0 GOFLAGS=-mod=readonly
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    go build -ldflags="-s -w" -buildvcs=false -trimpath \
+    go build -ldflags="-s -w -X main.version=${VERSION}" -buildvcs=false -trimpath \
         -o /out/service ./services/bff/cmd/server
 
 

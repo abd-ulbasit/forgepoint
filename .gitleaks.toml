@@ -1,0 +1,38 @@
+# =============================================================================
+# gitleaks configuration — used by the Security workflow (full git history) and
+# the pre-commit hook (staged changes).
+# =============================================================================
+# Start from gitleaks' built-in rules and add a NARROW allowlist of published
+# development placeholders. Every value below is deliberately public, appears
+# in docs or committed dev values, and is never a working credential anywhere.
+# Do not add a real secret here "temporarily": rotate it instead.
+# =============================================================================
+
+title = "forgepoint"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Published dev/test placeholders, never valid credentials"
+# Matched against the extracted SECRET (gitleaks' default regexTarget).
+regexes = [
+  # dev-only-change-me* placeholders in chart values and placeholder Secrets.
+  # This also covers the old dev JWT placeholder, which is public (git history
+  # and the fp-*/_helpers.tpl denylist, which makes the charts refuse it). Any
+  # environment that ever used it as its signing key must rotate (SECURITY.md).
+  '''^dev-only-change-me(-[a-z0-9-]+)?$''',
+  '''^changeme-[a-z0-9-]+$''',
+  # The fixed HMAC key used by pkg/auth unit tests.
+  '''^unit-test-jwt-secret-32bytes-ok!$''',
+]
+
+[[allowlists]]
+description = "False positive: the C4 diagram's technology label for the API gateway"
+# generic-api-key matches `Container(gateway_edge, "API Gateway", "Traefik/Kong", ...)`
+# in docs/diagrams/c4-architecture.md (commit d553f7fe, line 112) and captures
+# the label "Traefik/Kong" as a key. Both conditions must hold (AND): this exact
+# value AND this one file, so the same string anywhere else is still scanned.
+condition = "AND"
+paths = ['''^docs/diagrams/c4-architecture\.md$''']
+regexes = ['''^Traefik/Kong$''']

@@ -104,9 +104,9 @@ config:
 #                           below. Convenient for local Kind; NEVER commit real
 #                           values here.
 #   secrets.create: false → chart renders NO Secret. You must provide a Secret
-#                           named `secrets.existingSecret` out-of-band (External
-#                           Secrets / Sealed Secrets / kubectl). The Deployment
-#                           still envFrom's it.
+#                           named `secrets.existingSecret` (default: the chart
+#                           fullname) out-of-band (External Secrets / Sealed
+#                           Secrets / kubectl). The Deployment still envFrom's it.
 #
 # This service does NOT MINT JWTs (auth is the sole minter), but it MUST VERIFY
 # caller JWTs in-process for its auth interceptor (design D2 — local HMAC verify,
@@ -116,7 +116,12 @@ config:
 # JWT signing key and its own Postgres DSN.
 # ----------------------------------------------------------------------------
 secrets:
-  create: true
+  # DEFAULT false (fail-closed). The chart renders NO Secret and the Deployment
+  # envFrom's an externally-managed one (External Secrets Operator / Sealed
+  # Secrets). If that Secret is missing the pod fails to start, instead of
+  # silently running with the committed dev placeholders below. Local Kind:
+  # `make helm-install` passes --set secrets.create=true.
+  create: false
   # When create=false, the Deployment envFrom's this externally-managed Secret.
   # Defaults to the chart's fullname when empty (see _helpers "secretName").
   existingSecret: ""
@@ -164,10 +169,12 @@ migrations:
   image:
     # golang-migrate official image. Alpine-based, so it has /bin/sh (needed to
     # expand the DSN from env without baking it into the pod spec) and the
-    # `migrate` binary on PATH. Pinned to an immutable tag for reproducible
-    # rollouts — bump deliberately, never track a moving tag.
+    # `migrate` binary on PATH. Pinned BY DIGEST: Docker Hub tags are
+    # mutable (a re-pushed v4.18.3 would change what the kubelet pulls), so the
+    # tag is for humans and the digest is what actually gets pulled. Bump both
+    # together, deliberately.
     repository: migrate/migrate
-    tag: v4.18.3
+    tag: v4.18.3@sha256:39b59b389634e43bb3f2d4e94bc1edef0775ec2a9a3540ce6a2cf330e5daae55
     pullPolicy: IfNotPresent
   # Modest resources: the migrate step is short-lived and IO-light. Requests are
   # tiny so it never blocks scheduling; limits cap a pathological migration.

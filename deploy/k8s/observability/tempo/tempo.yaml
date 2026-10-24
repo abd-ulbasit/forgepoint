@@ -137,7 +137,7 @@ spec:
           # VERIFY before first deploy: confirm this tag exists on Docker Hub
           # (hub.docker.com/r/grafana/tempo/tags) and check the changelog for
           # storage-format or config breaking changes before bumping.
-          image: grafana/tempo:2.7.1
+          image: grafana/tempo:2.7.1@sha256:4443be217c396b065ee34845534199c36fdba4dc619cb96550e228d73fba6e69
           args: ["-config.file=/etc/tempo/tempo.yaml"]
           ports:
             - name: http-query

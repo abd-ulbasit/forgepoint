@@ -1,0 +1,45 @@
+# =============================================================================
+# Trivy accepted findings — every entry needs a reason AND an expiry.
+# =============================================================================
+# Read by the Security workflow (trivyignores: .trivyignore.yaml) for both the
+# filesystem and the image scans. Policy (SECURITY.md, "Accepted findings"):
+#   - an entry is a DECISION, not a mute button: `statement` says why the
+#     finding is a false positive or why the risk is accepted, and what would
+#     remove the entry;
+#   - `expired_at` is mandatory; after it, Trivy stops honouring the entry and
+#     the gate goes red again, forcing a re-decision;
+#   - scope every entry with `paths` (or a package/CVE) as tightly as possible,
+#     never a bare rule ID for the whole repo.
+# =============================================================================
+
+misconfigurations:
+  # FALSE POSITIVE. KSV-0109 ("ConfigMap with secrets") matches the key name
+  # FP_TEAM_TOKEN_BUDGET because it contains "TOKEN". The value is an integer
+  # token-count budget for LLM usage ("1000000"), not a credential. Renaming the
+  # env var would change the service's configuration contract to silence a
+  # heuristic. Re-check on expiry (or if the ConfigMap gains new keys).
+  - id: KSV-0109
+    paths:
+      - "deploy/helm/fp-ai-gateway/templates/configmap.yaml"
+    statement: >-
+      False positive: FP_TEAM_TOKEN_BUDGET is an integer LLM token budget, not a
+      secret. The ConfigMap holds no credentials (those are in the chart Secret).
+    expired_at: 2027-04-30
+
+  # ACCEPTED RISK, TIME-BOXED. The backup CronJob cannot run with a read-only
+  # root FS as written, because its script installs tools at runtime
+  # (`apk add`, `curl ... -o /usr/local/bin/mc`). That script is ALSO broken
+  # independently of this finding: it runs as uid 999, which cannot apk add or
+  # write /usr/local/bin, its database names do not match
+  # scripts/init-postgres.sh, and the minio/mc image it would need is gone from
+  # Docker Hub. The fix is a rewrite (tools baked into a pinned image, no
+  # runtime downloads, then readOnlyRootFilesystem: true), tracked in
+  # SECURITY.md. Compensating controls: non-root, drop ALL, no privilege
+  # escalation, seccomp RuntimeDefault, no SA token.
+  - id: KSV-0014
+    paths:
+      - "deploy/backup/postgres-backup-cronjob.yaml"
+    statement: >-
+      Backup job installs tools at runtime, so it cannot be read-only until it
+      is rewritten (see SECURITY.md). Non-root, drop ALL, no privesc, seccomp.
+    expired_at: 2027-01-31

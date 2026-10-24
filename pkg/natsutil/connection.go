@@ -78,7 +78,7 @@ func Connect(url string, opts ...nats.Option) (*nats.Conn, jetstream.JetStream, 
 			}
 		}),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
-			slog.Info("NATS reconnected", slog.String("url", nc.ConnectedUrl()))
+			slog.Info("NATS reconnected", slog.String("url", nc.ConnectedUrlRedacted()))
 		}),
 	}
 

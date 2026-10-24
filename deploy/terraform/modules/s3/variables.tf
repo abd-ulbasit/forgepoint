@@ -18,7 +18,7 @@ variable "bucket_name" {
 }
 
 variable "kms_key_arn" {
-  description = "ARN of the KMS key for SSE-KMS. Passed in (created in the env layer or eks/rds module) so all artifact encryption can share one key, or set per-env. If empty, the bucket falls back to SSE-S3 (still encrypted, AWS-managed key)."
+  description = "ARN of an existing KMS key for SSE-KMS. Leave EMPTY (the default) and the module creates a dedicated, rotated CMK for this bucket. Do not pass a key that protects another data class (e.g. the RDS key): every reader of artifacts would then also be able to decrypt that data."
   type        = string
   default     = ""
 }

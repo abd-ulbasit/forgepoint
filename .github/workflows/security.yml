@@ -15,14 +15,17 @@
 #     line is in the OSV database."
 #   - Trivy (fs): scans go.sum/lockfiles + IaC/secrets in the working tree —
 #     a broad net for dependency and config issues before anything is built.
-#   - Trivy (image): scans the BUILT container (OS packages + app deps). Our
-#     distroless base means this should find ~zero OS CVEs; it gates HIGH/CRITICAL.
+#   - Trivy (image): scans the BUILT container (OS packages + app deps) as a
+#     local tarball, BEFORE anything is pushed; `publish` pushes that same
+#     tarball. Our distroless base means this should find ~zero OS CVEs; it
+#     gates HIGH/CRITICAL.
 #   - Syft SBOM (CycloneDX): the bill of materials — required for provenance,
 #     consumed by downstream policy (e.g. "no GPL", "no log4j") and audits.
-#   - cosign keyless: signs the image using a short-lived Sigstore cert tied to
-#     this workflow's OIDC identity — NO long-lived private key to leak. The
-#     signature + Rekor transparency-log entry let anyone verify the image came
-#     from THIS repo's release workflow.
+#   - cosign keyless: signs every published image (main and v* tags) using a
+#     short-lived Sigstore cert tied to this workflow's OIDC identity — NO
+#     long-lived private key to leak. The signature + Rekor transparency-log
+#     entry let anyone (and the Kyverno verifyImages policy) verify the image
+#     came from THIS repo's Security workflow on main or a release tag.
 #
 # STRUCTURE — onboarding a service costs nothing here:
 #   Both matrices are RESOLVED FROM THE REPO by the `matrix` job below —
@@ -50,24 +53,39 @@ on:
   # Allow on-demand runs (e.g. to re-scan after a base-image CVE disclosure)
   # without a code change.
   workflow_dispatch:
+  # Weekly re-scan with a fresh vulnerability DB, plus the third-party image
+  # scan below, which only runs on schedule/dispatch.
+  schedule:
+    - cron: "17 4 * * 1"
 
-# SECURITY: least privilege at the TOP. The default for every job is read-only;
-# the two jobs that need more elevate locally:
-#   - The image job adds id-token:write (Sigstore OIDC for keyless cosign) and
-#     packages:write (push to GHCR) ONLY when it actually signs/pushes.
+# SECURITY: least privilege at the TOP. The default for every job is read-only.
+# Exactly one job elevates: `publish`, which runs only for pushes to main or a
+# v* tag (never for pull_request or workflow_dispatch), adds packages:write
+# (push to GHCR) and id-token:write (Sigstore OIDC for keyless cosign). The
+# `image` job, which builds pull-request code, keeps contents:read.
 permissions:
   contents: read
 
+# The event is part of the group. GitHub keeps at most one PENDING run per
+# group and cancels it when another run queues, whatever cancel-in-progress
+# says. Without the event, the weekly schedule run (ref = main) could queue
+# behind an in-progress push run and cancel a pending push run, so that commit
+# would never be published or signed. Schedule and dispatch runs now queue in
+# their own groups and never displace a push.
 concurrency:
-  group: security-${{ github.workflow }}-${{ github.ref }}
+  group: security-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  GO_VERSION: "1.26"
-  # Container registry + image namespace. GHCR keyed to the repo owner so
-  # `cosign verify` can assert the image came from this org's workflows.
+  # Exact patch release, kept equal to go.work, every go.mod and the golang
+  # builder image in services/*/Dockerfile. govulncheck reports standard-library
+  # vulnerabilities against THIS toolchain, so a bare "1.26" made the result
+  # depend on whichever 1.26.x the runner had cached.
+  GO_VERSION: "1.26.10"
   REGISTRY: ghcr.io
-  IMAGE_NAMESPACE: ${{ github.repository_owner }}
+  # Every image is ghcr.io/<owner>/<repo>/<service>, the name the Helm charts,
+  # Rollouts and the Kyverno allowlist use (ghcr.io/abd-ulbasit/forgepoint/auth).
+  IMAGE_PREFIX: ghcr.io/${{ github.repository }}
 
 jobs:
   # ===========================================================================
@@ -168,9 +186,25 @@ jobs:
       # cannot break this gate the same way again.
       - name: Trivy filesystem scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          # Render the Helm charts against a Kubernetes version they accept.
+          # Trivy renders charts as Kubernetes v1.20.0 by default, below every
+          # chart's kubeVersion (>=1.23.0-0), so it logged "Failed to render
+          # Chart files" for all 12 charts and scanned NONE of them, and the job
+          # still passed on that part. Keep this in step with the EKS
+          # cluster_version in deploy/terraform.
+          TRIVY_HELM_KUBE_VERSION: "1.36.0"
         with:
           scan-type: fs
           scan-ref: .
+          # Evaluate the Terraform with the values people actually copy. Trivy
+          # does not read *.tfvars.example on its own, which is how an example
+          # opening the EKS API to 0.0.0.0/0 sat in the repo with the gate
+          # green (AWS-0040/AWS-0041 fire on it when this is set).
+          tf-vars: deploy/terraform/environments/dev/terraform.tfvars.example
+          # Accepted findings: every entry has a reason and an expiry date
+          # (see .trivyignore.yaml and SECURITY.md "Accepted findings").
+          trivyignores: .trivyignore.yaml
           # Gate the build on actionable severities only; INFO/LOW noise would
           # train people to ignore the gate.
           severity: HIGH,CRITICAL
@@ -179,74 +213,174 @@ jobs:
           # NOTE: ignore-unfixed has been intentionally removed. Keeping it would
           # silently pass HIGH/CRITICAL CVEs that have no upstream fix yet —
           # exactly the ones you most need visibility on. An unfixed CVE is a
-          # real risk; we want the gate to be honest. If a specific CVE must be
-          # accepted (e.g. no fix exists and a compensating control is in place),
-          # add it to a `.trivyignore` file with a documented expiry date.
+          # real risk; we want the gate to be honest. If a specific finding must
+          # be accepted, add it to .trivyignore.yaml with a statement and an
+          # expired_at date; after that date the gate goes red again.
           # Cover dependency CVEs, leaked secrets, and IaC misconfig in one pass.
           scanners: vuln,secret,misconfig
 
   # ===========================================================================
-  # 3. Image: build → Trivy image scan → SBOM → cosign sign (per service).
+  # 2b. gitleaks — secrets in the FULL git history, not just the working tree.
   # ===========================================================================
+  # Trivy's secret scanner (above) only sees the current checkout. A credential
+  # committed and later deleted is invisible to it, yet still in every clone.
+  # This job walks every commit. Findings fail the gate; a known-safe value is
+  # allowlisted in .gitleaks.toml with a reason, a real one is ROTATED (removing
+  # it from history does not un-leak it).
+  #
+  # gitleaks is built from source at a pinned version with `go install`, so the
+  # module checksum database verifies it (the same way govulncheck is installed
+  # above) instead of trusting a downloaded binary or a third-party action.
+  # --redact keeps any finding's value out of the job log.
+  gitleaks:
+    name: gitleaks (full history)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Install gitleaks
+        run: go install github.com/zricethezav/gitleaks/v8@v8.30.1
+
+      - name: Scan every commit
+        run: gitleaks git --config .gitleaks.toml --redact --verbose --exit-code 1 .
+
+  # ===========================================================================
+  # 2c. third-party images — the images we RUN but do not build.
+  # ===========================================================================
+  # The image job scans only first-party services. postgres, redis, nats,
+  # grafana, prometheus, tempo, loki, the OTel collector, ollama and the
+  # migrate initContainer also run in the cluster and were never scanned. The
+  # list is derived from the repo (every `image: ...@sha256:` in deploy/ and
+  # docker-compose.yaml, plus repository/tag@sha256 pairs in chart values), so
+  # a newly pinned image is covered automatically. The minio images are absent
+  # because they cannot be digest-pinned any more (see deploy/k8s/infra/minio).
+  #
+  # Runs on the weekly schedule and on demand, NOT on push/PR: these CVEs are
+  # fixed by bumping a pin (Dependabot's docker ecosystem proposes those), not
+  # by the change under review, so they must not block unrelated merges. A red
+  # scheduled run is the alert.
+  #
+  # Unlike the first-party gates this uses ignore-unfixed: an upstream CVE with
+  # no fixed release cannot be acted on by bumping, so reporting it weekly would
+  # only train people to ignore the run. Accept anything else via
+  # .trivyignore.yaml (statement + expiry) like every other finding.
+  third-party-matrix:
+    name: resolve third-party images
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.set.outputs.images }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve
+        id: set
+        run: |
+          set -euo pipefail
+          images=$( {
+            grep -rhoE '^[[:space:]]*image:[[:space:]]*"?[^"[:space:]]+@sha256:[0-9a-f]{64}' deploy docker-compose.yaml \
+              | sed -E 's/^[[:space:]]*image:[[:space:]]*"?//'
+            for f in deploy/helm/*/values.yaml; do
+              awk '/^[[:space:]]+repository:/{r=$2} /^[[:space:]]+tag:.*@sha256:/{print r":"$2}' "$f"
+            done
+          } | sort -u | jq -R . | jq -sc . )
+          [ "$(jq -r 'length' <<<"$images")" -gt 0 ] || { echo "no digest-pinned third-party images found" >&2; exit 1; }
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+          jq -r '.[]' <<<"$images"
+
+  third-party-images:
+    name: third-party (${{ matrix.image }})
+    needs: [third-party-matrix]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(needs.third-party-matrix.outputs.images) }}
+    steps:
+      - name: Checkout (for .trivyignore.yaml)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ matrix.image }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os,library
+          trivyignores: .trivyignore.yaml
+
+  # ===========================================================================
+  # 3. image — build → Trivy image scan → SBOM, per service. NEVER pushes.
+  # ===========================================================================
+  # ORDER OF OPERATIONS (the point of splitting this from `publish`):
+  #   build to a local tarball → scan that tarball → SBOM it → (main/tags only)
+  #   hand the SAME tarball to `publish`. Nothing reaches the registry unless
+  #   the scan of those exact bytes passed. The old single job pushed on every
+  #   push event BEFORE Trivy ran, and scanned the first mutable tag (:main)
+  #   rather than what it had just built, so an image with a HIGH CVE was
+  #   already pullable by the time the gate went red.
+  #
+  # PERMISSIONS: contents:read only. This job builds code from pull requests,
+  # so it must not hold packages:write or id-token:write. (It used to hold both
+  # statically, on same-repo PR runs too.)
   image:
     name: image (${{ matrix.service }})
     runs-on: ubuntu-latest
-    needs: [matrix, govulncheck, trivy-fs]
+    needs: [matrix, govulncheck, trivy-fs, gitleaks]
     strategy:
       fail-fast: false
       matrix:
         service: ${{ fromJSON(needs.matrix.outputs.services) }}
     permissions:
       contents: read
-      # Push images to GHCR (only used on push/tag, see the `if` on push/sign).
-      packages: write
-      # Sigstore keyless signing: mints a short-lived OIDC token as the cert
-      # subject. WITHOUT this, cosign would need a long-lived key (the thing we
-      # are deliberately avoiding).
-      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Buildx gives us the modern BuildKit builder (cache mounts in the
-      # Dockerfile, multi-stage, provenance) used by build-push-action.
+      # Dockerfile, multi-stage) used by build-push-action.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
-      # Derive tags/labels from git context. On a PR we build but do NOT push
-      # (no login below); on push/tag we push and sign. metadata-action emits a
-      # canonical ${{ steps.meta.outputs.tags }} + OCI labels.
+      # Tags/labels from git context. The image NAME is the one the Helm charts,
+      # Rollouts and Kyverno allowlist already use:
+      #   ghcr.io/<owner>/<repo>/<service>   e.g. ghcr.io/abd-ulbasit/forgepoint/auth
+      # (it used to be ghcr.io/<owner>/forgepoint-<service>, which nothing that
+      # deploys images referenced).
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/forgepoint-${{ matrix.service }}
+          images: ${{ env.IMAGE_PREFIX }}/${{ matrix.service }}
           tags: |
             type=ref,event=branch
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=sha,format=long
 
-      # Log in to GHCR ONLY when we intend to push (push to main or a tag).
-      # On PRs from forks the GITHUB_TOKEN can't push anyway; gating the login
-      # keeps PR runs read-only and avoids a useless auth attempt.
-      - name: Log in to GHCR
-        if: github.event_name == 'push'
-        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # Build the image from the REPO ROOT context (context: .) with the
-      # service's Dockerfile. Root context is mandatory: the Dockerfile copies
-      # sibling modules (pkg, gen/go) and generates a per-service go.work on the
-      # fly — those paths don't exist in a services/<svc>/ context. See the long
-      # header in services/<svc>/Dockerfile for the full rationale.
-      #   - load:true on PR → image stays local for the Trivy scan, no push.
-      #   - push only on a real push event.
-      #   - digest output feeds the SBOM + cosign steps (sign by digest, not tag,
-      #     so the signature is immutable even if the tag is later re-pointed).
+      # Build from the REPO ROOT context (the Dockerfile copies sibling modules:
+      # pkg, gen/go). Output is a docker-archive TARBALL, not a push and not a
+      # registry ref: the scan and the SBOM below read this file, and `publish`
+      # pushes this file. provenance/sbom attestations are off because the
+      # docker exporter cannot carry them (Syft's SBOM below is attached with
+      # cosign instead).
       - name: Build image
         id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
@@ -255,59 +389,37 @@ jobs:
           file: services/${{ matrix.service }}/Dockerfile
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          push: ${{ github.event_name == 'push' }}
-          load: ${{ github.event_name != 'push' }}
+          outputs: type=docker,dest=${{ runner.temp }}/image.tar
+          provenance: false
+          sbom: false
           build-args: |
             VERSION=${{ github.ref_name }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Scan the BUILT image. On push we built with push:true (no local image),
-      # so scan the pushed ref; on PR we scan the locally loaded tag. Either way
-      # we reference the first metadata tag. FAIL on HIGH/CRITICAL — distroless
-      # should keep this green; a red here means a dependency CVE shipped.
-      - name: Resolve scan target
-        id: target
-        # SECURITY: steps.meta.outputs.tags is derived from git context (branch
-        # name, PR ref, SHA). Interpolating ${{ ... }} directly into `run:` shell
-        # is a script-injection vector — a maliciously crafted branch name could
-        # embed shell metacharacters or commands that execute in the runner.
-        # Fix: pass the value through an environment variable (env:) instead of
-        # inline interpolation. The shell receives it as a plain string ($TAGS),
-        # so metacharacters are never interpreted by bash. This is the standard
-        # GitHub Actions mitigation for CWE-78 / GHSA script injection.
-        env:
-          TAGS: ${{ steps.meta.outputs.tags }}
-        run: |
-          # Take the first line of the multi-line tags output as the scan ref.
-          ref="$(printf '%s\n' "${TAGS}" | head -n1)"
-          echo "image=${ref}" >> "$GITHUB_OUTPUT"
-
+      # Scan the BUILT bytes (the tarball), not a tag. FAIL on HIGH/CRITICAL.
       - name: Trivy image scan
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: image
-          image-ref: ${{ steps.target.outputs.image }}
+          input: ${{ runner.temp }}/image.tar
           severity: HIGH,CRITICAL
           exit-code: "1"
           # NOTE: ignore-unfixed has been intentionally removed — same rationale
-          # as the fs scan above. A HIGH/CRITICAL with no upstream fix is still a
-          # real risk that deserves a decision, not a silent pass. Add a
-          # .trivyignore entry with justification if a specific CVE must be
-          # accepted (e.g. distroless ships an unfixed low-risk OpenSSL build).
+          # as the fs scan above. Accept a specific CVE only through
+          # .trivyignore.yaml (statement + expiry).
           vuln-type: os,library
+          trivyignores: .trivyignore.yaml
 
-      # Generate a CycloneDX SBOM from the built image. anchore/sbom-action wraps
-      # Syft; CycloneDX is the format policy engines + `cosign attest` consume.
-      # Uploaded as an artifact (and as a release asset on a tag).
+      # CycloneDX SBOM of the same tarball. Uploaded as an artifact on every
+      # run; attached to the pushed image as a signed attestation in `publish`.
       - name: Generate CycloneDX SBOM (Syft)
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
-          image: ${{ steps.target.outputs.image }}
+          image: docker-archive:${{ runner.temp }}/image.tar
           format: cyclonedx-json
           output-file: sbom-${{ matrix.service }}.cyclonedx.json
-          # Don't auto-publish to a GitHub release on tags from here; we attach
-          # explicitly so the artifact name is deterministic.
+          upload-artifact: false
           upload-release-assets: false
 
       - name: Upload SBOM artifact
@@ -317,40 +429,162 @@ jobs:
           path: sbom-${{ matrix.service }}.cyclonedx.json
           if-no-files-found: error
 
-      # Install cosign for keyless signing.
-      - name: Install cosign
-        # Sign only on TAGGED release builds. We don't sign every main push —
-        # signatures are a release artifact; signing dev images is noise.
+      # Hand the scanned tarball (and its config digest = image ID) to
+      # `publish`. Only on events that publish, so PR runs do not store
+      # 12 images. One-day retention: this is a hand-off, not an archive.
+      - name: Record scanned image ID
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        env:
+          IMAGE_ID: ${{ steps.build.outputs.imageid }}
+        run: |
+          set -euo pipefail
+          [ -n "${IMAGE_ID}" ] || { echo "build produced no image id" >&2; exit 1; }
+          mkdir -p "${RUNNER_TEMP}/publish"
+          mv "${RUNNER_TEMP}/image.tar" "${RUNNER_TEMP}/publish/image.tar"
+          printf '%s\n' "${IMAGE_ID}" > "${RUNNER_TEMP}/publish/scanned-imageid.txt"
+
+      - name: Upload scanned image for publish
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-${{ matrix.service }}
+          path: ${{ runner.temp }}/publish/
+          if-no-files-found: error
+          retention-days: 1
+
+  # ===========================================================================
+  # 4. publish — push the SCANNED image, then sign it. main and v* tags only.
+  # ===========================================================================
+  # Runs only after `image` passed for every service (a matrix `needs` waits
+  # for all legs), only for pushes to main or a v* tag, and only here do the
+  # write permissions exist:
+  #   packages:write — push to GHCR with GITHUB_TOKEN
+  #   id-token:write — Sigstore keyless signing (a short-lived Fulcio cert bound
+  #                    to this workflow's OIDC identity; no long-lived key)
+  # pull_request and workflow_dispatch runs never reach this job.
+  publish:
+    name: publish (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    needs: [matrix, image]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJSON(needs.matrix.outputs.services) }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      # Full history so the tag check below can see main.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # A v* tag can point at ANY commit, including one that never went through
+      # review on main. Publish (and sign) only commits that are on main.
+      - name: Refuse tags that are not on main
         if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "::error::${GITHUB_REF_NAME} points at ${GITHUB_SHA}, which is not on main; refusing to publish" >&2
+            exit 1
+          fi
+
+      - name: Download scanned image
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image-${{ matrix.service }}
+          path: scanned
+
+      - name: Download SBOM
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sbom-${{ matrix.service }}
+          path: sbom
+
+      # Prove the tarball is the image that was scanned, then load it. The
+      # "image ID" buildx reported is the digest of the image CONFIG, which
+      # lists every layer's uncompressed digest: same config digest, same
+      # layers. It is recomputed from the tarball itself, so the check does not
+      # depend on which image store the runner's Docker uses.
+      - name: Verify and load the scanned image
+        id: load
+        env:
+          SERVICE: ${{ matrix.service }}
+        run: |
+          set -euo pipefail
+          expected="$(cat scanned/scanned-imageid.txt)"
+          config_path="$(tar -xOf scanned/image.tar manifest.json | jq -r '.[0].Config')"
+          actual="sha256:$(tar -xOf scanned/image.tar "${config_path}" | sha256sum | cut -d' ' -f1)"
+          if [ "${actual}" != "${expected}" ]; then
+            echo "::error::tarball config ${actual} != scanned image ${expected}" >&2
+            exit 1
+          fi
+          docker load --input scanned/image.tar
+          repo="$(printf '%s/%s' "${IMAGE_PREFIX}" "${SERVICE}" | tr '[:upper:]' '[:lower:]')"
+          echo "repo=${repo}" >> "$GITHUB_OUTPUT"
+          echo "image_id=${expected}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4.5.1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Push every tag metadata-action put on the image (main or the semver,
+      # plus sha-<40>), then ask the REGISTRY for the manifest digest of the
+      # sha-<40> tag and check that manifest's config is the scanned image.
+      - name: Push
+        id: push
+        env:
+          REPO: ${{ steps.load.outputs.repo }}
+          IMAGE_ID: ${{ steps.load.outputs.image_id }}
+        run: |
+          set -euo pipefail
+          docker push --all-tags "${REPO}"
+          digest="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "${REPO}:sha-${GITHUB_SHA}" | jq -r .digest)"
+          case "${digest}" in sha256:*) ;; *) echo "::error::no digest for ${REPO}:sha-${GITHUB_SHA}" >&2; exit 1 ;; esac
+          remote_config="$(docker buildx imagetools inspect --raw "${REPO}@${digest}" | jq -r .config.digest)"
+          if [ "${remote_config}" != "${IMAGE_ID}" ]; then
+            echo "::error::pushed config ${remote_config} != scanned image ${IMAGE_ID}" >&2
+            exit 1
+          fi
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "pushed ${REPO}@${digest}"
+
+      - name: Install cosign
         uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
 
-      # Keyless sign the image BY DIGEST. COSIGN_EXPERIMENTAL/--yes drive the
-      # OIDC keyless flow: cosign requests a token from GitHub's OIDC provider
-      # (enabled by id-token:write), Fulcio issues a short-lived cert bound to
-      # this workflow's identity, the signature + cert land in Rekor (public
-      # transparency log). Verifiers run:
-      #   cosign verify --certificate-identity-regexp '...forgepoint/.github/...' \
-      #                 --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-      #                 ghcr.io/<owner>/forgepoint-<svc>@<digest>
-      # We sign the DIGEST (immutable), not a tag, so re-pointing the tag can't
-      # invalidate or hijack the signature.
+      # Keyless sign the image BY DIGEST: cosign exchanges this job's GitHub
+      # OIDC token for a short-lived Fulcio cert, and the signature + cert land
+      # in the public Rekor log. Every published image is signed, main builds
+      # included, so the cluster can require a signature on ANY image from this
+      # repository (deploy/policies/base/50-verify-images.yaml). Verify with:
+      #   cosign verify \
+      #     --certificate-identity-regexp '^https://github\.com/abd-ulbasit/forgepoint/\.github/workflows/security\.yml@refs/(heads/main|tags/v.*)$' \
+      #     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      #     ghcr.io/abd-ulbasit/forgepoint/<svc>@<digest>
       - name: Cosign sign (keyless)
-        if: startsWith(github.ref, 'refs/tags/v')
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/forgepoint-${{ matrix.service }}
+          REPO: ${{ steps.load.outputs.repo }}
+          DIGEST: ${{ steps.push.outputs.digest }}
         run: |
-          cosign sign --yes "${IMAGE}@${DIGEST}"
+          cosign sign --yes "${REPO}@${DIGEST}"
 
-      # Attach the SBOM to the image as a signed CycloneDX attestation so the
-      # bill of materials travels WITH the image and is itself verifiable.
+      # Attach the SBOM as a signed CycloneDX attestation so the bill of
+      # materials travels WITH the image and is itself verifiable.
       - name: Cosign attest SBOM (keyless)
-        if: startsWith(github.ref, 'refs/tags/v')
         env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/forgepoint-${{ matrix.service }}
+          REPO: ${{ steps.load.outputs.repo }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          SERVICE: ${{ matrix.service }}
         run: |
           cosign attest --yes \
-            --predicate "sbom-${{ matrix.service }}.cyclonedx.json" \
+            --predicate "sbom/sbom-${SERVICE}.cyclonedx.json" \
             --type cyclonedx \
-            "${IMAGE}@${DIGEST}"
+            "${REPO}@${DIGEST}"

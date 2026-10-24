@@ -59,25 +59,27 @@ spec:
       releaseName: fp-registry
       # valueFiles layered LEFT→RIGHT (later overrides earlier). The chart's
       # committed values.yaml carries DEV-safe defaults (per its SECURITY
-      # CONTRACT: in-chart Secret with placeholder creds, FP_ENV=local). For prod
+      # CONTRACT: secrets.create=false, so a Secret named after the release
+      # must already exist, see README "Secrets note"; FP_ENV=local). For prod
       # you ADD `- values-prod.yaml` here (External Secrets, real image tag,
       # higher replicas) — that file is the env override surface.
       valueFiles:
         - values.yaml
       # ----------------------------------------------------------------------
-      # IMAGE TAG — the ONE value CI bumps in Git (see README "how images update").
-      # The chart defaults image.tag to "" → falls back to Chart.appVersion. In a
-      # real GitOps flow, CI rewrites THIS line (or a values-<env>.yaml) to the
-      # freshly built immutable tag (git SHA / semver), commits, and pushes. That
-      # Git commit is the deploy trigger — ArgoCD syncs the new tag. No cluster
-      # creds in CI; the only thing CI touches is Git.
+      # IMAGE TAG — the value a GitOps flow bumps in Git. The chart defaults
+      # image.tag to "" → falls back to Chart.appVersion.
       #
-      # Left empty here so the committed default (appVersion) renders; CI's job is
-      # to fill it. Never set ":latest" — immutable tags make rollbacks a revert.
+      # CURRENT STATE: NOTHING bumps it. ADR-0002 plans for CI to rewrite this
+      # line (or a values-<env>.yaml) after build → scan → sign → push, but that
+      # step does not exist (an earlier comment here claimed "CI overwrites" it).
+      # Until it does, deploy a build by setting this to its published tag
+      # (the semver, e.g. "0.2.0", or "sha-<40-char commit>") in a reviewed PR.
+      # Images: ghcr.io/abd-ulbasit/forgepoint/<svc>, signed by the Security
+      # workflow. Never ":latest" — immutable tags make rollbacks a revert.
       # ----------------------------------------------------------------------
       parameters:
         - name: image.tag
-          value: ""   # CI overwrites with the built image's immutable tag
+          value: ""   # empty = Chart.appVersion; set by hand until CI bumps it
 
   destination:
     server: https://kubernetes.default.svc

@@ -84,6 +84,11 @@ import (
 	"github.com/abd-ulbasit/forgepoint/services/experiment-tracker/internal/repository/postgres"
 )
 
+// version is set at build time with -ldflags "-X main.version=<ref>" (see the
+// Dockerfile's VERSION build arg) and reported as the OTel service.version.
+// Local `go run` builds report "dev".
+var version = "dev"
+
 // serviceName is the canonical identity used for telemetry resource attributes,
 // the NATS event source, and the consumer-group/DLQ naming. It MUST match
 // events.ServiceName (the value stamped into every published EventEnvelope.source)
@@ -190,7 +195,7 @@ func main() {
 
 	otelShutdown, err := observability.Setup(ctx, observability.Config{
 		ServiceName:    serviceName,
-		ServiceVersion: "dev",
+		ServiceVersion: version,
 		Environment:    cfg.Environment,
 		OTLPEndpoint:   cfg.OTelEndpoint,
 		OTLPInsecure:   cfg.OTLPInsecure, // driven by config, not hardcoded (see field comment)
@@ -249,7 +254,7 @@ func main() {
 			logger.Error("nats drain error", slog.String("error", drainErr.Error()))
 		}
 	}()
-	logger.Info("NATS connected", slog.String("url", cfg.NATSUrl))
+	logger.Info("NATS connected", slog.String("url", config.RedactURL(cfg.NATSUrl)))
 
 	// --- ENSURE THE EXPERIMENTS STREAM EXISTS (producer owns its stream) ---
 	// experiment-tracker is the OWNER and sole producer of the fp.experiments.* tree

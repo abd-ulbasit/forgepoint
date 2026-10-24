@@ -107,7 +107,7 @@ secrets.existingSecret. Either way the Deployment references ONE stable name.
 {{- if .Values.secrets.create -}}
 {{- include "fp-feature-store.fullname" . -}}
 {{- else -}}
-{{- required "secrets.create=false requires secrets.existingSecret to name the externally-managed Secret" .Values.secrets.existingSecret -}}
+{{- default (include "fp-feature-store.fullname" .) .Values.secrets.existingSecret -}}
 {{- end -}}
 {{- end -}}
 

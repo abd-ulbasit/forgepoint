@@ -17,9 +17,10 @@
 # ============================================================================
 
 terraform {
-  # 1.14.x is what this repo is validated against. Allow forward patch/minor,
-  # forbid the next major where breaking language changes could land.
-  required_version = ">= 1.9.0, < 2.0.0"
+  # 1.14.x is what this repo is validated against. >= 1.11 because the S3
+  # backend's use_lockfile is GA from 1.11. Allow forward patch/minor, forbid
+  # the next major where breaking language changes could land.
+  required_version = ">= 1.11.0, < 2.0.0"
 
   required_providers {
     # The AWS provider is the workhorse — VPC, EKS, RDS, ElastiCache, S3, ECR, IAM.

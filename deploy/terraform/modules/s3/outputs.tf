@@ -11,6 +11,11 @@ output "bucket_arn" {
   value       = aws_s3_bucket.artifacts.arn
 }
 
+output "kms_key_arn" {
+  description = "ARN of the KMS key encrypting the bucket (the module's own CMK unless one was passed in). Readers need kms:Decrypt on it, writers also kms:GenerateDataKey."
+  value       = local.artifacts_kms_key_arn
+}
+
 output "bucket_regional_domain_name" {
   description = "Regional domain name of the bucket (e.g. <name>.s3.<region>.amazonaws.com). Useful for S3 client endpoint config."
   value       = aws_s3_bucket.artifacts.bucket_regional_domain_name
